@@ -5,10 +5,9 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "../include/wamble/wamble.h"
 #include "../board_manager.c"
+#include "../include/wamble/wamble.h"
 #include "../move_engine.c"
-
 
 typedef struct {
   const char *name;
