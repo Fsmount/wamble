@@ -123,6 +123,7 @@ void board_manager_init(void);
 WambleBoard *get_or_create_board(void);
 void release_board(uint64_t board_id);
 void archive_board(uint64_t board_id);
+int start_board_manager_thread(void);
 
 void calculate_and_distribute_pot(uint64_t board_id);
 
