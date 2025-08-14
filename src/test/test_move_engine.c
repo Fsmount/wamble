@@ -5,8 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
-typedef struct
-{
+typedef struct {
   const char *name;
   const char *start_fen;
   const char *uci;
@@ -54,33 +53,28 @@ static const Case cases[] = {
     {"queen cannot jump pieces", "4Q3/4p3/8/8/8/8/8/5K2 w - - 0 1", "e8e4", "",
      0}};
 
-static int run_case(const Case *c)
-{
+static int run_case(const Case *c) {
   Board board;
   parse_fen_to_bitboard(c->start_fen, &board);
 
   int rc = validate_and_apply_move(&board, c->uci);
 
-  if (rc != 0 && c->expect_ok)
-  {
+  if (rc != 0 && c->expect_ok) {
     printf("%s FAILED: engine returned %d (expected 0)\n", c->name, rc);
     return 0;
   }
-  if (rc == 0 && !c->expect_ok)
-  {
+  if (rc == 0 && !c->expect_ok) {
     printf("%s FAILED: expected rejection but engine accepted the move\n",
            c->name);
     return 0;
   }
 
-  if (c->expect_ok)
-  {
+  if (c->expect_ok) {
     char final_fen[FEN_MAX_LENGTH];
     bitboard_to_fen(&board, final_fen);
     if (c->expected_fen_prefix && *c->expected_fen_prefix &&
         strncmp(final_fen, c->expected_fen_prefix,
-                strlen(c->expected_fen_prefix)) != 0)
-    {
+                strlen(c->expected_fen_prefix)) != 0) {
       printf("%s FAILED: FEN mismatch\n"
              "  expected: %s\n"
              "  actual:   %s\n",
@@ -91,19 +85,16 @@ static int run_case(const Case *c)
   return 1;
 }
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
   const char *filter = (argc > 1 ? argv[1] : "");
   int pass = 0, total = 0;
 
-  for (size_t i = 0; i < (sizeof(cases) / sizeof((cases)[0])); ++i)
-  {
+  for (size_t i = 0; i < (sizeof(cases) / sizeof((cases)[0])); ++i) {
     if (*filter && !strstr(cases[i].name, filter))
       continue;
 
     ++total;
-    if (run_case(&cases[i]))
-    {
+    if (run_case(&cases[i])) {
       printf("%s PASSED\n", cases[i].name);
       ++pass;
     }
