@@ -111,12 +111,14 @@ typedef struct {
   uint64_t player_id;
   char uci_move[MAX_UCI_LENGTH];
   time_t timestamp;
+  bool is_white_move;
 } WambleMove;
 
 typedef struct {
   uint64_t id;
   uint8_t token[TOKEN_LENGTH];
   uint8_t public_key[32];
+  double score;
 } WamblePlayer;
 
 void board_manager_init(void);
