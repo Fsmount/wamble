@@ -94,7 +94,7 @@ typedef struct WambleBoard {
   time_t reservation_time;
 } WambleBoard;
 
-int validate_and_apply_move(Board *board, const char *uci_move);
+int validate_and_apply_move(WambleBoard *wamble_board, const char *uci_move);
 
 int parse_fen_to_bitboard(const char *fen, Board *board);
 void bitboard_to_fen(const Board *board, char *fen);

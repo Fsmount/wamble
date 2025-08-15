@@ -611,6 +611,25 @@ static int generate_legal_moves_bitboard(Board *board, Move *moves) {
   return move_count;
 }
 
+static void update_game_result(WambleBoard *wamble_board) {
+  Board *board = &wamble_board->board;
+  int color = (board->turn == 'w') ? 0 : 1;
+
+  Move legal_moves[256];
+  int num_legal_moves = generate_legal_moves_bitboard(board, legal_moves);
+
+  if (num_legal_moves == 0) {
+    if (is_king_in_check(board, color)) {
+      wamble_board->result =
+          (color == 0) ? GAME_RESULT_BLACK_WINS : GAME_RESULT_WHITE_WINS;
+    } else {
+      wamble_board->result = GAME_RESULT_DRAW;
+    }
+  } else if (board->halfmove_clock >= 100) {
+    wamble_board->result = GAME_RESULT_DRAW;
+  }
+}
+
 int parse_fen_to_bitboard(const char *fen, Board *board) {
   memset(board, 0, sizeof(Board));
 
@@ -805,10 +824,11 @@ void bitboard_to_fen(const Board *board, char *fen) {
   *fen_ptr = '\0';
 }
 
-int validate_and_apply_move(Board *board, const char *uci_move) {
-  if (!board || !uci_move) {
+int validate_and_apply_move(WambleBoard *wamble_board, const char *uci_move) {
+  if (!wamble_board || !uci_move) {
     return -1;
   }
+  Board *board = &wamble_board->board;
   int from, to;
   if (uci_to_squares(uci_move, &from, &to) != 0) {
     return -1;
@@ -832,6 +852,7 @@ int validate_and_apply_move(Board *board, const char *uci_move) {
   }
 
   make_move_bitboard(board, &candidate_move);
+  update_game_result(wamble_board);
 
   return 0;
 }
