@@ -824,10 +824,21 @@ void bitboard_to_fen(const Board *board, char *fen) {
   *fen_ptr = '\0';
 }
 
-int validate_and_apply_move(WambleBoard *wamble_board, const char *uci_move) {
-  if (!wamble_board || !uci_move) {
+int validate_and_apply_move(WambleBoard *wamble_board, WamblePlayer *player,
+                            const char *uci_move) {
+  if (!wamble_board || !uci_move || !player) {
     return -1;
   }
+
+  if (wamble_board->reservation_player_id != player->id) {
+    return -1;
+  }
+
+  bool is_white_turn = (wamble_board->board.turn == 'w');
+  if (wamble_board->reserved_for_white != is_white_turn) {
+    return -1;
+  }
+
   Board *board = &wamble_board->board;
   int from, to;
   if (uci_to_squares(uci_move, &from, &to) != 0) {
@@ -853,6 +864,11 @@ int validate_and_apply_move(WambleBoard *wamble_board, const char *uci_move) {
 
   make_move_bitboard(board, &candidate_move);
   update_game_result(wamble_board);
+
+  if (wamble_board->result != GAME_RESULT_IN_PROGRESS) {
+    update_player_ratings(wamble_board);
+    archive_board(wamble_board->id);
+  }
 
   return 0;
 }

@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "../include/wamble/wamble.h"
@@ -36,11 +37,12 @@ WamblePlayer *get_player_by_id(uint64_t player_id) {
   return NULL;
 }
 
-int get_moves_for_board(uint64_t board_id, WambleMove *moves, int max_moves) {
+int get_moves_for_board(uint64_t board_id, WambleMove **moves) {
+  *moves = malloc(sizeof(WambleMove) * num_test_moves);
   int count = 0;
   for (int i = 0; i < num_test_moves; i++) {
-    if (test_moves[i].board_id == board_id && count < max_moves) {
-      moves[count++] = test_moves[i];
+    if (test_moves[i].board_id == board_id) {
+      (*moves)[count++] = test_moves[i];
     }
   }
   return count;
