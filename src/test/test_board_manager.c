@@ -12,12 +12,35 @@
 static WamblePlayer *white_player_mock;
 static WamblePlayer *black_player_mock;
 
-WamblePlayer *get_player_by_id(uint64_t player_id) {
-  if (player_id == 2)
+WamblePlayer *get_player_by_token(const uint8_t *token) {
+  if (token[0] == 2)
     return white_player_mock;
-  if (player_id == 3)
+  if (token[0] == 3)
     return black_player_mock;
   return NULL;
+}
+
+int get_moves_for_board(uint64_t board_id, WambleMove **moves_ptr) {
+  WambleMove *moves = malloc(sizeof(WambleMove) * 2);
+
+  moves[0].id = 1;
+  moves[0].board_id = 1;
+  memset(moves[0].player_token, 0, TOKEN_LENGTH);
+  moves[0].player_token[0] = 2;
+  strcpy(moves[0].uci_move, "e2e4");
+  moves[0].timestamp = 0;
+  moves[0].is_white_move = true;
+
+  moves[1].id = 2;
+  moves[1].board_id = 1;
+  memset(moves[1].player_token, 0, TOKEN_LENGTH);
+  moves[1].player_token[0] = 3;
+  strcpy(moves[1].uci_move, "e7e5");
+  moves[1].timestamp = 0;
+  moves[1].is_white_move = false;
+
+  *moves_ptr = moves;
+  return 2;
 }
 
 typedef struct {
@@ -29,9 +52,12 @@ static WamblePlayer test_player;
 
 static void reset_board_manager() {
   board_manager_init();
-  test_player.id = 1;
+  memset(test_player.token, 0, TOKEN_LENGTH);
+  test_player.token[0] = 1;
   test_player.score = 1200;
   test_player.games_played = 0;
+  test_player.has_persistent_identity = false;
+  test_player.last_seen_time = 0;
 }
 
 static bool test_get_game_phase() {
@@ -209,7 +235,7 @@ static bool test_new_player_gets_new_board() {
 
     for (int j = 0; j < MIN_BOARDS; j++) {
       board_pool[j].state = BOARD_STATE_DORMANT;
-      board_pool[j].reservation_player_id = 0;
+      memset(board_pool[j].reservation_player_token, 0, TOKEN_LENGTH);
       board_pool[j].reservation_time = 0;
     }
 
@@ -220,7 +246,7 @@ static bool test_new_player_gets_new_board() {
 
     if (board) {
       board->state = BOARD_STATE_DORMANT;
-      board->reservation_player_id = 0;
+      memset(board->reservation_player_token, 0, TOKEN_LENGTH);
       board->reservation_time = 0;
     }
   }
@@ -245,7 +271,7 @@ static bool test_experienced_player_gets_old_board() {
 
     for (int j = 0; j < MIN_BOARDS; j++) {
       board_pool[j].state = BOARD_STATE_DORMANT;
-      board_pool[j].reservation_player_id = 0;
+      memset(board_pool[j].reservation_player_token, 0, TOKEN_LENGTH);
       board_pool[j].reservation_time = 0;
     }
 
@@ -256,7 +282,7 @@ static bool test_experienced_player_gets_old_board() {
 
     if (board) {
       board->state = BOARD_STATE_DORMANT;
-      board->reservation_player_id = 0;
+      memset(board->reservation_player_token, 0, TOKEN_LENGTH);
       board->reservation_time = 0;
     }
   }
@@ -265,9 +291,12 @@ static bool test_experienced_player_gets_old_board() {
 }
 
 static bool test_rating_update_white_wins() {
-  reset_board_manager();
-  WamblePlayer white_player = {2, {0}, {0}, 1200, 0};
-  WamblePlayer black_player = {3, {0}, {0}, 1200, 0};
+  WamblePlayer white_player = {{0}, {0}, false, 0, 1200, 0};
+  WamblePlayer black_player = {{0}, {0}, false, 0, 1200, 0};
+
+  white_player.token[0] = 2;
+  black_player.token[0] = 3;
+
   white_player_mock = &white_player;
   black_player_mock = &black_player;
 
@@ -275,22 +304,9 @@ static bool test_rating_update_white_wins() {
   board.id = 1;
   board.result = GAME_RESULT_WHITE_WINS;
 
-  WambleMove moves[] = {
-      {1, 1, 2, "e2e4", 0, true},
-      {2, 1, 3, "e7e5", 0, false},
-  };
-
   update_player_ratings(&board);
 
   return white_player.score > 1200 && black_player.score < 1200;
-}
-
-int get_moves_for_board(uint64_t board_id, WambleMove **moves_ptr) {
-  WambleMove *moves = malloc(sizeof(WambleMove) * 2);
-  moves[0] = (WambleMove){1, 1, 2, "e2e4", 0, true};
-  moves[1] = (WambleMove){2, 1, 3, "e7e5", 0, false};
-  *moves_ptr = moves;
-  return 2;
 }
 
 static const TestCase cases[] = {

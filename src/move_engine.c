@@ -3,6 +3,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+static int tokens_equal(const uint8_t *token1, const uint8_t *token2) {
+  for (int i = 0; i < 16; i++) {
+    if (token1[i] != token2[i]) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static const Bitboard KNIGHT_ATTACKS[64] = {
     0x0000000000020400ULL, 0x0000000000050800ULL, 0x00000000000a1100ULL,
     0x0000000000142200ULL, 0x0000000000284400ULL, 0x0000000000508800ULL,
@@ -830,7 +839,7 @@ int validate_and_apply_move(WambleBoard *wamble_board, WamblePlayer *player,
     return -1;
   }
 
-  if (wamble_board->reservation_player_id != player->id) {
+  if (!tokens_equal(wamble_board->reservation_player_token, player->token)) {
     return -1;
   }
 

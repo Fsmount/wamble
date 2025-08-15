@@ -84,9 +84,10 @@ struct WambleMsg {
 #pragma pack(pop)
 
 typedef struct WamblePlayer {
-  uint64_t id;
   uint8_t token[TOKEN_LENGTH];
   uint8_t public_key[32];
+  bool has_persistent_identity;
+  time_t last_seen_time;
   double score;
   int games_played;
 } WamblePlayer;
@@ -100,7 +101,7 @@ typedef struct WambleBoard {
   time_t last_move_time;
   time_t creation_time;
   time_t last_assignment_time;
-  uint64_t reservation_player_id;
+  uint8_t reservation_player_token[TOKEN_LENGTH];
   bool reserved_for_white;
   time_t reservation_time;
 } WambleBoard;
@@ -127,7 +128,7 @@ typedef enum { GAME_PHASE_EARLY, GAME_PHASE_MID, GAME_PHASE_END } GamePhase;
 typedef struct WambleMove {
   uint64_t id;
   uint64_t board_id;
-  uint64_t player_id;
+  uint8_t player_token[TOKEN_LENGTH];
   char uci_move[MAX_UCI_LENGTH];
   time_t timestamp;
   bool is_white_move;
@@ -139,10 +140,18 @@ void release_board(uint64_t board_id);
 void archive_board(uint64_t board_id);
 void update_player_ratings(WambleBoard *board);
 int get_moves_for_board(uint64_t board_id, WambleMove **moves);
+
 WamblePlayer *get_player_by_id(uint64_t player_id);
 int start_board_manager_thread(void);
 
 void calculate_and_distribute_pot(uint64_t board_id);
+
+void player_manager_init(void);
+WamblePlayer *find_player_by_token(const uint8_t *token);
+WamblePlayer *create_new_player(void);
+void format_token_for_url(const uint8_t *token, char *url_buffer);
+int decode_token_from_url(const char *url_string, uint8_t *token_buffer);
+void player_manager_tick(void);
 
 WamblePlayer *get_player_by_token(const uint8_t *token);
 void create_player(uint8_t *token);

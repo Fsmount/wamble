@@ -36,7 +36,7 @@ void board_manager_tick() {
     if (board->state == BOARD_STATE_RESERVED &&
         (now - board->reservation_time) > RESERVATION_TIMEOUT) {
       board->state = BOARD_STATE_DORMANT;
-      board->reservation_player_id = 0;
+      memset(board->reservation_player_token, 0, TOKEN_LENGTH);
       board->reservation_time = 0;
     }
 
@@ -75,7 +75,7 @@ void board_manager_init(void) {
       board->last_move_time = 0;
       board->creation_time = time(NULL);
       board->last_assignment_time = 0;
-      board->reservation_player_id = 0;
+      memset(board->reservation_player_token, 0, TOKEN_LENGTH);
       board->reservation_time = 0;
       board->reserved_for_white = false;
     }
@@ -159,7 +159,8 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
     selected_board->state = BOARD_STATE_RESERVED;
     selected_board->reservation_time = now;
     selected_board->last_assignment_time = now;
-    selected_board->reservation_player_id = player->id;
+    memcpy(selected_board->reservation_player_token, player->token,
+           TOKEN_LENGTH);
     selected_board->reserved_for_white = (selected_board->board.turn == 'w');
     return selected_board;
   }
@@ -182,7 +183,7 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
     board->last_move_time = now;
     board->creation_time = now;
     board->last_assignment_time = now;
-    board->reservation_player_id = player->id;
+    memcpy(board->reservation_player_token, player->token, TOKEN_LENGTH);
     board->reserved_for_white = (board->board.turn == 'w');
     board->reservation_time = now;
     return board;
@@ -196,7 +197,7 @@ void release_board(uint64_t board_id) {
     if (board_pool[i].id == board_id) {
       board_pool[i].state = BOARD_STATE_ACTIVE;
       board_pool[i].last_move_time = time(NULL);
-      board_pool[i].reservation_player_id = 0;
+      memset(board_pool[i].reservation_player_token, 0, TOKEN_LENGTH);
       board_pool[i].reservation_time = 0;
       board_pool[i].reserved_for_white = false;
       break;
@@ -226,11 +227,11 @@ void update_player_ratings(WambleBoard *board) {
   for (int i = 0; i < num_moves; i++) {
     if (moves[i].is_white_move) {
       if (!white_player) {
-        white_player = get_player_by_id(moves[i].player_id);
+        white_player = get_player_by_token(moves[i].player_token);
       }
     } else {
       if (!black_player) {
-        black_player = get_player_by_id(moves[i].player_id);
+        black_player = get_player_by_token(moves[i].player_token);
       }
     }
     if (white_player && black_player) {

@@ -7,14 +7,9 @@
 #include "../include/wamble/wamble.h"
 #include "../move_engine.c"
 
-// Stub functions needed by move_engine.c
-void update_player_ratings(WambleBoard *board) {
-  // Stub - not needed for move engine tests
-}
+void update_player_ratings(WambleBoard *board) {}
 
-void archive_board(uint64_t board_id) {
-  // Stub - not needed for move engine tests
-}
+void archive_board(uint64_t board_id) {}
 
 typedef struct {
   const char *name;
@@ -78,19 +73,20 @@ static int run_case(const Case *c) {
   wamble_board.id = 1;
   wamble_board.state = BOARD_STATE_RESERVED;
 
-  // Create a test player
   WamblePlayer test_player;
-  test_player.id = 1;
   test_player.score = 1200;
   test_player.games_played = 0;
+  test_player.has_persistent_identity = false;
+  test_player.last_seen_time = 0;
 
-  // Set up reservation for the test player
-  wamble_board.reservation_player_id = test_player.id;
+  memset(test_player.token, 0, TOKEN_LENGTH);
+  test_player.token[0] = 1;
+  memcpy(wamble_board.reservation_player_token, test_player.token,
+         TOKEN_LENGTH);
   wamble_board.reserved_for_white = true;
 
   parse_fen_to_bitboard(c->start_fen, &wamble_board.board);
 
-  // Adjust reservation based on whose turn it is
   wamble_board.reserved_for_white = (wamble_board.board.turn == 'w');
 
   int rc = validate_and_apply_move(&wamble_board, &test_player, c->uci);
