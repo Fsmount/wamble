@@ -1,4 +1,5 @@
 #include "../include/wamble/wamble.h"
+#include <stdlib.h>
 #include <string.h>
 
 #define MAX_POT 20.0
@@ -6,13 +7,21 @@
 #define MAX_CONTRIBUTORS 100
 
 typedef struct {
-  uint64_t player_id;
+  uint8_t player_token[TOKEN_LENGTH];
   int white_moves;
   int black_moves;
 } PlayerContribution;
 
 WambleBoard *get_board_by_id(uint64_t board_id);
-WamblePlayer *get_player_by_id(uint64_t player_id);
+
+static int tokens_equal(const uint8_t *token1, const uint8_t *token2) {
+  for (int i = 0; i < TOKEN_LENGTH; i++) {
+    if (token1[i] != token2[i]) {
+      return 0;
+    }
+  }
+  return 1;
+}
 
 void calculate_and_distribute_pot(uint64_t board_id) {
   WambleBoard *board = get_board_by_id(board_id);
@@ -35,7 +44,7 @@ void calculate_and_distribute_pot(uint64_t board_id) {
     WambleMove *move = &moves[i];
     int contributor_index = -1;
     for (int j = 0; j < num_contributors; j++) {
-      if (contributions[j].player_id == move->player_id) {
+      if (tokens_equal(contributions[j].player_token, move->player_token)) {
         contributor_index = j;
         break;
       }
@@ -43,7 +52,8 @@ void calculate_and_distribute_pot(uint64_t board_id) {
 
     if (contributor_index == -1 && num_contributors < MAX_CONTRIBUTORS) {
       contributor_index = num_contributors++;
-      contributions[contributor_index].player_id = move->player_id;
+      memcpy(contributions[contributor_index].player_token, move->player_token,
+             TOKEN_LENGTH);
       contributions[contributor_index].white_moves = 0;
       contributions[contributor_index].black_moves = 0;
     }
@@ -86,7 +96,7 @@ void calculate_and_distribute_pot(uint64_t board_id) {
       score /= 2.0;
     }
 
-    WamblePlayer *player = get_player_by_id(contrib->player_id);
+    WamblePlayer *player = get_player_by_token(contrib->player_token);
     if (player) {
       player->score += score;
     }
