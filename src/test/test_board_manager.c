@@ -5,16 +5,71 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "../../include/wamble/wamble.h"
 #include "../board_manager.c"
-#include "../include/wamble/wamble.h"
 #include "../move_engine.c"
+
+static WamblePlayer *white_player_mock;
+static WamblePlayer *black_player_mock;
+
+WamblePlayer *get_player_by_id(uint64_t player_id) {
+  if (player_id == 2)
+    return white_player_mock;
+  if (player_id == 3)
+    return black_player_mock;
+  return NULL;
+}
 
 typedef struct {
   const char *name;
   bool (*run)(void);
 } TestCase;
 
-static void reset_board_manager() { board_manager_init(); }
+static WamblePlayer test_player;
+
+static void reset_board_manager() {
+  board_manager_init();
+  test_player.id = 1;
+  test_player.score = 1200;
+  test_player.games_played = 0;
+}
+
+static bool test_get_game_phase() {
+  WambleBoard board;
+
+  board.board.fullmove_number = GAME_PHASE_EARLY_THRESHOLD - 1;
+  if (get_game_phase(&board) != GAME_PHASE_EARLY)
+    return false;
+
+  board.board.fullmove_number = GAME_PHASE_EARLY_THRESHOLD;
+  if (get_game_phase(&board) != GAME_PHASE_MID)
+    return false;
+
+  board.board.fullmove_number = GAME_PHASE_EARLY_THRESHOLD + 1;
+  if (get_game_phase(&board) != GAME_PHASE_MID)
+    return false;
+
+  board.board.fullmove_number = GAME_PHASE_MID_THRESHOLD;
+  if (get_game_phase(&board) != GAME_PHASE_END)
+    return false;
+
+  board.board.fullmove_number = GAME_PHASE_MID_THRESHOLD + 1;
+  if (get_game_phase(&board) != GAME_PHASE_END)
+    return false;
+
+  return true;
+}
+
+static bool test_get_longest_game_moves() {
+  reset_board_manager();
+  board_pool[0].board.fullmove_number = 10;
+  board_pool[1].board.fullmove_number = 50;
+  board_pool[2].board.fullmove_number = 20;
+  board_pool[3].board.fullmove_number = 5;
+
+  int longest_moves = get_longest_game_moves();
+  return longest_moves == 50;
+}
 
 static bool test_initialization() {
   reset_board_manager();
@@ -32,11 +87,11 @@ static bool test_initialization() {
 
 static bool test_get_board_reuses_dormant() {
   reset_board_manager();
-  WambleBoard *board1 = get_or_create_board();
+  WambleBoard *board1 = find_board_for_player(&test_player);
   if (!board1 || board1->state != BOARD_STATE_RESERVED)
     return false;
 
-  WambleBoard *board2 = get_or_create_board();
+  WambleBoard *board2 = find_board_for_player(&test_player);
   if (!board2 || board2->state != BOARD_STATE_RESERVED)
     return false;
 
@@ -49,19 +104,19 @@ static bool test_get_board_reuses_dormant() {
 static bool test_no_new_board_if_at_min_capacity() {
   reset_board_manager();
   for (int i = 0; i < MIN_BOARDS; i++) {
-    WambleBoard *b = get_or_create_board();
+    WambleBoard *b = find_board_for_player(&test_player);
     if (!b || b->state != BOARD_STATE_RESERVED)
       return false;
   }
 
-  WambleBoard *new_board = get_or_create_board();
+  WambleBoard *new_board = find_board_for_player(&test_player);
 
   return new_board == NULL && num_boards == MIN_BOARDS;
 }
 
 static bool test_release_board_makes_it_active() {
   reset_board_manager();
-  WambleBoard *board = get_or_create_board();
+  WambleBoard *board = find_board_for_player(&test_player);
   if (!board)
     return false;
 
@@ -76,7 +131,7 @@ static bool test_release_board_makes_it_active() {
 
 static bool test_archive_board_works() {
   reset_board_manager();
-  WambleBoard *board = get_or_create_board();
+  WambleBoard *board = find_board_for_player(&test_player);
   if (!board)
     return false;
 
@@ -91,14 +146,13 @@ static bool test_archive_board_works() {
 
 static bool test_board_creation_when_scaling_up() {
   reset_board_manager();
-  board_pool[0].state = BOARD_STATE_ACTIVE;
   board_pool[0].board.fullmove_number = 50;
 
-  for (int i = 1; i < MIN_BOARDS; i++) {
+  for (int i = 0; i < MIN_BOARDS; i++) {
     board_pool[i].state = BOARD_STATE_RESERVED;
   }
 
-  WambleBoard *new_board = get_or_create_board();
+  WambleBoard *new_board = find_board_for_player(&test_player);
   if (!new_board)
     return false;
 
@@ -112,7 +166,7 @@ static bool test_board_creation_when_scaling_up() {
 
 static bool test_reservation_expiry() {
   reset_board_manager();
-  WambleBoard *board = get_or_create_board();
+  WambleBoard *board = find_board_for_player(&test_player);
   if (!board)
     return false;
 
@@ -125,7 +179,7 @@ static bool test_reservation_expiry() {
 
 static bool test_inactivity_timeout() {
   reset_board_manager();
-  WambleBoard *board = get_or_create_board();
+  WambleBoard *board = find_board_for_player(&test_player);
   if (!board)
     return false;
 
@@ -138,7 +192,110 @@ static bool test_inactivity_timeout() {
   return board->state == BOARD_STATE_DORMANT;
 }
 
+static bool test_new_player_gets_new_board() {
+  reset_board_manager();
+
+  board_pool[0].board.fullmove_number = GAME_PHASE_EARLY_THRESHOLD - 1;
+  board_pool[1].board.fullmove_number = GAME_PHASE_EARLY_THRESHOLD - 1;
+  board_pool[2].board.fullmove_number = GAME_PHASE_EARLY_THRESHOLD - 1;
+  board_pool[3].board.fullmove_number = GAME_PHASE_MID_THRESHOLD + 1;
+
+  test_player.games_played = 1;
+
+  int early_game_selections = 0;
+  int total_attempts = 20;
+
+  for (int i = 0; i < total_attempts; i++) {
+
+    for (int j = 0; j < MIN_BOARDS; j++) {
+      board_pool[j].state = BOARD_STATE_DORMANT;
+      board_pool[j].reservation_player_id = 0;
+      board_pool[j].reservation_time = 0;
+    }
+
+    WambleBoard *board = find_board_for_player(&test_player);
+    if (board && get_game_phase(board) == GAME_PHASE_EARLY) {
+      early_game_selections++;
+    }
+
+    if (board) {
+      board->state = BOARD_STATE_DORMANT;
+      board->reservation_player_id = 0;
+      board->reservation_time = 0;
+    }
+  }
+
+  return early_game_selections > total_attempts * 0.7;
+}
+
+static bool test_experienced_player_gets_old_board() {
+  reset_board_manager();
+
+  board_pool[0].board.fullmove_number = GAME_PHASE_EARLY_THRESHOLD - 1;
+  board_pool[1].board.fullmove_number = GAME_PHASE_MID_THRESHOLD + 1;
+  board_pool[2].board.fullmove_number = GAME_PHASE_MID_THRESHOLD + 1;
+  board_pool[3].board.fullmove_number = GAME_PHASE_MID_THRESHOLD + 1;
+
+  test_player.games_played = 20;
+
+  int end_game_selections = 0;
+  int total_attempts = 20;
+
+  for (int i = 0; i < total_attempts; i++) {
+
+    for (int j = 0; j < MIN_BOARDS; j++) {
+      board_pool[j].state = BOARD_STATE_DORMANT;
+      board_pool[j].reservation_player_id = 0;
+      board_pool[j].reservation_time = 0;
+    }
+
+    WambleBoard *board = find_board_for_player(&test_player);
+    if (board && get_game_phase(board) == GAME_PHASE_END) {
+      end_game_selections++;
+    }
+
+    if (board) {
+      board->state = BOARD_STATE_DORMANT;
+      board->reservation_player_id = 0;
+      board->reservation_time = 0;
+    }
+  }
+
+  return end_game_selections > total_attempts * 0.7;
+}
+
+static bool test_rating_update_white_wins() {
+  reset_board_manager();
+  WamblePlayer white_player = {2, {0}, {0}, 1200, 0};
+  WamblePlayer black_player = {3, {0}, {0}, 1200, 0};
+  white_player_mock = &white_player;
+  black_player_mock = &black_player;
+
+  WambleBoard board;
+  board.id = 1;
+  board.result = GAME_RESULT_WHITE_WINS;
+
+  WambleMove moves[] = {
+      {1, 1, 2, "e2e4", 0, true},
+      {2, 1, 3, "e7e5", 0, false},
+  };
+
+  update_player_ratings(&board);
+
+  return white_player.score > 1200 && black_player.score < 1200;
+}
+
+int get_moves_for_board(uint64_t board_id, WambleMove **moves_ptr) {
+  WambleMove *moves = malloc(sizeof(WambleMove) * 2);
+  moves[0] = (WambleMove){1, 1, 2, "e2e4", 0, true};
+  moves[1] = (WambleMove){2, 1, 3, "e7e5", 0, false};
+  *moves_ptr = moves;
+  return 2;
+}
+
 static const TestCase cases[] = {
+    {"get game phase", test_get_game_phase},
+    {"get longest game moves", test_get_longest_game_moves},
     {"initialization", test_initialization},
     {"get board reuses dormant", test_get_board_reuses_dormant},
     {"no new board at min capacity", test_no_new_board_if_at_min_capacity},
@@ -147,6 +304,10 @@ static const TestCase cases[] = {
     {"board creation when scaling up", test_board_creation_when_scaling_up},
     {"reservation expiry", test_reservation_expiry},
     {"inactivity timeout", test_inactivity_timeout},
+    {"new player gets new board", test_new_player_gets_new_board},
+    {"experienced player gets old board",
+     test_experienced_player_gets_old_board},
+    {"rating update white wins", test_rating_update_white_wins},
 };
 
 static int run_case(const TestCase *c) {

@@ -83,6 +83,14 @@ struct WambleMsg {
 };
 #pragma pack(pop)
 
+typedef struct WamblePlayer {
+  uint64_t id;
+  uint8_t token[TOKEN_LENGTH];
+  uint8_t public_key[32];
+  double score;
+  int games_played;
+} WamblePlayer;
+
 typedef struct WambleBoard {
   char fen[FEN_MAX_LENGTH];
   Board board;
@@ -90,11 +98,15 @@ typedef struct WambleBoard {
   BoardState state;
   GameResult result;
   time_t last_move_time;
+  time_t creation_time;
+  time_t last_assignment_time;
   uint64_t reservation_player_id;
+  bool reserved_for_white;
   time_t reservation_time;
 } WambleBoard;
 
-int validate_and_apply_move(WambleBoard *wamble_board, const char *uci_move);
+int validate_and_apply_move(WambleBoard *wamble_board, WamblePlayer *player,
+                            const char *uci_move);
 
 int parse_fen_to_bitboard(const char *fen, Board *board);
 void bitboard_to_fen(const Board *board, char *fen);
@@ -105,7 +117,14 @@ void unmake_move_bitboard(Board *board, const Move *move, const MoveInfo *info);
 static inline int square_to_index(int file, int rank);
 static inline void index_to_square(int index, int *file, int *rank);
 
-typedef struct {
+typedef enum { GAME_PHASE_EARLY, GAME_PHASE_MID, GAME_PHASE_END } GamePhase;
+
+#define GAME_PHASE_EARLY_THRESHOLD 10
+#define GAME_PHASE_MID_THRESHOLD 30
+
+#define NEW_PLAYER_GAMES_THRESHOLD 10
+
+typedef struct WambleMove {
   uint64_t id;
   uint64_t board_id;
   uint64_t player_id;
@@ -114,17 +133,13 @@ typedef struct {
   bool is_white_move;
 } WambleMove;
 
-typedef struct {
-  uint64_t id;
-  uint8_t token[TOKEN_LENGTH];
-  uint8_t public_key[32];
-  double score;
-} WamblePlayer;
-
 void board_manager_init(void);
-WambleBoard *get_or_create_board(void);
+WambleBoard *find_board_for_player(WamblePlayer *player);
 void release_board(uint64_t board_id);
 void archive_board(uint64_t board_id);
+void update_player_ratings(WambleBoard *board);
+int get_moves_for_board(uint64_t board_id, WambleMove **moves);
+WamblePlayer *get_player_by_id(uint64_t player_id);
 int start_board_manager_thread(void);
 
 void calculate_and_distribute_pot(uint64_t board_id);
@@ -134,5 +149,7 @@ void create_player(uint8_t *token);
 
 void start_network_listener(void);
 void send_response(const struct WambleMsg *msg);
+
+GamePhase get_game_phase(WambleBoard *board);
 
 #endif

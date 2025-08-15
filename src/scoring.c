@@ -12,7 +12,6 @@ typedef struct {
 } PlayerContribution;
 
 WambleBoard *get_board_by_id(uint64_t board_id);
-int get_moves_for_board(uint64_t board_id, WambleMove *moves, int max_moves);
 WamblePlayer *get_player_by_id(uint64_t player_id);
 
 void calculate_and_distribute_pot(uint64_t board_id) {
@@ -21,8 +20,8 @@ void calculate_and_distribute_pot(uint64_t board_id) {
     return;
   }
 
-  WambleMove moves[MAX_MOVES_PER_BOARD];
-  int num_moves = get_moves_for_board(board_id, moves, MAX_MOVES_PER_BOARD);
+  WambleMove *moves;
+  int num_moves = get_moves_for_board(board_id, &moves);
   if (num_moves == 0) {
     return;
   }
@@ -92,4 +91,6 @@ void calculate_and_distribute_pot(uint64_t board_id) {
       player->score += score;
     }
   }
+
+  free(moves);
 }
