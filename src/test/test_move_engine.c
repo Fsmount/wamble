@@ -11,6 +11,29 @@ void update_player_ratings(WambleBoard *board) {}
 
 void archive_board(uint64_t board_id) {}
 
+uint64_t db_get_session_by_token(const uint8_t *token) {
+  (void)token;
+  return 1;
+}
+
+int db_record_move(uint64_t board_id, uint64_t session_id, const char *move_uci,
+                   int move_number) {
+  (void)board_id;
+  (void)session_id;
+  (void)move_uci;
+  (void)move_number;
+  return 0;
+}
+
+int db_update_board(uint64_t board_id, const char *fen, const char *status) {
+  (void)board_id;
+  (void)fen;
+  (void)status;
+  return 0;
+}
+
+void calculate_and_distribute_pot(uint64_t board_id) { (void)board_id; }
+
 typedef struct {
   const char *name;
   const char *start_fen;

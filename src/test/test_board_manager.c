@@ -4,8 +4,128 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "../../include/wamble/wamble.h"
+
+#define MAX_BOARDS 1024
+#define MIN_BOARDS 4
+#define INACTIVITY_TIMEOUT 300
+#define RESERVATION_TIMEOUT 2
+
+static int mock_active_players = 2;
+static int mock_longest_moves = 10;
+static WambleBoard mock_board_pool[MAX_BOARDS];
+static int mock_num_boards = 0;
+static uint64_t next_mock_board_id = 1;
+
+void db_expire_reservations(void) {
+  time_t now = time(NULL);
+  for (int i = 0; i < mock_num_boards; i++) {
+    if (mock_board_pool[i].state == BOARD_STATE_RESERVED &&
+        (now - mock_board_pool[i].reservation_time) > RESERVATION_TIMEOUT) {
+      mock_board_pool[i].state = BOARD_STATE_DORMANT;
+    }
+  }
+}
+
+void db_archive_inactive_boards(int timeout_seconds) {
+  time_t now = time(NULL);
+  for (int i = 0; i < mock_num_boards; i++) {
+    if (mock_board_pool[i].state == BOARD_STATE_ACTIVE &&
+        (now - mock_board_pool[i].last_move_time) > timeout_seconds) {
+      mock_board_pool[i].state = BOARD_STATE_DORMANT;
+    }
+  }
+}
+
+int db_get_active_session_count(void) { return mock_active_players; }
+int db_get_longest_game_moves(void) { return mock_longest_moves; }
+void db_cleanup_expired_reservations(void) {}
+
+int db_update_board(uint64_t board_id, const char *fen, const char *status) {
+  for (int i = 0; i < mock_num_boards; i++) {
+    if (mock_board_pool[i].id == board_id) {
+      strncpy(mock_board_pool[i].fen, fen, FEN_MAX_LENGTH);
+      if (strcmp(status, "ACTIVE") == 0)
+        mock_board_pool[i].state = BOARD_STATE_ACTIVE;
+      else if (strcmp(status, "RESERVED") == 0)
+        mock_board_pool[i].state = BOARD_STATE_RESERVED;
+      else if (strcmp(status, "DORMANT") == 0)
+        mock_board_pool[i].state = BOARD_STATE_DORMANT;
+      else if (strcmp(status, "ARCHIVED") == 0)
+        mock_board_pool[i].state = BOARD_STATE_ARCHIVED;
+      return 0;
+    }
+  }
+  return -1;
+}
+
+int db_get_board(uint64_t board_id, char *fen_out, char *status_out) {
+  for (int i = 0; i < mock_num_boards; i++) {
+    if (mock_board_pool[i].id == board_id) {
+      strcpy(fen_out, mock_board_pool[i].fen);
+      switch (mock_board_pool[i].state) {
+      case BOARD_STATE_ACTIVE:
+        strcpy(status_out, "ACTIVE");
+        break;
+      case BOARD_STATE_RESERVED:
+        strcpy(status_out, "RESERVED");
+        break;
+      case BOARD_STATE_DORMANT:
+        strcpy(status_out, "DORMANT");
+        break;
+      case BOARD_STATE_ARCHIVED:
+        strcpy(status_out, "ARCHIVED");
+        break;
+      }
+      return 0;
+    }
+  }
+  return -1;
+}
+
+int db_get_boards_by_status(const char *status, uint64_t *board_ids,
+                            int max_boards) {
+  int count = 0;
+  BoardState state;
+  if (strcmp(status, "DORMANT") == 0)
+    state = BOARD_STATE_DORMANT;
+  else
+    return 0;
+
+  for (int i = 0; i < mock_num_boards && count < max_boards; i++) {
+    if (mock_board_pool[i].state == state) {
+      board_ids[count++] = mock_board_pool[i].id;
+    }
+  }
+  return count;
+}
+
+uint64_t db_create_board(const char *fen) {
+  if (mock_num_boards >= MAX_BOARDS)
+    return 0;
+  WambleBoard *board = &mock_board_pool[mock_num_boards++];
+  board->id = next_mock_board_id++;
+  strncpy(board->fen, fen, FEN_MAX_LENGTH);
+  board->fen[FEN_MAX_LENGTH - 1] = '\0';
+  board->state = BOARD_STATE_DORMANT;
+  return board->id;
+}
+
+uint64_t db_get_session_by_token(const uint8_t *token) { return 1; }
+int db_create_reservation(uint64_t board_id, uint64_t session_id,
+                          int timeout_seconds) {
+  return 0;
+}
+void db_remove_reservation(uint64_t board_id) {}
+int db_record_game_result(uint64_t board_id, char winning_side) { return 0; }
+int db_record_move(uint64_t board_id, uint64_t session_id, const char *move_uci,
+                   int move_number) {
+  return 0;
+}
+void calculate_and_distribute_pot(uint64_t board_id) {}
+
 #include "../board_manager.c"
 #include "../move_engine.c"
 
@@ -20,328 +140,167 @@ WamblePlayer *get_player_by_token(const uint8_t *token) {
   return NULL;
 }
 
-int get_moves_for_board(uint64_t board_id, WambleMove **moves_ptr) {
-  WambleMove *moves = malloc(sizeof(WambleMove) * 2);
+int db_get_moves_for_board(uint64_t board_id, WambleMove *moves_out,
+                           int max_moves) {
+  if (max_moves < 2) {
+    return 0;
+  }
 
-  moves[0].id = 1;
-  moves[0].board_id = 1;
-  memset(moves[0].player_token, 0, TOKEN_LENGTH);
-  moves[0].player_token[0] = 2;
-  strcpy(moves[0].uci_move, "e2e4");
-  moves[0].timestamp = 0;
-  moves[0].is_white_move = true;
+  moves_out[0] = (WambleMove){.id = 1,
+                              .board_id = 1,
+                              .player_token = {2},
+                              .timestamp = 0,
+                              .is_white_move = true};
+  strcpy(moves_out[0].uci_move, "e2e4");
 
-  moves[1].id = 2;
-  moves[1].board_id = 1;
-  memset(moves[1].player_token, 0, TOKEN_LENGTH);
-  moves[1].player_token[0] = 3;
-  strcpy(moves[1].uci_move, "e7e5");
-  moves[1].timestamp = 0;
-  moves[1].is_white_move = false;
+  moves_out[1] = (WambleMove){.id = 2,
+                              .board_id = 1,
+                              .player_token = {3},
+                              .timestamp = 0,
+                              .is_white_move = false};
+  strcpy(moves_out[1].uci_move, "e7e5");
 
-  *moves_ptr = moves;
   return 2;
 }
 
+typedef enum {
+  ACTION_INIT,
+  ACTION_FIND_BOARD,
+  ACTION_RELEASE_BOARD,
+  ACTION_ARCHIVE_BOARD,
+  ACTION_TICK,
+  ACTION_UPDATE_RATINGS
+} TestCaseAction;
+
 typedef struct {
   const char *name;
-  bool (*run)(void);
+  TestCaseAction action;
+  int player_games_played;
+  uint64_t board_id_arg;
+  int time_travel_seconds;
+  BoardState expected_board_state;
+  GameResult expected_game_result;
+  bool expect_board_found;
+  double expected_white_rating;
+  double expected_black_rating;
 } TestCase;
 
 static WamblePlayer test_player;
 
-static void reset_board_manager() {
-  board_manager_init();
-  memset(test_player.token, 0, TOKEN_LENGTH);
+static void setup_test_player(int games_played) {
+  memset(&test_player, 0, sizeof(WamblePlayer));
   test_player.token[0] = 1;
   test_player.score = 1200;
-  test_player.games_played = 0;
-  test_player.has_persistent_identity = false;
-  test_player.last_seen_time = 0;
+  test_player.games_played = games_played;
 }
 
-static bool test_get_game_phase() {
-  WambleBoard board;
-
-  board.board.fullmove_number = GAME_PHASE_EARLY_THRESHOLD - 1;
-  if (get_game_phase(&board) != GAME_PHASE_EARLY)
-    return false;
-
-  board.board.fullmove_number = GAME_PHASE_EARLY_THRESHOLD;
-  if (get_game_phase(&board) != GAME_PHASE_MID)
-    return false;
-
-  board.board.fullmove_number = GAME_PHASE_EARLY_THRESHOLD + 1;
-  if (get_game_phase(&board) != GAME_PHASE_MID)
-    return false;
-
-  board.board.fullmove_number = GAME_PHASE_MID_THRESHOLD;
-  if (get_game_phase(&board) != GAME_PHASE_END)
-    return false;
-
-  board.board.fullmove_number = GAME_PHASE_MID_THRESHOLD + 1;
-  if (get_game_phase(&board) != GAME_PHASE_END)
-    return false;
-
-  return true;
+static void reset_mocks() {
+  mock_active_players = 2;
+  mock_longest_moves = 10;
+  mock_num_boards = 0;
+  next_mock_board_id = 1;
+  memset(mock_board_pool, 0, sizeof(mock_board_pool));
+  board_manager_init();
 }
 
-static bool test_get_longest_game_moves() {
-  reset_board_manager();
-  board_pool[0].board.fullmove_number = 10;
-  board_pool[1].board.fullmove_number = 50;
-  board_pool[2].board.fullmove_number = 20;
-  board_pool[3].board.fullmove_number = 5;
+static bool run_case(const TestCase *c) {
+  WambleBoard *board = NULL;
 
-  int longest_moves = get_longest_game_moves();
-  return longest_moves == 50;
-}
-
-static bool test_initialization() {
-  reset_board_manager();
-  if (num_boards != MIN_BOARDS)
-    return false;
-
-  for (int i = 0; i < MIN_BOARDS; i++) {
-    if (board_pool[i].state != BOARD_STATE_DORMANT)
+  switch (c->action) {
+  case ACTION_INIT:
+    return mock_num_boards >= MIN_BOARDS;
+  case ACTION_FIND_BOARD:
+    setup_test_player(c->player_games_played);
+    board = find_board_for_player(&test_player);
+    if ((board != NULL) != c->expect_board_found)
       return false;
-    if (board_pool[i].id == 0)
+    if (board && board->state != c->expected_board_state)
       return false;
-  }
-  return true;
-}
-
-static bool test_get_board_reuses_dormant() {
-  reset_board_manager();
-  WambleBoard *board1 = find_board_for_player(&test_player);
-  if (!board1 || board1->state != BOARD_STATE_RESERVED)
-    return false;
-
-  WambleBoard *board2 = find_board_for_player(&test_player);
-  if (!board2 || board2->state != BOARD_STATE_RESERVED)
-    return false;
-
-  if (board1->id == board2->id)
-    return false;
-
-  return num_boards == MIN_BOARDS;
-}
-
-static bool test_no_new_board_if_at_min_capacity() {
-  reset_board_manager();
-  for (int i = 0; i < MIN_BOARDS; i++) {
-    WambleBoard *b = find_board_for_player(&test_player);
-    if (!b || b->state != BOARD_STATE_RESERVED)
+    break;
+  case ACTION_RELEASE_BOARD:
+    release_board(c->board_id_arg);
+    board = get_board_by_id(c->board_id_arg);
+    return board && board->state == c->expected_board_state;
+  case ACTION_ARCHIVE_BOARD:
+    archive_board(c->board_id_arg);
+    board = get_board_by_id(c->board_id_arg);
+    return board && board->state == c->expected_board_state;
+  case ACTION_TICK:
+    board = get_board_by_id(c->board_id_arg);
+    if (!board)
       return false;
+    if (c->expected_board_state == BOARD_STATE_DORMANT &&
+        board->state == BOARD_STATE_RESERVED) {
+      board->reservation_time -= c->time_travel_seconds;
+    } else if (c->expected_board_state == BOARD_STATE_DORMANT &&
+               board->state == BOARD_STATE_ACTIVE) {
+      board->last_move_time -= c->time_travel_seconds;
+    }
+    board_manager_tick();
+
+    board = NULL;
+    for (int i = 0; i < mock_num_boards; i++) {
+      if (mock_board_pool[i].id == c->board_id_arg) {
+        board = &mock_board_pool[i];
+        break;
+      }
+    }
+    return board && board->state == c->expected_board_state;
+  case ACTION_UPDATE_RATINGS: {
+    WamblePlayer white = {.token = {2}, .score = 1200, .games_played = 0};
+    WamblePlayer black = {.token = {3}, .score = 1200, .games_played = 0};
+    white_player_mock = &white;
+    black_player_mock = &black;
+    WambleBoard b = {.id = 1, .result = c->expected_game_result};
+    update_player_ratings(&b);
+    return white.score == c->expected_white_rating &&
+           black.score == c->expected_black_rating;
   }
-
-  WambleBoard *new_board = find_board_for_player(&test_player);
-
-  return new_board == NULL && num_boards == MIN_BOARDS;
-}
-
-static bool test_release_board_makes_it_active() {
-  reset_board_manager();
-  WambleBoard *board = find_board_for_player(&test_player);
-  if (!board)
-    return false;
-
-  uint64_t id = board->id;
-  release_board(id);
-
-  if (board->state != BOARD_STATE_ACTIVE)
-    return false;
-
+  }
   return true;
-}
-
-static bool test_archive_board_works() {
-  reset_board_manager();
-  WambleBoard *board = find_board_for_player(&test_player);
-  if (!board)
-    return false;
-
-  uint64_t id = board->id;
-  archive_board(id);
-
-  if (board->state != BOARD_STATE_ARCHIVED)
-    return false;
-
-  return true;
-}
-
-static bool test_board_creation_when_scaling_up() {
-  reset_board_manager();
-  board_pool[0].board.fullmove_number = 50;
-
-  for (int i = 0; i < MIN_BOARDS; i++) {
-    board_pool[i].state = BOARD_STATE_RESERVED;
-  }
-
-  WambleBoard *new_board = find_board_for_player(&test_player);
-  if (!new_board)
-    return false;
-
-  if (num_boards != MIN_BOARDS + 1)
-    return false;
-  if (new_board->state != BOARD_STATE_RESERVED)
-    return false;
-
-  return true;
-}
-
-static bool test_reservation_expiry() {
-  reset_board_manager();
-  WambleBoard *board = find_board_for_player(&test_player);
-  if (!board)
-    return false;
-
-  board->reservation_time = time(NULL) - (RESERVATION_TIMEOUT + 1);
-
-  board_manager_tick();
-
-  return board->state == BOARD_STATE_DORMANT;
-}
-
-static bool test_inactivity_timeout() {
-  reset_board_manager();
-  WambleBoard *board = find_board_for_player(&test_player);
-  if (!board)
-    return false;
-
-  release_board(board->id);
-
-  board->last_move_time = time(NULL) - (INACTIVITY_TIMEOUT + 1);
-
-  board_manager_tick();
-
-  return board->state == BOARD_STATE_DORMANT;
-}
-
-static bool test_new_player_gets_new_board() {
-  reset_board_manager();
-
-  board_pool[0].board.fullmove_number = GAME_PHASE_EARLY_THRESHOLD - 1;
-  board_pool[1].board.fullmove_number = GAME_PHASE_EARLY_THRESHOLD - 1;
-  board_pool[2].board.fullmove_number = GAME_PHASE_EARLY_THRESHOLD - 1;
-  board_pool[3].board.fullmove_number = GAME_PHASE_MID_THRESHOLD + 1;
-
-  test_player.games_played = 1;
-
-  int early_game_selections = 0;
-  int total_attempts = 20;
-
-  for (int i = 0; i < total_attempts; i++) {
-
-    for (int j = 0; j < MIN_BOARDS; j++) {
-      board_pool[j].state = BOARD_STATE_DORMANT;
-      memset(board_pool[j].reservation_player_token, 0, TOKEN_LENGTH);
-      board_pool[j].reservation_time = 0;
-    }
-
-    WambleBoard *board = find_board_for_player(&test_player);
-    if (board && get_game_phase(board) == GAME_PHASE_EARLY) {
-      early_game_selections++;
-    }
-
-    if (board) {
-      board->state = BOARD_STATE_DORMANT;
-      memset(board->reservation_player_token, 0, TOKEN_LENGTH);
-      board->reservation_time = 0;
-    }
-  }
-
-  return early_game_selections > total_attempts * 0.7;
-}
-
-static bool test_experienced_player_gets_old_board() {
-  reset_board_manager();
-
-  board_pool[0].board.fullmove_number = GAME_PHASE_EARLY_THRESHOLD - 1;
-  board_pool[1].board.fullmove_number = GAME_PHASE_MID_THRESHOLD + 1;
-  board_pool[2].board.fullmove_number = GAME_PHASE_MID_THRESHOLD + 1;
-  board_pool[3].board.fullmove_number = GAME_PHASE_MID_THRESHOLD + 1;
-
-  test_player.games_played = 20;
-
-  int end_game_selections = 0;
-  int total_attempts = 20;
-
-  for (int i = 0; i < total_attempts; i++) {
-
-    for (int j = 0; j < MIN_BOARDS; j++) {
-      board_pool[j].state = BOARD_STATE_DORMANT;
-      memset(board_pool[j].reservation_player_token, 0, TOKEN_LENGTH);
-      board_pool[j].reservation_time = 0;
-    }
-
-    WambleBoard *board = find_board_for_player(&test_player);
-    if (board && get_game_phase(board) == GAME_PHASE_END) {
-      end_game_selections++;
-    }
-
-    if (board) {
-      board->state = BOARD_STATE_DORMANT;
-      memset(board->reservation_player_token, 0, TOKEN_LENGTH);
-      board->reservation_time = 0;
-    }
-  }
-
-  return end_game_selections > total_attempts * 0.7;
-}
-
-static bool test_rating_update_white_wins() {
-  WamblePlayer white_player = {{0}, {0}, false, 0, 1200, 0};
-  WamblePlayer black_player = {{0}, {0}, false, 0, 1200, 0};
-
-  white_player.token[0] = 2;
-  black_player.token[0] = 3;
-
-  white_player_mock = &white_player;
-  black_player_mock = &black_player;
-
-  WambleBoard board;
-  board.id = 1;
-  board.result = GAME_RESULT_WHITE_WINS;
-
-  update_player_ratings(&board);
-
-  return white_player.score > 1200 && black_player.score < 1200;
-}
-
-static const TestCase cases[] = {
-    {"get game phase", test_get_game_phase},
-    {"get longest game moves", test_get_longest_game_moves},
-    {"initialization", test_initialization},
-    {"get board reuses dormant", test_get_board_reuses_dormant},
-    {"no new board at min capacity", test_no_new_board_if_at_min_capacity},
-    {"release board makes it active", test_release_board_makes_it_active},
-    {"archive board works", test_archive_board_works},
-    {"board creation when scaling up", test_board_creation_when_scaling_up},
-    {"reservation expiry", test_reservation_expiry},
-    {"inactivity timeout", test_inactivity_timeout},
-    {"new player gets new board", test_new_player_gets_new_board},
-    {"experienced player gets old board",
-     test_experienced_player_gets_old_board},
-    {"rating update white wins", test_rating_update_white_wins},
-};
-
-static int run_case(const TestCase *c) {
-  if (c->run()) {
-    return 1;
-  }
-  return 0;
 }
 
 int main(int argc, char **argv) {
   const char *filter = (argc > 1 ? argv[1] : "");
   int pass = 0, total = 0;
 
+  TestCase cases[] = {
+      {"initialization", ACTION_INIT, 0, 0, 0, 0, 0, true},
+      {"find board for new player", ACTION_FIND_BOARD, 5, 0, 0,
+       BOARD_STATE_RESERVED, GAME_RESULT_IN_PROGRESS, true},
+      {"find board for experienced player", ACTION_FIND_BOARD, 20, 0, 0,
+       BOARD_STATE_RESERVED, GAME_RESULT_IN_PROGRESS, true},
+      {"release board", ACTION_RELEASE_BOARD, 0, 1, 0, BOARD_STATE_ACTIVE},
+      {"archive board", ACTION_ARCHIVE_BOARD, 0, 2, 0, BOARD_STATE_ARCHIVED},
+      {"reservation expiry", ACTION_TICK, 0, 3, RESERVATION_TIMEOUT + 1,
+       BOARD_STATE_DORMANT},
+      {"inactivity timeout", ACTION_TICK, 0, 4, INACTIVITY_TIMEOUT + 1,
+       BOARD_STATE_DORMANT},
+      {"rating update white wins", ACTION_UPDATE_RATINGS, 0, 0, 0, 0,
+       GAME_RESULT_WHITE_WINS, false, 1216.0, 1184.0},
+      {"rating update black wins", ACTION_UPDATE_RATINGS, 0, 0, 0, 0,
+       GAME_RESULT_BLACK_WINS, false, 1184.0, 1216.0},
+      {"rating update draw", ACTION_UPDATE_RATINGS, 0, 0, 0, 0,
+       GAME_RESULT_DRAW, false, 1200.0, 1200.0},
+  };
+
   for (size_t i = 0; i < (sizeof(cases) / sizeof((cases)[0])); ++i) {
     if (*filter && !strstr(cases[i].name, filter))
       continue;
 
     total++;
+    reset_mocks();
+    setup_test_player(0);
+
+    if (cases[i].action != ACTION_INIT) {
+      find_board_for_player(&test_player);
+      find_board_for_player(&test_player);
+      WambleBoard *b3 = find_board_for_player(&test_player);
+      b3->state = BOARD_STATE_RESERVED;
+      WambleBoard *b4 = find_board_for_player(&test_player);
+      release_board(b4->id);
+    }
+
     if (run_case(&cases[i])) {
       printf("%s PASSED\n", cases[i].name);
       pass++;

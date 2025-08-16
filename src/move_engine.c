@@ -262,7 +262,13 @@ static inline void remove_castling_right(Board *board, char right) {
 }
 
 MoveInfo make_move_bitboard(Board *board, const Move *move) {
-  MoveInfo info = {-1, -1, "--", "----", 0, 0};
+  MoveInfo info = {.captured_square = -1,
+                   .captured_piece_type = -1,
+                   .prev_en_passant = "--",
+                   .prev_castling = "----",
+                   .prev_halfmove_clock = 0,
+                   .prev_fullmove_number = 0,
+                   .moving_piece_color = 0};
 
   info.prev_halfmove_clock = board->halfmove_clock;
   info.prev_fullmove_number = board->fullmove_number;
@@ -872,10 +878,22 @@ int validate_and_apply_move(WambleBoard *wamble_board, WamblePlayer *player,
   }
 
   make_move_bitboard(board, &candidate_move);
+
+  uint64_t session_id = db_get_session_by_token(player->token);
+  if (session_id > 0) {
+    db_record_move(wamble_board->id, session_id, uci_move,
+                   board->fullmove_number);
+  }
+
+  bitboard_to_fen(board, wamble_board->fen);
+
+  db_update_board(wamble_board->id, wamble_board->fen, "ACTIVE");
+
   update_game_result(wamble_board);
 
   if (wamble_board->result != GAME_RESULT_IN_PROGRESS) {
     update_player_ratings(wamble_board);
+    calculate_and_distribute_pot(wamble_board->id);
     archive_board(wamble_board->id);
   }
 

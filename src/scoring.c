@@ -29,9 +29,9 @@ void calculate_and_distribute_pot(uint64_t board_id) {
     return;
   }
 
-  WambleMove *moves;
-  int num_moves = get_moves_for_board(board_id, &moves);
-  if (num_moves == 0) {
+  static WambleMove moves[MAX_MOVES_PER_BOARD];
+  int num_moves = db_get_moves_for_board(board_id, moves, MAX_MOVES_PER_BOARD);
+  if (num_moves <= 0) {
     return;
   }
 
@@ -96,11 +96,14 @@ void calculate_and_distribute_pot(uint64_t board_id) {
       score /= 2.0;
     }
 
+    uint64_t session_id = db_get_session_by_token(contrib->player_token);
+    if (session_id > 0 && score > 0.0) {
+      db_record_payout(board_id, session_id, score);
+    }
+
     WamblePlayer *player = get_player_by_token(contrib->player_token);
     if (player) {
       player->score += score;
     }
   }
-
-  free(moves);
 }

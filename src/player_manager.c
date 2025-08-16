@@ -1,6 +1,7 @@
 #include "../include/wamble/wamble.h"
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -78,8 +79,33 @@ WamblePlayer *get_player_by_token(const uint8_t *token) {
   for (int i = 0; i < num_players; i++) {
     if (tokens_equal(player_pool[i].token, token)) {
       player_pool[i].last_seen_time = time(NULL);
+
+      uint64_t session_id = db_get_session_by_token(token);
+      if (session_id > 0) {
+        db_update_session_last_seen(session_id);
+      }
+
       pthread_mutex_unlock(&player_mutex);
       return &player_pool[i];
+    }
+  }
+
+  uint64_t session_id = db_get_session_by_token(token);
+  if (session_id > 0) {
+
+    WamblePlayer *player = find_empty_player_slot();
+    if (player) {
+      memcpy(player->token, token, TOKEN_LENGTH);
+      memset(player->public_key, 0, 32);
+      player->has_persistent_identity = false;
+      player->last_seen_time = time(NULL);
+      player->score = db_get_player_total_score(session_id) + 1200.0;
+      player->games_played = db_get_session_games_played(session_id);
+
+      db_update_session_last_seen(session_id);
+
+      pthread_mutex_unlock(&player_mutex);
+      return player;
     }
   }
 
@@ -114,6 +140,13 @@ WamblePlayer *create_new_player(void) {
     }
 
     if (!collision_found) {
+      uint64_t existing_session = db_get_session_by_token(candidate_token);
+      if (existing_session > 0) {
+        collision_found = 1;
+      }
+    }
+
+    if (!collision_found) {
       break;
     }
   } while (attempts < max_attempts);
@@ -129,6 +162,8 @@ WamblePlayer *create_new_player(void) {
   player->last_seen_time = time(NULL);
   player->score = 1200.0;
   player->games_played = 0;
+
+  uint64_t session_id = db_create_session(candidate_token, 0);
 
   pthread_mutex_unlock(&player_mutex);
   return player;
