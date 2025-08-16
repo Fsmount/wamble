@@ -8,6 +8,18 @@
 #include <string.h>
 
 #include "../include/wamble/wamble.h"
+
+uint64_t db_get_session_by_token(const uint8_t *token) {
+  (void)token;
+  return 1;
+}
+int db_record_payout(uint64_t board_id, uint64_t session_id, double points) {
+  (void)board_id;
+  (void)session_id;
+  (void)points;
+  return 0;
+}
+
 #include "../scoring.c"
 
 #define MAX_TEST_PLAYERS 10
@@ -20,6 +32,17 @@ static WambleMove test_moves[MAX_TEST_MOVES];
 static int num_test_moves = 0;
 
 static WambleBoard test_board;
+
+int db_get_moves_for_board(uint64_t board_id, WambleMove *moves_out,
+                           int max_moves) {
+  int count = 0;
+  for (int i = 0; i < num_test_moves && count < max_moves; i++) {
+    if (test_moves[i].board_id == board_id) {
+      moves_out[count++] = test_moves[i];
+    }
+  }
+  return count;
+}
 
 WamblePlayer *get_player_by_token(const uint8_t *token) {
   for (int i = 0; i < num_test_players; i++) {
@@ -45,13 +68,21 @@ WambleBoard *get_board_by_id(uint64_t board_id) {
 }
 
 int get_moves_for_board(uint64_t board_id, WambleMove **moves) {
-  *moves = malloc(sizeof(WambleMove) * num_test_moves);
+  static WambleMove move_buffer[1000];
   int count = 0;
   for (int i = 0; i < num_test_moves; i++) {
-    if (test_moves[i].board_id == board_id) {
-      (*moves)[count++] = test_moves[i];
+    if (test_moves[i].board_id == board_id && count < 1000) {
+      move_buffer[count++] = test_moves[i];
     }
   }
+
+  if (count == 0) {
+    *moves = NULL;
+    return 0;
+  }
+
+  *moves = malloc(sizeof(WambleMove) * count);
+  memcpy(*moves, move_buffer, count * sizeof(WambleMove));
   return count;
 }
 

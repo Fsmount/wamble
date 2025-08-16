@@ -8,6 +8,7 @@
 #define FEN_MAX_LENGTH 90
 #define MAX_UCI_LENGTH 6
 #define TOKEN_LENGTH 16
+#define STATUS_MAX_LENGTH 17
 
 #define get_bit(square) (1ULL << (square))
 #define get_square(file, rank) ((rank) * 8 + (file))
@@ -140,6 +141,7 @@ void release_board(uint64_t board_id);
 void archive_board(uint64_t board_id);
 void update_player_ratings(WambleBoard *board);
 int get_moves_for_board(uint64_t board_id, WambleMove **moves);
+WambleBoard *get_board_by_id(uint64_t board_id);
 
 WamblePlayer *get_player_by_id(uint64_t player_id);
 int start_board_manager_thread(void);
@@ -160,5 +162,39 @@ void start_network_listener(void);
 void send_response(const struct WambleMsg *msg);
 
 GamePhase get_game_phase(WambleBoard *board);
+
+int db_init(const char *connection_string);
+void db_cleanup(void);
+
+uint64_t db_create_session(const uint8_t *token, uint64_t player_id);
+uint64_t db_get_session_by_token(const uint8_t *token);
+void db_update_session_last_seen(uint64_t session_id);
+
+uint64_t db_create_board(const char *fen);
+int db_update_board(uint64_t board_id, const char *fen, const char *status);
+int db_get_board(uint64_t board_id, char *fen_out, char *status_out);
+int db_get_boards_by_status(const char *status, uint64_t *board_ids,
+                            int max_boards);
+
+int db_record_move(uint64_t board_id, uint64_t session_id, const char *move_uci,
+                   int move_number);
+int db_get_moves_for_board(uint64_t board_id, WambleMove *moves_out,
+                           int max_moves);
+
+int db_create_reservation(uint64_t board_id, uint64_t session_id,
+                          int timeout_seconds);
+void db_cleanup_expired_reservations(void);
+void db_remove_reservation(uint64_t board_id);
+
+int db_record_game_result(uint64_t board_id, char winning_side);
+int db_record_payout(uint64_t board_id, uint64_t session_id, double points);
+double db_get_player_total_score(uint64_t session_id);
+
+int db_get_active_session_count(void);
+int db_get_longest_game_moves(void);
+int db_get_session_games_played(uint64_t session_id);
+
+void db_expire_reservations(void);
+void db_archive_inactive_boards(int timeout_seconds);
 
 #endif

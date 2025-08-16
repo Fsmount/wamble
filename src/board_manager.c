@@ -3,6 +3,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_BOARDS 1024
@@ -14,8 +15,9 @@ static WambleBoard board_pool[MAX_BOARDS];
 static int num_boards = 0;
 static uint64_t next_board_id = 1;
 static pthread_t board_manager_thread;
+static pthread_mutex_t board_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static inline int get_player_count() { return 2; }
+static inline int get_player_count() { return db_get_active_session_count(); }
 
 void board_manager_tick();
 
@@ -29,32 +31,12 @@ static void *board_manager_thread_main(void *arg) {
 }
 
 void board_manager_tick() {
-  time_t now = time(NULL);
-  for (int i = 0; i < num_boards; i++) {
-    WambleBoard *board = &board_pool[i];
-
-    if (board->state == BOARD_STATE_RESERVED &&
-        (now - board->reservation_time) > RESERVATION_TIMEOUT) {
-      board->state = BOARD_STATE_DORMANT;
-      memset(board->reservation_player_token, 0, TOKEN_LENGTH);
-      board->reservation_time = 0;
-    }
-
-    if (board->state == BOARD_STATE_ACTIVE &&
-        (now - board->last_move_time) > INACTIVITY_TIMEOUT) {
-      board->state = BOARD_STATE_DORMANT;
-    }
-  }
+  db_expire_reservations();
+  db_archive_inactive_boards(INACTIVITY_TIMEOUT);
 }
 
 static inline int get_longest_game_moves(void) {
-  int max_moves = 0;
-  for (int i = 0; i < num_boards; i++) {
-    if (board_pool[i].board.fullmove_number > max_moves) {
-      max_moves = board_pool[i].board.fullmove_number;
-    }
-  }
-  return max_moves;
+  return db_get_longest_game_moves();
 }
 
 void board_manager_init(void) {
@@ -63,14 +45,47 @@ void board_manager_init(void) {
   next_board_id = 1;
   srand(time(NULL));
 
-  for (int i = 0; i < MIN_BOARDS; i++) {
-    if (num_boards < MAX_BOARDS) {
-      WambleBoard *board = &board_pool[num_boards++];
-      board->id = next_board_id++;
+  uint64_t board_ids[MAX_BOARDS];
+  int dormant_count = db_get_boards_by_status("DORMANT", board_ids, MAX_BOARDS);
+
+  for (int i = 0; i < dormant_count && i < MAX_BOARDS; i++) {
+    WambleBoard *board = &board_pool[num_boards++];
+    board->id = board_ids[i];
+
+    char status[17];
+    if (db_get_board(board->id, board->fen, status) == 0) {
+      parse_fen_to_bitboard(board->fen, &board->board);
       board->state = BOARD_STATE_DORMANT;
       board->result = GAME_RESULT_IN_PROGRESS;
+      board->last_move_time = 0;
+      board->creation_time = time(NULL);
+      board->last_assignment_time = 0;
+      memset(board->reservation_player_token, 0, TOKEN_LENGTH);
+      board->reservation_time = 0;
+      board->reserved_for_white = false;
+
+      if (board->id >= next_board_id) {
+        next_board_id = board->id + 1;
+      }
+    }
+  }
+
+  for (int i = num_boards; i < MIN_BOARDS; i++) {
+    if (num_boards < MAX_BOARDS) {
+      WambleBoard *board = &board_pool[num_boards++];
       strcpy(board->fen,
              "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+
+      board->id = db_create_board(board->fen);
+      if (board->id == 0) {
+
+        board->id = next_board_id++;
+      } else {
+        next_board_id = board->id + 1;
+      }
+
+      board->state = BOARD_STATE_DORMANT;
+      board->result = GAME_RESULT_IN_PROGRESS;
       parse_fen_to_bitboard(board->fen, &board->board);
       board->last_move_time = 0;
       board->creation_time = time(NULL);
@@ -162,6 +177,14 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
     memcpy(selected_board->reservation_player_token, player->token,
            TOKEN_LENGTH);
     selected_board->reserved_for_white = (selected_board->board.turn == 'w');
+
+    db_update_board(selected_board->id, selected_board->fen, "RESERVED");
+    uint64_t session_id = db_get_session_by_token(player->token);
+    if (session_id > 0) {
+      db_create_reservation(selected_board->id, session_id,
+                            RESERVATION_TIMEOUT);
+    }
+
     return selected_board;
   }
 
@@ -174,11 +197,18 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
 
   if (num_boards < target_boards && num_boards < MAX_BOARDS) {
     WambleBoard *board = &board_pool[num_boards++];
-    board->id = next_board_id++;
-    board->state = BOARD_STATE_RESERVED;
-    board->result = GAME_RESULT_IN_PROGRESS;
     strcpy(board->fen,
            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+
+    board->id = db_create_board(board->fen);
+    if (board->id == 0) {
+      board->id = next_board_id++;
+    } else {
+      next_board_id = board->id + 1;
+    }
+
+    board->state = BOARD_STATE_RESERVED;
+    board->result = GAME_RESULT_IN_PROGRESS;
     parse_fen_to_bitboard(board->fen, &board->board);
     board->last_move_time = now;
     board->creation_time = now;
@@ -186,6 +216,13 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
     memcpy(board->reservation_player_token, player->token, TOKEN_LENGTH);
     board->reserved_for_white = (board->board.turn == 'w');
     board->reservation_time = now;
+
+    db_update_board(board->id, board->fen, "RESERVED");
+    uint64_t session_id = db_get_session_by_token(player->token);
+    if (session_id > 0) {
+      db_create_reservation(board->id, session_id, RESERVATION_TIMEOUT);
+    }
+
     return board;
   }
 
@@ -193,6 +230,8 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
 }
 
 void release_board(uint64_t board_id) {
+  pthread_mutex_lock(&board_mutex);
+
   for (int i = 0; i < num_boards; i++) {
     if (board_pool[i].id == board_id) {
       board_pool[i].state = BOARD_STATE_ACTIVE;
@@ -200,18 +239,38 @@ void release_board(uint64_t board_id) {
       memset(board_pool[i].reservation_player_token, 0, TOKEN_LENGTH);
       board_pool[i].reservation_time = 0;
       board_pool[i].reserved_for_white = false;
+
+      db_update_board(board_id, board_pool[i].fen, "ACTIVE");
+      db_remove_reservation(board_id);
       break;
     }
   }
+
+  pthread_mutex_unlock(&board_mutex);
 }
 
 void archive_board(uint64_t board_id) {
+  pthread_mutex_lock(&board_mutex);
+
   for (int i = 0; i < num_boards; i++) {
     if (board_pool[i].id == board_id) {
       board_pool[i].state = BOARD_STATE_ARCHIVED;
+
+      db_update_board(board_id, board_pool[i].fen, "ARCHIVED");
+
+      char winning_side = 'd';
+      if (board_pool[i].result == GAME_RESULT_WHITE_WINS) {
+        winning_side = 'w';
+      } else if (board_pool[i].result == GAME_RESULT_BLACK_WINS) {
+        winning_side = 'b';
+      }
+      db_record_game_result(board_id, winning_side);
+
       break;
     }
   }
+
+  pthread_mutex_unlock(&board_mutex);
 }
 
 #define K_FACTOR 32
@@ -281,4 +340,37 @@ GamePhase get_game_phase(WambleBoard *board) {
   } else {
     return GAME_PHASE_END;
   }
+}
+
+WamblePlayer *get_player_by_id(uint64_t player_id) { return NULL; }
+
+WambleBoard *get_board_by_id(uint64_t board_id) {
+  pthread_mutex_lock(&board_mutex);
+
+  for (int i = 0; i < num_boards; i++) {
+    if (board_pool[i].id == board_id) {
+      pthread_mutex_unlock(&board_mutex);
+      return &board_pool[i];
+    }
+  }
+
+  pthread_mutex_unlock(&board_mutex);
+  return NULL;
+}
+
+int get_moves_for_board(uint64_t board_id, WambleMove **moves) {
+  static WambleMove move_buffer[1000];
+  int count = db_get_moves_for_board(board_id, move_buffer, 1000);
+  if (count <= 0) {
+    *moves = NULL;
+    return count;
+  }
+
+  *moves = malloc(count * sizeof(WambleMove));
+  if (!*moves) {
+    return -1;
+  }
+
+  memcpy(*moves, move_buffer, count * sizeof(WambleMove));
+  return count;
 }
