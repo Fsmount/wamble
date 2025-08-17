@@ -7,9 +7,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_PLAYERS 1024
-#define TOKEN_EXPIRATION_SECONDS 86400
-
 static WamblePlayer player_pool[MAX_PLAYERS];
 static int num_players = 0;
 static pthread_mutex_t player_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -164,6 +161,7 @@ WamblePlayer *create_new_player(void) {
   player->games_played = 0;
 
   uint64_t session_id = db_create_session(candidate_token, 0);
+  (void)session_id;
 
   pthread_mutex_unlock(&player_mutex);
   return player;
@@ -252,4 +250,13 @@ void player_manager_tick(void) {
   }
 
   pthread_mutex_unlock(&player_mutex);
+}
+
+void create_player(uint8_t *token) {
+  WamblePlayer *player = create_new_player();
+  if (player) {
+    memcpy(token, player->token, TOKEN_LENGTH);
+  } else {
+    memset(token, 0, TOKEN_LENGTH);
+  }
 }
