@@ -6,11 +6,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_BOARDS 1024
-#define MIN_BOARDS 4
-#define INACTIVITY_TIMEOUT 300
-#define RESERVATION_TIMEOUT 2
-
 static WambleBoard board_pool[MAX_BOARDS];
 static int num_boards = 0;
 static uint64_t next_board_id = 1;
@@ -273,9 +268,6 @@ void archive_board(uint64_t board_id) {
   pthread_mutex_unlock(&board_mutex);
 }
 
-#define K_FACTOR 32
-#define DEFAULT_RATING 1200
-
 void update_player_ratings(WambleBoard *board) {
   WambleMove *moves;
   int num_moves = get_moves_for_board(board->id, &moves);
@@ -342,7 +334,11 @@ GamePhase get_game_phase(WambleBoard *board) {
   }
 }
 
-WamblePlayer *get_player_by_id(uint64_t player_id) { return NULL; }
+WamblePlayer *get_player_by_id(uint64_t player_id) {
+  (void)player_id;
+
+  return NULL;
+}
 
 WambleBoard *get_board_by_id(uint64_t board_id) {
   pthread_mutex_lock(&board_mutex);

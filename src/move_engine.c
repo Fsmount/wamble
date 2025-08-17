@@ -60,15 +60,6 @@ static const Bitboard KING_ATTACKS[64] = {
     0x2838000000000000ULL, 0x5070000000000000ULL, 0xa0e0000000000000ULL,
     0x40c0000000000000ULL};
 
-static inline int square_to_index(int file, int rank) {
-  return rank * 8 + file;
-}
-
-static inline void index_to_square(int index, int *file, int *rank) {
-  *file = index % 8;
-  *rank = index / 8;
-}
-
 static inline int get_lsb(Bitboard bb) { return __builtin_ctzll(bb); }
 
 static inline Bitboard pop_lsb(Bitboard *bb) {

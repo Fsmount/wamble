@@ -1,6 +1,7 @@
 #ifndef WAMBLE_H
 #define WAMBLE_H
 
+#include <netinet/in.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
@@ -9,6 +10,32 @@
 #define MAX_UCI_LENGTH 6
 #define TOKEN_LENGTH 16
 #define STATUS_MAX_LENGTH 17
+
+#define WAMBLE_DEFAULT_PORT 8888
+#define WAMBLE_DEFAULT_TIMEOUT_MS 100
+#define WAMBLE_DEFAULT_MAX_RETRIES 3
+#define WAMBLE_MAX_MESSAGE_SIZE 126
+#define WAMBLE_BUFFER_SIZE (64 * 1024)
+
+#define MAX_CLIENT_SESSIONS 1024
+#define SESSION_TIMEOUT_SECONDS 300
+#define MAX_BOARDS 1024
+#define MIN_BOARDS 4
+#define INACTIVITY_TIMEOUT 300
+#define RESERVATION_TIMEOUT 2
+#define K_FACTOR 32
+#define DEFAULT_RATING 1200
+#define MAX_PLAYERS 1024
+#define TOKEN_EXPIRATION_SECONDS 86400
+#define MAX_POT 20.0
+#define MAX_MOVES_PER_BOARD 1000
+#define MAX_CONTRIBUTORS 100
+
+#define WAMBLE_CTRL_CLIENT_HELLO 0x01
+#define WAMBLE_CTRL_SERVER_HELLO 0x02
+#define WAMBLE_CTRL_PLAYER_MOVE 0x03
+#define WAMBLE_CTRL_BOARD_UPDATE 0x04
+#define WAMBLE_CTRL_ACK 0x05
 
 #define get_bit(square) (1ULL << (square))
 #define get_square(file, rank) ((rank) * 8 + (file))
@@ -79,8 +106,10 @@ struct WambleMsg {
   uint8_t ctrl;
   uint8_t token[TOKEN_LENGTH];
   uint64_t board_id;
+  uint32_t seq_num;
   uint8_t uci_len;
   char uci[MAX_UCI_LENGTH];
+  char fen[FEN_MAX_LENGTH];
 };
 #pragma pack(pop)
 
@@ -107,6 +136,14 @@ typedef struct WambleBoard {
   time_t reservation_time;
 } WambleBoard;
 
+typedef struct WambleClientSession {
+  struct sockaddr_in addr;
+  uint8_t token[TOKEN_LENGTH];
+  uint32_t last_seq_num;
+  time_t last_seen;
+  uint32_t next_seq_num;
+} WambleClientSession;
+
 int validate_and_apply_move(WambleBoard *wamble_board, WamblePlayer *player,
                             const char *uci_move);
 
@@ -116,8 +153,14 @@ void bitboard_to_fen(const Board *board, char *fen);
 MoveInfo make_move_bitboard(Board *board, const Move *move);
 void unmake_move_bitboard(Board *board, const Move *move, const MoveInfo *info);
 
-static inline int square_to_index(int file, int rank);
-static inline void index_to_square(int index, int *file, int *rank);
+static inline int square_to_index(int file, int rank) {
+  return rank * 8 + file;
+}
+
+static inline void index_to_square(int index, int *file, int *rank) {
+  *file = index % 8;
+  *rank = index / 8;
+}
 
 typedef enum { GAME_PHASE_EARLY, GAME_PHASE_MID, GAME_PHASE_END } GamePhase;
 
@@ -161,6 +204,15 @@ void create_player(uint8_t *token);
 void start_network_listener(void);
 void send_response(const struct WambleMsg *msg);
 
+int validate_message(const struct WambleMsg *msg, size_t received_size);
+int is_duplicate_message(const struct sockaddr_in *addr, uint32_t seq_num);
+void update_client_session(const struct sockaddr_in *addr, const uint8_t *token,
+                           uint32_t seq_num);
+
+int create_and_bind_socket_on_port(int port);
+void set_network_timeouts(int timeout_ms, int max_retries);
+void cleanup_expired_sessions(void);
+
 GamePhase get_game_phase(WambleBoard *board);
 
 int db_init(const char *connection_string);
@@ -196,5 +248,15 @@ int db_get_session_games_played(uint64_t session_id);
 
 void db_expire_reservations(void);
 void db_archive_inactive_boards(int timeout_seconds);
+
+int create_and_bind_socket(void);
+int receive_message(int sockfd, struct WambleMsg *msg,
+                    struct sockaddr_in *cliaddr);
+void send_ack(int sockfd, const struct WambleMsg *msg,
+              const struct sockaddr_in *cliaddr);
+int send_reliable_message(int sockfd, const struct WambleMsg *msg,
+                          const struct sockaddr_in *cliaddr, int timeout_ms,
+                          int max_retries);
+int wait_for_ack(int sockfd, uint32_t expected_seq, int timeout_ms);
 
 #endif

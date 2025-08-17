@@ -2,10 +2,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MAX_POT 20.0
-#define MAX_MOVES_PER_BOARD 1000
-#define MAX_CONTRIBUTORS 100
-
 typedef struct {
   uint8_t player_token[TOKEN_LENGTH];
   int white_moves;
