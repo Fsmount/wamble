@@ -113,6 +113,13 @@ struct WambleMsg {
 };
 #pragma pack(pop)
 
+int serialize_wamble_msg(const struct WambleMsg *msg, uint8_t *buffer);
+int deserialize_wamble_msg(const uint8_t *buffer, size_t buffer_size,
+                           struct WambleMsg *msg);
+
+#define WAMBLE_SERIALIZED_SIZE                                                 \
+  (1 + TOKEN_LENGTH + 8 + 4 + 1 + MAX_UCI_LENGTH + FEN_MAX_LENGTH)
+
 typedef struct WamblePlayer {
   uint8_t token[TOKEN_LENGTH];
   uint8_t public_key[32];

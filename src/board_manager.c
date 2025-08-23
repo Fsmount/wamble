@@ -319,8 +319,6 @@ void update_player_ratings(WambleBoard *board) {
     black_player->score += K_FACTOR * (actual_black - expected_black);
     black_player->games_played++;
   }
-
-  free(moves);
 }
 
 GamePhase get_game_phase(WambleBoard *board) {
@@ -355,18 +353,14 @@ WambleBoard *get_board_by_id(uint64_t board_id) {
 }
 
 int get_moves_for_board(uint64_t board_id, WambleMove **moves) {
-  static WambleMove move_buffer[1000];
-  int count = db_get_moves_for_board(board_id, move_buffer, 1000);
+  static WambleMove move_buffer[MAX_MOVES_PER_BOARD];
+  int count =
+      db_get_moves_for_board(board_id, move_buffer, MAX_MOVES_PER_BOARD);
   if (count <= 0) {
     *moves = NULL;
     return count;
   }
 
-  *moves = malloc(count * sizeof(WambleMove));
-  if (!*moves) {
-    return -1;
-  }
-
-  memcpy(*moves, move_buffer, count * sizeof(WambleMove));
+  *moves = move_buffer;
   return count;
 }
