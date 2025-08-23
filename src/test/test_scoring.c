@@ -81,8 +81,7 @@ int get_moves_for_board(uint64_t board_id, WambleMove **moves) {
     return 0;
   }
 
-  *moves = malloc(sizeof(WambleMove) * count);
-  memcpy(*moves, move_buffer, count * sizeof(WambleMove));
+  *moves = move_buffer;
   return count;
 }
 
