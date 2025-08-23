@@ -111,60 +111,83 @@ WamblePlayer *get_player_by_token(const uint8_t *token) {
 }
 
 WamblePlayer *create_new_player(void) {
-  pthread_mutex_lock(&player_mutex);
-
-  WamblePlayer *player = find_empty_player_slot();
-  if (!player) {
-    pthread_mutex_unlock(&player_mutex);
-    return NULL;
-  }
-
-  uint8_t candidate_token[16];
   int max_attempts = 1000;
-  int attempts = 0;
 
-  do {
-    generate_new_token(candidate_token);
-    attempts++;
+  for (int global_attempt = 0; global_attempt < max_attempts;
+       global_attempt++) {
+    pthread_mutex_lock(&player_mutex);
 
-    int collision_found = 0;
-    for (int i = 0; i < num_players; i++) {
-      if (&player_pool[i] != player &&
-          tokens_equal(player_pool[i].token, candidate_token)) {
-        collision_found = 1;
+    WamblePlayer *player = find_empty_player_slot();
+    if (!player) {
+      pthread_mutex_unlock(&player_mutex);
+      return NULL;
+    }
+
+    uint8_t candidate_token[16];
+    int collision_found;
+    int local_attempts = 0;
+    int max_local_attempts = 100;
+
+    do {
+      generate_new_token(candidate_token);
+      local_attempts++;
+
+      collision_found = 0;
+
+      Check against in -
+          memory player pool for (int i = 0; i < num_players; i++) {
+        if (&player_pool[i] != player &&
+            tokens_equal(player_pool[i].token, candidate_token)) {
+          collision_found = 1;
+          break;
+        }
+      }
+
+      Check against database(
+          still under mutex to prevent other threads from inserting the same
+              token between check and insert) if (!collision_found) {
+        uint64_t existing_session = db_get_session_by_token(candidate_token);
+        if (existing_session > 0) {
+          collision_found = 1;
+        }
+      }
+
+      if (!collision_found) {
         break;
       }
+    } while (local_attempts < max_local_attempts);
+
+    if (local_attempts >= max_local_attempts) {
+      pthread_mutex_unlock(&player_mutex);
+      continue;
+      Try again with a new player slot
     }
 
-    if (!collision_found) {
-      uint64_t existing_session = db_get_session_by_token(candidate_token);
-      if (existing_session > 0) {
-        collision_found = 1;
-      }
+    We have a candidate token,
+        now try to create the player memcpy(player->token, candidate_token, 16);
+    memset(player->public_key, 0, 32);
+    player->has_persistent_identity = 0;
+    player->last_seen_time = time(NULL);
+    player->score = 1200.0;
+    player->games_played = 0;
+
+    Try to create the session in the database uint64_t session_id =
+        db_create_session(candidate_token, 0);
+    if (session_id == 0) {
+      Database insertion failed, likely due to UNIQUE constraint violation This
+                                         indicates a race condition occurred -
+                                     clear the player slot and retry memset(
+                                         player, 0, sizeof(WamblePlayer));
+      pthread_mutex_unlock(&player_mutex);
+      continue;
+      Retry with a new token
     }
 
-    if (!collision_found) {
-      break;
-    }
-  } while (attempts < max_attempts);
-
-  if (attempts >= max_attempts) {
     pthread_mutex_unlock(&player_mutex);
-    return NULL;
+    return player;
   }
 
-  memcpy(player->token, candidate_token, 16);
-  memset(player->public_key, 0, 32);
-  player->has_persistent_identity = 0;
-  player->last_seen_time = time(NULL);
-  player->score = 1200.0;
-  player->games_played = 0;
-
-  uint64_t session_id = db_create_session(candidate_token, 0);
-  (void)session_id;
-
-  pthread_mutex_unlock(&player_mutex);
-  return player;
+  Failed after max attempts return NULL;
 }
 
 void format_token_for_url(const uint8_t *token, char *url_buffer) {

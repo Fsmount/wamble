@@ -1,6 +1,8 @@
 #include "../include/wamble/wamble.h"
+#include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +18,83 @@ static int network_max_retries = WAMBLE_DEFAULT_MAX_RETRIES;
 static WambleClientSession client_sessions[MAX_CLIENT_SESSIONS];
 static int num_sessions = 0;
 static uint32_t global_seq_num = 1;
+
+static uint64_t host_to_net64(uint64_t host_val) {
+  uint64_t net_val = 0;
+  for (int i = 0; i < 8; i++) {
+    net_val = (net_val << 8) | ((host_val >> (8 * i)) & 0xFF);
+  }
+  return net_val;
+}
+
+static uint64_t net_to_host64(uint64_t net_val) {
+  uint64_t host_val = 0;
+  for (int i = 0; i < 8; i++) {
+    host_val = (host_val << 8) | ((net_val >> (8 * i)) & 0xFF);
+  }
+  return host_val;
+}
+
+int serialize_wamble_msg(const struct WambleMsg *msg, uint8_t *buffer) {
+  uint8_t *ptr = buffer;
+
+  *ptr++ = msg->ctrl;
+
+  memcpy(ptr, msg->token, TOKEN_LENGTH);
+  ptr += TOKEN_LENGTH;
+
+  uint64_t board_id_net = host_to_net64(msg->board_id);
+  memcpy(ptr, &board_id_net, 8);
+  ptr += 8;
+
+  uint32_t seq_num_net = htonl(msg->seq_num);
+  memcpy(ptr, &seq_num_net, 4);
+  ptr += 4;
+
+  *ptr++ = msg->uci_len;
+
+  memcpy(ptr, msg->uci, MAX_UCI_LENGTH);
+  ptr += MAX_UCI_LENGTH;
+
+  memcpy(ptr, msg->fen, FEN_MAX_LENGTH);
+  ptr += FEN_MAX_LENGTH;
+
+  return ptr - buffer;
+}
+
+int deserialize_wamble_msg(const uint8_t *buffer, size_t buffer_size,
+                           struct WambleMsg *msg) {
+  if (buffer_size < WAMBLE_SERIALIZED_SIZE) {
+    return -1;
+  }
+
+  const uint8_t *ptr = buffer;
+
+  msg->ctrl = *ptr++;
+
+  memcpy(msg->token, ptr, TOKEN_LENGTH);
+  ptr += TOKEN_LENGTH;
+
+  uint64_t board_id_net;
+  memcpy(&board_id_net, ptr, 8);
+  msg->board_id = net_to_host64(board_id_net);
+  ptr += 8;
+
+  uint32_t seq_num_net;
+  memcpy(&seq_num_net, ptr, 4);
+  msg->seq_num = ntohl(seq_num_net);
+  ptr += 4;
+
+  msg->uci_len = *ptr++;
+
+  memcpy(msg->uci, ptr, MAX_UCI_LENGTH);
+  ptr += MAX_UCI_LENGTH;
+
+  memcpy(msg->fen, ptr, FEN_MAX_LENGTH);
+  ptr += FEN_MAX_LENGTH;
+
+  return 0;
+}
 
 void set_network_timeouts(int timeout_ms, int max_retries) {
   if (timeout_ms > 0)
@@ -56,8 +135,7 @@ create_client_session(const struct sockaddr_in *addr, const uint8_t *token) {
 }
 
 int validate_message(const struct WambleMsg *msg, size_t received_size) {
-
-  if (received_size != sizeof(struct WambleMsg)) {
+  if (received_size != WAMBLE_SERIALIZED_SIZE) {
     return -1;
   }
 
@@ -92,6 +170,11 @@ int is_duplicate_message(const struct sockaddr_in *addr, uint32_t seq_num) {
   WambleClientSession *session = find_client_session(addr);
   if (!session) {
     return 0;
+  }
+
+  uint32_t diff = seq_num - session->last_seq_num;
+  if (diff > (UINT32_MAX / 2)) {
+    return seq_num == session->last_seq_num;
   }
 
   return seq_num <= session->last_seq_num;
@@ -160,11 +243,19 @@ int create_and_bind_socket(void) {
 int receive_message(int sockfd, struct WambleMsg *msg,
                     struct sockaddr_in *cliaddr) {
   socklen_t len = sizeof(*cliaddr);
+  static uint8_t receive_buffer[WAMBLE_SERIALIZED_SIZE];
+
   ssize_t bytes_received =
-      recvfrom(sockfd, msg, sizeof(*msg), 0, (struct sockaddr *)cliaddr, &len);
+      recvfrom(sockfd, receive_buffer, WAMBLE_SERIALIZED_SIZE, 0,
+               (struct sockaddr *)cliaddr, &len);
 
   if (bytes_received <= 0) {
     return bytes_received;
+  }
+
+  if (deserialize_wamble_msg(receive_buffer, bytes_received, msg) != 0) {
+    fprintf(stderr, "Failed to deserialize message from client\n");
+    return -1;
   }
 
   if (validate_message(msg, bytes_received) != 0) {
@@ -196,8 +287,11 @@ void send_ack(int sockfd, const struct WambleMsg *msg,
   memset(ack_msg.uci, 0, MAX_UCI_LENGTH);
   memset(ack_msg.fen, 0, FEN_MAX_LENGTH);
 
-  sendto(sockfd, &ack_msg, sizeof(ack_msg), 0, (const struct sockaddr *)cliaddr,
-         sizeof(*cliaddr));
+  static uint8_t send_buffer[WAMBLE_SERIALIZED_SIZE];
+  int serialized_size = serialize_wamble_msg(&ack_msg, send_buffer);
+
+  sendto(sockfd, send_buffer, serialized_size, 0,
+         (const struct sockaddr *)cliaddr, sizeof(*cliaddr));
 }
 
 int wait_for_ack(int sockfd, uint32_t expected_seq, int timeout_ms) {
@@ -215,16 +309,19 @@ int wait_for_ack(int sockfd, uint32_t expected_seq, int timeout_ms) {
     return -1;
   }
 
+  static uint8_t ack_buffer[WAMBLE_SERIALIZED_SIZE];
   struct WambleMsg ack_msg;
   struct sockaddr_in cliaddr;
   socklen_t len = sizeof(cliaddr);
 
-  int bytes_received = recvfrom(sockfd, &ack_msg, sizeof(ack_msg), 0,
+  int bytes_received = recvfrom(sockfd, ack_buffer, WAMBLE_SERIALIZED_SIZE, 0,
                                 (struct sockaddr *)&cliaddr, &len);
 
-  if (bytes_received > 0 && ack_msg.ctrl == WAMBLE_CTRL_ACK &&
-      ack_msg.seq_num == expected_seq) {
-    return 0;
+  if (bytes_received > 0) {
+    if (deserialize_wamble_msg(ack_buffer, bytes_received, &ack_msg) == 0 &&
+        ack_msg.ctrl == WAMBLE_CTRL_ACK && ack_msg.seq_num == expected_seq) {
+      return 0;
+    }
   }
 
   return -1;
@@ -244,8 +341,7 @@ int send_reliable_message(int sockfd, const struct WambleMsg *msg,
   if (!session) {
     session = create_client_session(cliaddr, msg->token);
     if (!session) {
-
-      reliable_msg.seq_num = global_seq_num++;
+      global_seq_num = 1;
     } else {
       reliable_msg.seq_num = session->next_seq_num++;
     }
@@ -253,8 +349,11 @@ int send_reliable_message(int sockfd, const struct WambleMsg *msg,
     reliable_msg.seq_num = session->next_seq_num++;
   }
 
+  static uint8_t send_buffer[WAMBLE_SERIALIZED_SIZE];
+  int serialized_size = serialize_wamble_msg(&reliable_msg, send_buffer);
+
   for (int attempt = 0; attempt < max_retries; attempt++) {
-    int bytes_sent = sendto(sockfd, &reliable_msg, sizeof(reliable_msg), 0,
+    int bytes_sent = sendto(sockfd, send_buffer, serialized_size, 0,
                             (const struct sockaddr *)cliaddr, sizeof(*cliaddr));
 
     if (bytes_sent < 0) {
