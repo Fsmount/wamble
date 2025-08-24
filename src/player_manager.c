@@ -6,6 +6,15 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) ||      \
+    defined(__NetBSD__)
+#include <stdlib.h>
+#elif defined(_WIN32)
+#include <bcrypt.h>
+#include <windows.h>
+#elif defined(__linux__)
+#include <sys/random.h>
+#endif
 
 static WamblePlayer player_pool[MAX_PLAYERS];
 static int num_players = 0;
@@ -13,24 +22,176 @@ static pthread_mutex_t player_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static const char base64url_chars[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+static pthread_mutex_t rng_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int rng_initialized = 0;
+static uint64_t pcg_state = 0x853c49e6748fea9bULL;
+static uint64_t pcg_inc = 0xda3e39cb94b95bdbULL;
 
-static void generate_new_token(uint8_t *token_buffer) {
-  int fd = open("/dev/urandom", O_RDONLY);
-  if (fd < 0) {
-    for (int i = 0; i < 16; i++) {
-      token_buffer[i] = rand() & 0xFF;
-    }
+static inline uint32_t pcg32_random_r(void) {
+  uint64_t oldstate = pcg_state;
+  pcg_state = oldstate * 6364136223846793005ULL + (pcg_inc | 1ULL);
+  uint32_t xorshifted = (uint32_t)(((oldstate >> 18u) ^ oldstate) >> 27u);
+  uint32_t rot = (uint32_t)(oldstate >> 59u);
+  return (xorshifted >> rot) | (xorshifted << ((-rot) & 31));
+}
+
+static uint64_t mix64(uint64_t x) {
+  x ^= x >> 33;
+  x *= 0xff51afd7ed558ccdULL;
+  x ^= x >> 33;
+  x *= 0xc4ceb9fe1a85ec53ULL;
+  x ^= x >> 33;
+  return x;
+}
+
+void rng_init(void) {
+  pthread_mutex_lock(&rng_mutex);
+  if (rng_initialized) {
+    pthread_mutex_unlock(&rng_mutex);
     return;
   }
 
-  ssize_t bytes_read = 0;
-  while (bytes_read < 16) {
-    ssize_t result = read(fd, token_buffer + bytes_read, 16 - bytes_read);
-    if (result > 0) {
-      bytes_read += result;
+  uint64_t seed1 = (uint64_t)time(NULL);
+  uint64_t seed2 = (uint64_t)clock();
+  uint64_t seed3 = (uint64_t)getpid();
+  uint64_t seed4 = (uint64_t)(uintptr_t)&seed1;
+  uint64_t entropy = mix64(seed1) ^ mix64(seed2) ^ mix64(seed3) ^ mix64(seed4);
+
+  {
+    uint64_t ur = 0;
+    int have_os_entropy = 0;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) ||      \
+    defined(__NetBSD__)
+    arc4random_buf(&ur, sizeof ur);
+    have_os_entropy = 1;
+#elif defined(_WIN32)
+    if (BCryptGenRandom(NULL, (PUCHAR)&ur, (ULONG)sizeof ur,
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0) {
+      have_os_entropy = 1;
+    }
+#elif defined(__linux__)
+    ssize_t r = getrandom(&ur, sizeof ur, 0);
+    if (r == (ssize_t)sizeof ur) {
+      have_os_entropy = 1;
+    }
+#endif
+    if (have_os_entropy) {
+      entropy ^= ur;
     }
   }
-  close(fd);
+
+  pcg_state ^= mix64(entropy);
+  pcg_inc ^= mix64(entropy << 1);
+  (void)pcg32_random_r();
+
+  rng_initialized = 1;
+  pthread_mutex_unlock(&rng_mutex);
+}
+
+uint64_t rng_u64(void) {
+  pthread_mutex_lock(&rng_mutex);
+  uint64_t hi = (uint64_t)pcg32_random_r();
+  uint64_t lo = (uint64_t)pcg32_random_r();
+  pthread_mutex_unlock(&rng_mutex);
+  return (hi << 32) | lo;
+}
+
+double rng_double(void) {
+  uint64_t r = rng_u64();
+  r >>= 11;
+  return (double)r * (1.0 / 9007199254740992.0);
+}
+
+void rng_bytes(uint8_t *out, size_t len) {
+  size_t i = 0;
+  while (i < len) {
+    uint64_t r = rng_u64();
+    for (int b = 0; b < 8 && i < len; b++, i++) {
+      out[i] = (uint8_t)(r & 0xFF);
+      r >>= 8;
+    }
+  }
+}
+
+#define PLAYER_MAP_SIZE (MAX_PLAYERS * 2)
+static int player_index_map[PLAYER_MAP_SIZE];
+
+static uint64_t token_hash(const uint8_t *token) {
+  uint64_t h = 1469598103934665603ULL;
+  for (int i = 0; i < 16; i++) {
+    h ^= token[i];
+    h *= 1099511628211ULL;
+  }
+  h ^= h >> 33;
+  h *= 0xff51afd7ed558ccdULL;
+  h ^= h >> 33;
+  h *= 0xc4ceb9fe1a85ec53ULL;
+  h ^= h >> 33;
+  return h;
+}
+
+static void player_map_init(void) {
+  for (int i = 0; i < PLAYER_MAP_SIZE; i++)
+    player_index_map[i] = -1;
+}
+
+static int tokens_equal(const uint8_t *token1, const uint8_t *token2);
+
+static void player_map_put(const uint8_t *token, int index) {
+  uint64_t h = token_hash(token);
+  int mask = PLAYER_MAP_SIZE - 1;
+  int i = (int)(h & mask);
+  int first_tombstone = -1;
+  for (int probe = 0; probe < PLAYER_MAP_SIZE; probe++) {
+    int cur = player_index_map[i];
+    if (cur == -1) {
+      player_index_map[(first_tombstone >= 0) ? first_tombstone : i] = index;
+      return;
+    }
+    if (cur == -2) {
+      if (first_tombstone < 0)
+        first_tombstone = i;
+    } else if (tokens_equal(player_pool[cur].token, token)) {
+      player_index_map[i] = index;
+      return;
+    }
+    i = (i + 1) & mask;
+  }
+}
+
+static int player_map_get(const uint8_t *token) {
+  uint64_t h = token_hash(token);
+  int mask = PLAYER_MAP_SIZE - 1;
+  int i = (int)(h & mask);
+  for (int probe = 0; probe < PLAYER_MAP_SIZE; probe++) {
+    int cur = player_index_map[i];
+    if (cur == -1)
+      return -1;
+    if (cur >= 0 && tokens_equal(player_pool[cur].token, token))
+      return cur;
+    i = (i + 1) & mask;
+  }
+  return -1;
+}
+
+static void player_map_delete(const uint8_t *token) {
+  uint64_t h = token_hash(token);
+  int mask = PLAYER_MAP_SIZE - 1;
+  int i = (int)(h & mask);
+  for (int probe = 0; probe < PLAYER_MAP_SIZE; probe++) {
+    int cur = player_index_map[i];
+    if (cur == -1)
+      return;
+    if (cur >= 0 && tokens_equal(player_pool[cur].token, token)) {
+      player_index_map[i] = -2;
+      return;
+    }
+    i = (i + 1) & mask;
+  }
+}
+
+static void generate_new_token(uint8_t *token_buffer) {
+  rng_bytes(token_buffer, 16);
 }
 
 static int tokens_equal(const uint8_t *token1, const uint8_t *token2) {
@@ -64,7 +225,8 @@ static WamblePlayer *find_empty_player_slot(void) {
 void player_manager_init(void) {
   memset(player_pool, 0, sizeof(player_pool));
   num_players = 0;
-  srand(time(NULL));
+  rng_init();
+  player_map_init();
 }
 
 WamblePlayer *get_player_by_token(const uint8_t *token) {
@@ -73,18 +235,17 @@ WamblePlayer *get_player_by_token(const uint8_t *token) {
 
   pthread_mutex_lock(&player_mutex);
 
-  for (int i = 0; i < num_players; i++) {
-    if (tokens_equal(player_pool[i].token, token)) {
-      player_pool[i].last_seen_time = time(NULL);
+  int idx = player_map_get(token);
+  if (idx >= 0) {
+    player_pool[idx].last_seen_time = time(NULL);
 
-      uint64_t session_id = db_get_session_by_token(token);
-      if (session_id > 0) {
-        db_update_session_last_seen(session_id);
-      }
-
-      pthread_mutex_unlock(&player_mutex);
-      return &player_pool[i];
+    uint64_t session_id = db_get_session_by_token(token);
+    if (session_id > 0) {
+      db_update_session_last_seen(session_id);
     }
+
+    pthread_mutex_unlock(&player_mutex);
+    return &player_pool[idx];
   }
 
   uint64_t session_id = db_get_session_by_token(token);
@@ -98,7 +259,7 @@ WamblePlayer *get_player_by_token(const uint8_t *token) {
       player->last_seen_time = time(NULL);
       player->score = db_get_player_total_score(session_id) + 1200.0;
       player->games_played = db_get_session_games_played(session_id);
-
+      player_map_put(player->token, (int)(player - player_pool));
       db_update_session_last_seen(session_id);
 
       pthread_mutex_unlock(&player_mutex);
@@ -134,18 +295,14 @@ WamblePlayer *create_new_player(void) {
 
       collision_found = 0;
 
-      Check against in -
-          memory player pool for (int i = 0; i < num_players; i++) {
+      for (int i = 0; i < num_players; i++) {
         if (&player_pool[i] != player &&
             tokens_equal(player_pool[i].token, candidate_token)) {
           collision_found = 1;
           break;
         }
       }
-
-      Check against database(
-          still under mutex to prevent other threads from inserting the same
-              token between check and insert) if (!collision_found) {
+      if (!collision_found) {
         uint64_t existing_session = db_get_session_by_token(candidate_token);
         if (existing_session > 0) {
           collision_found = 1;
@@ -160,34 +317,26 @@ WamblePlayer *create_new_player(void) {
     if (local_attempts >= max_local_attempts) {
       pthread_mutex_unlock(&player_mutex);
       continue;
-      Try again with a new player slot
     }
 
-    We have a candidate token,
-        now try to create the player memcpy(player->token, candidate_token, 16);
+    memcpy(player->token, candidate_token, 16);
     memset(player->public_key, 0, 32);
     player->has_persistent_identity = 0;
     player->last_seen_time = time(NULL);
     player->score = 1200.0;
     player->games_played = 0;
-
-    Try to create the session in the database uint64_t session_id =
-        db_create_session(candidate_token, 0);
+    uint64_t session_id = db_create_session(candidate_token, 0);
     if (session_id == 0) {
-      Database insertion failed, likely due to UNIQUE constraint violation This
-                                         indicates a race condition occurred -
-                                     clear the player slot and retry memset(
-                                         player, 0, sizeof(WamblePlayer));
+      memset(player, 0, sizeof(WamblePlayer));
       pthread_mutex_unlock(&player_mutex);
       continue;
-      Retry with a new token
     }
+    player_map_put(player->token, (int)(player - player_pool));
 
     pthread_mutex_unlock(&player_mutex);
     return player;
   }
-
-  Failed after max attempts return NULL;
+  return NULL;
 }
 
 void format_token_for_url(const uint8_t *token, char *url_buffer) {
@@ -265,7 +414,10 @@ void player_manager_tick(void) {
 
     if (!is_empty &&
         (now - player_pool[i].last_seen_time) > TOKEN_EXPIRATION_SECONDS) {
+      uint8_t old_token[16];
+      memcpy(old_token, player_pool[i].token, 16);
       memset(&player_pool[i], 0, sizeof(WamblePlayer));
+      player_map_delete(old_token);
       if (i == num_players - 1) {
         num_players--;
       }

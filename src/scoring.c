@@ -94,7 +94,7 @@ void calculate_and_distribute_pot(uint64_t board_id) {
 
     uint64_t session_id = db_get_session_by_token(contrib->player_token);
     if (session_id > 0 && score > 0.0) {
-      db_record_payout(board_id, session_id, score);
+      db_async_record_payout(board_id, session_id, score);
     }
 
     WamblePlayer *player = get_player_by_token(contrib->player_token);

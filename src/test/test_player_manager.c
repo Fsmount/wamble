@@ -6,7 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "../include/wamble/wamble.h"
+#include "../../include/wamble/wamble.h"
 
 uint64_t db_get_session_by_token(const uint8_t *token) {
   (void)token;
