@@ -1,6 +1,7 @@
 #include "../include/wamble/wamble.h"
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -18,6 +19,70 @@ static int network_max_retries = WAMBLE_DEFAULT_MAX_RETRIES;
 static WambleClientSession client_sessions[MAX_CLIENT_SESSIONS];
 static int num_sessions = 0;
 static uint32_t global_seq_num = 1;
+
+#define SESSION_MAP_SIZE (MAX_CLIENT_SESSIONS * 2)
+static int session_index_map[SESSION_MAP_SIZE];
+
+static inline uint64_t mix64_s(uint64_t x) {
+  x ^= x >> 33;
+  x *= 0xff51afd7ed558ccdULL;
+  x ^= x >> 33;
+  x *= 0xc4ceb9fe1a85ec53ULL;
+  x ^= x >> 33;
+  return x;
+}
+
+static inline uint64_t addr_hash_key(const struct sockaddr_in *addr) {
+  uint64_t ip = (uint64_t)addr->sin_addr.s_addr;
+  uint64_t port = (uint64_t)addr->sin_port;
+  return mix64_s((ip << 16) ^ port);
+}
+
+static void session_map_init(void) {
+  for (int i = 0; i < SESSION_MAP_SIZE; i++)
+    session_index_map[i] = -1;
+}
+
+static void session_map_put(const struct sockaddr_in *addr, int index) {
+  uint64_t h = addr_hash_key(addr);
+  int mask = SESSION_MAP_SIZE - 1;
+  int i = (int)(h & mask);
+  for (int probe = 0; probe < SESSION_MAP_SIZE; probe++) {
+    if (session_index_map[i] == -1) {
+      session_index_map[i] = index;
+      return;
+    }
+    int cur = session_index_map[i];
+    if (cur >= 0) {
+      const struct sockaddr_in *saddr = &client_sessions[cur].addr;
+      if (saddr->sin_addr.s_addr == addr->sin_addr.s_addr &&
+          saddr->sin_port == addr->sin_port) {
+        session_index_map[i] = index;
+        return;
+      }
+    }
+    i = (i + 1) & mask;
+  }
+}
+
+static int session_map_get(const struct sockaddr_in *addr) {
+  uint64_t h = addr_hash_key(addr);
+  int mask = SESSION_MAP_SIZE - 1;
+  int i = (int)(h & mask);
+  for (int probe = 0; probe < SESSION_MAP_SIZE; probe++) {
+    int cur = session_index_map[i];
+    if (cur == -1)
+      return -1;
+    if (cur >= 0) {
+      const struct sockaddr_in *saddr = &client_sessions[cur].addr;
+      if (saddr->sin_addr.s_addr == addr->sin_addr.s_addr &&
+          saddr->sin_port == addr->sin_port)
+        return cur;
+    }
+    i = (i + 1) & mask;
+  }
+  return -1;
+}
 
 static uint64_t host_to_net64(uint64_t host_val) {
   uint64_t net_val = 0;
@@ -103,19 +168,11 @@ void set_network_timeouts(int timeout_ms, int max_retries) {
     network_max_retries = max_retries;
 }
 
-static int addr_equal(const struct sockaddr_in *addr1,
-                      const struct sockaddr_in *addr2) {
-  return addr1->sin_addr.s_addr == addr2->sin_addr.s_addr &&
-         addr1->sin_port == addr2->sin_port;
-}
-
 static WambleClientSession *
 find_client_session(const struct sockaddr_in *addr) {
-  for (int i = 0; i < num_sessions; i++) {
-    if (addr_equal(&client_sessions[i].addr, addr)) {
-      return &client_sessions[i];
-    }
-  }
+  int idx = session_map_get(addr);
+  if (idx >= 0)
+    return &client_sessions[idx];
   return NULL;
 }
 
@@ -131,6 +188,7 @@ create_client_session(const struct sockaddr_in *addr, const uint8_t *token) {
   session->last_seq_num = 0;
   session->last_seen = time(NULL);
   session->next_seq_num = 1;
+  session_map_put(addr, (int)(session - client_sessions));
   return session;
 }
 
@@ -173,11 +231,13 @@ int is_duplicate_message(const struct sockaddr_in *addr, uint32_t seq_num) {
   }
 
   uint32_t diff = seq_num - session->last_seq_num;
-  if (diff > (UINT32_MAX / 2)) {
-    return seq_num == session->last_seq_num;
+  if (diff == 0) {
+    return 1;
   }
-
-  return seq_num <= session->last_seq_num;
+  if (diff > (UINT32_MAX / 2u)) {
+    return 1;
+  }
+  return 0;
 }
 
 void update_client_session(const struct sockaddr_in *addr, const uint8_t *token,
@@ -236,6 +296,13 @@ int create_and_bind_socket(void) {
     close(sockfd);
     return -1;
   }
+
+  int flags = fcntl(sockfd, F_GETFL, 0);
+  if (flags >= 0) {
+    (void)fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+  }
+
+  session_map_init();
 
   return sockfd;
 }
@@ -341,7 +408,10 @@ int send_reliable_message(int sockfd, const struct WambleMsg *msg,
   if (!session) {
     session = create_client_session(cliaddr, msg->token);
     if (!session) {
-      global_seq_num = 1;
+      reliable_msg.seq_num = global_seq_num++;
+      if (global_seq_num > (UINT32_MAX - 1000)) {
+        global_seq_num = 1;
+      }
     } else {
       reliable_msg.seq_num = session->next_seq_num++;
     }
@@ -400,5 +470,9 @@ void cleanup_expired_sessions(void) {
   if (write_idx != num_sessions) {
     printf("Cleaned up %d expired client sessions\n", num_sessions - write_idx);
     num_sessions = write_idx;
+    session_map_init();
+    for (int i = 0; i < num_sessions; i++) {
+      session_map_put(&client_sessions[i].addr, i);
+    }
   }
 }

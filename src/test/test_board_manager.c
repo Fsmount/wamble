@@ -42,6 +42,8 @@ void db_archive_inactive_boards(int timeout_seconds) {
 int db_get_active_session_count(void) { return mock_active_players; }
 int db_get_longest_game_moves(void) { return mock_longest_moves; }
 void db_cleanup_expired_reservations(void) {}
+void rng_init(void) {}
+double rng_double(void) { return 0.5; }
 
 int db_update_board(uint64_t board_id, const char *fen, const char *status) {
   for (int i = 0; i < mock_num_boards; i++) {
@@ -123,6 +125,24 @@ int db_record_game_result(uint64_t board_id, char winning_side) { return 0; }
 int db_record_move(uint64_t board_id, uint64_t session_id, const char *move_uci,
                    int move_number) {
   return 0;
+}
+void db_async_update_board(uint64_t board_id, const char *fen,
+                           const char *status) {
+  (void)db_update_board(board_id, fen, status);
+}
+void db_async_create_reservation(uint64_t board_id, uint64_t session_id,
+                                 int timeout_seconds) {
+  (void)db_create_reservation(board_id, session_id, timeout_seconds);
+}
+void db_async_remove_reservation(uint64_t board_id) {
+  db_remove_reservation(board_id);
+}
+void db_async_record_game_result(uint64_t board_id, char winning_side) {
+  (void)db_record_game_result(board_id, winning_side);
+}
+void db_async_record_move(uint64_t board_id, uint64_t session_id,
+                          const char *move_uci, int move_number) {
+  (void)db_record_move(board_id, session_id, move_uci, move_number);
 }
 void calculate_and_distribute_pot(uint64_t board_id) {}
 

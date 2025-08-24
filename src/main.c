@@ -3,11 +3,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 
 void handle_message(int sockfd, const struct WambleMsg *msg,
                     const struct sockaddr_in *cliaddr);
 
 int main(int argc, char *argv[]) {
+  (void)argc;
+  (void)argv;
   if (db_init("dbname=wamble user=wamble password=wamble host=localhost") !=
       0) {
     fprintf(stderr, "Failed to initialize database\n");
@@ -35,11 +38,21 @@ int main(int argc, char *argv[]) {
   time_t last_cleanup = time(NULL);
 
   while (1) {
-    struct WambleMsg msg;
-    struct sockaddr_in cliaddr;
-    int n = receive_message(sockfd, &msg, &cliaddr);
-    if (n > 0) {
-      handle_message(sockfd, &msg, &cliaddr);
+    fd_set rfds;
+    struct timeval tv;
+    FD_ZERO(&rfds);
+    FD_SET(sockfd, &rfds);
+    tv.tv_sec = 0;
+    tv.tv_usec = 100000;
+
+    int ready = select(sockfd + 1, &rfds, NULL, NULL, &tv);
+    if (ready > 0 && FD_ISSET(sockfd, &rfds)) {
+      struct WambleMsg msg;
+      struct sockaddr_in cliaddr;
+      int n = receive_message(sockfd, &msg, &cliaddr);
+      if (n > 0) {
+        handle_message(sockfd, &msg, &cliaddr);
+      }
     }
 
     time_t now = time(NULL);
@@ -60,7 +73,9 @@ static void handle_client_hello(int sockfd, const struct WambleMsg *msg,
 
   WamblePlayer *player = get_player_by_token(msg->token);
   if (!player) {
-    player = create_new_player();
+    uint8_t new_token[TOKEN_LENGTH];
+    create_player(new_token);
+    player = get_player_by_token(new_token);
     if (!player) {
       fprintf(stderr, "Failed to create new player\n");
       return;

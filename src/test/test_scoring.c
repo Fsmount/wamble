@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../include/wamble/wamble.h"
+#include "../../include/wamble/wamble.h"
 
 uint64_t db_get_session_by_token(const uint8_t *token) {
   (void)token;
@@ -18,6 +18,11 @@ int db_record_payout(uint64_t board_id, uint64_t session_id, double points) {
   (void)session_id;
   (void)points;
   return 0;
+}
+
+void db_async_record_payout(uint64_t board_id, uint64_t session_id,
+                            double points) {
+  (void)db_record_payout(board_id, session_id, points);
 }
 
 #include "../scoring.c"
