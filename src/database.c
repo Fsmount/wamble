@@ -1,5 +1,6 @@
 #include "../include/wamble/wamble.h"
 #include <libpq-fe.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,6 +8,167 @@
 
 static PGconn *db_conn = NULL;
 static bool db_initialized = false;
+static pthread_mutex_t db_conn_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static PGresult *pq_exec_locked(const char *command) {
+  PGresult *res;
+  pthread_mutex_lock(&db_conn_mutex);
+  res = PQexec(db_conn, command);
+  pthread_mutex_unlock(&db_conn_mutex);
+  return res;
+}
+
+static PGresult *
+pq_exec_params_locked(const char *command, int nParams, const Oid *paramTypes,
+                      const char *const *paramValues, const int *paramLengths,
+                      const int *paramFormats, int resultFormat) {
+  PGresult *res;
+  pthread_mutex_lock(&db_conn_mutex);
+  res = PQexecParams(db_conn, command, nParams, paramTypes, paramValues,
+                     paramLengths, paramFormats, resultFormat);
+  pthread_mutex_unlock(&db_conn_mutex);
+  return res;
+}
+
+typedef enum {
+  DB_JOB_UPDATE_BOARD,
+  DB_JOB_CREATE_RESERVATION,
+  DB_JOB_REMOVE_RESERVATION,
+  DB_JOB_RECORD_GAME_RESULT,
+  DB_JOB_RECORD_MOVE,
+  DB_JOB_RECORD_PAYOUT
+} DbJobType;
+
+typedef struct {
+  DbJobType type;
+  uint64_t board_id;
+  uint64_t session_id;
+  int move_number;
+  int timeout_seconds;
+  double points;
+  char fen[FEN_MAX_LENGTH];
+  char status[STATUS_MAX_LENGTH];
+  char move_uci[MAX_UCI_LENGTH];
+  char winning_side;
+} DbJob;
+
+#define DB_QUEUE_CAP 1024
+static DbJob db_queue[DB_QUEUE_CAP];
+static int db_q_head = 0;
+static int db_q_tail = 0;
+static pthread_mutex_t db_q_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t db_q_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t db_workers[2];
+static int db_worker_running = 0;
+static unsigned long db_q_dropped = 0;
+static unsigned long db_job_failures[6] = {0};
+static unsigned long db_job_success[6] = {0};
+
+static int db_q_empty(void) { return db_q_head == db_q_tail; }
+static int db_q_full(void) {
+  return ((db_q_tail + 1) % DB_QUEUE_CAP) == db_q_head;
+}
+
+static void db_q_push(const DbJob *job) {
+  pthread_mutex_lock(&db_q_mutex);
+  if (!db_q_full()) {
+    db_queue[db_q_tail] = *job;
+    db_q_tail = (db_q_tail + 1) % DB_QUEUE_CAP;
+    pthread_cond_signal(&db_q_cond);
+  } else {
+    db_q_dropped++;
+    if ((db_q_dropped % 1000UL) == 1UL) {
+      fprintf(stderr, "db queue full, dropping jobs (total: %lu)\n",
+              db_q_dropped);
+    }
+  }
+  pthread_mutex_unlock(&db_q_mutex);
+}
+
+static int db_q_pop(DbJob *out) {
+  pthread_mutex_lock(&db_q_mutex);
+  while (db_worker_running && db_q_empty()) {
+    pthread_cond_wait(&db_q_cond, &db_q_mutex);
+  }
+  if (!db_worker_running && db_q_empty()) {
+    pthread_mutex_unlock(&db_q_mutex);
+    return 0;
+  }
+  *out = db_queue[db_q_head];
+  db_q_head = (db_q_head + 1) % DB_QUEUE_CAP;
+  pthread_mutex_unlock(&db_q_mutex);
+  return 1;
+}
+
+static void *db_worker_main(void *arg) {
+  (void)arg;
+  DbJob job;
+  while (db_worker_running) {
+    if (!db_q_pop(&job))
+      continue;
+    if (!db_conn)
+      continue;
+    switch (job.type) {
+    case DB_JOB_UPDATE_BOARD:
+      if (db_update_board(job.board_id, job.fen, job.status) == 0)
+        db_job_success[DB_JOB_UPDATE_BOARD]++;
+      else {
+        db_job_failures[DB_JOB_UPDATE_BOARD]++;
+        if ((db_job_failures[DB_JOB_UPDATE_BOARD] % 100UL) == 1UL)
+          fprintf(stderr, "db failure: update_board (total: %lu)\n",
+                  db_job_failures[DB_JOB_UPDATE_BOARD]);
+      }
+      break;
+    case DB_JOB_CREATE_RESERVATION:
+      if (db_create_reservation(job.board_id, job.session_id,
+                                job.timeout_seconds) == 0)
+        db_job_success[DB_JOB_CREATE_RESERVATION]++;
+      else {
+        db_job_failures[DB_JOB_CREATE_RESERVATION]++;
+        if ((db_job_failures[DB_JOB_CREATE_RESERVATION] % 100UL) == 1UL)
+          fprintf(stderr, "db failure: create_reservation (total: %lu)\n",
+                  db_job_failures[DB_JOB_CREATE_RESERVATION]);
+      }
+      break;
+    case DB_JOB_REMOVE_RESERVATION:
+      db_remove_reservation(job.board_id);
+      db_job_success[DB_JOB_REMOVE_RESERVATION]++;
+      break;
+    case DB_JOB_RECORD_GAME_RESULT:
+      if (db_record_game_result(job.board_id, job.winning_side) == 0)
+        db_job_success[DB_JOB_RECORD_GAME_RESULT]++;
+      else {
+        db_job_failures[DB_JOB_RECORD_GAME_RESULT]++;
+        if ((db_job_failures[DB_JOB_RECORD_GAME_RESULT] % 100UL) == 1UL)
+          fprintf(stderr, "db failure: record_game_result (total: %lu)\n",
+                  db_job_failures[DB_JOB_RECORD_GAME_RESULT]);
+      }
+      break;
+    case DB_JOB_RECORD_MOVE:
+      if (db_record_move(job.board_id, job.session_id, job.move_uci,
+                         job.move_number) == 0)
+        db_job_success[DB_JOB_RECORD_MOVE]++;
+      else {
+        db_job_failures[DB_JOB_RECORD_MOVE]++;
+        if ((db_job_failures[DB_JOB_RECORD_MOVE] % 100UL) == 1UL)
+          fprintf(stderr, "db failure: record_move (total: %lu)\n",
+                  db_job_failures[DB_JOB_RECORD_MOVE]);
+      }
+      break;
+    case DB_JOB_RECORD_PAYOUT:
+      if (db_record_payout(job.board_id, job.session_id, job.points) == 0)
+        db_job_success[DB_JOB_RECORD_PAYOUT]++;
+      else {
+        db_job_failures[DB_JOB_RECORD_PAYOUT]++;
+        if ((db_job_failures[DB_JOB_RECORD_PAYOUT] % 100UL) == 1UL)
+          fprintf(stderr, "db failure: record_payout (total: %lu)\n",
+                  db_job_failures[DB_JOB_RECORD_PAYOUT]);
+      }
+      break;
+    }
+  }
+  return NULL;
+}
 
 static void bytes_to_hex(const uint8_t *bytes, int len, char *hex_out) {
   if (bytes == NULL || hex_out == NULL) {
@@ -29,24 +191,105 @@ int db_init(const char *connection_string) {
     return 0;
   }
 
+  pthread_mutex_lock(&db_conn_mutex);
   db_conn = PQconnectdb(connection_string);
-
   if (PQstatus(db_conn) != CONNECTION_OK) {
     PQfinish(db_conn);
     db_conn = NULL;
+    pthread_mutex_unlock(&db_conn_mutex);
     return -1;
   }
+  pthread_mutex_unlock(&db_conn_mutex);
 
   db_initialized = true;
+
+  db_worker_running = 1;
+  for (int i = 0; i < 2; i++) {
+    pthread_create(&db_workers[i], NULL, db_worker_main, NULL);
+  }
   return 0;
 }
 
 void db_cleanup(void) {
   if (db_conn) {
+    pthread_mutex_lock(&db_conn_mutex);
     PQfinish(db_conn);
     db_conn = NULL;
+    pthread_mutex_unlock(&db_conn_mutex);
   }
   db_initialized = false;
+  if (db_worker_running) {
+    pthread_mutex_lock(&db_q_mutex);
+    db_worker_running = 0;
+    pthread_cond_broadcast(&db_q_cond);
+    pthread_mutex_unlock(&db_q_mutex);
+    for (int i = 0; i < 2; i++) {
+      pthread_join(db_workers[i], NULL);
+    }
+  }
+}
+
+void db_async_update_board(uint64_t board_id, const char *fen,
+                           const char *status) {
+  DbJob j;
+  j.type = DB_JOB_UPDATE_BOARD;
+  j.board_id = board_id;
+  strncpy(j.fen, fen ? fen : "", FEN_MAX_LENGTH - 1);
+  j.fen[FEN_MAX_LENGTH - 1] = '\0';
+  strncpy(j.status, status ? status : "", STATUS_MAX_LENGTH - 1);
+  j.status[STATUS_MAX_LENGTH - 1] = '\0';
+  db_q_push(&j);
+}
+
+void db_async_create_reservation(uint64_t board_id, uint64_t session_id,
+                                 int timeout_seconds) {
+  DbJob j;
+  j.type = DB_JOB_CREATE_RESERVATION;
+  j.board_id = board_id;
+  j.session_id = session_id;
+  j.timeout_seconds = timeout_seconds;
+  db_q_push(&j);
+}
+
+void db_async_remove_reservation(uint64_t board_id) {
+  DbJob j;
+  j.type = DB_JOB_REMOVE_RESERVATION;
+  j.board_id = board_id;
+  db_q_push(&j);
+}
+
+void db_async_record_game_result(uint64_t board_id, char winning_side) {
+  DbJob j;
+  j.type = DB_JOB_RECORD_GAME_RESULT;
+  j.board_id = board_id;
+  j.winning_side = winning_side;
+  db_q_push(&j);
+}
+
+void db_async_record_move(uint64_t board_id, uint64_t session_id,
+                          const char *move_uci, int move_number) {
+  DbJob j;
+  j.type = DB_JOB_RECORD_MOVE;
+  j.board_id = board_id;
+  j.session_id = session_id;
+  j.move_number = move_number;
+  if (move_uci) {
+    strncpy(j.move_uci, move_uci, MAX_UCI_LENGTH - 1);
+    j.move_uci[MAX_UCI_LENGTH - 1] = '\0';
+  } else {
+    j.move_uci[0] = '\0';
+  }
+  db_q_push(&j);
+}
+
+void db_async_record_payout(uint64_t board_id, uint64_t session_id,
+                            double points) {
+  DbJob j;
+  j.type = DB_JOB_RECORD_PAYOUT;
+  j.board_id = board_id;
+  j.session_id = session_id;
+  j.points = points;
+  db_q_push(&j);
 }
 
 uint64_t db_create_session(const uint8_t *token, uint64_t player_id) {
@@ -68,7 +311,7 @@ uint64_t db_create_session(const uint8_t *token, uint64_t player_id) {
   }
 
   PGresult *res =
-      PQexecParams(db_conn, query, 2, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 2, NULL, paramValues, NULL, NULL, 0);
 
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     PQclear(res);
@@ -93,7 +336,7 @@ uint64_t db_get_session_by_token(const uint8_t *token) {
   }
 
   PGresult *res =
-      PQexecParams(db_conn, query, 1, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
 
   if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
     PQclear(res);
@@ -118,7 +361,7 @@ void db_update_session_last_seen(uint64_t session_id) {
   }
 
   PGresult *res =
-      PQexecParams(db_conn, query, 1, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
   PQclear(res);
 }
 
@@ -133,7 +376,7 @@ uint64_t db_create_board(const char *fen) {
   }
 
   PGresult *res =
-      PQexecParams(db_conn, query, 1, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
 
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     PQclear(res);
@@ -159,7 +402,7 @@ int db_update_board(uint64_t board_id, const char *fen, const char *status) {
   }
 
   PGresult *res =
-      PQexecParams(db_conn, query, 3, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 3, NULL, paramValues, NULL, NULL, 0);
 
   if (PQresultStatus(res) != PGRES_COMMAND_OK) {
     PQclear(res);
@@ -183,7 +426,7 @@ int db_get_board(uint64_t board_id, char *fen_out, char *status_out) {
   }
 
   PGresult *res =
-      PQexecParams(db_conn, query, 1, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
 
   if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
     PQclear(res);
@@ -210,7 +453,7 @@ int db_get_boards_by_status(const char *status, uint64_t *board_ids,
   }
 
   PGresult *res =
-      PQexecParams(db_conn, query, 1, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
 
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     PQclear(res);
@@ -251,7 +494,7 @@ int db_record_move(uint64_t board_id, uint64_t session_id, const char *move_uci,
   }
 
   PGresult *res =
-      PQexecParams(db_conn, query, 4, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 4, NULL, paramValues, NULL, NULL, 0);
 
   if (PQresultStatus(res) != PGRES_COMMAND_OK) {
     PQclear(res);
@@ -282,7 +525,7 @@ int db_get_moves_for_board(uint64_t board_id, WambleMove *moves_out,
   }
 
   PGresult *res =
-      PQexecParams(db_conn, query, 1, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
 
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     PQclear(res);
@@ -365,12 +608,12 @@ void db_expire_reservations(void) {
       "UPDATE boards SET status = 'DORMANT', updated_at = NOW() "
       "WHERE status = 'RESERVED' AND id IN "
       "(SELECT board_id FROM reservations WHERE expires_at <= NOW())";
-  PGresult *res_update = PQexec(db_conn, update_query);
+  PGresult *res_update = pq_exec_locked(update_query);
   PQclear(res_update);
 
   const char *delete_query =
       "DELETE FROM reservations WHERE expires_at <= NOW()";
-  PGresult *res_delete = PQexec(db_conn, delete_query);
+  PGresult *res_delete = pq_exec_locked(delete_query);
   PQclear(res_delete);
 }
 
@@ -389,7 +632,7 @@ void db_archive_inactive_boards(int timeout_seconds) {
   }
 
   PGresult *res =
-      PQexecParams(db_conn, query, 1, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
   PQclear(res);
 }
 void db_remove_reservation(uint64_t board_id) {
@@ -405,7 +648,7 @@ void db_remove_reservation(uint64_t board_id) {
   }
 
   PGresult *res =
-      PQexecParams(db_conn, query, 1, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
   PQclear(res);
 }
 
@@ -507,7 +750,7 @@ int db_get_active_session_count(void) {
     return 0;
   }
 
-  PGresult *res = PQexec(db_conn, query);
+  PGresult *res = pq_exec_locked(query);
 
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     PQclear(res);
@@ -533,7 +776,7 @@ int db_get_longest_game_moves(void) {
     return 0;
   }
 
-  PGresult *res = PQexec(db_conn, query);
+  PGresult *res = pq_exec_locked(query);
 
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     PQclear(res);
@@ -564,7 +807,7 @@ int db_get_session_games_played(uint64_t session_id) {
   }
 
   PGresult *res =
-      PQexecParams(db_conn, query, 1, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
 
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     PQclear(res);
@@ -581,13 +824,4 @@ int db_get_session_games_played(uint64_t session_id) {
   return (int)games_played;
 }
 
-void db_cleanup_expired_reservations(void) {
-  const char *query = "DELETE FROM reservations WHERE expires_at <= NOW()";
-
-  if (!db_conn) {
-    return;
-  }
-
-  PGresult *res = PQexec(db_conn, query);
-  PQclear(res);
-}
+void db_cleanup_expired_reservations(void) { db_expire_reservations(); }

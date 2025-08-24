@@ -1,7 +1,11 @@
 #include "../include/wamble/wamble.h"
 #include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 static int tokens_equal(const uint8_t *token1, const uint8_t *token2) {
   for (int i = 0; i < 16; i++) {
@@ -60,7 +64,26 @@ static const Bitboard KING_ATTACKS[64] = {
     0x2838000000000000ULL, 0x5070000000000000ULL, 0xa0e0000000000000ULL,
     0x40c0000000000000ULL};
 
-static inline int get_lsb(Bitboard bb) { return __builtin_ctzll(bb); }
+static inline int ctz64_u64(Bitboard bb) {
+#if defined(_MSC_VER)
+  unsigned long idx;
+  _BitScanForward64(&idx, (unsigned __int64)bb);
+  return (int)idx;
+#elif defined(__GNUC__) || defined(__clang__)
+  return __builtin_ctzll(bb);
+#else
+  if (bb == 0ULL)
+    return 0;
+  int c = 0;
+  while ((bb & 1ULL) == 0ULL) {
+    bb >>= 1;
+    c++;
+  }
+  return c;
+#endif
+}
+
+static inline int get_lsb(Bitboard bb) { return ctz64_u64(bb); }
 
 static inline Bitboard pop_lsb(Bitboard *bb) {
   int sq = get_lsb(*bb);
@@ -68,7 +91,22 @@ static inline Bitboard pop_lsb(Bitboard *bb) {
   return get_bit(sq);
 }
 
-static inline int count_bits(Bitboard bb) { return __builtin_popcountll(bb); }
+static inline int popcount64_u64(Bitboard bb) {
+#if defined(_MSC_VER)
+  return (int)__popcnt64((unsigned __int64)bb);
+#elif defined(__GNUC__) || defined(__clang__)
+  return __builtin_popcountll(bb);
+#else
+  int c = 0;
+  while (bb) {
+    bb &= (bb - 1);
+    c++;
+  }
+  return c;
+#endif
+}
+
+static inline int count_bits(Bitboard bb) { return popcount64_u64(bb); }
 
 static int uci_to_squares(const char *uci, int *from, int *to) {
   if (strlen(uci) < 4)
@@ -722,43 +760,6 @@ int parse_fen_to_bitboard(const char *fen, Board *board) {
   return 0;
 }
 
-static void int_to_str(char *buf, int val) {
-  int i = 0;
-  int is_negative = 0;
-
-  if (val == 0) {
-    buf[i++] = '0';
-    buf[i] = '\0';
-    return;
-  }
-
-  if (val < 0) {
-    is_negative = 1;
-    val = -val;
-  }
-
-  while (val != 0) {
-    buf[i++] = (val % 10) + '0';
-    val /= 10;
-  }
-
-  if (is_negative) {
-    buf[i++] = '-';
-  }
-
-  buf[i] = '\0';
-
-  int start = 0;
-  int end = i - 1;
-  while (start < end) {
-    char temp = buf[start];
-    buf[start] = buf[end];
-    buf[end] = temp;
-    start++;
-    end--;
-  }
-}
-
 void bitboard_to_fen(const Board *board, char *fen) {
   char *fen_ptr = fen;
 
@@ -817,13 +818,13 @@ void bitboard_to_fen(const Board *board, char *fen) {
   fen_ptr += strlen(fen_ptr);
 
   *fen_ptr++ = ' ';
-  char num_buf[10];
-  int_to_str(num_buf, board->halfmove_clock);
+  char num_buf[16];
+  snprintf(num_buf, sizeof num_buf, "%d", board->halfmove_clock);
   strcpy(fen_ptr, num_buf);
   fen_ptr += strlen(fen_ptr);
 
   *fen_ptr++ = ' ';
-  int_to_str(num_buf, board->fullmove_number);
+  snprintf(num_buf, sizeof num_buf, "%d", board->fullmove_number);
   strcpy(fen_ptr, num_buf);
   fen_ptr += strlen(fen_ptr);
 
@@ -872,13 +873,13 @@ int validate_and_apply_move(WambleBoard *wamble_board, WamblePlayer *player,
 
   uint64_t session_id = db_get_session_by_token(player->token);
   if (session_id > 0) {
-    db_record_move(wamble_board->id, session_id, uci_move,
-                   board->fullmove_number);
+    db_async_record_move(wamble_board->id, session_id, uci_move,
+                         board->fullmove_number);
   }
 
   bitboard_to_fen(board, wamble_board->fen);
 
-  db_update_board(wamble_board->id, wamble_board->fen, "ACTIVE");
+  db_async_update_board(wamble_board->id, wamble_board->fen, "ACTIVE");
 
   update_game_result(wamble_board);
 

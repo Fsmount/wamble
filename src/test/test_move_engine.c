@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "../include/wamble/wamble.h"
+#include "../../include/wamble/wamble.h"
 #include "../move_engine.c"
 
 void update_player_ratings(WambleBoard *board) {}
@@ -30,6 +30,16 @@ int db_update_board(uint64_t board_id, const char *fen, const char *status) {
   (void)fen;
   (void)status;
   return 0;
+}
+
+void db_async_record_move(uint64_t board_id, uint64_t session_id,
+                          const char *move_uci, int move_number) {
+  (void)db_record_move(board_id, session_id, move_uci, move_number);
+}
+
+void db_async_update_board(uint64_t board_id, const char *fen,
+                           const char *status) {
+  (void)db_update_board(board_id, fen, status);
 }
 
 void calculate_and_distribute_pot(uint64_t board_id) { (void)board_id; }

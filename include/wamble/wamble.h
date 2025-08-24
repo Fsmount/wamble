@@ -254,6 +254,21 @@ int db_get_longest_game_moves(void);
 int db_get_session_games_played(uint64_t session_id);
 
 void db_expire_reservations(void);
+void db_async_update_board(uint64_t board_id, const char *fen,
+                           const char *status);
+void db_async_create_reservation(uint64_t board_id, uint64_t session_id,
+                                 int timeout_seconds);
+void db_async_remove_reservation(uint64_t board_id);
+void db_async_record_game_result(uint64_t board_id, char winning_side);
+void db_async_record_move(uint64_t board_id, uint64_t session_id,
+                          const char *move_uci, int move_number);
+void db_async_record_payout(uint64_t board_id, uint64_t session_id,
+                            double points);
+
+void rng_init(void);
+uint64_t rng_u64(void);
+double rng_double(void);
+void rng_bytes(uint8_t *out, size_t len);
 void db_archive_inactive_boards(int timeout_seconds);
 
 int create_and_bind_socket(void);
