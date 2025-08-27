@@ -1,8 +1,6 @@
 #ifdef TEST_BOARD_MANAGER
 
 #include <assert.h>
-#include <stdbool.h>
-#include <stdio.h>
 #include <string.h>
 #include <time.h>
 
@@ -41,7 +39,6 @@ void db_archive_inactive_boards(int timeout_seconds) {
 
 int db_get_active_session_count(void) { return mock_active_players; }
 int db_get_longest_game_moves(void) { return mock_longest_moves; }
-void db_cleanup_expired_reservations(void) {}
 void rng_init(void) {}
 double rng_double(void) { return 0.5; }
 
@@ -151,6 +148,21 @@ void calculate_and_distribute_pot(uint64_t board_id) {}
 
 static WamblePlayer *white_player_mock;
 static WamblePlayer *black_player_mock;
+
+void db_update_session_last_seen(uint64_t session_id) { (void)session_id; }
+double db_get_player_total_score(uint64_t session_id) {
+  (void)session_id;
+  return 0.0;
+}
+uint64_t db_create_session(const uint8_t *token, uint64_t player_id) {
+  (void)token;
+  (void)player_id;
+  return 1;
+}
+int db_get_session_games_played(uint64_t session_id) {
+  (void)session_id;
+  return 0;
+}
 
 WamblePlayer *get_player_by_token(const uint8_t *token) {
   if (token[0] == 2)

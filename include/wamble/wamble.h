@@ -1,10 +1,271 @@
 #ifndef WAMBLE_H
 #define WAMBLE_H
 
+#if defined(_WIN32)
+#include <windows.h>
+#elif defined(__unix__) || defined(__APPLE__)
+#include <pthread.h>
+#else
+#define WAMBLE_SINGLE_THREADED
+#endif
+
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <math.h>
 #include <netinet/in.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/select.h>
+#include <sys/socket.h>
 #include <time.h>
+#include <unistd.h>
+
+#define LOG_LEVEL_FATAL 0
+#define LOG_LEVEL_ERROR 1
+#define LOG_LEVEL_WARN 2
+#define LOG_LEVEL_INFO 3
+#define LOG_LEVEL_DEBUG 4
+
+#ifdef DEBUG
+#define LOG_LEVEL LOG_LEVEL_DEBUG
+#else
+#define LOG_LEVEL LOG_LEVEL_INFO
+#endif
+
+static inline void wamble_log(int level, const char *file, int line,
+                              const char *func, const char *level_str,
+                              const char *format, ...) {
+  if (level > LOG_LEVEL) {
+    return;
+  }
+
+  time_t now = time(NULL);
+  char time_buf[21];
+  strftime(time_buf, 21, "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
+
+  FILE *output_stream = (level <= LOG_LEVEL_WARN) ? stderr : stdout;
+  fprintf(output_stream, "%s [%s] %s:%d:%s(): ", time_buf, level_str, file,
+          line, func);
+
+  va_list args;
+  va_start(args, format);
+  vfprintf(output_stream, format, args);
+  va_end(args);
+
+  fprintf(output_stream, "\n");
+}
+
+#define LOG_FATAL(format, ...)                                                 \
+                                                                               \
+  do {                                                                         \
+    wamble_log(LOG_LEVEL_FATAL, __FILE__, __LINE__, __func__, "FATAL", format, \
+               ##__VA_ARGS__);                                                 \
+    exit(1);                                                                   \
+  } while (0)
+
+#define LOG_ERROR(format, ...)                                                 \
+                                                                               \
+  wamble_log(LOG_LEVEL_ERROR, __FILE__, __LINE__, __func__, "ERROR", format,   \
+             ##__VA_ARGS__)
+#define LOG_WARN(format, ...)                                                  \
+                                                                               \
+  wamble_log(LOG_LEVEL_WARN, __FILE__, __LINE__, __func__, "WARN", format,     \
+             ##__VA_ARGS__)
+#define LOG_INFO(format, ...)                                                  \
+  wamble_log(LOG_LEVEL_INFO, __FILE__, __LINE__, __func__, "INFO", format,     \
+             ##__VA_ARGS__)
+#define LOG_DEBUG(format, ...)                                                 \
+  wamble_log(LOG_LEVEL_DEBUG, __FILE__, __LINE__, __func__, "DEBUG", format,   \
+             ##__VA_ARGS__)
+
+#if defined(WAMBLE_SINGLE_THREADED)
+typedef int wamble_thread_t;
+typedef int wamble_mutex_t;
+typedef int wamble_cond_t;
+typedef void *(*wamble_thread_func_t)(void *);
+static inline int wamble_thread_create(wamble_thread_t *thread,
+                                       wamble_thread_func_t func, void *arg) {
+  (void)thread;
+  (void)func;
+  (void)arg;
+  return 0;
+}
+static inline int wamble_thread_join(wamble_thread_t thread, void **res) {
+  (void)thread;
+  (void)res;
+  return 0;
+}
+static inline int wamble_thread_detach(wamble_thread_t thread) {
+  (void)thread;
+  return 0;
+}
+static inline int wamble_mutex_init(wamble_mutex_t *mutex) {
+  (void)mutex;
+  return 0;
+}
+static inline int wamble_mutex_destroy(wamble_mutex_t *mutex) {
+  (void)mutex;
+  return 0;
+}
+static inline int wamble_mutex_lock(wamble_mutex_t *mutex) {
+  (void)mutex;
+  return 0;
+}
+static inline int wamble_mutex_unlock(wamble_mutex_t *mutex) {
+  (void)mutex;
+  return 0;
+}
+static inline int wamble_cond_init(wamble_cond_t *cond) {
+  (void)cond;
+  return 0;
+}
+static inline int wamble_cond_destroy(wamble_cond_t *cond) {
+  (void)cond;
+  return 0;
+}
+static inline int wamble_cond_wait(wamble_cond_t *cond, wamble_mutex_t *mutex) {
+  (void)cond;
+  (void)mutex;
+  return 0;
+}
+static inline int wamble_cond_signal(wamble_cond_t *cond) {
+  (void)cond;
+  return 0;
+}
+static inline int wamble_cond_broadcast(wamble_cond_t *cond) {
+  (void)cond;
+  return 0;
+}
+#elif defined(_WIN32)
+
+typedef HANDLE wamble_thread_t;
+typedef CRITICAL_SECTION wamble_mutex_t;
+typedef CONDITION_VARIABLE wamble_cond_t;
+typedef DWORD(WINAPI *wamble_thread_func_t)(void *);
+
+static inline int wamble_thread_create(wamble_thread_t *thread,
+                                       wamble_thread_func_t func, void *arg) {
+  *thread = CreateThread(NULL, 0, func, arg, 0, NULL);
+  return (*thread != NULL) ? 0 : -1;
+}
+
+static inline int wamble_thread_join(wamble_thread_t thread, void **res) {
+  WaitForSingleObject(thread, INFINITE);
+  if (res != NULL) {
+    GetExitCodeThread(thread, (LPDWORD)res);
+  }
+  CloseHandle(thread);
+  return 0;
+}
+
+static inline int wamble_thread_detach(wamble_thread_t thread) {
+  return CloseHandle(thread) ? 0 : -1;
+}
+
+static inline int wamble_mutex_init(wamble_mutex_t *mutex) {
+  InitializeCriticalSection(mutex);
+  return 0;
+}
+
+static inline int wamble_mutex_destroy(wamble_mutex_t *mutex) {
+  DeleteCriticalSection(mutex);
+  return 0;
+}
+
+static inline int wamble_mutex_lock(wamble_mutex_t *mutex) {
+  EnterCriticalSection(mutex);
+  return 0;
+}
+
+static inline int wamble_mutex_unlock(wamble_mutex_t *mutex) {
+  LeaveCriticalSection(mutex);
+  return 0;
+}
+
+static inline int wamble_cond_init(wamble_cond_t *cond) {
+  InitializeConditionVariable(cond);
+  return 0;
+}
+
+static inline int wamble_cond_destroy(wamble_cond_t *cond) {
+  (void)cond;
+  return 0;
+}
+
+static inline int wamble_cond_wait(wamble_cond_t *cond, wamble_mutex_t *mutex) {
+  return SleepConditionVariableCS(cond, mutex, INFINITE) ? 0 : -1;
+}
+
+static inline int wamble_cond_signal(wamble_cond_t *cond) {
+  WakeConditionVariable(cond);
+  return 0;
+}
+
+static inline int wamble_cond_broadcast(wamble_cond_t *cond) {
+  WakeAllConditionVariable(cond);
+  return 0;
+}
+
+#else
+typedef pthread_t wamble_thread_t;
+typedef pthread_mutex_t wamble_mutex_t;
+typedef pthread_cond_t wamble_cond_t;
+typedef void *(*wamble_thread_func_t)(void *);
+
+static inline int wamble_thread_create(wamble_thread_t *thread,
+                                       wamble_thread_func_t func, void *arg) {
+  return pthread_create(thread, NULL, func, arg);
+}
+
+static inline int wamble_thread_join(wamble_thread_t thread, void **res) {
+  return pthread_join(thread, res);
+}
+
+static inline int wamble_thread_detach(wamble_thread_t thread) {
+  return pthread_detach(thread);
+}
+
+static inline int wamble_mutex_init(wamble_mutex_t *mutex) {
+  return pthread_mutex_init(mutex, NULL);
+}
+
+static inline int wamble_mutex_destroy(wamble_mutex_t *mutex) {
+  return pthread_mutex_destroy(mutex);
+}
+
+static inline int wamble_mutex_lock(wamble_mutex_t *mutex) {
+  return pthread_mutex_lock(mutex);
+}
+
+static inline int wamble_mutex_unlock(wamble_mutex_t *mutex) {
+  return pthread_mutex_unlock(mutex);
+}
+
+static inline int wamble_cond_init(wamble_cond_t *cond) {
+  return pthread_cond_init(cond, NULL);
+}
+
+static inline int wamble_cond_destroy(wamble_cond_t *cond) {
+  return pthread_cond_destroy(cond);
+}
+
+static inline int wamble_cond_wait(wamble_cond_t *cond, wamble_mutex_t *mutex) {
+  return pthread_cond_wait(cond, mutex);
+}
+
+static inline int wamble_cond_signal(wamble_cond_t *cond) {
+  return pthread_cond_signal(cond);
+}
+
+static inline int wamble_cond_broadcast(wamble_cond_t *cond) {
+  return pthread_cond_broadcast(cond);
+}
+#endif
 
 #define FEN_MAX_LENGTH 90
 #define MAX_UCI_LENGTH 6
@@ -186,6 +447,7 @@ typedef struct WambleMove {
 } WambleMove;
 
 void board_manager_init(void);
+void board_manager_tick(void);
 WambleBoard *find_board_for_player(WamblePlayer *player);
 void release_board(uint64_t board_id);
 void archive_board(uint64_t board_id);
@@ -206,7 +468,6 @@ int decode_token_from_url(const char *url_string, uint8_t *token_buffer);
 void player_manager_tick(void);
 
 WamblePlayer *get_player_by_token(const uint8_t *token);
-void create_player(uint8_t *token);
 
 void start_network_listener(void);
 void send_response(const struct WambleMsg *msg);
@@ -224,6 +485,7 @@ GamePhase get_game_phase(WambleBoard *board);
 
 int db_init(const char *connection_string);
 void db_cleanup(void);
+void db_tick(void);
 
 uint64_t db_create_session(const uint8_t *token, uint64_t player_id);
 uint64_t db_get_session_by_token(const uint8_t *token);
@@ -242,7 +504,6 @@ int db_get_moves_for_board(uint64_t board_id, WambleMove *moves_out,
 
 int db_create_reservation(uint64_t board_id, uint64_t session_id,
                           int timeout_seconds);
-void db_cleanup_expired_reservations(void);
 void db_remove_reservation(uint64_t board_id);
 
 int db_record_game_result(uint64_t board_id, char winning_side);
@@ -280,5 +541,14 @@ int send_reliable_message(int sockfd, const struct WambleMsg *msg,
                           const struct sockaddr_in *cliaddr, int timeout_ms,
                           int max_retries);
 int wait_for_ack(int sockfd, uint32_t expected_seq, int timeout_ms);
+
+static inline int tokens_equal(const uint8_t *token1, const uint8_t *token2) {
+  for (int i = 0; i < TOKEN_LENGTH; i++) {
+    if (token1[i] != token2[i]) {
+      return 0;
+    }
+  }
+  return 1;
+}
 
 #endif
