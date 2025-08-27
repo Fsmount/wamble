@@ -1,9 +1,5 @@
 #ifdef TEST_MOVE_ENGINE
 
-#include <stdbool.h>
-#include <stdio.h>
-#include <string.h>
-
 #include "../../include/wamble/wamble.h"
 #include "../move_engine.c"
 

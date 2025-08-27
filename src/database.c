@@ -1,20 +1,16 @@
 #include "../include/wamble/wamble.h"
 #include <libpq-fe.h>
-#include <pthread.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 static PGconn *db_conn = NULL;
 static bool db_initialized = false;
-static pthread_mutex_t db_conn_mutex = PTHREAD_MUTEX_INITIALIZER;
+static wamble_mutex_t db_conn_mutex;
 
 static PGresult *pq_exec_locked(const char *command) {
   PGresult *res;
-  pthread_mutex_lock(&db_conn_mutex);
+  wamble_mutex_lock(&db_conn_mutex);
   res = PQexec(db_conn, command);
-  pthread_mutex_unlock(&db_conn_mutex);
+  wamble_mutex_unlock(&db_conn_mutex);
   return res;
 }
 
@@ -23,10 +19,10 @@ pq_exec_params_locked(const char *command, int nParams, const Oid *paramTypes,
                       const char *const *paramValues, const int *paramLengths,
                       const int *paramFormats, int resultFormat) {
   PGresult *res;
-  pthread_mutex_lock(&db_conn_mutex);
+  wamble_mutex_lock(&db_conn_mutex);
   res = PQexecParams(db_conn, command, nParams, paramTypes, paramValues,
                      paramLengths, paramFormats, resultFormat);
-  pthread_mutex_unlock(&db_conn_mutex);
+  wamble_mutex_unlock(&db_conn_mutex);
   return res;
 }
 
@@ -52,13 +48,14 @@ typedef struct {
   char winning_side;
 } DbJob;
 
+#ifndef WAMBLE_SINGLE_THREADED
 #define DB_QUEUE_CAP 1024
 static DbJob db_queue[DB_QUEUE_CAP];
 static int db_q_head = 0;
 static int db_q_tail = 0;
-static pthread_mutex_t db_q_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t db_q_cond = PTHREAD_COND_INITIALIZER;
-static pthread_t db_workers[2];
+static wamble_mutex_t db_q_mutex;
+static wamble_cond_t db_q_cond;
+static wamble_thread_t db_workers[2];
 static int db_worker_running = 0;
 static unsigned long db_q_dropped = 0;
 static unsigned long db_job_failures[6] = {0};
@@ -70,33 +67,32 @@ static int db_q_full(void) {
 }
 
 static void db_q_push(const DbJob *job) {
-  pthread_mutex_lock(&db_q_mutex);
+  wamble_mutex_lock(&db_q_mutex);
   if (!db_q_full()) {
     db_queue[db_q_tail] = *job;
     db_q_tail = (db_q_tail + 1) % DB_QUEUE_CAP;
-    pthread_cond_signal(&db_q_cond);
+    wamble_cond_signal(&db_q_cond);
   } else {
     db_q_dropped++;
     if ((db_q_dropped % 1000UL) == 1UL) {
-      fprintf(stderr, "db queue full, dropping jobs (total: %lu)\n",
-              db_q_dropped);
+      LOG_WARN("db queue full, dropping jobs (total: %lu)", db_q_dropped);
     }
   }
-  pthread_mutex_unlock(&db_q_mutex);
+  wamble_mutex_unlock(&db_q_mutex);
 }
 
 static int db_q_pop(DbJob *out) {
-  pthread_mutex_lock(&db_q_mutex);
+  wamble_mutex_lock(&db_q_mutex);
   while (db_worker_running && db_q_empty()) {
-    pthread_cond_wait(&db_q_cond, &db_q_mutex);
+    wamble_cond_wait(&db_q_cond, &db_q_mutex);
   }
   if (!db_worker_running && db_q_empty()) {
-    pthread_mutex_unlock(&db_q_mutex);
+    wamble_mutex_unlock(&db_q_mutex);
     return 0;
   }
   *out = db_queue[db_q_head];
   db_q_head = (db_q_head + 1) % DB_QUEUE_CAP;
-  pthread_mutex_unlock(&db_q_mutex);
+  wamble_mutex_unlock(&db_q_mutex);
   return 1;
 }
 
@@ -115,8 +111,8 @@ static void *db_worker_main(void *arg) {
       else {
         db_job_failures[DB_JOB_UPDATE_BOARD]++;
         if ((db_job_failures[DB_JOB_UPDATE_BOARD] % 100UL) == 1UL)
-          fprintf(stderr, "db failure: update_board (total: %lu)\n",
-                  db_job_failures[DB_JOB_UPDATE_BOARD]);
+          LOG_ERROR("db failure: update_board (total: %lu)",
+                    db_job_failures[DB_JOB_UPDATE_BOARD]);
       }
       break;
     case DB_JOB_CREATE_RESERVATION:
@@ -126,8 +122,8 @@ static void *db_worker_main(void *arg) {
       else {
         db_job_failures[DB_JOB_CREATE_RESERVATION]++;
         if ((db_job_failures[DB_JOB_CREATE_RESERVATION] % 100UL) == 1UL)
-          fprintf(stderr, "db failure: create_reservation (total: %lu)\n",
-                  db_job_failures[DB_JOB_CREATE_RESERVATION]);
+          LOG_ERROR("db failure: create_reservation (total: %lu)",
+                    db_job_failures[DB_JOB_CREATE_RESERVATION]);
       }
       break;
     case DB_JOB_REMOVE_RESERVATION:
@@ -140,8 +136,8 @@ static void *db_worker_main(void *arg) {
       else {
         db_job_failures[DB_JOB_RECORD_GAME_RESULT]++;
         if ((db_job_failures[DB_JOB_RECORD_GAME_RESULT] % 100UL) == 1UL)
-          fprintf(stderr, "db failure: record_game_result (total: %lu)\n",
-                  db_job_failures[DB_JOB_RECORD_GAME_RESULT]);
+          LOG_ERROR("db failure: record_game_result (total: %lu)",
+                    db_job_failures[DB_JOB_RECORD_GAME_RESULT]);
       }
       break;
     case DB_JOB_RECORD_MOVE:
@@ -151,8 +147,8 @@ static void *db_worker_main(void *arg) {
       else {
         db_job_failures[DB_JOB_RECORD_MOVE]++;
         if ((db_job_failures[DB_JOB_RECORD_MOVE] % 100UL) == 1UL)
-          fprintf(stderr, "db failure: record_move (total: %lu)\n",
-                  db_job_failures[DB_JOB_RECORD_MOVE]);
+          LOG_ERROR("db failure: record_move (total: %lu)",
+                    db_job_failures[DB_JOB_RECORD_MOVE]);
       }
       break;
     case DB_JOB_RECORD_PAYOUT:
@@ -161,14 +157,15 @@ static void *db_worker_main(void *arg) {
       else {
         db_job_failures[DB_JOB_RECORD_PAYOUT]++;
         if ((db_job_failures[DB_JOB_RECORD_PAYOUT] % 100UL) == 1UL)
-          fprintf(stderr, "db failure: record_payout (total: %lu)\n",
-                  db_job_failures[DB_JOB_RECORD_PAYOUT]);
+          LOG_ERROR("db failure: record_payout (total: %lu)",
+                    db_job_failures[DB_JOB_RECORD_PAYOUT]);
       }
       break;
     }
   }
   return NULL;
 }
+#endif
 
 static void bytes_to_hex(const uint8_t *bytes, int len, char *hex_out) {
   if (bytes == NULL || hex_out == NULL) {
@@ -188,49 +185,76 @@ static void hex_to_bytes(const char *hex, uint8_t *bytes_out, int len) {
 
 int db_init(const char *connection_string) {
   if (db_initialized) {
+    LOG_WARN("Database already initialized");
     return 0;
   }
 
-  pthread_mutex_lock(&db_conn_mutex);
+  LOG_INFO("Initializing database connection");
+  wamble_mutex_init(&db_conn_mutex);
+#ifndef WAMBLE_SINGLE_THREADED
+  wamble_mutex_init(&db_q_mutex);
+  wamble_cond_init(&db_q_cond);
+#endif
+
+  wamble_mutex_lock(&db_conn_mutex);
   db_conn = PQconnectdb(connection_string);
   if (PQstatus(db_conn) != CONNECTION_OK) {
+    LOG_FATAL("failed to connect to db: %s", PQerrorMessage(db_conn));
     PQfinish(db_conn);
     db_conn = NULL;
-    pthread_mutex_unlock(&db_conn_mutex);
+    wamble_mutex_unlock(&db_conn_mutex);
     return -1;
   }
-  pthread_mutex_unlock(&db_conn_mutex);
+  wamble_mutex_unlock(&db_conn_mutex);
 
   db_initialized = true;
 
+#ifndef WAMBLE_SINGLE_THREADED
   db_worker_running = 1;
   for (int i = 0; i < 2; i++) {
-    pthread_create(&db_workers[i], NULL, db_worker_main, NULL);
+    wamble_thread_create(&db_workers[i], db_worker_main, NULL);
   }
+  LOG_INFO("Database connection initialized and worker threads started");
+#else
+  LOG_INFO("Database connection initialized in single-threaded mode");
+#endif
   return 0;
 }
 
 void db_cleanup(void) {
+  LOG_INFO("Cleaning up database connection");
   if (db_conn) {
-    pthread_mutex_lock(&db_conn_mutex);
+    wamble_mutex_lock(&db_conn_mutex);
     PQfinish(db_conn);
     db_conn = NULL;
-    pthread_mutex_unlock(&db_conn_mutex);
+    wamble_mutex_unlock(&db_conn_mutex);
   }
   db_initialized = false;
+#ifndef WAMBLE_SINGLE_THREADED
   if (db_worker_running) {
-    pthread_mutex_lock(&db_q_mutex);
+    wamble_mutex_lock(&db_q_mutex);
     db_worker_running = 0;
-    pthread_cond_broadcast(&db_q_cond);
-    pthread_mutex_unlock(&db_q_mutex);
+    wamble_cond_broadcast(&db_q_cond);
+    wamble_mutex_unlock(&db_q_mutex);
     for (int i = 0; i < 2; i++) {
-      pthread_join(db_workers[i], NULL);
+      wamble_thread_join(db_workers[i], NULL);
     }
+    LOG_INFO("Database worker threads stopped");
   }
+#endif
+  wamble_mutex_destroy(&db_conn_mutex);
+#ifndef WAMBLE_SINGLE_THREADED
+  wamble_mutex_destroy(&db_q_mutex);
+  wamble_cond_destroy(&db_q_cond);
+#endif
+  LOG_INFO("Database cleanup complete");
 }
 
 void db_async_update_board(uint64_t board_id, const char *fen,
                            const char *status) {
+#ifdef WAMBLE_SINGLE_THREADED
+  db_update_board(board_id, fen, status);
+#else
   DbJob j;
   j.type = DB_JOB_UPDATE_BOARD;
   j.board_id = board_id;
@@ -239,35 +263,51 @@ void db_async_update_board(uint64_t board_id, const char *fen,
   strncpy(j.status, status ? status : "", STATUS_MAX_LENGTH - 1);
   j.status[STATUS_MAX_LENGTH - 1] = '\0';
   db_q_push(&j);
+#endif
 }
 
 void db_async_create_reservation(uint64_t board_id, uint64_t session_id,
                                  int timeout_seconds) {
+#ifdef WAMBLE_SINGLE_THREADED
+  db_create_reservation(board_id, session_id, timeout_seconds);
+#else
   DbJob j;
   j.type = DB_JOB_CREATE_RESERVATION;
   j.board_id = board_id;
   j.session_id = session_id;
   j.timeout_seconds = timeout_seconds;
   db_q_push(&j);
+#endif
 }
 
 void db_async_remove_reservation(uint64_t board_id) {
+#ifdef WAMBLE_SINGLE_THREADED
+  db_remove_reservation(board_id);
+#else
   DbJob j;
   j.type = DB_JOB_REMOVE_RESERVATION;
   j.board_id = board_id;
   db_q_push(&j);
+#endif
 }
 
 void db_async_record_game_result(uint64_t board_id, char winning_side) {
+#ifdef WAMBLE_SINGLE_THREADED
+  db_record_game_result(board_id, winning_side);
+#else
   DbJob j;
   j.type = DB_JOB_RECORD_GAME_RESULT;
   j.board_id = board_id;
   j.winning_side = winning_side;
   db_q_push(&j);
+#endif
 }
 
 void db_async_record_move(uint64_t board_id, uint64_t session_id,
                           const char *move_uci, int move_number) {
+#ifdef WAMBLE_SINGLE_THREADED
+  db_record_move(board_id, session_id, move_uci, move_number);
+#else
   DbJob j;
   j.type = DB_JOB_RECORD_MOVE;
   j.board_id = board_id;
@@ -280,16 +320,21 @@ void db_async_record_move(uint64_t board_id, uint64_t session_id,
     j.move_uci[0] = '\0';
   }
   db_q_push(&j);
+#endif
 }
 
 void db_async_record_payout(uint64_t board_id, uint64_t session_id,
                             double points) {
+#ifdef WAMBLE_SINGLE_THREADED
+  db_record_payout(board_id, session_id, points);
+#else
   DbJob j;
   j.type = DB_JOB_RECORD_PAYOUT;
   j.board_id = board_id;
   j.session_id = session_id;
   j.points = points;
   db_q_push(&j);
+#endif
 }
 
 uint64_t db_create_session(const uint8_t *token, uint64_t player_id) {
@@ -824,4 +869,4 @@ int db_get_session_games_played(uint64_t session_id) {
   return (int)games_played;
 }
 
-void db_cleanup_expired_reservations(void) { db_expire_reservations(); }
+void db_tick(void) { db_expire_reservations(); }
