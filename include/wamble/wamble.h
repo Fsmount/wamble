@@ -17,6 +17,7 @@
 #include <netinet/in.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,18 +32,14 @@
 #define LOG_LEVEL_INFO 3
 #define LOG_LEVEL_DEBUG 4
 
-#ifdef DEBUG
-#define LOG_LEVEL LOG_LEVEL_DEBUG
-#else
+#ifndef LOG_LEVEL
 #define LOG_LEVEL LOG_LEVEL_INFO
 #endif
 
 static inline void wamble_log(int level, const char *file, int line,
                               const char *func, const char *level_str,
                               const char *format, ...) {
-  if (level > LOG_LEVEL) {
-    return;
-  }
+  (void)level;
 
   time_t now = time(NULL);
   char time_buf[21];
@@ -61,27 +58,51 @@ static inline void wamble_log(int level, const char *file, int line,
 }
 
 #define LOG_FATAL(format, ...)                                                 \
-                                                                               \
   do {                                                                         \
     wamble_log(LOG_LEVEL_FATAL, __FILE__, __LINE__, __func__, "FATAL", format, \
                ##__VA_ARGS__);                                                 \
     exit(1);                                                                   \
   } while (0)
 
+#if LOG_LEVEL >= LOG_LEVEL_ERROR
 #define LOG_ERROR(format, ...)                                                 \
-                                                                               \
   wamble_log(LOG_LEVEL_ERROR, __FILE__, __LINE__, __func__, "ERROR", format,   \
              ##__VA_ARGS__)
+#else
+#define LOG_ERROR(format, ...)                                                 \
+  do {                                                                         \
+  } while (0)
+#endif
+
+#if LOG_LEVEL >= LOG_LEVEL_WARN
 #define LOG_WARN(format, ...)                                                  \
-                                                                               \
   wamble_log(LOG_LEVEL_WARN, __FILE__, __LINE__, __func__, "WARN", format,     \
              ##__VA_ARGS__)
+#else
+#define LOG_WARN(format, ...)                                                  \
+  do {                                                                         \
+  } while (0)
+#endif
+
+#if LOG_LEVEL >= LOG_LEVEL_INFO
 #define LOG_INFO(format, ...)                                                  \
   wamble_log(LOG_LEVEL_INFO, __FILE__, __LINE__, __func__, "INFO", format,     \
              ##__VA_ARGS__)
+#else
+#define LOG_INFO(format, ...)                                                  \
+  do {                                                                         \
+  } while (0)
+#endif
+
+#if LOG_LEVEL >= LOG_LEVEL_DEBUG
 #define LOG_DEBUG(format, ...)                                                 \
   wamble_log(LOG_LEVEL_DEBUG, __FILE__, __LINE__, __func__, "DEBUG", format,   \
              ##__VA_ARGS__)
+#else
+#define LOG_DEBUG(format, ...)                                                 \
+  do {                                                                         \
+  } while (0)
+#endif
 
 #if defined(WAMBLE_SINGLE_THREADED)
 typedef int wamble_thread_t;
@@ -267,30 +288,48 @@ static inline int wamble_cond_broadcast(wamble_cond_t *cond) {
 }
 #endif
 
+typedef struct {
+  int port;
+  int timeout_ms;
+  int max_retries;
+  int max_message_size;
+  int buffer_size;
+  int max_client_sessions;
+  int session_timeout;
+  int max_boards;
+  int min_boards;
+  int inactivity_timeout;
+  int reservation_timeout;
+  int k_factor;
+  int default_rating;
+  int max_players;
+  int token_expiration;
+  double max_pot;
+  int max_moves_per_board;
+  int max_contributors;
+  char *db_host;
+  char *db_user;
+  char *db_pass;
+  char *db_name;
+  int select_timeout_usec;
+  int cleanup_interval_sec;
+  int max_token_attempts;
+  int max_token_local_attempts;
+  int db_log_frequency;
+  double new_player_early_phase_mult;
+  double new_player_mid_phase_mult;
+  double new_player_end_phase_mult;
+  double experienced_player_early_phase_mult;
+  double experienced_player_mid_phase_mult;
+  double experienced_player_end_phase_mult;
+} WambleConfig;
+
+void config_load(const char *filename, const char *profile);
+
 #define FEN_MAX_LENGTH 90
 #define MAX_UCI_LENGTH 6
 #define TOKEN_LENGTH 16
 #define STATUS_MAX_LENGTH 17
-
-#define WAMBLE_DEFAULT_PORT 8888
-#define WAMBLE_DEFAULT_TIMEOUT_MS 100
-#define WAMBLE_DEFAULT_MAX_RETRIES 3
-#define WAMBLE_MAX_MESSAGE_SIZE 126
-#define WAMBLE_BUFFER_SIZE (64 * 1024)
-
-#define MAX_CLIENT_SESSIONS 1024
-#define SESSION_TIMEOUT_SECONDS 300
-#define MAX_BOARDS 1024
-#define MIN_BOARDS 4
-#define INACTIVITY_TIMEOUT 300
-#define RESERVATION_TIMEOUT 2
-#define K_FACTOR 32
-#define DEFAULT_RATING 1200
-#define MAX_PLAYERS 1024
-#define TOKEN_EXPIRATION_SECONDS 86400
-#define MAX_POT 20.0
-#define MAX_MOVES_PER_BOARD 1000
-#define MAX_CONTRIBUTORS 100
 
 #define WAMBLE_CTRL_CLIENT_HELLO 0x01
 #define WAMBLE_CTRL_SERVER_HELLO 0x02
@@ -469,6 +508,8 @@ void player_manager_tick(void);
 
 WamblePlayer *get_player_by_token(const uint8_t *token);
 
+const WambleConfig *get_config(void);
+
 void start_network_listener(void);
 void send_response(const struct WambleMsg *msg);
 
@@ -477,7 +518,6 @@ int is_duplicate_message(const struct sockaddr_in *addr, uint32_t seq_num);
 void update_client_session(const struct sockaddr_in *addr, const uint8_t *token,
                            uint32_t seq_num);
 
-int create_and_bind_socket_on_port(int port);
 void set_network_timeouts(int timeout_ms, int max_retries);
 void cleanup_expired_sessions(void);
 
@@ -532,7 +572,7 @@ double rng_double(void);
 void rng_bytes(uint8_t *out, size_t len);
 void db_archive_inactive_boards(int timeout_seconds);
 
-int create_and_bind_socket(void);
+int create_and_bind_socket(int port);
 int receive_message(int sockfd, struct WambleMsg *msg,
                     struct sockaddr_in *cliaddr);
 void send_ack(int sockfd, const struct WambleMsg *msg,

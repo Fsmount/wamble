@@ -5,12 +5,47 @@ void handle_message(int sockfd, const struct WambleMsg *msg,
                     const struct sockaddr_in *cliaddr);
 
 int main(int argc, char *argv[]) {
-  (void)argc;
-  (void)argv;
-  LOG_INFO("Wamble server starting up");
+  const char *config_file = "wamble.conf";
+  const char *profile = NULL;
 
-  if (db_init("dbname=wamble user=wamble password=wamble host=localhost") !=
-      0) {
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--config") == 0) {
+      if (i + 1 < argc) {
+        config_file = argv[++i];
+      } else {
+        fprintf(stderr, "Option %s requires an argument.\n", argv[i]);
+        return 1;
+      }
+    } else if (strcmp(argv[i], "-p") == 0 ||
+               strcmp(argv[i], "--profile") == 0) {
+      if (i + 1 < argc) {
+        profile = argv[++i];
+      } else {
+        fprintf(stderr, "Option %s requires an argument.\n", argv[i]);
+        return 1;
+      }
+    } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+      printf("Usage: %s [-c|--config <config_file>] [-p|--profile <profile>]\n",
+             argv[0]);
+      return 0;
+    }
+  }
+
+  LOG_INFO("Wamble server starting up");
+  if (profile) {
+    LOG_INFO("Using profile: %s from config file: %s", profile, config_file);
+  } else {
+    LOG_INFO("Using default configuration from config file: %s", config_file);
+  }
+
+  config_load(config_file, profile);
+
+  char db_conn_str[256];
+  snprintf(db_conn_str, sizeof(db_conn_str),
+           "dbname=%s user=%s password=%s host=%s", get_config()->db_name,
+           get_config()->db_user, get_config()->db_pass, get_config()->db_host);
+
+  if (db_init(db_conn_str) != 0) {
     LOG_FATAL("Failed to initialize database");
     return 1;
   }
@@ -30,13 +65,13 @@ int main(int argc, char *argv[]) {
   start_network_listener();
   LOG_INFO("Network listener started");
 
-  int sockfd = create_and_bind_socket();
+  int sockfd = create_and_bind_socket(get_config()->port);
   if (sockfd < 0) {
     LOG_FATAL("Failed to create and bind socket");
     return 1;
   }
 
-  LOG_INFO("Server listening on port %d", WAMBLE_DEFAULT_PORT);
+  LOG_INFO("Server listening on port %d", get_config()->port);
 
   time_t last_cleanup = time(NULL);
   time_t last_tick = time(NULL);
@@ -49,7 +84,7 @@ int main(int argc, char *argv[]) {
     FD_ZERO(&rfds);
     FD_SET(sockfd, &rfds);
     tv.tv_sec = 0;
-    tv.tv_usec = 100000;
+    tv.tv_usec = get_config()->select_timeout_usec;
 
     int ready = select(sockfd + 1, &rfds, NULL, NULL, &tv);
     if (ready == -1) {
@@ -70,7 +105,7 @@ int main(int argc, char *argv[]) {
     }
 
     time_t now = time(NULL);
-    if (now - last_cleanup > 60) {
+    if (now - last_cleanup > get_config()->cleanup_interval_sec) {
       LOG_INFO("Cleaning up expired client sessions");
       cleanup_expired_sessions();
       last_cleanup = now;
@@ -129,7 +164,9 @@ static void handle_client_hello(int sockfd, const struct WambleMsg *msg,
   LOG_DEBUG("Sending Server Hello response (board_id: %lu, fen: %s)",
             response.board_id, response.fen);
 
-  if (send_reliable_message(sockfd, &response, cliaddr, 100, 3) != 0) {
+  if (send_reliable_message(sockfd, &response, cliaddr,
+                            get_config()->timeout_ms,
+                            get_config()->max_retries) != 0) {
     LOG_WARN("Failed to send reliable response to client hello for player %s",
              token_str);
   }
@@ -193,7 +230,9 @@ static void handle_player_move(int sockfd, const struct WambleMsg *msg,
         "Sending Board Update response (board_id: %lu, fen: %s) to player %s",
         response.board_id, response.fen, token_str);
 
-    if (send_reliable_message(sockfd, &response, cliaddr, 100, 3) != 0) {
+    if (send_reliable_message(sockfd, &response, cliaddr,
+                              get_config()->timeout_ms,
+                              get_config()->max_retries) != 0) {
       LOG_WARN("Failed to send reliable response to player move for player %s",
                token_str);
     } else {

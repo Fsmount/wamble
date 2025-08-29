@@ -74,7 +74,7 @@ static void db_q_push(const DbJob *job) {
     wamble_cond_signal(&db_q_cond);
   } else {
     db_q_dropped++;
-    if ((db_q_dropped % 1000UL) == 1UL) {
+    if ((db_q_dropped % get_config()->db_log_frequency) == 1UL) {
       LOG_WARN("db queue full, dropping jobs (total: %lu)", db_q_dropped);
     }
   }
@@ -110,7 +110,8 @@ static void *db_worker_main(void *arg) {
         db_job_success[DB_JOB_UPDATE_BOARD]++;
       else {
         db_job_failures[DB_JOB_UPDATE_BOARD]++;
-        if ((db_job_failures[DB_JOB_UPDATE_BOARD] % 100UL) == 1UL)
+        if ((db_job_failures[DB_JOB_UPDATE_BOARD] %
+             get_config()->db_log_frequency) == 1UL)
           LOG_ERROR("db failure: update_board (total: %lu)",
                     db_job_failures[DB_JOB_UPDATE_BOARD]);
       }
@@ -121,7 +122,8 @@ static void *db_worker_main(void *arg) {
         db_job_success[DB_JOB_CREATE_RESERVATION]++;
       else {
         db_job_failures[DB_JOB_CREATE_RESERVATION]++;
-        if ((db_job_failures[DB_JOB_CREATE_RESERVATION] % 100UL) == 1UL)
+        if ((db_job_failures[DB_JOB_CREATE_RESERVATION] %
+             get_config()->db_log_frequency) == 1UL)
           LOG_ERROR("db failure: create_reservation (total: %lu)",
                     db_job_failures[DB_JOB_CREATE_RESERVATION]);
       }
@@ -135,7 +137,8 @@ static void *db_worker_main(void *arg) {
         db_job_success[DB_JOB_RECORD_GAME_RESULT]++;
       else {
         db_job_failures[DB_JOB_RECORD_GAME_RESULT]++;
-        if ((db_job_failures[DB_JOB_RECORD_GAME_RESULT] % 100UL) == 1UL)
+        if ((db_job_failures[DB_JOB_RECORD_GAME_RESULT] %
+             get_config()->db_log_frequency) == 1UL)
           LOG_ERROR("db failure: record_game_result (total: %lu)",
                     db_job_failures[DB_JOB_RECORD_GAME_RESULT]);
       }
@@ -146,7 +149,8 @@ static void *db_worker_main(void *arg) {
         db_job_success[DB_JOB_RECORD_MOVE]++;
       else {
         db_job_failures[DB_JOB_RECORD_MOVE]++;
-        if ((db_job_failures[DB_JOB_RECORD_MOVE] % 100UL) == 1UL)
+        if ((db_job_failures[DB_JOB_RECORD_MOVE] %
+             get_config()->db_log_frequency) == 1UL)
           LOG_ERROR("db failure: record_move (total: %lu)",
                     db_job_failures[DB_JOB_RECORD_MOVE]);
       }
@@ -156,7 +160,8 @@ static void *db_worker_main(void *arg) {
         db_job_success[DB_JOB_RECORD_PAYOUT]++;
       else {
         db_job_failures[DB_JOB_RECORD_PAYOUT]++;
-        if ((db_job_failures[DB_JOB_RECORD_PAYOUT] % 100UL) == 1UL)
+        if ((db_job_failures[DB_JOB_RECORD_PAYOUT] %
+             get_config()->db_log_frequency) == 1UL)
           LOG_ERROR("db failure: record_payout (total: %lu)",
                     db_job_failures[DB_JOB_RECORD_PAYOUT]);
       }

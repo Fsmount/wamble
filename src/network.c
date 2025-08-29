@@ -7,16 +7,12 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-static int network_port = WAMBLE_DEFAULT_PORT;
-static int network_timeout_ms = WAMBLE_DEFAULT_TIMEOUT_MS;
-static int network_max_retries = WAMBLE_DEFAULT_MAX_RETRIES;
-
-static WambleClientSession client_sessions[MAX_CLIENT_SESSIONS];
+static WambleClientSession *client_sessions;
 static int num_sessions = 0;
 static uint32_t global_seq_num = 1;
 
-#define SESSION_MAP_SIZE (MAX_CLIENT_SESSIONS * 2)
-static int session_index_map[SESSION_MAP_SIZE];
+#define SESSION_MAP_SIZE (get_config()->max_client_sessions * 2)
+static int *session_index_map;
 
 static inline uint64_t mix64_s(uint64_t x) {
   x ^= x >> 33;
@@ -156,15 +152,6 @@ int deserialize_wamble_msg(const uint8_t *buffer, size_t buffer_size,
   return 0;
 }
 
-void set_network_timeouts(int timeout_ms, int max_retries) {
-  LOG_INFO("Setting network timeouts: timeout_ms=%d, max_retries=%d",
-           timeout_ms, max_retries);
-  if (timeout_ms > 0)
-    network_timeout_ms = timeout_ms;
-  if (max_retries > 0)
-    network_max_retries = max_retries;
-}
-
 static WambleClientSession *
 find_client_session(const struct sockaddr_in *addr) {
   int idx = session_map_get(addr);
@@ -175,9 +162,9 @@ find_client_session(const struct sockaddr_in *addr) {
 
 static WambleClientSession *
 create_client_session(const struct sockaddr_in *addr, const uint8_t *token) {
-  if (num_sessions >= MAX_CLIENT_SESSIONS) {
+  if (num_sessions >= get_config()->max_client_sessions) {
     LOG_WARN("Maximum number of client sessions reached (%d)",
-             MAX_CLIENT_SESSIONS);
+             get_config()->max_client_sessions);
     return NULL;
   }
 
@@ -263,12 +250,7 @@ void update_client_session(const struct sockaddr_in *addr, const uint8_t *token,
   memcpy(session->token, token, TOKEN_LENGTH);
 }
 
-int create_and_bind_socket_on_port(int port) {
-  network_port = port;
-  return create_and_bind_socket();
-}
-
-int create_and_bind_socket(void) {
+int create_and_bind_socket(int port) {
   int sockfd;
   struct sockaddr_in servaddr;
 
@@ -285,7 +267,7 @@ int create_and_bind_socket(void) {
     LOG_WARN("setsockopt SO_REUSEADDR failed: %s", strerror(errno));
   }
 
-  int buffer_size = WAMBLE_BUFFER_SIZE;
+  int buffer_size = get_config()->buffer_size;
   if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &buffer_size,
                  sizeof(buffer_size)) < 0) {
     LOG_WARN("setsockopt SO_RCVBUF failed: %s", strerror(errno));
@@ -299,15 +281,15 @@ int create_and_bind_socket(void) {
 
   servaddr.sin_family = AF_INET;
   servaddr.sin_addr.s_addr = INADDR_ANY;
-  servaddr.sin_port = htons(network_port);
+  servaddr.sin_port = htons(port);
 
-  LOG_DEBUG("Attempting to bind socket to port %d", network_port);
+  LOG_DEBUG("Attempting to bind socket to port %d", port);
   if (bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
     LOG_FATAL("bind failed: %s", strerror(errno));
     close(sockfd);
     return -1;
   }
-  LOG_INFO("Socket bound successfully to port %d", network_port);
+  LOG_INFO("Socket bound successfully to port %d", port);
 
   int flags = fcntl(sockfd, F_GETFL, 0);
   if (flags >= 0) {
@@ -316,6 +298,10 @@ int create_and_bind_socket(void) {
   }
 
   LOG_DEBUG("Initializing session map");
+  client_sessions =
+      malloc(sizeof(WambleClientSession) * get_config()->max_client_sessions);
+  session_index_map =
+      malloc(sizeof(int) * (get_config()->max_client_sessions * 2));
   session_map_init();
 
   return sockfd;
@@ -438,9 +424,9 @@ int send_reliable_message(int sockfd, const struct WambleMsg *msg,
                           const struct sockaddr_in *cliaddr, int timeout_ms,
                           int max_retries) {
   if (timeout_ms <= 0)
-    timeout_ms = network_timeout_ms;
+    timeout_ms = get_config()->timeout_ms;
   if (max_retries <= 0)
-    max_retries = network_max_retries;
+    max_retries = get_config()->max_retries;
 
   struct WambleMsg reliable_msg = *msg;
 
@@ -510,9 +496,9 @@ int send_reliable_message(int sockfd, const struct WambleMsg *msg,
 }
 
 void start_network_listener(void) {
-  LOG_INFO("Network listener started on port %d", network_port);
-  LOG_INFO("Timeout: %dms, Max retries: %d", network_timeout_ms,
-           network_max_retries);
+  LOG_INFO("Network listener started on port %d", get_config()->port);
+  LOG_INFO("Timeout: %dms, Max retries: %d", get_config()->timeout_ms,
+           get_config()->max_retries);
 }
 
 void send_response(const struct WambleMsg *msg) {
@@ -526,7 +512,8 @@ void cleanup_expired_sessions(void) {
   int write_idx = 0;
 
   for (int read_idx = 0; read_idx < num_sessions; read_idx++) {
-    if (now - client_sessions[read_idx].last_seen < SESSION_TIMEOUT_SECONDS) {
+    if (now - client_sessions[read_idx].last_seen <
+        get_config()->session_timeout) {
       if (write_idx != read_idx) {
         client_sessions[write_idx] = client_sessions[read_idx];
       }

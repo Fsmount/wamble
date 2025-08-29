@@ -12,7 +12,7 @@
 #include <sys/random.h>
 #endif
 
-static WamblePlayer player_pool[MAX_PLAYERS];
+static WamblePlayer *player_pool;
 static int num_players = 0;
 static wamble_mutex_t player_mutex;
 
@@ -114,8 +114,8 @@ void rng_bytes(uint8_t *out, size_t len) {
   }
 }
 
-#define PLAYER_MAP_SIZE (MAX_PLAYERS * 2)
-static int player_index_map[PLAYER_MAP_SIZE];
+#define PLAYER_MAP_SIZE (get_config()->max_players * 2)
+static int *player_index_map;
 
 static uint64_t token_hash(const uint8_t *token) {
   uint64_t h = 1469598103934665603ULL;
@@ -194,7 +194,7 @@ static void generate_new_token(uint8_t *token_buffer) {
 }
 
 static WamblePlayer *find_empty_player_slot(void) {
-  for (int i = 0; i < MAX_PLAYERS; i++) {
+  for (int i = 0; i < get_config()->max_players; i++) {
     int is_empty = 1;
     for (int j = 0; j < 16; j++) {
       if (player_pool[i].token[j] != 0) {
@@ -213,7 +213,15 @@ static WamblePlayer *find_empty_player_slot(void) {
 }
 
 void player_manager_init(void) {
-  memset(player_pool, 0, sizeof(player_pool));
+  if (player_pool) {
+    free(player_pool);
+    free(player_index_map);
+    wamble_mutex_destroy(&player_mutex);
+    wamble_mutex_destroy(&rng_mutex);
+  }
+  player_pool = malloc(sizeof(WamblePlayer) * get_config()->max_players);
+  player_index_map = malloc(sizeof(int) * (get_config()->max_players * 2));
+  memset(player_pool, 0, sizeof(WamblePlayer) * get_config()->max_players);
   num_players = 0;
   wamble_mutex_init(&player_mutex);
   wamble_mutex_init(&rng_mutex);
@@ -251,7 +259,8 @@ WamblePlayer *get_player_by_token(const uint8_t *token) {
       memset(player->public_key, 0, 32);
       player->has_persistent_identity = false;
       player->last_seen_time = time(NULL);
-      player->score = db_get_player_total_score(session_id) + 1200.0;
+      player->score =
+          db_get_player_total_score(session_id) + get_config()->default_rating;
       player->games_played = db_get_session_games_played(session_id);
       player_map_put(player->token, (int)(player - player_pool));
       db_update_session_last_seen(session_id);
@@ -266,10 +275,8 @@ WamblePlayer *get_player_by_token(const uint8_t *token) {
 }
 
 WamblePlayer *create_new_player(void) {
-  int max_attempts = 1000;
-
-  for (int global_attempt = 0; global_attempt < max_attempts;
-       global_attempt++) {
+  for (int global_attempt = 0;
+       global_attempt < get_config()->max_token_attempts; global_attempt++) {
     wamble_mutex_lock(&player_mutex);
 
     WamblePlayer *player = find_empty_player_slot();
@@ -281,7 +288,6 @@ WamblePlayer *create_new_player(void) {
     uint8_t candidate_token[16];
     int collision_found;
     int local_attempts = 0;
-    int max_local_attempts = 100;
 
     do {
       generate_new_token(candidate_token);
@@ -306,9 +312,9 @@ WamblePlayer *create_new_player(void) {
       if (!collision_found) {
         break;
       }
-    } while (local_attempts < max_local_attempts);
+    } while (local_attempts < get_config()->max_token_local_attempts);
 
-    if (local_attempts >= max_local_attempts) {
+    if (local_attempts >= get_config()->max_token_local_attempts) {
       wamble_mutex_unlock(&player_mutex);
       continue;
     }
@@ -317,7 +323,7 @@ WamblePlayer *create_new_player(void) {
     memset(player->public_key, 0, 32);
     player->has_persistent_identity = 0;
     player->last_seen_time = time(NULL);
-    player->score = 1200.0;
+    player->score = get_config()->default_rating;
     player->games_played = 0;
     uint64_t session_id = db_create_session(candidate_token, 0);
     if (session_id == 0) {
@@ -348,8 +354,8 @@ void player_manager_tick(void) {
       }
     }
 
-    if (!is_empty &&
-        (now - player_pool[i].last_seen_time) > TOKEN_EXPIRATION_SECONDS) {
+    if (!is_empty && (now - player_pool[i].last_seen_time) >
+                         get_config()->token_expiration) {
       uint8_t old_token[16];
       memcpy(old_token, player_pool[i].token, 16);
       memset(&player_pool[i], 0, sizeof(WamblePlayer));
