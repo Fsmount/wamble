@@ -76,7 +76,7 @@ static bool test_url_token_conversion() {
 
 static bool test_player_pool_full() {
 
-  for (int i = 0; i < MAX_PLAYERS; i++) {
+  for (int i = 0; i < get_config()->max_players; i++) {
     if (create_new_player() == NULL)
       return false;
   }
@@ -92,7 +92,7 @@ static bool test_token_expiration() {
   uint8_t expired_token[TOKEN_LENGTH];
   memcpy(expired_token, p->token, TOKEN_LENGTH);
 
-  p->last_seen_time = time(NULL) - TOKEN_EXPIRATION_SECONDS - 1;
+  p->last_seen_time = time(NULL) - get_config()->token_expiration - 1;
 
   player_manager_tick();
 
@@ -111,6 +111,7 @@ static const TestCase cases[] = {
 };
 
 int main(int argc, char **argv) {
+  config_load(NULL, NULL);
   const char *filter = (argc > 1 ? argv[1] : "");
   int pass = 0, total = 0;
 

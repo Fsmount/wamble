@@ -3,14 +3,14 @@
 #include <string.h>
 #include <unistd.h>
 
-static WambleBoard board_pool[MAX_BOARDS];
+static WambleBoard *board_pool;
 static int num_boards = 0;
 static uint64_t next_board_id = 1;
 static wamble_thread_t board_manager_thread;
 static wamble_mutex_t board_mutex;
 
-#define BOARD_MAP_SIZE (MAX_BOARDS * 2)
-static int board_index_map[BOARD_MAP_SIZE];
+#define BOARD_MAP_SIZE (get_config()->max_boards * 2)
+static int *board_index_map;
 
 static inline uint64_t mix64_hash(uint64_t x) {
   x ^= x >> 33;
@@ -69,7 +69,7 @@ static void *board_manager_thread_main(void *arg) {
 
 void board_manager_tick() {
   db_expire_reservations();
-  db_archive_inactive_boards(INACTIVITY_TIMEOUT);
+  db_archive_inactive_boards(get_config()->inactivity_timeout);
 }
 
 static inline int get_longest_game_moves(void) {
@@ -77,19 +77,27 @@ static inline int get_longest_game_moves(void) {
 }
 
 void board_manager_init(void) {
+  if (board_pool) {
+    free(board_pool);
+    free(board_index_map);
+    wamble_mutex_destroy(&board_mutex);
+  }
   LOG_INFO("Initializing board manager");
-  memset(board_pool, 0, sizeof(board_pool));
+  board_pool = malloc(sizeof(WambleBoard) * get_config()->max_boards);
+  board_index_map = malloc(sizeof(int) * (get_config()->max_boards * 2));
+  memset(board_pool, 0, sizeof(WambleBoard) * get_config()->max_boards);
   num_boards = 0;
   next_board_id = 1;
   wamble_mutex_init(&board_mutex);
   rng_init();
   board_map_init();
 
-  uint64_t board_ids[MAX_BOARDS];
-  int dormant_count = db_get_boards_by_status("DORMANT", board_ids, MAX_BOARDS);
+  uint64_t board_ids[get_config()->max_boards];
+  int dormant_count =
+      db_get_boards_by_status("DORMANT", board_ids, get_config()->max_boards);
   LOG_INFO("Found %d dormant boards in the database", dormant_count);
 
-  for (int i = 0; i < dormant_count && i < MAX_BOARDS; i++) {
+  for (int i = 0; i < dormant_count && i < get_config()->max_boards; i++) {
     WambleBoard *board = &board_pool[num_boards++];
     board->id = board_ids[i];
 
@@ -117,12 +125,12 @@ void board_manager_init(void) {
     }
   }
 
-  int boards_to_create = MIN_BOARDS - num_boards;
+  int boards_to_create = get_config()->min_boards - num_boards;
   if (boards_to_create > 0) {
     LOG_INFO("Creating %d new boards to meet the minimum of %d",
-             boards_to_create, MIN_BOARDS);
+             boards_to_create, get_config()->min_boards);
     for (int i = 0; i < boards_to_create; i++) {
-      if (num_boards < MAX_BOARDS) {
+      if (num_boards < get_config()->max_boards) {
         WambleBoard *board = &board_pool[num_boards++];
         strcpy(board->fen,
                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
@@ -173,7 +181,7 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
     double score;
   } ScoredBoard;
 
-  ScoredBoard eligible_boards[MAX_BOARDS];
+  ScoredBoard eligible_boards[get_config()->max_boards];
   int eligible_count = 0;
   double total_score = 0.0;
 
@@ -191,20 +199,20 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
     if (player->games_played < NEW_PLAYER_GAMES_THRESHOLD) {
 
       if (phase == GAME_PHASE_EARLY) {
-        score *= 2.0;
+        score *= get_config()->new_player_early_phase_mult;
       } else if (phase == GAME_PHASE_MID) {
-        score *= 1.0;
+        score *= get_config()->new_player_mid_phase_mult;
       } else {
-        score *= 0.5;
+        score *= get_config()->new_player_end_phase_mult;
       }
     } else {
 
       if (phase == GAME_PHASE_EARLY) {
-        score *= 0.5;
+        score *= get_config()->experienced_player_early_phase_mult;
       } else if (phase == GAME_PHASE_MID) {
-        score *= 1.0;
+        score *= get_config()->experienced_player_mid_phase_mult;
       } else {
-        score *= 2.0;
+        score *= get_config()->experienced_player_end_phase_mult;
       }
     }
 
@@ -241,7 +249,7 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
     uint64_t session_id = db_get_session_by_token(player->token);
     if (session_id > 0) {
       db_async_create_reservation(selected_board->id, session_id,
-                                  RESERVATION_TIMEOUT);
+                                  get_config()->reservation_timeout);
     }
 
     LOG_DEBUG("Reserved board %lu for player", selected_board->id);
@@ -251,11 +259,11 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
   int longest_game = get_longest_game_moves();
   int players = get_player_count();
   int target_boards = longest_game * players;
-  if (target_boards < MIN_BOARDS) {
-    target_boards = MIN_BOARDS;
+  if (target_boards < get_config()->min_boards) {
+    target_boards = get_config()->min_boards;
   }
 
-  if (num_boards < target_boards && num_boards < MAX_BOARDS) {
+  if (num_boards < target_boards && num_boards < get_config()->max_boards) {
     WambleBoard *board = &board_pool[num_boards++];
     strcpy(board->fen,
            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
@@ -281,7 +289,8 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
     db_async_update_board(board->id, board->fen, "RESERVED");
     uint64_t session_id = db_get_session_by_token(player->token);
     if (session_id > 0) {
-      db_async_create_reservation(board->id, session_id, RESERVATION_TIMEOUT);
+      db_async_create_reservation(board->id, session_id,
+                                  get_config()->reservation_timeout);
     }
 
     LOG_INFO("Created new board %lu for player", board->id);
@@ -359,9 +368,12 @@ void update_player_ratings(WambleBoard *board) {
       break;
     }
   }
+  free(moves);
 
-  double white_rating = white_player ? white_player->score : DEFAULT_RATING;
-  double black_rating = black_player ? black_player->score : DEFAULT_RATING;
+  double white_rating =
+      white_player ? white_player->score : get_config()->default_rating;
+  double black_rating =
+      black_player ? black_player->score : get_config()->default_rating;
 
   double expected_white =
       1.0 / (1.0 + pow(10.0, (black_rating - white_rating) / 400.0));
@@ -382,11 +394,13 @@ void update_player_ratings(WambleBoard *board) {
   }
 
   if (white_player) {
-    white_player->score += K_FACTOR * (actual_white - expected_white);
+    white_player->score +=
+        get_config()->k_factor * (actual_white - expected_white);
     white_player->games_played++;
   }
   if (black_player) {
-    black_player->score += K_FACTOR * (actual_black - expected_black);
+    black_player->score +=
+        get_config()->k_factor * (actual_black - expected_black);
     black_player->games_played++;
   }
 }
@@ -421,11 +435,13 @@ WambleBoard *get_board_by_id(uint64_t board_id) {
 }
 
 int get_moves_for_board(uint64_t board_id, WambleMove **moves) {
-  static WambleMove move_buffer[MAX_MOVES_PER_BOARD];
-  int count =
-      db_get_moves_for_board(board_id, move_buffer, MAX_MOVES_PER_BOARD);
+  WambleMove *move_buffer =
+      malloc(sizeof(WambleMove) * get_config()->max_moves_per_board);
+  int count = db_get_moves_for_board(board_id, move_buffer,
+                                     get_config()->max_moves_per_board);
   if (count <= 0) {
     *moves = NULL;
+    free(move_buffer);
     return count;
   }
 

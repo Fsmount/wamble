@@ -22,14 +22,18 @@ void calculate_and_distribute_pot(uint64_t board_id) {
     return;
   }
 
-  static WambleMove moves[MAX_MOVES_PER_BOARD];
-  int num_moves = db_get_moves_for_board(board_id, moves, MAX_MOVES_PER_BOARD);
+  WambleMove *moves =
+      malloc(sizeof(WambleMove) * get_config()->max_moves_per_board);
+  int num_moves = db_get_moves_for_board(board_id, moves,
+                                         get_config()->max_moves_per_board);
   if (num_moves <= 0) {
     LOG_WARN("No moves found for board %lu, cannot distribute pot", board_id);
+    free(moves);
     return;
   }
 
-  PlayerContribution contributions[MAX_CONTRIBUTORS];
+  PlayerContribution *contributions =
+      malloc(sizeof(PlayerContribution) * get_config()->max_contributors);
   int num_contributors = 0;
   int total_white_moves = 0;
   int total_black_moves = 0;
@@ -44,7 +48,8 @@ void calculate_and_distribute_pot(uint64_t board_id) {
       }
     }
 
-    if (contributor_index == -1 && num_contributors < MAX_CONTRIBUTORS) {
+    if (contributor_index == -1 &&
+        num_contributors < get_config()->max_contributors) {
       contributor_index = num_contributors++;
       memcpy(contributions[contributor_index].player_token, move->player_token,
              TOKEN_LENGTH);
@@ -68,12 +73,12 @@ void calculate_and_distribute_pot(uint64_t board_id) {
   double black_pot = 0.0;
 
   if (board->result == GAME_RESULT_WHITE_WINS) {
-    white_pot = MAX_POT;
+    white_pot = get_config()->max_pot;
   } else if (board->result == GAME_RESULT_BLACK_WINS) {
-    black_pot = MAX_POT;
+    black_pot = get_config()->max_pot;
   } else if (board->result == GAME_RESULT_DRAW) {
-    white_pot = MAX_POT / 2.0;
-    black_pot = MAX_POT / 2.0;
+    white_pot = get_config()->max_pot / 2.0;
+    black_pot = get_config()->max_pot / 2.0;
   }
   LOG_DEBUG("Board %lu result: %d, white_pot: %.2f, black_pot: %.2f", board_id,
             board->result, white_pot, black_pot);
@@ -108,4 +113,7 @@ void calculate_and_distribute_pot(uint64_t board_id) {
              board_id);
   }
   LOG_INFO("Finished distributing pot for board %lu", board_id);
+
+  free(moves);
+  free(contributions);
 }
