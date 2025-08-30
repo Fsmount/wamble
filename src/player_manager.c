@@ -12,16 +12,16 @@
 #include <sys/random.h>
 #endif
 
-static WamblePlayer *player_pool;
-static int num_players = 0;
-static wamble_mutex_t player_mutex;
+static __thread WamblePlayer *player_pool;
+static __thread int num_players = 0;
+static __thread wamble_mutex_t player_mutex;
 
 static const char base64url_chars[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_ ";
-static wamble_mutex_t rng_mutex;
-static int rng_initialized = 0;
-static uint64_t pcg_state = 0x853c49e6748fea9bULL;
-static uint64_t pcg_inc = 0xda3e39cb94b95bdbULL;
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+static __thread wamble_mutex_t rng_mutex;
+static __thread int rng_initialized = 0;
+static __thread uint64_t pcg_state = 0x853c49e6748fea9bULL;
+static __thread uint64_t pcg_inc = 0xda3e39cb94b95bdbULL;
 
 static inline uint32_t pcg32_random_r(void) {
   uint64_t oldstate = pcg_state;
@@ -115,7 +115,7 @@ void rng_bytes(uint8_t *out, size_t len) {
 }
 
 #define PLAYER_MAP_SIZE (get_config()->max_players * 2)
-static int *player_index_map;
+static __thread int *player_index_map;
 
 static uint64_t token_hash(const uint8_t *token) {
   uint64_t h = 1469598103934665603ULL;

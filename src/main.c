@@ -1,8 +1,23 @@
+#define _POSIX_C_SOURCE 200809L
 #include "../include/wamble/wamble.h"
+#include <signal.h>
 #include <string.h>
 
 void handle_message(int sockfd, const struct WambleMsg *msg,
                     const struct sockaddr_in *cliaddr);
+
+static volatile sig_atomic_t g_reload_requested = 0;
+static volatile sig_atomic_t g_shutdown_requested = 0;
+
+static void handle_sighup(int signo) {
+  (void)signo;
+  g_reload_requested = 1;
+}
+
+static void handle_sigterm(int signo) {
+  (void)signo;
+  g_shutdown_requested = 1;
+}
 
 int main(int argc, char *argv[]) {
   const char *config_file = "wamble.conf";
@@ -40,6 +55,17 @@ int main(int argc, char *argv[]) {
 
   config_load(config_file, profile);
 
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = handle_sighup;
+  sigaction(SIGHUP, &sa, NULL);
+
+  struct sigaction sb;
+  memset(&sb, 0, sizeof(sb));
+  sb.sa_handler = handle_sigterm;
+  sigaction(SIGINT, &sb, NULL);
+  sigaction(SIGTERM, &sb, NULL);
+
   char db_conn_str[256];
   snprintf(db_conn_str, sizeof(db_conn_str),
            "dbname=%s user=%s password=%s host=%s", get_config()->db_name,
@@ -51,57 +77,70 @@ int main(int argc, char *argv[]) {
   }
   LOG_INFO("Database initialized successfully");
 
-  player_manager_init();
-  LOG_INFO("Player manager initialized");
-  board_manager_init();
-  LOG_INFO("Board manager initialized");
-
-  if (start_board_manager_thread() != 0) {
-    LOG_FATAL("Failed to start board manager thread");
-    return 1;
-  }
-  LOG_INFO("Board manager thread started");
-
   start_network_listener();
   LOG_INFO("Network listener started");
 
-  int sockfd = create_and_bind_socket(get_config()->port);
-  if (sockfd < 0) {
-    LOG_FATAL("Failed to create and bind socket");
-    return 1;
+  int has_profiles = config_profile_count();
+  if (has_profiles > 0) {
+
+    int started = start_profile_listeners();
+    if (started <= 0) {
+      LOG_WARN("No profile listeners started; falling back to default port");
+    } else {
+      LOG_INFO("Started %d profile listener(s)", started);
+    }
   }
 
-  LOG_INFO("Server listening on port %d", get_config()->port);
+  int sockfd = -1;
+  if (has_profiles == 0) {
+
+    player_manager_init();
+    LOG_INFO("Player manager initialized");
+    board_manager_init();
+    LOG_INFO("Board manager initialized");
+    sockfd = create_and_bind_socket(get_config()->port);
+    if (sockfd < 0) {
+      LOG_FATAL("Failed to create and bind socket");
+      return 1;
+    }
+    LOG_INFO("Server listening on port %d", get_config()->port);
+  }
 
   time_t last_cleanup = time(NULL);
   time_t last_tick = time(NULL);
 
   LOG_INFO("Server main loop starting");
-  while (1) {
+  while (!g_shutdown_requested) {
     LOG_DEBUG("Main loop iteration start");
-    fd_set rfds;
-    struct timeval tv;
-    FD_ZERO(&rfds);
-    FD_SET(sockfd, &rfds);
-    tv.tv_sec = 0;
-    tv.tv_usec = get_config()->select_timeout_usec;
+    if (sockfd >= 0) {
+      fd_set rfds;
+      struct timeval tv;
+      FD_ZERO(&rfds);
+      FD_SET(sockfd, &rfds);
+      tv.tv_sec = 0;
+      tv.tv_usec = get_config()->select_timeout_usec;
 
-    int ready = select(sockfd + 1, &rfds, NULL, NULL, &tv);
-    if (ready == -1) {
-      LOG_ERROR("select failed: %s", strerror(errno));
-    } else if (ready == 0) {
-      LOG_DEBUG("select timed out, no activity");
-    } else if (FD_ISSET(sockfd, &rfds)) {
-      struct WambleMsg msg;
-      struct sockaddr_in cliaddr;
-      int n = receive_message(sockfd, &msg, &cliaddr);
-      if (n > 0) {
-        handle_message(sockfd, &msg, &cliaddr);
-      } else if (n == 0) {
-        LOG_WARN("Received 0 bytes from socket, client disconnected?");
-      } else {
-        LOG_ERROR("receive_message failed: %s", strerror(errno));
+      int ready = select(sockfd + 1, &rfds, NULL, NULL, &tv);
+      if (ready == -1) {
+        LOG_ERROR("select failed: %s", strerror(errno));
+      } else if (ready == 0) {
+        LOG_DEBUG("select timed out, no activity");
+      } else if (FD_ISSET(sockfd, &rfds)) {
+        struct WambleMsg msg;
+        struct sockaddr_in cliaddr;
+        int n = receive_message(sockfd, &msg, &cliaddr);
+        if (n > 0) {
+          handle_message(sockfd, &msg, &cliaddr);
+        } else if (n == 0) {
+          LOG_WARN("Received 0 bytes from socket, client disconnected?");
+        } else {
+          LOG_ERROR("receive_message failed: %s", strerror(errno));
+        }
       }
+    } else {
+
+      struct timespec ts = {.tv_sec = 0, .tv_nsec = 10000000};
+      nanosleep(&ts, NULL);
     }
 
     time_t now = time(NULL);
@@ -112,17 +151,32 @@ int main(int argc, char *argv[]) {
       LOG_INFO("Finished cleaning up expired client sessions");
     }
 
-#ifdef WAMBLE_SINGLE_THREADED
-    if (now - last_tick > 1) {
-      board_manager_tick();
-      db_tick();
-      last_tick = now;
+    if (has_profiles == 0) {
+      if (now - last_tick > 1) {
+        board_manager_tick();
+        db_tick();
+        last_tick = now;
+      }
     }
-#endif
+    if (g_reload_requested) {
+      LOG_INFO("Reload requested; reloading config and reconciling listeners");
+      config_load(config_file, profile);
+      if (config_profile_count() > 0) {
+        reconcile_profile_listeners();
+      }
+      g_reload_requested = 0;
+    }
+
     LOG_DEBUG("Main loop iteration end");
   }
   LOG_INFO("Server main loop ending");
 
+  if (config_profile_count() > 0) {
+    stop_profile_listeners();
+  }
+  if (sockfd >= 0) {
+    close(sockfd);
+  }
   db_cleanup();
 
   return 0;
@@ -262,6 +316,60 @@ void handle_message(int sockfd, const struct WambleMsg *msg,
     LOG_DEBUG("Handling PLAYER_MOVE message (seq: %u)", msg->seq_num);
     handle_player_move(sockfd, msg, cliaddr);
     break;
+  case WAMBLE_CTRL_LIST_PROFILES: {
+    LOG_DEBUG("Handling LIST_PROFILES message (seq: %u)", msg->seq_num);
+    struct WambleMsg resp = {0};
+    resp.ctrl = WAMBLE_CTRL_PROFILE_INFO;
+    memcpy(resp.token, msg->token, TOKEN_LENGTH);
+
+    int trust = db_get_trust_tier_by_token(msg->token);
+    int count = config_profile_count();
+    int written = 0;
+    for (int i = 0; i < count; i++) {
+      const WambleProfile *p = config_get_profile(i);
+      if (!p || !p->advertise)
+        continue;
+
+      if (trust < p->visibility)
+        continue;
+      const char *name = p->name ? p->name : "";
+      int need = (int)strlen(name);
+      if (written + need + (written ? 1 : 0) >= FEN_MAX_LENGTH)
+        break;
+      if (written) {
+        resp.fen[written++] = ',';
+      }
+      memcpy(&resp.fen[written], name, (size_t)need);
+      written += need;
+    }
+    if (written < FEN_MAX_LENGTH)
+      resp.fen[written] = '\0';
+    (void)send_reliable_message(sockfd, &resp, cliaddr,
+                                get_config()->timeout_ms,
+                                get_config()->max_retries);
+    break;
+  }
+  case WAMBLE_CTRL_PROFILE_INFO: {
+    LOG_DEBUG("Handling PROFILE_INFO message (seq: %u)", msg->seq_num);
+    char name[MAX_UCI_LENGTH + 1];
+    int nlen = msg->uci_len < MAX_UCI_LENGTH ? msg->uci_len : MAX_UCI_LENGTH;
+    memcpy(name, msg->uci, (size_t)nlen);
+    name[nlen] = '\0';
+    const WambleProfile *p = config_find_profile(name);
+    struct WambleMsg resp = {0};
+    resp.ctrl = WAMBLE_CTRL_PROFILE_INFO;
+    memcpy(resp.token, msg->token, TOKEN_LENGTH);
+    if (p) {
+      snprintf(resp.fen, FEN_MAX_LENGTH, "%s;%d;%d;%d", p->name, p->config.port,
+               p->advertise, p->visibility);
+    } else {
+      snprintf(resp.fen, FEN_MAX_LENGTH, "NOTFOUND;%s", name);
+    }
+    (void)send_reliable_message(sockfd, &resp, cliaddr,
+                                get_config()->timeout_ms,
+                                get_config()->max_retries);
+    break;
+  }
   case WAMBLE_CTRL_ACK:
     LOG_DEBUG("Handling ACK message (seq: %u)", msg->seq_num);
     break;

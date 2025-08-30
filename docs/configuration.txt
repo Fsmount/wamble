@@ -1,0 +1,177 @@
+Wamble Configuration
+====================
+
+Overview
+- Format: minimal Lisp-like expressions with forms and symbols.
+- Top-level forms are evaluated in order.
+- Use `(def name value)` to define variables.
+- Use `(defprofile name ((forms...)))` to define a named profile.
+
+Core Options (common defaults)
+- `port` (int, 8888): UDP server port.
+- `timeout-ms` (int, 100): Reliable send ACK timeout (ms).
+- `max-retries` (int, 3): Reliable send retries.
+- `max-message-size` (int, 126): Fixed message body size (informational).
+- `buffer-size` (int, 65536): Socket send/recv buffer bytes.
+- `max-client-sessions` (int, 1024): Client session capacity.
+- `session-timeout` (int, 300): Idle session timeout (sec).
+- `max-boards` / `min-boards` (int, 1024 / 4): Board pool sizing.
+- `inactivity-timeout` (int, 300): Archive inactive boards (sec).
+- `reservation-timeout` (int, 2): Board reservation lease (sec).
+- `k-factor` (int, 32): Elo K factor.
+- `default-rating` (int, 1200): Starting rating for new players.
+- `max-players` (int, 1024): Player capacity.
+- `token-expiration` (int, 86400): Token TTL (sec).
+- `max-pot` (double, 20.0): Scoring pot cap per board.
+- `max-moves-per-board` (int, 1000): Move history cap per board.
+- `max-contributors` (int, 100): Max contributors per board for scoring.
+- `db-host`, `db-user`, `db-pass`, `db-name` (string, defaults
+  localhost/wamble/wamble/wamble): Database connection.
+Database Connections
+- Each profile listener runs in its own thread and opens its own DB connection
+  using that profile's `db-host`, `db-user`, `db-pass`, `db-name`.
+- `select-timeout-usec` (int, 100000): Main loop select timeout (usec).
+- `cleanup-interval-sec` (int, 60): Session cleanup cadence.
+- `max-token-attempts` / `max-token-local-attempts` (int, 1000 / 100): Token
+  generation limits.
+ 
+
+Logging Verbosity
+- `log-level` (int, 0..4; default 3=INFO): Global default (0=FATAL, 4=DEBUG).
+- Per-module overrides (inherit with -1; default -1 for all):
+  - `log-level-main`, `log-level-network`, `log-level-database`,
+    `log-level-board-manager`, `log-level-player-manager`,
+    `log-level-move-engine`, `log-level-scoring`.
+
+Builtins for Computed and Conditional Values
+- Arithmetic: `(+ a b ...)`, `(- a [b ...])`, `(* a b ...)`, `(/ a b ...)`.
+- Comparison: `(= a b)` for ints, floats, or strings.
+- Conditionals: `(if cond then-expr else-expr?)`.
+- Environment access: `(getenv "VAR")` returns a string (empty if unset).
+- Sequencing: `(do expr1 expr2 ... exprN)` evaluates in order, returns last.
+- Quoting: `(quote expr)` returns `expr` without evaluating it.
+
+Functions and Macros
+- Define a function: `(defn name (arg1 arg2 ...) body...)`
+  - Lexically scoped; arguments are evaluated before binding.
+  - Returns the value of the last body form.
+- Define a macro: `(defmacro name (arg1 arg2 ...) body...)`
+  - Arguments are NOT evaluated; they are raw syntax (AST) values.
+  - Body should produce an expanded form which is then evaluated at call-site.
+- Example helper function:
+  `(defn port-for (base offset) (+ base offset))`
+  `(def port (port-for 8800 12)) ; => 8812`
+- Example macro for common profile shape:
+  `(defmacro simple-profile (pname pport)
+     (do (defprofile pname ((def port pport)
+                             (def advertise 1)
+                             (def visibility 0)))))`
+  `(simple-profile canary 8891)`
+
+Examples: Functions and Macros
+--------------------------------
+- Helper function for ports and timeouts:
+  
+  `(defn port-for (base offset) (+ base offset))`
+  `(defn ms->sec (ms) (/ ms 1000))`
+  `(def port (port-for 8800 42))           ; => 8842`
+  `(def session-timeout (ms->sec 250000))  ; => 250`
+
+- Macro to DRY up common profiles:
+  
+  `(defmacro simple-profile (name p)
+     (do (defprofile name ((def port p)
+                            (def advertise 1)
+                            (def visibility 0)
+                            (def log-level 3)))))`
+  
+  `(simple-profile default-a 8888)`
+  `(simple-profile default-b 8889)`
+
+- Macro with inheritance (wraps defprofile :inherits):
+  
+  `(defmacro inherit (new base p)
+     (do (defprofile new :inherits base ((def port p)))))`
+  
+  `(defprofile base ((def db-name "wamble_base") (def log-level 2)))`
+  `(inherit canary base 8891)`
+
+- Per-module verbosity via functions/macros:
+  
+  `(defn dbg-if (flag level) (if (= flag 1) level -1))`
+  `(def debug-modules 1)`
+  `(def log-level 3)`
+  `(def log-level-network (dbg-if debug-modules 4))  ; DEBUG only if flag=1`
+  `(def log-level-database 2)`
+
+- Quoting and sequencing utilities:
+  
+  `(do (def tmp 1) (def tmp (+ tmp 1)) tmp)  ; => 2`
+  `(def quoted (quote (def some-setting 1))) ; not evaluated`
+  `quoted` evaluates to the AST of `(def some-setting 1)`.
+
+Examples
+- Computed value:
+  `(def session-timeout (* 3 timeout-ms))`
+- Conditional by env:
+  `(def db-host (if (= (getenv "WAMBLE_ENV") "production") "prod.db" "localhost"))`
+- Per-module verbosity:
+  `(def log-level 3)`
+  `(def log-level-network 2)`
+  `(defn dbg (x) (if (= log-level 4) x 0))
+  `(def log-level-database (dbg 4))`
+
+Profiles
+- Define a profile with grouped overrides:
+  `(defprofile test ((def port 8890) (def db-name "wamble_test") (def log-level 4)))`
+- Metadata inside a profile:
+  - `advertise` (int 0/1, default 0): Whether to advertise/offer this profile
+    to clients.
+  - `visibility` (int, default 0): Minimum trust tier required to see this profile in
+    LIST_PROFILES. The server compares this to `sessions.trust_level` for the
+    requesting token.
+  - `db-isolated` (int 0/1): If 1, this profile must not share the same
+    database (host/user/name) with any other advertised profile that also
+    sets `db-isolated=1`. Conflicts cause startup to fail with a fatal error.
+  
+- Explicit inheritance:
+  `(defprofile canary :inherits base ((def port 8891) (def log-level 4)))`
+  Inherits all values from profile `base`, then applies listed overrides.
+
+Macros
+- Optional helpers like `simple-profile` can reduce repetition; there is no
+  db-root concept.
+
+Defaults and Precedence
+- Unspecified options use the compiled-in defaults listed above.
+- Top-level `def` sets process-wide defaults; `defprofile` overrides values
+  for that profile only.
+- Inheritance copies all base values and metadata (including `advertise`,
+  `visibility`, and `db-isolated`) unless overridden in the child profile.
+
+Running with a Profile
+- Pass `--profile <name>` to apply that profile at startup.
+- Multiple profiles can be defined; the server exposes them via config APIs
+  for multi-profile runtime integrations.
+
+Concurrent Profiles
+- When multiple profiles are defined with `advertise=1`, the server starts
+  one listener per profile on its configured `port`, enforcing unique ports.
+- On SIGHUP, config reloads and listeners are reconciled: added/removed/updated
+  profiles are started/stopped/restarted accordingly.
+- Validation is strict: if two advertised profiles conflict (duplicate ports),
+  the server terminates with a fatal error.
+- DB model: Profiles may use distinct DB settings; each listener thread manages
+  its own connection. If two advertised profiles both set `db-isolated=1` they
+  must not point to the same DB.
+
+Visibility and Discovery
+- LIST_PROFILES returns only advertised profiles whose `visibility` is less
+  than or equal to the requesting client's trust tier,
+  `sessions.trust_level` (see database docs). PROFILE_INFO remains available
+  and returns `name;port;advertise;visibility`.
+
+Notes
+- Strings must be quoted. Numbers parse as integers unless they contain a dot.
+- Unknown names in `def` are ignored by the engine unless referenced by code; 
+  they remain available for user logic inside the config.
