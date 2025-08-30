@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -33,29 +34,17 @@
 #define LOG_LEVEL_DEBUG 4
 
 #ifndef LOG_LEVEL
-#define LOG_LEVEL LOG_LEVEL_INFO
+#define LOG_LEVEL LOG_LEVEL_DEBUG
 #endif
+
+struct WambleConfig;
+const struct WambleConfig *get_config(void);
+void set_thread_config(const struct WambleConfig *cfg);
+typedef struct WambleProfile WambleProfile;
 
 static inline void wamble_log(int level, const char *file, int line,
                               const char *func, const char *level_str,
-                              const char *format, ...) {
-  (void)level;
-
-  time_t now = time(NULL);
-  char time_buf[21];
-  strftime(time_buf, 21, "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
-
-  FILE *output_stream = (level <= LOG_LEVEL_WARN) ? stderr : stdout;
-  fprintf(output_stream, "%s [%s] %s:%d:%s(): ", time_buf, level_str, file,
-          line, func);
-
-  va_list args;
-  va_start(args, format);
-  vfprintf(output_stream, format, args);
-  va_end(args);
-
-  fprintf(output_stream, "\n");
-}
+                              const char *format, ...);
 
 #define LOG_FATAL(format, ...)                                                 \
   do {                                                                         \
@@ -288,7 +277,7 @@ static inline int wamble_cond_broadcast(wamble_cond_t *cond) {
 }
 #endif
 
-typedef struct {
+typedef struct WambleConfig {
   int port;
   int timeout_ms;
   int max_retries;
@@ -315,16 +304,95 @@ typedef struct {
   int cleanup_interval_sec;
   int max_token_attempts;
   int max_token_local_attempts;
-  int db_log_frequency;
   double new_player_early_phase_mult;
   double new_player_mid_phase_mult;
   double new_player_end_phase_mult;
   double experienced_player_early_phase_mult;
   double experienced_player_mid_phase_mult;
   double experienced_player_end_phase_mult;
+  int log_level;
+  int log_level_main;
+  int log_level_network;
+  int log_level_database;
+  int log_level_board_manager;
+  int log_level_player_manager;
+  int log_level_move_engine;
+  int log_level_scoring;
 } WambleConfig;
 
 void config_load(const char *filename, const char *profile);
+
+struct WambleProfile {
+  char *name;
+  WambleConfig config;
+  int advertise;
+  int visibility;
+  int db_isolated;
+};
+
+int config_profile_count(void);
+const WambleProfile *config_get_profile(int index);
+const WambleProfile *config_find_profile(const char *name);
+
+int start_profile_listeners(void);
+void stop_profile_listeners(void);
+void reconcile_profile_listeners(void);
+
+static inline void wamble_log(int level, const char *file, int line,
+                              const char *func, const char *level_str,
+                              const char *format, ...) {
+  int effective = LOG_LEVEL_INFO;
+  {
+    const struct WambleConfig *cfg = get_config();
+    if (cfg)
+      effective = cfg->log_level;
+    if (cfg && file) {
+      if (strstr(file, "/network.c") || strstr(file, "network.c")) {
+        if (cfg->log_level_network >= 0)
+          effective = cfg->log_level_network;
+      } else if (strstr(file, "/database.c") || strstr(file, "database.c")) {
+        if (cfg->log_level_database >= 0)
+          effective = cfg->log_level_database;
+      } else if (strstr(file, "/board_manager.c") ||
+                 strstr(file, "board_manager.c")) {
+        if (cfg->log_level_board_manager >= 0)
+          effective = cfg->log_level_board_manager;
+      } else if (strstr(file, "/player_manager.c") ||
+                 strstr(file, "player_manager.c")) {
+        if (cfg->log_level_player_manager >= 0)
+          effective = cfg->log_level_player_manager;
+      } else if (strstr(file, "/move_engine.c") ||
+                 strstr(file, "move_engine.c")) {
+        if (cfg->log_level_move_engine >= 0)
+          effective = cfg->log_level_move_engine;
+      } else if (strstr(file, "/scoring.c") || strstr(file, "scoring.c")) {
+        if (cfg->log_level_scoring >= 0)
+          effective = cfg->log_level_scoring;
+      } else if (strstr(file, "/main.c") || strstr(file, "main.c")) {
+        if (cfg->log_level_main >= 0)
+          effective = cfg->log_level_main;
+      }
+    }
+  }
+  if (level > effective) {
+    return;
+  }
+
+  time_t now = time(NULL);
+  char time_buf[21];
+  strftime(time_buf, 21, "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
+
+  FILE *output_stream = (level <= LOG_LEVEL_WARN) ? stderr : stdout;
+  fprintf(output_stream, "%s [%s] %s:%d:%s(): ", time_buf, level_str, file,
+          line, func);
+
+  va_list args;
+  va_start(args, format);
+  vfprintf(output_stream, format, args);
+  va_end(args);
+
+  fprintf(output_stream, "\n");
+}
 
 #define FEN_MAX_LENGTH 90
 #define MAX_UCI_LENGTH 6
@@ -336,6 +404,9 @@ void config_load(const char *filename, const char *profile);
 #define WAMBLE_CTRL_PLAYER_MOVE 0x03
 #define WAMBLE_CTRL_BOARD_UPDATE 0x04
 #define WAMBLE_CTRL_ACK 0x05
+
+#define WAMBLE_CTRL_LIST_PROFILES 0x06
+#define WAMBLE_CTRL_PROFILE_INFO 0x07
 
 #define get_bit(square) (1ULL << (square))
 #define get_square(file, rank) ((rank) * 8 + (file))
@@ -508,10 +579,11 @@ void player_manager_tick(void);
 
 WamblePlayer *get_player_by_token(const uint8_t *token);
 
-const WambleConfig *get_config(void);
+const struct WambleConfig *get_config(void);
 
 void start_network_listener(void);
 void send_response(const struct WambleMsg *msg);
+void network_init_thread_state(void);
 
 int validate_message(const struct WambleMsg *msg, size_t received_size);
 int is_duplicate_message(const struct sockaddr_in *addr, uint32_t seq_num);
@@ -566,6 +638,10 @@ void db_async_record_move(uint64_t board_id, uint64_t session_id,
 void db_async_record_payout(uint64_t board_id, uint64_t session_id,
                             double points);
 
+void db_cleanup_thread(void) __attribute__((weak));
+
+int db_get_trust_tier_by_token(const uint8_t *token);
+
 void rng_init(void);
 uint64_t rng_u64(void);
 double rng_double(void);
@@ -580,6 +656,8 @@ void send_ack(int sockfd, const struct WambleMsg *msg,
 int send_reliable_message(int sockfd, const struct WambleMsg *msg,
                           const struct sockaddr_in *cliaddr, int timeout_ms,
                           int max_retries);
+void handle_message(int sockfd, const struct WambleMsg *msg,
+                    const struct sockaddr_in *cliaddr);
 int wait_for_ack(int sockfd, uint32_t expected_seq, int timeout_ms);
 
 static inline int tokens_equal(const uint8_t *token1, const uint8_t *token2) {

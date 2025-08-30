@@ -7,12 +7,12 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-static WambleClientSession *client_sessions;
-static int num_sessions = 0;
-static uint32_t global_seq_num = 1;
+static __thread WambleClientSession *client_sessions;
+static __thread int num_sessions = 0;
+static __thread uint32_t global_seq_num = 1;
 
 #define SESSION_MAP_SIZE (get_config()->max_client_sessions * 2)
-static int *session_index_map;
+static __thread int *session_index_map;
 
 static inline uint64_t mix64_s(uint64_t x) {
   x ^= x >> 33;
@@ -192,7 +192,9 @@ int validate_message(const struct WambleMsg *msg, size_t received_size) {
   if (msg->ctrl != WAMBLE_CTRL_CLIENT_HELLO &&
       msg->ctrl != WAMBLE_CTRL_SERVER_HELLO &&
       msg->ctrl != WAMBLE_CTRL_PLAYER_MOVE &&
-      msg->ctrl != WAMBLE_CTRL_BOARD_UPDATE && msg->ctrl != WAMBLE_CTRL_ACK) {
+      msg->ctrl != WAMBLE_CTRL_BOARD_UPDATE && msg->ctrl != WAMBLE_CTRL_ACK &&
+      msg->ctrl != WAMBLE_CTRL_LIST_PROFILES &&
+      msg->ctrl != WAMBLE_CTRL_PROFILE_INFO) {
     LOG_WARN("Invalid message control code: 0x%02x", msg->ctrl);
     return -1;
   }
@@ -250,6 +252,19 @@ void update_client_session(const struct sockaddr_in *addr, const uint8_t *token,
   memcpy(session->token, token, TOKEN_LENGTH);
 }
 
+void network_init_thread_state(void) {
+  if (!client_sessions) {
+    client_sessions =
+        malloc(sizeof(WambleClientSession) * get_config()->max_client_sessions);
+  }
+  if (!session_index_map) {
+    session_index_map =
+        malloc(sizeof(int) * (get_config()->max_client_sessions * 2));
+  }
+  num_sessions = 0;
+  session_map_init();
+}
+
 int create_and_bind_socket(int port) {
   int sockfd;
   struct sockaddr_in servaddr;
@@ -298,11 +313,7 @@ int create_and_bind_socket(int port) {
   }
 
   LOG_DEBUG("Initializing session map");
-  client_sessions =
-      malloc(sizeof(WambleClientSession) * get_config()->max_client_sessions);
-  session_index_map =
-      malloc(sizeof(int) * (get_config()->max_client_sessions * 2));
-  session_map_init();
+  network_init_thread_state();
 
   return sockfd;
 }
@@ -532,7 +543,7 @@ void cleanup_expired_sessions(void) {
 }
 
 static const char base64url_chars[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_ ";
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 void format_token_for_url(const uint8_t *token, char *url_buffer) {
   if (!token || !url_buffer)

@@ -2,16 +2,37 @@
 #include <libpq-fe.h>
 #include <string.h>
 
-static PGconn *db_conn = NULL;
+static __thread PGconn *db_conn_tls = NULL;
 static bool db_initialized = false;
-static wamble_mutex_t db_conn_mutex;
+
+static void build_conn_string_from_cfg(const WambleConfig *cfg, char *out,
+                                       size_t outlen) {
+  snprintf(out, outlen, "dbname=%s user=%s password=%s host=%s", cfg->db_name,
+           cfg->db_user, cfg->db_pass, cfg->db_host);
+}
+
+static PGconn *ensure_connection(void) {
+  if (db_conn_tls)
+    return db_conn_tls;
+  char conn[256];
+  build_conn_string_from_cfg(get_config(), conn, sizeof conn);
+  db_conn_tls = PQconnectdb(conn);
+  if (PQstatus(db_conn_tls) != CONNECTION_OK) {
+    LOG_ERROR("failed to connect to db (thread): %s",
+              PQerrorMessage(db_conn_tls));
+    PQfinish(db_conn_tls);
+    db_conn_tls = NULL;
+    return NULL;
+  }
+  return db_conn_tls;
+}
 
 static PGresult *pq_exec_locked(const char *command) {
   PGresult *res;
-  wamble_mutex_lock(&db_conn_mutex);
-  res = PQexec(db_conn, command);
-  wamble_mutex_unlock(&db_conn_mutex);
-  return res;
+  PGconn *c = ensure_connection();
+  if (!c)
+    return NULL;
+  return PQexec(c, command);
 }
 
 static PGresult *
@@ -19,11 +40,11 @@ pq_exec_params_locked(const char *command, int nParams, const Oid *paramTypes,
                       const char *const *paramValues, const int *paramLengths,
                       const int *paramFormats, int resultFormat) {
   PGresult *res;
-  wamble_mutex_lock(&db_conn_mutex);
-  res = PQexecParams(db_conn, command, nParams, paramTypes, paramValues,
-                     paramLengths, paramFormats, resultFormat);
-  wamble_mutex_unlock(&db_conn_mutex);
-  return res;
+  PGconn *c = ensure_connection();
+  if (!c)
+    return NULL;
+  return PQexecParams(c, command, nParams, paramTypes, paramValues,
+                      paramLengths, paramFormats, resultFormat);
 }
 
 typedef enum {
@@ -48,130 +69,6 @@ typedef struct {
   char winning_side;
 } DbJob;
 
-#ifndef WAMBLE_SINGLE_THREADED
-#define DB_QUEUE_CAP 1024
-static DbJob db_queue[DB_QUEUE_CAP];
-static int db_q_head = 0;
-static int db_q_tail = 0;
-static wamble_mutex_t db_q_mutex;
-static wamble_cond_t db_q_cond;
-static wamble_thread_t db_workers[2];
-static int db_worker_running = 0;
-static unsigned long db_q_dropped = 0;
-static unsigned long db_job_failures[6] = {0};
-static unsigned long db_job_success[6] = {0};
-
-static int db_q_empty(void) { return db_q_head == db_q_tail; }
-static int db_q_full(void) {
-  return ((db_q_tail + 1) % DB_QUEUE_CAP) == db_q_head;
-}
-
-static void db_q_push(const DbJob *job) {
-  wamble_mutex_lock(&db_q_mutex);
-  if (!db_q_full()) {
-    db_queue[db_q_tail] = *job;
-    db_q_tail = (db_q_tail + 1) % DB_QUEUE_CAP;
-    wamble_cond_signal(&db_q_cond);
-  } else {
-    db_q_dropped++;
-    if ((db_q_dropped % get_config()->db_log_frequency) == 1UL) {
-      LOG_WARN("db queue full, dropping jobs (total: %lu)", db_q_dropped);
-    }
-  }
-  wamble_mutex_unlock(&db_q_mutex);
-}
-
-static int db_q_pop(DbJob *out) {
-  wamble_mutex_lock(&db_q_mutex);
-  while (db_worker_running && db_q_empty()) {
-    wamble_cond_wait(&db_q_cond, &db_q_mutex);
-  }
-  if (!db_worker_running && db_q_empty()) {
-    wamble_mutex_unlock(&db_q_mutex);
-    return 0;
-  }
-  *out = db_queue[db_q_head];
-  db_q_head = (db_q_head + 1) % DB_QUEUE_CAP;
-  wamble_mutex_unlock(&db_q_mutex);
-  return 1;
-}
-
-static void *db_worker_main(void *arg) {
-  (void)arg;
-  DbJob job;
-  while (db_worker_running) {
-    if (!db_q_pop(&job))
-      continue;
-    if (!db_conn)
-      continue;
-    switch (job.type) {
-    case DB_JOB_UPDATE_BOARD:
-      if (db_update_board(job.board_id, job.fen, job.status) == 0)
-        db_job_success[DB_JOB_UPDATE_BOARD]++;
-      else {
-        db_job_failures[DB_JOB_UPDATE_BOARD]++;
-        if ((db_job_failures[DB_JOB_UPDATE_BOARD] %
-             get_config()->db_log_frequency) == 1UL)
-          LOG_ERROR("db failure: update_board (total: %lu)",
-                    db_job_failures[DB_JOB_UPDATE_BOARD]);
-      }
-      break;
-    case DB_JOB_CREATE_RESERVATION:
-      if (db_create_reservation(job.board_id, job.session_id,
-                                job.timeout_seconds) == 0)
-        db_job_success[DB_JOB_CREATE_RESERVATION]++;
-      else {
-        db_job_failures[DB_JOB_CREATE_RESERVATION]++;
-        if ((db_job_failures[DB_JOB_CREATE_RESERVATION] %
-             get_config()->db_log_frequency) == 1UL)
-          LOG_ERROR("db failure: create_reservation (total: %lu)",
-                    db_job_failures[DB_JOB_CREATE_RESERVATION]);
-      }
-      break;
-    case DB_JOB_REMOVE_RESERVATION:
-      db_remove_reservation(job.board_id);
-      db_job_success[DB_JOB_REMOVE_RESERVATION]++;
-      break;
-    case DB_JOB_RECORD_GAME_RESULT:
-      if (db_record_game_result(job.board_id, job.winning_side) == 0)
-        db_job_success[DB_JOB_RECORD_GAME_RESULT]++;
-      else {
-        db_job_failures[DB_JOB_RECORD_GAME_RESULT]++;
-        if ((db_job_failures[DB_JOB_RECORD_GAME_RESULT] %
-             get_config()->db_log_frequency) == 1UL)
-          LOG_ERROR("db failure: record_game_result (total: %lu)",
-                    db_job_failures[DB_JOB_RECORD_GAME_RESULT]);
-      }
-      break;
-    case DB_JOB_RECORD_MOVE:
-      if (db_record_move(job.board_id, job.session_id, job.move_uci,
-                         job.move_number) == 0)
-        db_job_success[DB_JOB_RECORD_MOVE]++;
-      else {
-        db_job_failures[DB_JOB_RECORD_MOVE]++;
-        if ((db_job_failures[DB_JOB_RECORD_MOVE] %
-             get_config()->db_log_frequency) == 1UL)
-          LOG_ERROR("db failure: record_move (total: %lu)",
-                    db_job_failures[DB_JOB_RECORD_MOVE]);
-      }
-      break;
-    case DB_JOB_RECORD_PAYOUT:
-      if (db_record_payout(job.board_id, job.session_id, job.points) == 0)
-        db_job_success[DB_JOB_RECORD_PAYOUT]++;
-      else {
-        db_job_failures[DB_JOB_RECORD_PAYOUT]++;
-        if ((db_job_failures[DB_JOB_RECORD_PAYOUT] %
-             get_config()->db_log_frequency) == 1UL)
-          LOG_ERROR("db failure: record_payout (total: %lu)",
-                    db_job_failures[DB_JOB_RECORD_PAYOUT]);
-      }
-      break;
-    }
-  }
-  return NULL;
-}
-#endif
-
 static void bytes_to_hex(const uint8_t *bytes, int len, char *hex_out) {
   if (bytes == NULL || hex_out == NULL) {
     return;
@@ -195,151 +92,76 @@ int db_init(const char *connection_string) {
   }
 
   LOG_INFO("Initializing database connection");
-  wamble_mutex_init(&db_conn_mutex);
-#ifndef WAMBLE_SINGLE_THREADED
-  wamble_mutex_init(&db_q_mutex);
-  wamble_cond_init(&db_q_cond);
-#endif
-
-  wamble_mutex_lock(&db_conn_mutex);
-  db_conn = PQconnectdb(connection_string);
-  if (PQstatus(db_conn) != CONNECTION_OK) {
-    LOG_FATAL("failed to connect to db: %s", PQerrorMessage(db_conn));
-    PQfinish(db_conn);
-    db_conn = NULL;
-    wamble_mutex_unlock(&db_conn_mutex);
-    return -1;
-  }
-  wamble_mutex_unlock(&db_conn_mutex);
+  (void)connection_string;
 
   db_initialized = true;
 
-#ifndef WAMBLE_SINGLE_THREADED
-  db_worker_running = 1;
-  for (int i = 0; i < 2; i++) {
-    wamble_thread_create(&db_workers[i], db_worker_main, NULL);
-  }
-  LOG_INFO("Database connection initialized and worker threads started");
-#else
-  LOG_INFO("Database connection initialized in single-threaded mode");
-#endif
+  LOG_INFO("Database initialized (per-thread DB context)");
   return 0;
 }
 
 void db_cleanup(void) {
   LOG_INFO("Cleaning up database connection");
-  if (db_conn) {
-    wamble_mutex_lock(&db_conn_mutex);
-    PQfinish(db_conn);
-    db_conn = NULL;
-    wamble_mutex_unlock(&db_conn_mutex);
-  }
   db_initialized = false;
-#ifndef WAMBLE_SINGLE_THREADED
-  if (db_worker_running) {
-    wamble_mutex_lock(&db_q_mutex);
-    db_worker_running = 0;
-    wamble_cond_broadcast(&db_q_cond);
-    wamble_mutex_unlock(&db_q_mutex);
-    for (int i = 0; i < 2; i++) {
-      wamble_thread_join(db_workers[i], NULL);
-    }
-    LOG_INFO("Database worker threads stopped");
-  }
-#endif
-  wamble_mutex_destroy(&db_conn_mutex);
-#ifndef WAMBLE_SINGLE_THREADED
-  wamble_mutex_destroy(&db_q_mutex);
-  wamble_cond_destroy(&db_q_cond);
-#endif
   LOG_INFO("Database cleanup complete");
+}
+
+void db_cleanup_thread(void) {
+  if (db_conn_tls) {
+    PQfinish(db_conn_tls);
+    db_conn_tls = NULL;
+  }
+}
+
+int db_get_trust_tier_by_token(const uint8_t *token) {
+  const char *query =
+      "SELECT trust_level FROM sessions WHERE token = decode($1, 'hex')";
+
+  char token_hex[33];
+  bytes_to_hex(token, TOKEN_LENGTH, token_hex);
+
+  const char *paramValues[] = {token_hex};
+
+  PGresult *res =
+      pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
+  if (!res)
+    return 0;
+
+  if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+    PQclear(res);
+    return 0;
+  }
+  int trust = atoi(PQgetvalue(res, 0, 0));
+  PQclear(res);
+  return trust;
 }
 
 void db_async_update_board(uint64_t board_id, const char *fen,
                            const char *status) {
-#ifdef WAMBLE_SINGLE_THREADED
   db_update_board(board_id, fen, status);
-#else
-  DbJob j;
-  j.type = DB_JOB_UPDATE_BOARD;
-  j.board_id = board_id;
-  strncpy(j.fen, fen ? fen : "", FEN_MAX_LENGTH - 1);
-  j.fen[FEN_MAX_LENGTH - 1] = '\0';
-  strncpy(j.status, status ? status : "", STATUS_MAX_LENGTH - 1);
-  j.status[STATUS_MAX_LENGTH - 1] = '\0';
-  db_q_push(&j);
-#endif
 }
 
 void db_async_create_reservation(uint64_t board_id, uint64_t session_id,
                                  int timeout_seconds) {
-#ifdef WAMBLE_SINGLE_THREADED
   db_create_reservation(board_id, session_id, timeout_seconds);
-#else
-  DbJob j;
-  j.type = DB_JOB_CREATE_RESERVATION;
-  j.board_id = board_id;
-  j.session_id = session_id;
-  j.timeout_seconds = timeout_seconds;
-  db_q_push(&j);
-#endif
 }
 
 void db_async_remove_reservation(uint64_t board_id) {
-#ifdef WAMBLE_SINGLE_THREADED
   db_remove_reservation(board_id);
-#else
-  DbJob j;
-  j.type = DB_JOB_REMOVE_RESERVATION;
-  j.board_id = board_id;
-  db_q_push(&j);
-#endif
 }
 
 void db_async_record_game_result(uint64_t board_id, char winning_side) {
-#ifdef WAMBLE_SINGLE_THREADED
   db_record_game_result(board_id, winning_side);
-#else
-  DbJob j;
-  j.type = DB_JOB_RECORD_GAME_RESULT;
-  j.board_id = board_id;
-  j.winning_side = winning_side;
-  db_q_push(&j);
-#endif
 }
 
 void db_async_record_move(uint64_t board_id, uint64_t session_id,
                           const char *move_uci, int move_number) {
-#ifdef WAMBLE_SINGLE_THREADED
   db_record_move(board_id, session_id, move_uci, move_number);
-#else
-  DbJob j;
-  j.type = DB_JOB_RECORD_MOVE;
-  j.board_id = board_id;
-  j.session_id = session_id;
-  j.move_number = move_number;
-  if (move_uci) {
-    strncpy(j.move_uci, move_uci, MAX_UCI_LENGTH - 1);
-    j.move_uci[MAX_UCI_LENGTH - 1] = '\0';
-  } else {
-    j.move_uci[0] = '\0';
-  }
-  db_q_push(&j);
-#endif
 }
 
 void db_async_record_payout(uint64_t board_id, uint64_t session_id,
                             double points) {
-#ifdef WAMBLE_SINGLE_THREADED
   db_record_payout(board_id, session_id, points);
-#else
-  DbJob j;
-  j.type = DB_JOB_RECORD_PAYOUT;
-  j.board_id = board_id;
-  j.session_id = session_id;
-  j.points = points;
-  db_q_push(&j);
-#endif
 }
 
 uint64_t db_create_session(const uint8_t *token, uint64_t player_id) {
@@ -355,10 +177,6 @@ uint64_t db_create_session(const uint8_t *token, uint64_t player_id) {
   }
 
   const char *paramValues[] = {token_hex, player_id > 0 ? player_id_str : NULL};
-
-  if (!db_conn) {
-    return 0;
-  }
 
   PGresult *res =
       pq_exec_params_locked(query, 2, NULL, paramValues, NULL, NULL, 0);
@@ -381,10 +199,6 @@ uint64_t db_get_session_by_token(const uint8_t *token) {
 
   const char *paramValues[] = {token_hex};
 
-  if (!db_conn) {
-    return 0;
-  }
-
   PGresult *res =
       pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
 
@@ -406,10 +220,6 @@ void db_update_session_last_seen(uint64_t session_id) {
 
   const char *paramValues[] = {session_id_str};
 
-  if (!db_conn) {
-    return;
-  }
-
   PGresult *res =
       pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
   PQclear(res);
@@ -420,10 +230,6 @@ uint64_t db_create_board(const char *fen) {
       "INSERT INTO boards (fen, status) VALUES ($1, 'DORMANT') RETURNING id";
 
   const char *paramValues[] = {fen};
-
-  if (!db_conn) {
-    return 0;
-  }
 
   PGresult *res =
       pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
@@ -447,10 +253,6 @@ int db_update_board(uint64_t board_id, const char *fen, const char *status) {
 
   const char *paramValues[] = {board_id_str, fen, status};
 
-  if (!db_conn) {
-    return -1;
-  }
-
   PGresult *res =
       pq_exec_params_locked(query, 3, NULL, paramValues, NULL, NULL, 0);
 
@@ -470,10 +272,6 @@ int db_get_board(uint64_t board_id, char *fen_out, char *status_out) {
   snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
 
   const char *paramValues[] = {board_id_str};
-
-  if (!db_conn) {
-    return -1;
-  }
 
   PGresult *res =
       pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
@@ -497,10 +295,6 @@ int db_get_boards_by_status(const char *status, uint64_t *board_ids,
       "SELECT id FROM boards WHERE status = $1 ORDER BY created_at";
 
   const char *paramValues[] = {status};
-
-  if (!db_conn) {
-    return -1;
-  }
 
   PGresult *res =
       pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
@@ -539,10 +333,6 @@ int db_record_move(uint64_t board_id, uint64_t session_id, const char *move_uci,
   const char *paramValues[] = {board_id_str, session_id_str, move_uci,
                                move_number_str};
 
-  if (!db_conn) {
-    return -1;
-  }
-
   PGresult *res =
       pq_exec_params_locked(query, 4, NULL, paramValues, NULL, NULL, 0);
 
@@ -569,10 +359,6 @@ int db_get_moves_for_board(uint64_t board_id, WambleMove *moves_out,
   snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
 
   const char *paramValues[] = {board_id_str};
-
-  if (!db_conn) {
-    return -1;
-  }
 
   PGresult *res =
       pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
@@ -633,12 +419,8 @@ int db_create_reservation(uint64_t board_id, uint64_t session_id,
 
   const char *paramValues[] = {board_id_str, session_id_str, timeout_str};
 
-  if (!db_conn) {
-    return -1;
-  }
-
   PGresult *res =
-      PQexecParams(db_conn, query, 3, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 3, NULL, paramValues, NULL, NULL, 0);
 
   if (PQresultStatus(res) != PGRES_COMMAND_OK) {
     PQclear(res);
@@ -650,10 +432,6 @@ int db_create_reservation(uint64_t board_id, uint64_t session_id,
 }
 
 void db_expire_reservations(void) {
-  if (!db_conn) {
-    return;
-  }
-
   const char *update_query =
       "UPDATE boards SET status = 'DORMANT', updated_at = NOW() "
       "WHERE status = 'RESERVED' AND id IN "
@@ -677,10 +455,6 @@ void db_archive_inactive_boards(int timeout_seconds) {
   snprintf(timeout_str, sizeof(timeout_str), "%d", timeout_seconds);
   const char *paramValues[] = {timeout_str};
 
-  if (!db_conn) {
-    return;
-  }
-
   PGresult *res =
       pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
   PQclear(res);
@@ -692,10 +466,6 @@ void db_remove_reservation(uint64_t board_id) {
   snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
 
   const char *paramValues[] = {board_id_str};
-
-  if (!db_conn) {
-    return;
-  }
 
   PGresult *res =
       pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
@@ -715,12 +485,8 @@ int db_record_game_result(uint64_t board_id, char winning_side) {
 
   const char *paramValues[] = {board_id_str, winning_side_str};
 
-  if (!db_conn) {
-    return -1;
-  }
-
   PGresult *res =
-      PQexecParams(db_conn, query, 2, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 2, NULL, paramValues, NULL, NULL, 0);
 
   if (PQresultStatus(res) != PGRES_COMMAND_OK) {
     PQclear(res);
@@ -745,12 +511,8 @@ int db_record_payout(uint64_t board_id, uint64_t session_id, double points) {
 
   const char *paramValues[] = {board_id_str, session_id_str, points_str};
 
-  if (!db_conn) {
-    return -1;
-  }
-
   PGresult *res =
-      PQexecParams(db_conn, query, 3, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 3, NULL, paramValues, NULL, NULL, 0);
 
   if (PQresultStatus(res) != PGRES_COMMAND_OK) {
     PQclear(res);
@@ -770,12 +532,8 @@ double db_get_player_total_score(uint64_t session_id) {
 
   const char *paramValues[] = {session_id_str};
 
-  if (!db_conn) {
-    return 0.0;
-  }
-
   PGresult *res =
-      PQexecParams(db_conn, query, 1, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
 
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     PQclear(res);
@@ -795,10 +553,6 @@ double db_get_player_total_score(uint64_t session_id) {
 int db_get_active_session_count(void) {
   const char *query = "SELECT COUNT(*) FROM sessions WHERE last_seen_at > "
                       "NOW() - INTERVAL '5 minutes'";
-
-  if (!db_conn) {
-    return 0;
-  }
 
   PGresult *res = pq_exec_locked(query);
 
@@ -821,10 +575,6 @@ int db_get_longest_game_moves(void) {
   const char *query = "SELECT COALESCE(MAX(move_number), 0) FROM moves m "
                       "JOIN boards b ON m.board_id = b.id "
                       "WHERE b.status IN ('ACTIVE', 'RESERVED', 'DORMANT')";
-
-  if (!db_conn) {
-    return 0;
-  }
 
   PGresult *res = pq_exec_locked(query);
 
@@ -851,10 +601,6 @@ int db_get_session_games_played(uint64_t session_id) {
   snprintf(session_id_str, sizeof(session_id_str), "%lu", session_id);
 
   const char *paramValues[] = {session_id_str};
-
-  if (!db_conn) {
-    return 0;
-  }
 
   PGresult *res =
       pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
