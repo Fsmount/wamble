@@ -621,3 +621,69 @@ int db_get_session_games_played(uint64_t session_id) {
 }
 
 void db_tick(void) { db_expire_reservations(); }
+
+uint64_t db_create_player(const uint8_t *public_key) {
+  const char *query = "INSERT INTO players (public_key) VALUES (decode($1, "
+                      "'hex')) RETURNING id";
+
+  char public_key_hex[65];
+  bytes_to_hex(public_key, 32, public_key_hex);
+
+  const char *paramValues[] = {public_key_hex};
+
+  PGresult *res =
+      pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
+
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    PQclear(res);
+    return 0;
+  }
+
+  uint64_t player_id = strtoull(PQgetvalue(res, 0, 0), NULL, 10);
+  PQclear(res);
+  return player_id;
+}
+
+uint64_t db_get_player_by_public_key(const uint8_t *public_key) {
+  const char *query =
+      "SELECT id FROM players WHERE public_key = decode($1, 'hex')";
+
+  char public_key_hex[65];
+  bytes_to_hex(public_key, 32, public_key_hex);
+
+  const char *paramValues[] = {public_key_hex};
+
+  PGresult *res =
+      pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
+
+  if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+    PQclear(res);
+    return 0;
+  }
+
+  uint64_t player_id = strtoull(PQgetvalue(res, 0, 0), NULL, 10);
+  PQclear(res);
+  return player_id;
+}
+
+int db_link_session_to_player(uint64_t session_id, uint64_t player_id) {
+  const char *query = "UPDATE sessions SET player_id = $2 WHERE id = $1";
+
+  char session_id_str[32];
+  char player_id_str[32];
+  snprintf(session_id_str, sizeof(session_id_str), "%lu", session_id);
+  snprintf(player_id_str, sizeof(player_id_str), "%lu", player_id);
+
+  const char *paramValues[] = {session_id_str, player_id_str};
+
+  PGresult *res =
+      pq_exec_params_locked(query, 2, NULL, paramValues, NULL, NULL, 0);
+
+  if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+    PQclear(res);
+    return -1;
+  }
+
+  PQclear(res);
+  return 0;
+}

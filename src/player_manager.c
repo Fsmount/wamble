@@ -340,6 +340,27 @@ WamblePlayer *create_new_player(void) {
   return NULL;
 }
 
+WamblePlayer *login_player(const uint8_t *public_key) {
+  uint64_t player_id = db_get_player_by_public_key(public_key);
+  if (player_id == 0) {
+    player_id = db_create_player(public_key);
+    if (player_id == 0) {
+      return NULL;
+    }
+  }
+
+  WamblePlayer *player = create_new_player();
+  if (player) {
+    memcpy(player->public_key, public_key, 32);
+    player->has_persistent_identity = true;
+    uint64_t session_id = db_get_session_by_token(player->token);
+    if (session_id > 0) {
+      db_link_session_to_player(session_id, player_id);
+    }
+  }
+  return player;
+}
+
 void player_manager_tick(void) {
   time_t now = time(NULL);
 

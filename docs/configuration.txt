@@ -25,6 +25,12 @@ Core Options (common defaults)
 - `max-pot` (double, 20.0): Scoring pot cap per board.
 - `max-moves-per-board` (int, 1000): Move history cap per board.
 - `max-contributors` (int, 100): Max contributors per board for scoring.
+- `new-player-early-phase-mult` (double, 2.0): Payout multiplier for new players in the early game.
+- `new-player-mid-phase-mult` (double, 1.0): Payout multiplier for new players in the mid game.
+- `new-player-end-phase-mult` (double, 0.5): Payout multiplier for new players in the late game.
+- `experienced-player-early-phase-mult` (double, 0.5): Payout multiplier for experienced players in the early game.
+- `experienced-player-mid-phase-mult` (double, 1.0): Payout multiplier for experienced players in the mid game.
+- `experienced-player-end-phase-mult` (double, 2.0): Payout multiplier for experienced players in the late game.
 - `db-host`, `db-user`, `db-pass`, `db-name` (string, defaults
   localhost/wamble/wamble/wamble): Database connection.
 Database Connections

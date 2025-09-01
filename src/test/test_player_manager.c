@@ -6,25 +6,6 @@
 
 #include "../../include/wamble/wamble.h"
 
-uint64_t db_get_session_by_token(const uint8_t *token) {
-  (void)token;
-  return 0;
-}
-void db_update_session_last_seen(uint64_t session_id) { (void)session_id; }
-double db_get_player_total_score(uint64_t session_id) {
-  (void)session_id;
-  return 0.0;
-}
-uint64_t db_create_session(const uint8_t *token, uint64_t player_id) {
-  (void)token;
-  (void)player_id;
-  return 1;
-}
-int db_get_session_games_played(uint64_t session_id) {
-  (void)session_id;
-  return 0;
-}
-
 #include "../player_manager.c"
 
 static bool are_tokens_equal(const uint8_t *t1, const uint8_t *t2) {

@@ -4,45 +4,17 @@
 #include <assert.h>
 #include <math.h>
 
-uint64_t db_get_session_by_token(const uint8_t *token) {
-  (void)token;
-  return 1;
-}
-int db_record_payout(uint64_t board_id, uint64_t session_id, double points) {
-  (void)board_id;
-  (void)session_id;
-  (void)points;
-  return 0;
-}
-
-void db_async_record_payout(uint64_t board_id, uint64_t session_id,
-                            double points) {
-  (void)db_record_payout(board_id, session_id, points);
-}
+void dbstub_reset_moves(void);
+void dbstub_add_move(uint64_t board_id, const uint8_t *player_token,
+                     bool is_white, const char *uci);
 
 #include "../scoring.c"
 
 #define MAX_TEST_PLAYERS 10
-#define MAX_TEST_MOVES 50
 
 static WamblePlayer test_players[MAX_TEST_PLAYERS];
 static int num_test_players = 0;
-
-static WambleMove test_moves[MAX_TEST_MOVES];
-static int num_test_moves = 0;
-
 static WambleBoard test_board;
-
-int db_get_moves_for_board(uint64_t board_id, WambleMove *moves_out,
-                           int max_moves) {
-  int count = 0;
-  for (int i = 0; i < num_test_moves && count < max_moves; i++) {
-    if (test_moves[i].board_id == board_id) {
-      moves_out[count++] = test_moves[i];
-    }
-  }
-  return count;
-}
 
 WamblePlayer *get_player_by_token(const uint8_t *token) {
   for (int i = 0; i < num_test_players; i++) {
@@ -67,24 +39,6 @@ WambleBoard *get_board_by_id(uint64_t board_id) {
   return NULL;
 }
 
-int get_moves_for_board(uint64_t board_id, WambleMove **moves) {
-  static WambleMove move_buffer[1000];
-  int count = 0;
-  for (int i = 0; i < num_test_moves; i++) {
-    if (test_moves[i].board_id == board_id && count < 1000) {
-      move_buffer[count++] = test_moves[i];
-    }
-  }
-
-  if (count == 0) {
-    *moves = NULL;
-    return 0;
-  }
-
-  *moves = move_buffer;
-  return count;
-}
-
 typedef struct {
   const char *name;
   bool (*run)(void);
@@ -104,18 +58,14 @@ static void setup_test_players() {
 }
 
 static void add_move(uint64_t board_id, int player_index, bool is_white_move) {
-  if (num_test_moves < MAX_TEST_MOVES && player_index < num_test_players) {
-    WambleMove *move = &test_moves[num_test_moves++];
-    move->board_id = board_id;
-    memcpy(move->player_token, test_players[player_index].token, TOKEN_LENGTH);
-    move->is_white_move = is_white_move;
-    strcpy(move->uci_move, is_white_move ? "e2e4" : "e7e5");
+  if (player_index < num_test_players) {
+    dbstub_add_move(board_id, test_players[player_index].token, is_white_move,
+                    is_white_move ? "e2e4" : "e7e5");
   }
 }
 
 static void reset_test_data() {
-  num_test_moves = 0;
-  memset(test_moves, 0, sizeof(test_moves));
+  dbstub_reset_moves();
   memset(&test_board, 0, sizeof(test_board));
   setup_test_players();
 }
