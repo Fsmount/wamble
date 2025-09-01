@@ -408,6 +408,22 @@ static inline void wamble_log(int level, const char *file, int line,
 #define WAMBLE_CTRL_LIST_PROFILES 0x06
 #define WAMBLE_CTRL_PROFILE_INFO 0x07
 
+#define WAMBLE_CTRL_ERROR 0x08
+#define WAMBLE_CTRL_SERVER_NOTIFICATION 0x09
+#define WAMBLE_CTRL_CLIENT_GOODBYE 0x0A
+#define WAMBLE_CTRL_SPECTATE_GAME 0x0B
+#define WAMBLE_CTRL_SPECTATE_UPDATE 0x0C
+
+#define WAMBLE_CTRL_LOGIN 0x0D
+#define WAMBLE_CTRL_LOGOUT 0x0E
+#define WAMBLE_CTRL_LOGIN_SUCCESS 0x0F
+#define WAMBLE_CTRL_LOGIN_FAILED 0x10
+#define WAMBLE_CTRL_GET_PLAYER_STATS 0x11
+#define WAMBLE_CTRL_PLAYER_STATS_DATA 0x12
+
+#define WAMBLE_CTRL_GET_PROFILE_INFO 0x13
+#define WAMBLE_CTRL_PROFILES_LIST 0x14
+
 #define get_bit(square) (1ULL << (square))
 #define get_square(file, rank) ((rank) * 8 + (file))
 
@@ -472,24 +488,33 @@ typedef enum {
   GAME_RESULT_DRAW
 } GameResult;
 
+#define WAMBLE_PROTO_VERSION 1
+#define WAMBLE_FLAG_UNRELIABLE 0x80
+
 #pragma pack(push, 1)
 struct WambleMsg {
   uint8_t ctrl;
+  uint8_t flags;
   uint8_t token[TOKEN_LENGTH];
   uint64_t board_id;
   uint32_t seq_num;
   uint8_t uci_len;
   char uci[MAX_UCI_LENGTH];
   char fen[FEN_MAX_LENGTH];
+  uint16_t error_code;
+  char error_reason[FEN_MAX_LENGTH];
+  uint8_t login_pubkey[32];
 };
 #pragma pack(pop)
 
-int serialize_wamble_msg(const struct WambleMsg *msg, uint8_t *buffer);
-int deserialize_wamble_msg(const uint8_t *buffer, size_t buffer_size,
-                           struct WambleMsg *msg);
+#define WAMBLE_MAX_PAYLOAD 1200
+#define WAMBLE_DUP_WINDOW 1024
 
-#define WAMBLE_SERIALIZED_SIZE                                                 \
-  (1 + TOKEN_LENGTH + 8 + 4 + 1 + MAX_UCI_LENGTH + FEN_MAX_LENGTH)
+int serialize_wamble_msg(const struct WambleMsg *msg, uint8_t *buffer,
+                         size_t buffer_capacity, size_t *out_len,
+                         uint8_t flags);
+int deserialize_wamble_msg(const uint8_t *buffer, size_t buffer_size,
+                           struct WambleMsg *msg, uint8_t *out_flags);
 
 typedef struct WamblePlayer {
   uint8_t token[TOKEN_LENGTH];
@@ -586,7 +611,8 @@ void send_response(const struct WambleMsg *msg);
 void network_init_thread_state(void);
 
 int validate_message(const struct WambleMsg *msg, size_t received_size);
-int is_duplicate_message(const struct sockaddr_in *addr, uint32_t seq_num);
+int is_duplicate_message(const struct sockaddr_in *addr, const uint8_t *token,
+                         uint32_t seq_num);
 void update_client_session(const struct sockaddr_in *addr, const uint8_t *token,
                            uint32_t seq_num);
 
@@ -626,6 +652,10 @@ int db_get_active_session_count(void);
 int db_get_longest_game_moves(void);
 int db_get_session_games_played(uint64_t session_id);
 
+uint64_t db_create_player(const uint8_t *public_key);
+uint64_t db_get_player_by_public_key(const uint8_t *public_key);
+int db_link_session_to_player(uint64_t session_id, uint64_t player_id);
+
 void db_expire_reservations(void);
 void db_async_update_board(uint64_t board_id, const char *fen,
                            const char *status);
@@ -658,7 +688,8 @@ int send_reliable_message(int sockfd, const struct WambleMsg *msg,
                           int max_retries);
 void handle_message(int sockfd, const struct WambleMsg *msg,
                     const struct sockaddr_in *cliaddr);
-int wait_for_ack(int sockfd, uint32_t expected_seq, int timeout_ms);
+int wait_for_ack(int sockfd, const uint8_t *expected_token,
+                 uint32_t expected_seq, int timeout_ms);
 
 static inline int tokens_equal(const uint8_t *token1, const uint8_t *token2) {
   for (int i = 0; i < TOKEN_LENGTH; i++) {

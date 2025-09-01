@@ -1,0 +1,89 @@
+Wamble Database
+================
+
+Overview
+- Backend: PostgreSQL.
+- Purpose: Persist players/sessions, boards, moves, reservations, results, payouts, and predictions.
+- Profiles: Each advertised profile uses its own per-thread database connection.
+
+Connections
+- Per-thread per-listener: Each listener thread opens its own DB connection using
+  that profile's `db-host`, `db-user`, `db-pass`, `db-name`.
+  This supports running multiple profiles against different databases in a single process.
+
+Tables
+- players
+  - `id BIGSERIAL PRIMARY KEY`
+  - `public_key BYTEA UNIQUE NOT NULL` (32 bytes)
+  - `created_at TIMESTAMPTZ DEFAULT NOW()`
+
+- sessions
+  - `id BIGSERIAL PRIMARY KEY`
+  - `token BYTEA UNIQUE NOT NULL` (16 bytes)
+  - `player_id BIGINT NULL REFERENCES players(id)`
+  - `trust_level INTEGER NOT NULL DEFAULT 0`
+  - `created_at TIMESTAMPTZ DEFAULT NOW()`
+  - `last_seen_at TIMESTAMPTZ DEFAULT NOW()`
+  - Indexes: `idx_sessions_token` on `(token)`
+  - Usage:
+    - `trust_level` is used to filter profiles in LIST_PROFILES: only profiles with `visibility <= trust_level` are listed to the client.
+
+- boards
+  - `id BIGSERIAL PRIMARY KEY`
+  - `fen VARCHAR(90) NOT NULL`
+  - `status VARCHAR(16) NOT NULL` in {'ACTIVE','RESERVED','DORMANT','ARCHIVED'}
+  - `created_at TIMESTAMPTZ DEFAULT NOW()`
+  - `updated_at TIMESTAMPTZ DEFAULT NOW()`
+  - Indexes: `idx_boards_status` on `(status)`
+  - Trigger: `trigger_boards_updated_at` updates `updated_at` on update.
+
+- moves
+  - `id BIGSERIAL PRIMARY KEY`
+  - `board_id BIGINT NOT NULL REFERENCES boards(id)`
+  - `session_id BIGINT NOT NULL REFERENCES sessions(id)`
+  - `move_uci VARCHAR(6) NOT NULL`
+  - `move_number INTEGER NOT NULL`
+  - `timestamp TIMESTAMPTZ DEFAULT NOW()`
+  - Indexes: `(board_id)`, `(session_id)`, `(board_id, session_id)`
+
+- reservations
+  - `board_id BIGINT PRIMARY KEY REFERENCES boards(id)`
+  - `session_id BIGINT NOT NULL REFERENCES sessions(id)`
+  - `expires_at TIMESTAMPTZ NOT NULL`
+  - Index: `idx_reservations_expires_at` on `(expires_at)`
+
+- game_results
+  - `board_id BIGINT PRIMARY KEY REFERENCES boards(id)`
+  - `winning_side CHAR(1) NOT NULL` in {'w','b','d'}
+  - `finished_at TIMESTAMPTZ DEFAULT NOW()`
+
+- payouts
+  - `id BIGSERIAL PRIMARY KEY`
+  - `board_id BIGINT NOT NULL REFERENCES boards(id)`
+  - `session_id BIGINT NOT NULL REFERENCES sessions(id)`
+  - `points_awarded DECIMAL(10,4) NOT NULL`
+  - `created_at TIMESTAMPTZ DEFAULT NOW()`
+  - Index: `idx_payouts_session_id` on `(session_id)`
+
+- predictions
+  - `id BIGSERIAL PRIMARY KEY`
+  - `board_id BIGINT NOT NULL REFERENCES boards(id)`
+  - `session_id BIGINT NOT NULL REFERENCES sessions(id)`
+  - `predicted_move_uci VARCHAR(6) NOT NULL`
+  - `status VARCHAR(16) NOT NULL DEFAULT 'PENDING'` in {'PENDING','CORRECT','INCORRECT','EXPIRED'}
+  - `created_at TIMESTAMPTZ DEFAULT NOW()`
+
+Migrations
+- 001_initial_schema.sql: creates all tables, indexes, triggers.
+
+Trust and Visibility
+- Client trust is read from `sessions.trust_level`.
+- On LIST_PROFILES, the server filters advertised profiles where `profile.visibility <= sessions.trust_level` for the requesting token.
+- PROFILE_INFO still returns `name;port;advertise;visibility`; no server-side gating there yet.
+
+Operational Notes
+- Multiple advertised profiles within one process may point to different databases.
+
+Examples
+- Promote a session to trust level 10 by hex token:
+  UPDATE sessions SET trust_level = 10 WHERE token = decode('<hex>', 'hex');

@@ -5,6 +5,7 @@
 
 void handle_message(int sockfd, const struct WambleMsg *msg,
                     const struct sockaddr_in *cliaddr);
+WamblePlayer *login_player(const uint8_t *public_key);
 
 static volatile sig_atomic_t g_reload_requested = 0;
 static volatile sig_atomic_t g_shutdown_requested = 0;
@@ -301,12 +302,6 @@ static void handle_player_move(int sockfd, const struct WambleMsg *msg,
 void handle_message(int sockfd, const struct WambleMsg *msg,
                     const struct sockaddr_in *cliaddr) {
 
-  if (msg->ctrl != WAMBLE_CTRL_ACK) {
-    send_ack(sockfd, msg, cliaddr);
-    LOG_DEBUG("Sent ACK for message type 0x%02x (seq: %u)", msg->ctrl,
-              msg->seq_num);
-  }
-
   switch (msg->ctrl) {
   case WAMBLE_CTRL_CLIENT_HELLO:
     LOG_DEBUG("Handling CLIENT_HELLO message (seq: %u)", msg->seq_num);
@@ -314,12 +309,14 @@ void handle_message(int sockfd, const struct WambleMsg *msg,
     break;
   case WAMBLE_CTRL_PLAYER_MOVE:
     LOG_DEBUG("Handling PLAYER_MOVE message (seq: %u)", msg->seq_num);
+    if ((msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0)
+      send_ack(sockfd, msg, cliaddr);
     handle_player_move(sockfd, msg, cliaddr);
     break;
   case WAMBLE_CTRL_LIST_PROFILES: {
     LOG_DEBUG("Handling LIST_PROFILES message (seq: %u)", msg->seq_num);
     struct WambleMsg resp = {0};
-    resp.ctrl = WAMBLE_CTRL_PROFILE_INFO;
+    resp.ctrl = WAMBLE_CTRL_PROFILES_LIST;
     memcpy(resp.token, msg->token, TOKEN_LENGTH);
 
     int trust = db_get_trust_tier_by_token(msg->token);
@@ -349,8 +346,8 @@ void handle_message(int sockfd, const struct WambleMsg *msg,
                                 get_config()->max_retries);
     break;
   }
-  case WAMBLE_CTRL_PROFILE_INFO: {
-    LOG_DEBUG("Handling PROFILE_INFO message (seq: %u)", msg->seq_num);
+  case WAMBLE_CTRL_GET_PROFILE_INFO: {
+    LOG_DEBUG("Handling GET_PROFILE_INFO message (seq: %u)", msg->seq_num);
     char name[MAX_UCI_LENGTH + 1];
     int nlen = msg->uci_len < MAX_UCI_LENGTH ? msg->uci_len : MAX_UCI_LENGTH;
     memcpy(name, msg->uci, (size_t)nlen);
@@ -370,10 +367,45 @@ void handle_message(int sockfd, const struct WambleMsg *msg,
                                 get_config()->max_retries);
     break;
   }
+  case WAMBLE_CTRL_LOGIN_REQUEST: {
+    LOG_DEBUG("Handling LOGIN_REQUEST message (seq: %u)", msg->seq_num);
+    WamblePlayer *player = NULL;
+    if (msg->login_pubkey[0] || msg->login_pubkey[31]) {
+      player = login_player(msg->login_pubkey);
+    }
+    struct WambleMsg response = {0};
+    if (player) {
+      response.ctrl = WAMBLE_CTRL_LOGIN_SUCCESS;
+      memcpy(response.token, player->token, TOKEN_LENGTH);
+    } else {
+      response.ctrl = WAMBLE_CTRL_LOGIN_FAILED;
+      response.error_code = 1;
+      snprintf(response.error_reason, sizeof(response.error_reason),
+               "invalid or missing public key");
+    }
+    send_reliable_message(sockfd, &response, cliaddr, get_config()->timeout_ms,
+                          get_config()->max_retries);
+    break;
+  }
+  case WAMBLE_CTRL_GET_PLAYER_STATS: {
+    LOG_DEBUG("Handling GET_PLAYER_STATS message (seq: %u)", msg->seq_num);
+    WamblePlayer *player = get_player_by_token(msg->token);
+    if (player) {
+      struct WambleMsg response;
+      response.ctrl = WAMBLE_CTRL_PLAYER_STATS_DATA;
+      memcpy(response.token, player->token, TOKEN_LENGTH);
+      send_reliable_message(sockfd, &response, cliaddr,
+                            get_config()->timeout_ms,
+                            get_config()->max_retries);
+    }
+    break;
+  }
   case WAMBLE_CTRL_ACK:
     LOG_DEBUG("Handling ACK message (seq: %u)", msg->seq_num);
     break;
   default:
+    if ((msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0)
+      send_ack(sockfd, msg, cliaddr);
     LOG_WARN("Unknown message type: 0x%02x", msg->ctrl);
     break;
   }
