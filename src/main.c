@@ -21,6 +21,7 @@ static void handle_sigterm(int signo) {
 }
 
 int main(int argc, char *argv[]) {
+  wamble_net_init();
   const char *config_file = "wamble.conf";
   const char *profile = NULL;
 
@@ -92,7 +93,7 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  int sockfd = -1;
+  wamble_socket_t sockfd = WAMBLE_INVALID_SOCKET;
   if (has_profiles == 0) {
 
     player_manager_init();
@@ -100,7 +101,7 @@ int main(int argc, char *argv[]) {
     board_manager_init();
     LOG_INFO("Board manager initialized");
     sockfd = create_and_bind_socket(get_config()->port);
-    if (sockfd < 0) {
+    if (sockfd == WAMBLE_INVALID_SOCKET) {
       LOG_FATAL("Failed to create and bind socket");
       return 1;
     }
@@ -113,7 +114,7 @@ int main(int argc, char *argv[]) {
   LOG_INFO("Server main loop starting");
   while (!g_shutdown_requested) {
     LOG_DEBUG("Main loop iteration start");
-    if (sockfd >= 0) {
+    if (sockfd != WAMBLE_INVALID_SOCKET) {
       fd_set rfds;
       struct timeval tv;
       FD_ZERO(&rfds);
@@ -175,11 +176,12 @@ int main(int argc, char *argv[]) {
   if (config_profile_count() > 0) {
     stop_profile_listeners();
   }
-  if (sockfd >= 0) {
-    close(sockfd);
+  if (sockfd != WAMBLE_INVALID_SOCKET) {
+    wamble_close_socket(sockfd);
   }
   db_cleanup();
 
+  wamble_net_cleanup();
   return 0;
 }
 

@@ -5,7 +5,7 @@
 #include <string.h>
 
 static WambleConfig g_config;
-static __thread const WambleConfig *g_thread_config = NULL;
+static WAMBLE_THREAD_LOCAL const WambleConfig *g_thread_config = NULL;
 static WambleProfile *g_profiles = NULL;
 static int g_profile_count = 0;
 
