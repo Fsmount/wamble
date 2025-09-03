@@ -47,4 +47,4 @@ The server will start listening for connections on the default port (8888).
 
 ## Configuring
 
-Basically edit the constants in the header before compiling.
+Lisp like configuration run server with `--help` and read docs/configuration.txt for details.
