@@ -2,19 +2,34 @@
 #define WAMBLE_H
 
 #if defined(_WIN32)
-#include <windows.h>
+#define WAMBLE_PLATFORM_WINDOWS
 #elif defined(__unix__) || defined(__APPLE__)
+#define WAMBLE_PLATFORM_POSIX
+#else
+#error "Unsupported platform"
+#endif
+
+#if defined(WAMBLE_PLATFORM_WINDOWS)
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+#include <bcrypt.h>
+#elif defined(WAMBLE_PLATFORM_POSIX)
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
 #include <pthread.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #else
 #define WAMBLE_SINGLE_THREADED
 #endif
 
-#include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <math.h>
-#include <netinet/in.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -22,10 +37,137 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
-#include <sys/socket.h>
 #include <time.h>
+
+#if defined(_MSC_VER)
+#define WAMBLE_WEAK
+#else
+#define WAMBLE_WEAK __attribute__((weak))
+#endif
+
+#ifdef WAMBLE_PLATFORM_WINDOWS
+#define wamble_getpid() GetCurrentProcessId()
+#else
 #include <unistd.h>
+#define wamble_getpid() getpid()
+#endif
+
+#if defined(_MSC_VER) && _MSC_VER < 1900
+static inline size_t wamble_strnlen(const char *s, size_t max) {
+  size_t i = 0;
+  if (!s)
+    return 0;
+  for (; i < max && s[i]; i++) {
+  }
+  return i;
+}
+#define strnlen wamble_strnlen
+#endif
+
+#if __STDC_VERSION__ >= 201112L
+#define WAMBLE_THREAD_LOCAL _Thread_local
+#elif defined(__GNUC__) || defined(__clang__)
+#define WAMBLE_THREAD_LOCAL __thread
+#elif defined(_MSC_VER)
+#define WAMBLE_THREAD_LOCAL __declspec(thread)
+#else
+#define WAMBLE_THREAD_LOCAL
+#endif
+
+#ifdef WAMBLE_PLATFORM_WINDOWS
+typedef SOCKET wamble_socket_t;
+#define WAMBLE_INVALID_SOCKET INVALID_SOCKET
+#else
+typedef int wamble_socket_t;
+#define WAMBLE_INVALID_SOCKET -1
+#endif
+
+#ifdef WAMBLE_PLATFORM_WINDOWS
+typedef int wamble_socklen_t;
+#else
+typedef socklen_t wamble_socklen_t;
+#endif
+
+static inline int wamble_net_init(void);
+static inline void wamble_net_cleanup(void);
+static inline int wamble_close_socket(wamble_socket_t sock);
+static inline int wamble_set_nonblocking(wamble_socket_t sock);
+static inline const char *wamble_inet_ntop(int af, const void *src, char *dst,
+                                           wamble_socklen_t size);
+static inline int wamble_last_error(void);
+static inline const char *wamble_strerror(int err);
+
+#if defined(WAMBLE_PLATFORM_WINDOWS)
+static inline int wamble_net_init(void) {
+  WSADATA wsaData;
+  int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+  if (result != 0) {
+    LOG_FATAL("WSAStartup failed: %d", result);
+  }
+  return result;
+}
+
+static inline void wamble_net_cleanup(void) { WSACleanup(); }
+
+static inline int wamble_close_socket(wamble_socket_t sock) {
+  return closesocket(sock);
+}
+
+static inline int wamble_set_nonblocking(wamble_socket_t sock) {
+  u_long mode = 1;
+  return ioctlsocket(sock, FIONBIO, &mode);
+}
+
+static inline const char *wamble_inet_ntop(int af, const void *src, char *dst,
+                                           wamble_socklen_t size) {
+
+  if (af == AF_INET) {
+    struct in_addr tmp;
+    memcpy(&tmp, src, sizeof(struct in_addr));
+    return InetNtop(af, &tmp, dst, size);
+  } else if (af == AF_INET6) {
+    struct in6_addr tmp;
+    memcpy(&tmp, src, sizeof(struct in6_addr));
+    return InetNtop(af, &tmp, dst, size);
+  }
+  return NULL;
+}
+
+static inline int wamble_last_error(void) { return WSAGetLastError(); }
+
+static inline const char *wamble_strerror(int err) {
+  static WAMBLE_THREAD_LOCAL char buffer[256];
+  FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                 NULL, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), buffer,
+                 sizeof(buffer), NULL);
+  return buffer;
+}
+
+#elif defined(WAMBLE_PLATFORM_POSIX)
+static inline int wamble_net_init(void) { return 0; }
+
+static inline void wamble_net_cleanup(void) {}
+
+static inline int wamble_close_socket(wamble_socket_t sock) {
+  return close(sock);
+}
+
+static inline int wamble_set_nonblocking(wamble_socket_t sock) {
+  int flags = fcntl(sock, F_GETFL, 0);
+  if (flags == -1)
+    return -1;
+  return fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+}
+
+static inline const char *wamble_inet_ntop(int af, const void *src, char *dst,
+                                           wamble_socklen_t size) {
+  return inet_ntop(af, src, dst, size);
+}
+
+static inline int wamble_last_error(void) { return errno; }
+
+static inline const char *wamble_strerror(int err) { return strerror(err); }
+#endif
 
 #define LOG_LEVEL_FATAL 0
 #define LOG_LEVEL_ERROR 1
@@ -414,7 +556,7 @@ static inline void wamble_log(int level, const char *file, int line,
 #define WAMBLE_CTRL_SPECTATE_GAME 0x0B
 #define WAMBLE_CTRL_SPECTATE_UPDATE 0x0C
 
-#define WAMBLE_CTRL_LOGIN 0x0D
+#define WAMBLE_CTRL_LOGIN_REQUEST 0x0D
 #define WAMBLE_CTRL_LOGOUT 0x0E
 #define WAMBLE_CTRL_LOGIN_SUCCESS 0x0F
 #define WAMBLE_CTRL_LOGIN_FAILED 0x10
@@ -668,7 +810,7 @@ void db_async_record_move(uint64_t board_id, uint64_t session_id,
 void db_async_record_payout(uint64_t board_id, uint64_t session_id,
                             double points);
 
-void db_cleanup_thread(void) __attribute__((weak));
+void db_cleanup_thread(void) WAMBLE_WEAK;
 
 int db_get_trust_tier_by_token(const uint8_t *token);
 
@@ -678,17 +820,17 @@ double rng_double(void);
 void rng_bytes(uint8_t *out, size_t len);
 void db_archive_inactive_boards(int timeout_seconds);
 
-int create_and_bind_socket(int port);
-int receive_message(int sockfd, struct WambleMsg *msg,
+wamble_socket_t create_and_bind_socket(int port);
+int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
                     struct sockaddr_in *cliaddr);
-void send_ack(int sockfd, const struct WambleMsg *msg,
+void send_ack(wamble_socket_t sockfd, const struct WambleMsg *msg,
               const struct sockaddr_in *cliaddr);
-int send_reliable_message(int sockfd, const struct WambleMsg *msg,
+int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
                           const struct sockaddr_in *cliaddr, int timeout_ms,
                           int max_retries);
-void handle_message(int sockfd, const struct WambleMsg *msg,
+void handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
                     const struct sockaddr_in *cliaddr);
-int wait_for_ack(int sockfd, const uint8_t *expected_token,
+int wait_for_ack(wamble_socket_t sockfd, const uint8_t *expected_token,
                  uint32_t expected_seq, int timeout_ms);
 
 static inline int tokens_equal(const uint8_t *token1, const uint8_t *token2) {

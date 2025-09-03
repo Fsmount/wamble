@@ -2,7 +2,7 @@
 #include <libpq-fe.h>
 #include <string.h>
 
-static __thread PGconn *db_conn_tls = NULL;
+static WAMBLE_THREAD_LOCAL PGconn *db_conn_tls = NULL;
 static bool db_initialized = false;
 
 static void build_conn_string_from_cfg(const WambleConfig *cfg, char *out,

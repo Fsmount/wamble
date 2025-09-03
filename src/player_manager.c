@@ -2,26 +2,18 @@
 #include <fcntl.h>
 #include <string.h>
 #include <unistd.h>
-#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) ||      \
-    defined(__NetBSD__)
-#include <stdlib.h>
-#elif defined(_WIN32)
-#include <bcrypt.h>
-#include <windows.h>
-#elif defined(__linux__)
+#if defined(__linux__)
 #include <sys/random.h>
 #endif
 
-static __thread WamblePlayer *player_pool;
-static __thread int num_players = 0;
-static __thread wamble_mutex_t player_mutex;
+static WAMBLE_THREAD_LOCAL WamblePlayer *player_pool;
+static WAMBLE_THREAD_LOCAL int num_players = 0;
+static WAMBLE_THREAD_LOCAL wamble_mutex_t player_mutex;
 
-static const char base64url_chars[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-static __thread wamble_mutex_t rng_mutex;
-static __thread int rng_initialized = 0;
-static __thread uint64_t pcg_state = 0x853c49e6748fea9bULL;
-static __thread uint64_t pcg_inc = 0xda3e39cb94b95bdbULL;
+static WAMBLE_THREAD_LOCAL wamble_mutex_t rng_mutex;
+static WAMBLE_THREAD_LOCAL int rng_initialized = 0;
+static WAMBLE_THREAD_LOCAL uint64_t pcg_state = 0x853c49e6748fea9bULL;
+static WAMBLE_THREAD_LOCAL uint64_t pcg_inc = 0xda3e39cb94b95bdbULL;
 
 static inline uint32_t pcg32_random_r(void) {
   uint64_t oldstate = pcg_state;
@@ -50,7 +42,7 @@ void rng_init(void) {
 
   uint64_t seed1 = (uint64_t)time(NULL);
   uint64_t seed2 = (uint64_t)clock();
-  uint64_t seed3 = (uint64_t)getpid();
+  uint64_t seed3 = (uint64_t)wamble_getpid();
   uint64_t seed4 = (uint64_t)(uintptr_t)&seed1;
   uint64_t entropy = mix64(seed1) ^ mix64(seed2) ^ mix64(seed3) ^ mix64(seed4);
 
@@ -115,7 +107,7 @@ void rng_bytes(uint8_t *out, size_t len) {
 }
 
 #define PLAYER_MAP_SIZE (get_config()->max_players * 2)
-static __thread int *player_index_map;
+static WAMBLE_THREAD_LOCAL int *player_index_map;
 
 static uint64_t token_hash(const uint8_t *token) {
   uint64_t h = 1469598103934665603ULL;

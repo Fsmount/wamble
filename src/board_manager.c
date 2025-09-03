@@ -3,14 +3,14 @@
 #include <string.h>
 #include <unistd.h>
 
-static __thread WambleBoard *board_pool;
-static __thread int num_boards = 0;
-static __thread uint64_t next_board_id = 1;
+static WAMBLE_THREAD_LOCAL WambleBoard *board_pool;
+static WAMBLE_THREAD_LOCAL int num_boards = 0;
+static WAMBLE_THREAD_LOCAL uint64_t next_board_id = 1;
 static wamble_thread_t board_manager_thread;
-static __thread wamble_mutex_t board_mutex;
+static WAMBLE_THREAD_LOCAL wamble_mutex_t board_mutex;
 
 #define BOARD_MAP_SIZE (get_config()->max_boards * 2)
-static __thread int *board_index_map;
+static WAMBLE_THREAD_LOCAL int *board_index_map;
 
 static inline uint64_t mix64_hash(uint64_t x) {
   x ^= x >> 33;

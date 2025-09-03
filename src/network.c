@@ -1,11 +1,19 @@
 #include "../include/wamble/wamble.h"
-#include <arpa/inet.h>
-#include <errno.h>
-#include <fcntl.h>
+
+#if !defined(__STDC_VERSION__) || (__STDC_VERSION__ < 201112L)
+#ifndef HAVE_STRNLEN_DECL
 #include <string.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <unistd.h>
+static size_t wamble_local_strnlen(const char *s, size_t max) {
+  size_t i = 0;
+  if (!s)
+    return 0;
+  for (; i < max && s[i]; i++) {
+  }
+  return i;
+}
+#define strnlen wamble_local_strnlen
+#endif
+#endif
 
 #pragma pack(push, 1)
 typedef struct WambleHeader {
@@ -23,12 +31,12 @@ typedef struct WambleHeader {
 #define WAMBLE_HEADER_SIZE (sizeof(WambleHeader))
 #define WAMBLE_MAX_PACKET_SIZE (WAMBLE_HEADER_SIZE + WAMBLE_MAX_PAYLOAD)
 
-static __thread WambleClientSession *client_sessions;
-static __thread int num_sessions = 0;
-static __thread uint32_t global_seq_num = 1;
+static WAMBLE_THREAD_LOCAL WambleClientSession *client_sessions;
+static WAMBLE_THREAD_LOCAL int num_sessions = 0;
+static WAMBLE_THREAD_LOCAL uint32_t global_seq_num = 1;
 
 #define SESSION_MAP_SIZE (get_config()->max_client_sessions * 2)
-static __thread int *session_index_map;
+static WAMBLE_THREAD_LOCAL int *session_index_map;
 
 static inline uint64_t mix64_s(uint64_t x) {
   x ^= x >> 33;
@@ -91,21 +99,23 @@ static int session_map_get(const struct sockaddr_in *addr) {
   return -1;
 }
 
-static uint64_t host_to_net64(uint64_t host_val) {
-  uint64_t net_val = 0;
-  for (int i = 0; i < 8; i++) {
-    net_val = (net_val << 8) | ((host_val >> (8 * i)) & 0xFF);
-  }
-  return net_val;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+static inline uint64_t host_to_net64(uint64_t x) { return x; }
+static inline uint64_t net_to_host64(uint64_t x) { return x; }
+#else
+static inline uint64_t host_to_net64(uint64_t x) {
+  uint32_t hi = (uint32_t)(x >> 32);
+  uint32_t lo = (uint32_t)(x & 0xffffffffu);
+  uint64_t n = ((uint64_t)htonl(lo) << 32) | htonl(hi);
+  return n;
 }
-
-static uint64_t net_to_host64(uint64_t net_val) {
-  uint64_t host_val = 0;
-  for (int i = 0; i < 8; i++) {
-    host_val = (host_val << 8) | ((net_val >> (8 * i)) & 0xFF);
-  }
-  return host_val;
+static inline uint64_t net_to_host64(uint64_t x) {
+  uint32_t hi = (uint32_t)(x >> 32);
+  uint32_t lo = (uint32_t)(x & 0xffffffffu);
+  uint64_t h = ((uint64_t)ntohl(lo) << 32) | ntohl(hi);
+  return h;
 }
+#endif
 
 int serialize_wamble_msg(const struct WambleMsg *msg, uint8_t *buffer,
                          size_t buffer_capacity, size_t *out_len,
@@ -426,7 +436,7 @@ create_client_session(const struct sockaddr_in *addr, const uint8_t *token) {
   session->next_seq_num = 1;
   session_map_put(addr, (int)(session - client_sessions));
   char ip_str[INET_ADDRSTRLEN];
-  inet_ntop(AF_INET, &(addr->sin_addr), ip_str, INET_ADDRSTRLEN);
+  wamble_inet_ntop(AF_INET, &(addr->sin_addr), ip_str, INET_ADDRSTRLEN);
   LOG_INFO("Created new client session for %s:%d", ip_str,
            ntohs(addr->sin_port));
   return session;
@@ -540,30 +550,34 @@ void network_init_thread_state(void) {
 }
 
 int create_and_bind_socket(int port) {
-  int sockfd;
+  wamble_socket_t sockfd;
   struct sockaddr_in servaddr;
 
   LOG_DEBUG("Attempting to create socket");
-  if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-    LOG_FATAL("socket creation failed: %s", strerror(errno));
+  if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) == WAMBLE_INVALID_SOCKET) {
+    LOG_FATAL("socket creation failed: %s",
+              wamble_strerror(wamble_last_error()));
     return -1;
   }
-  LOG_INFO("Socket created successfully (sockfd: %d)", sockfd);
+  LOG_INFO("Socket created successfully (sockfd: %d)", (int)sockfd);
 
   int optval = 1;
-  if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) <
-      0) {
-    LOG_WARN("setsockopt SO_REUSEADDR failed: %s", strerror(errno));
+  if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (const char *)&optval,
+                 sizeof(optval)) < 0) {
+    LOG_WARN("setsockopt SO_REUSEADDR failed: %s",
+             wamble_strerror(wamble_last_error()));
   }
 
   int buffer_size = get_config()->buffer_size;
-  if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &buffer_size,
+  if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (const char *)&buffer_size,
                  sizeof(buffer_size)) < 0) {
-    LOG_WARN("setsockopt SO_RCVBUF failed: %s", strerror(errno));
+    LOG_WARN("setsockopt SO_RCVBUF failed: %s",
+             wamble_strerror(wamble_last_error()));
   }
-  if (setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &buffer_size,
+  if (setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (const char *)&buffer_size,
                  sizeof(buffer_size)) < 0) {
-    LOG_WARN("setsockopt SO_SNDBUF failed: %s", strerror(errno));
+    LOG_WARN("setsockopt SO_SNDBUF failed: %s",
+             wamble_strerror(wamble_last_error()));
   }
 
   memset(&servaddr, 0, sizeof(servaddr));
@@ -574,36 +588,49 @@ int create_and_bind_socket(int port) {
 
   LOG_DEBUG("Attempting to bind socket to port %d", port);
   if (bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
-    LOG_FATAL("bind failed: %s", strerror(errno));
-    close(sockfd);
+    LOG_FATAL("bind failed: %s", wamble_strerror(wamble_last_error()));
+    wamble_close_socket(sockfd);
     return -1;
   }
   LOG_INFO("Socket bound successfully to port %d", port);
 
-  int flags = fcntl(sockfd, F_GETFL, 0);
-  if (flags >= 0) {
-    (void)fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+  if (wamble_set_nonblocking(sockfd) != 0) {
+    LOG_WARN("Failed to set socket to non-blocking mode: %s",
+             wamble_strerror(wamble_last_error()));
+  } else {
     LOG_DEBUG("Socket set to non-blocking mode");
   }
 
   LOG_DEBUG("Initializing session map");
   network_init_thread_state();
 
-  return sockfd;
+  return (int)sockfd;
 }
 
-int receive_message(int sockfd, struct WambleMsg *msg,
+int receive_message(int sockfd_int, struct WambleMsg *msg,
                     struct sockaddr_in *cliaddr) {
-  socklen_t len = sizeof(*cliaddr);
+  wamble_socket_t sockfd = (wamble_socket_t)sockfd_int;
+  wamble_socklen_t len = sizeof(*cliaddr);
   static uint8_t receive_buffer[WAMBLE_MAX_PACKET_SIZE];
 
   ssize_t bytes_received =
-      recvfrom(sockfd, receive_buffer, WAMBLE_MAX_PACKET_SIZE, 0,
+      recvfrom(sockfd, (char *)receive_buffer, WAMBLE_MAX_PACKET_SIZE, 0,
                (struct sockaddr *)cliaddr, &len);
 
   if (bytes_received <= 0) {
-    LOG_DEBUG("recvfrom returned %zd", bytes_received);
-    return bytes_received;
+    if (bytes_received < 0) {
+      int err = wamble_last_error();
+#ifdef WAMBLE_PLATFORM_WINDOWS
+      if (err != WSAEWOULDBLOCK) {
+        LOG_DEBUG("recvfrom failed: %s", wamble_strerror(err));
+      }
+#else
+      if (err != EWOULDBLOCK && err != EAGAIN) {
+        LOG_DEBUG("recvfrom failed: %s", wamble_strerror(err));
+      }
+#endif
+    }
+    return (int)bytes_received;
   }
 
   LOG_DEBUG("Received %zd bytes from client", bytes_received);
@@ -634,16 +661,17 @@ int receive_message(int sockfd, struct WambleMsg *msg,
       (msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0) {
     update_client_session(cliaddr, msg->token, msg->seq_num);
     char ip_str[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &(cliaddr->sin_addr), ip_str, INET_ADDRSTRLEN);
+    wamble_inet_ntop(AF_INET, &(cliaddr->sin_addr), ip_str, INET_ADDRSTRLEN);
     LOG_DEBUG("Updated client session for %s:%d (seq: %u)", ip_str,
               ntohs(cliaddr->sin_port), msg->seq_num);
   }
 
-  return bytes_received;
+  return (int)bytes_received;
 }
 
-void send_ack(int sockfd, const struct WambleMsg *msg,
+void send_ack(int sockfd_int, const struct WambleMsg *msg,
               const struct sockaddr_in *cliaddr) {
+  wamble_socket_t sockfd = (wamble_socket_t)sockfd_int;
   struct WambleMsg ack_msg;
   ack_msg.ctrl = WAMBLE_CTRL_ACK;
   memcpy(ack_msg.token, msg->token, TOKEN_LENGTH);
@@ -662,17 +690,18 @@ void send_ack(int sockfd, const struct WambleMsg *msg,
   }
 
   char ip_str[INET_ADDRSTRLEN];
-  inet_ntop(AF_INET, &(cliaddr->sin_addr), ip_str, INET_ADDRSTRLEN);
+  wamble_inet_ntop(AF_INET, &(cliaddr->sin_addr), ip_str, INET_ADDRSTRLEN);
   LOG_DEBUG(
       "Sending ACK for message (ctrl: 0x%02x, seq: %u, board_id: %lu) to %s:%d",
       msg->ctrl, msg->seq_num, msg->board_id, ip_str, ntohs(cliaddr->sin_port));
 
-  sendto(sockfd, send_buffer, (int)serialized_size, 0,
+  sendto(sockfd, (const char *)send_buffer, (int)serialized_size, 0,
          (const struct sockaddr *)cliaddr, sizeof(*cliaddr));
 }
 
-int wait_for_ack(int sockfd, const uint8_t *expected_token,
+int wait_for_ack(int sockfd_int, const uint8_t *expected_token,
                  uint32_t expected_seq, int timeout_ms) {
+  wamble_socket_t sockfd = (wamble_socket_t)sockfd_int;
   fd_set readfds;
   struct timeval timeout;
 
@@ -685,9 +714,10 @@ int wait_for_ack(int sockfd, const uint8_t *expected_token,
   FD_ZERO(&readfds);
   FD_SET(sockfd, &readfds);
 
-  int result = select(sockfd + 1, &readfds, NULL, NULL, &timeout);
+  int result = select((int)sockfd + 1, &readfds, NULL, NULL, &timeout);
   if (result == -1) {
-    LOG_WARN("select failed while waiting for ACK: %s", strerror(errno));
+    LOG_WARN("select failed while waiting for ACK: %s",
+             wamble_strerror(wamble_last_error()));
     return -1;
   } else if (result == 0) {
     LOG_DEBUG("select timed out while waiting for ACK for seq %u",
@@ -698,10 +728,11 @@ int wait_for_ack(int sockfd, const uint8_t *expected_token,
   static uint8_t ack_buffer[WAMBLE_MAX_PACKET_SIZE];
   struct WambleMsg ack_msg;
   struct sockaddr_in cliaddr;
-  socklen_t len = sizeof(cliaddr);
+  wamble_socklen_t len = sizeof(cliaddr);
 
-  int bytes_received = recvfrom(sockfd, ack_buffer, WAMBLE_MAX_PACKET_SIZE, 0,
-                                (struct sockaddr *)&cliaddr, &len);
+  int bytes_received =
+      recvfrom(sockfd, (char *)ack_buffer, WAMBLE_MAX_PACKET_SIZE, 0,
+               (struct sockaddr *)&cliaddr, &len);
 
   if (bytes_received > 0) {
     uint8_t flags = 0;
@@ -718,9 +749,10 @@ int wait_for_ack(int sockfd, const uint8_t *expected_token,
   return -1;
 }
 
-int send_reliable_message(int sockfd, const struct WambleMsg *msg,
+int send_reliable_message(int sockfd_int, const struct WambleMsg *msg,
                           const struct sockaddr_in *cliaddr, int timeout_ms,
                           int max_retries) {
+  wamble_socket_t sockfd = (wamble_socket_t)sockfd_int;
   if (timeout_ms <= 0)
     timeout_ms = get_config()->timeout_ms;
   if (max_retries <= 0)
@@ -730,7 +762,7 @@ int send_reliable_message(int sockfd, const struct WambleMsg *msg,
 
   WambleClientSession *session = find_client_session(cliaddr);
   char ip_str[INET_ADDRSTRLEN];
-  inet_ntop(AF_INET, &(cliaddr->sin_addr), ip_str, INET_ADDRSTRLEN);
+  wamble_inet_ntop(AF_INET, &(cliaddr->sin_addr), ip_str, INET_ADDRSTRLEN);
 
   if (!session) {
     LOG_DEBUG(
@@ -770,18 +802,19 @@ int send_reliable_message(int sockfd, const struct WambleMsg *msg,
 
   int current_timeout = timeout_ms;
   for (int attempt = 0; attempt < max_retries; attempt++) {
-    int bytes_sent = sendto(sockfd, send_buffer, (int)serialized_size, 0,
-                            (const struct sockaddr *)cliaddr, sizeof(*cliaddr));
+    int bytes_sent =
+        sendto(sockfd, (const char *)send_buffer, (int)serialized_size, 0,
+               (const struct sockaddr *)cliaddr, sizeof(*cliaddr));
 
     if (bytes_sent < 0) {
-      LOG_ERROR("sendto failed: %s", strerror(errno));
+      LOG_ERROR("sendto failed: %s", wamble_strerror(wamble_last_error()));
       return -1;
     }
     LOG_DEBUG("Sent %d bytes (attempt %d/%d) for seq %u to %s:%d", bytes_sent,
               attempt + 1, max_retries, reliable_msg.seq_num, ip_str,
               ntohs(cliaddr->sin_port));
 
-    if (wait_for_ack(sockfd, reliable_msg.token, reliable_msg.seq_num,
+    if (wait_for_ack((int)sockfd, reliable_msg.token, reliable_msg.seq_num,
                      current_timeout) == 0) {
       LOG_DEBUG("Received ACK for seq %u from %s:%d", reliable_msg.seq_num,
                 ip_str, ntohs(cliaddr->sin_port));
