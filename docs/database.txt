@@ -44,7 +44,7 @@ Tables
   - `move_uci VARCHAR(6) NOT NULL`
   - `move_number INTEGER NOT NULL`
   - `timestamp TIMESTAMPTZ DEFAULT NOW()`
-  - Indexes: `(board_id)`, `(session_id)`, `(board_id, session_id)`
+  - Indexes: `(board_id)`, `(session_id)`
 
 - reservations
   - `board_id BIGINT PRIMARY KEY REFERENCES boards(id)`

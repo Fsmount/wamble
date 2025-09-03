@@ -8,6 +8,11 @@ Overview
 - Encoding: Base64url for tokens (logs/URLs).
 
 Message Layout
+- Transport: UDP with a custom header and a variable payload.
+- The `WambleMsg` struct in the source code is a container for message
+  data, not a direct representation of the on-the-wire format.
+- All packets share a common header, followed by a payload specific to the
+  message's control code (`ctrl`).
 - Common header (all packets):
   - `ctrl` (uint8): Control code for packet type.
   - `flags` (uint8): `0x80` bit indicates unreliable packet.
@@ -16,7 +21,7 @@ Message Layout
   - `token` (uint8[16]): Session token.
   - `board_id` (uint64): Board context (0 if not applicable).
   - `seq_num` (uint32): Reliable sequencing number.
-  - `payload_len` (uint16): Length of payload data.
+  - `payload_len` (uint16): Length of the payload data that follows the header.
 - Endianness:
   - `board_id`: Big-endian (8 bytes).
   - `seq_num`, `payload_len`: Network byte order (big-endian).
