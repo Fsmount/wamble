@@ -82,7 +82,6 @@ void board_manager_init(void) {
     free(board_index_map);
     wamble_mutex_destroy(&board_mutex);
   }
-  LOG_INFO("Initializing board manager");
   board_pool = malloc(sizeof(WambleBoard) * get_config()->max_boards);
   board_index_map = malloc(sizeof(int) * (get_config()->max_boards * 2));
   memset(board_pool, 0, sizeof(WambleBoard) * get_config()->max_boards);
@@ -95,7 +94,6 @@ void board_manager_init(void) {
   uint64_t board_ids[get_config()->max_boards];
   int dormant_count =
       db_get_boards_by_status("DORMANT", board_ids, get_config()->max_boards);
-  LOG_INFO("Found %d dormant boards in the database", dormant_count);
 
   for (int i = 0; i < dormant_count && i < get_config()->max_boards; i++) {
     WambleBoard *board = &board_pool[num_boards++];
@@ -117,18 +115,16 @@ void board_manager_init(void) {
         next_board_id = board->id + 1;
       }
       board_map_put(board->id, i);
-      LOG_DEBUG("Loaded dormant board %lu", board->id);
+      (void)0;
     } else {
-      LOG_WARN("Failed to load board details for dormant board id %lu",
-               board->id);
+      (void)0;
       num_boards--;
     }
   }
 
   int boards_to_create = get_config()->min_boards - num_boards;
   if (boards_to_create > 0) {
-    LOG_INFO("Creating %d new boards to meet the minimum of %d",
-             boards_to_create, get_config()->min_boards);
+    (void)0;
     for (int i = 0; i < boards_to_create; i++) {
       if (num_boards < get_config()->max_boards) {
         WambleBoard *board = &board_pool[num_boards++];
@@ -137,7 +133,7 @@ void board_manager_init(void) {
 
         board->id = db_create_board(board->fen);
         if (board->id == 0) {
-          LOG_WARN("Failed to create board in database, using next_board_id");
+          (void)0;
           board->id = next_board_id++;
         } else {
           if (board->id >= next_board_id) {
@@ -155,11 +151,11 @@ void board_manager_init(void) {
         board->reservation_time = 0;
         board->reserved_for_white = false;
         board_map_put(board->id, num_boards - 1);
-        LOG_DEBUG("Created new board with id %lu", board->id);
+        (void)0;
       }
     }
   }
-  LOG_INFO("Board manager initialized with %d boards", num_boards);
+  (void)0;
 }
 
 int start_board_manager_thread(void) {
@@ -252,7 +248,7 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
                                   get_config()->reservation_timeout);
     }
 
-    LOG_DEBUG("Reserved board %lu for player", selected_board->id);
+    (void)0;
     return selected_board;
   }
 
@@ -293,11 +289,11 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
                                   get_config()->reservation_timeout);
     }
 
-    LOG_INFO("Created new board %lu for player", board->id);
+    (void)0;
     return board;
   }
 
-  LOG_WARN("Failed to find or create a board for player");
+  (void)0;
   return NULL;
 }
 
@@ -314,7 +310,7 @@ void release_board(uint64_t board_id) {
 
       db_async_update_board(board_id, board_pool[i].fen, "ACTIVE");
       db_async_remove_reservation(board_id);
-      LOG_INFO("Released board %lu", board_id);
+      (void)0;
       break;
     }
   }
@@ -339,7 +335,7 @@ void archive_board(uint64_t board_id) {
       }
       db_async_record_game_result(board_id, winning_side);
 
-      LOG_INFO("Archived board %lu", board_id);
+      (void)0;
       break;
     }
   }

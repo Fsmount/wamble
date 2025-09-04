@@ -179,7 +179,7 @@ static LispValue *parse_list(Stream *s) {
   while (s->p < s->end && *s->p != ')') {
     skip_whitespace(s);
     if (s->p >= s->end) {
-      LOG_ERROR("Unterminated list in config");
+      (void)0;
       free_lisp_value(head);
       return NULL;
     }
@@ -190,7 +190,7 @@ static LispValue *parse_list(Stream *s) {
     skip_whitespace(s);
   }
   if (s->p >= s->end) {
-    LOG_ERROR("Unterminated list in config");
+    (void)0;
     free_lisp_value(head);
     return NULL;
   }
@@ -325,7 +325,7 @@ static LispValue *eval_list(LispEnv *env, LispValue *list) {
     free_lisp_value(op_res);
     return result;
   }
-  LOG_ERROR("Not a function");
+  (void)0;
   free_lisp_value(op_res);
   return make_value(LISP_VALUE_NIL);
 }
@@ -908,7 +908,10 @@ static void free_profiles(void) {
   g_profile_count = 0;
 }
 
-void config_load(const char *filename, const char *profile) {
+ConfigLoadStatus config_load(const char *filename, const char *profile,
+                             char *status_msg, size_t status_msg_size) {
+  if (status_msg && status_msg_size)
+    status_msg[0] = '\0';
   free(g_config.db_host);
   free(g_config.db_user);
   free(g_config.db_pass);
@@ -916,10 +919,18 @@ void config_load(const char *filename, const char *profile) {
   config_set_defaults();
   free_profiles();
 
+  if (!filename) {
+    if (status_msg && status_msg_size)
+      snprintf(status_msg, status_msg_size, "defaults: no file provided");
+    return CONFIG_LOAD_DEFAULTS;
+  }
+
   FILE *f = fopen(filename, "r");
   if (!f) {
-    LOG_WARN("Failed to open config file: %s. Using defaults.", filename);
-    return;
+    if (status_msg && status_msg_size)
+      snprintf(status_msg, status_msg_size, "defaults: cannot open %s",
+               filename);
+    return CONFIG_LOAD_DEFAULTS;
   }
   fseek(f, 0, SEEK_END);
   long fsize = ftell(f);
@@ -1134,12 +1145,19 @@ void config_load(const char *filename, const char *profile) {
         g_profile_count = built;
       }
 
+      int applied_profile = 0;
       if (profile) {
         for (int i = 0; i < g_profile_count; i++) {
           if (g_profiles[i].name && strcmp(g_profiles[i].name, profile) == 0) {
             g_config = g_profiles[i].config;
+            applied_profile = 1;
             break;
           }
+        }
+        if (!applied_profile && status_msg && status_msg_size) {
+
+          snprintf(status_msg, status_msg_size,
+                   "loaded %s, profile '%s' not found", filename, profile);
         }
       }
 
@@ -1151,6 +1169,25 @@ void config_load(const char *filename, const char *profile) {
 
   lisp_env_free(env);
   free(source);
+  if (profile) {
+    int found = 0;
+    for (int i = 0; i < g_profile_count; i++) {
+      if (g_profiles[i].name && strcmp(g_profiles[i].name, profile) == 0) {
+        found = 1;
+        break;
+      }
+    }
+    if (!found) {
+      if (status_msg && status_msg_size)
+        snprintf(status_msg, status_msg_size,
+                 "loaded %s, profile '%s' not found", filename, profile);
+      return CONFIG_LOAD_PROFILE_NOT_FOUND;
+    }
+  }
+
+  if (status_msg && status_msg_size)
+    snprintf(status_msg, status_msg_size, "loaded %s", filename);
+  return CONFIG_LOAD_OK;
 }
 
 int config_profile_count(void) { return g_profile_count; }

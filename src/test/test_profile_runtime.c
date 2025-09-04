@@ -104,7 +104,7 @@ static void test_lifecycle(void) {
   next_fd = 100;
   write_conf("(defprofile a ((def port 12012) (def advertise 1)))\n"
              "(defprofile b ((def port 12013) (def advertise 1)))\n");
-  config_load(conf_path, NULL);
+  config_load(conf_path, NULL, NULL, 0);
   int started = start_profile_listeners();
   assert(started == 2);
   assert(bind_count >= 2);
@@ -113,7 +113,7 @@ static void test_lifecycle(void) {
 
   write_conf("(defprofile c ((def port 12014) (def advertise 1)))\n"
              "(defprofile d ((def port 12015) (def advertise 1)))\n");
-  config_load(conf_path, NULL);
+  config_load(conf_path, NULL, NULL, 0);
   reconcile_profile_listeners();
   assert(bind_count >= 4);
   int saw_12014 = 0, saw_12015 = 0;
@@ -135,14 +135,14 @@ static void test_overlap(void) {
   next_fd = 200;
   write_conf("(defprofile a ((def port 12020) (def advertise 1)))\n"
              "(defprofile b ((def port 12021) (def advertise 1)))\n");
-  config_load(conf_path, NULL);
+  config_load(conf_path, NULL, NULL, 0);
   start_profile_listeners();
   assert(bind_count == 2);
 
   write_conf("(def select-timeout-usec 5000)\n"
              "(defprofile a ((def port 12020) (def advertise 1)))\n"
              "(defprofile b ((def port 12021) (def advertise 1)))\n");
-  config_load(conf_path, NULL);
+  config_load(conf_path, NULL, NULL, 0);
   reconcile_profile_listeners();
   assert(bind_count == 2);
   assert(close_count == 0);
@@ -156,12 +156,12 @@ static void test_empty_config(void) {
   close_count = 0;
   next_fd = 300;
   write_conf("(defprofile a ((def port 12030) (def advertise 1)))\n");
-  config_load(conf_path, NULL);
+  config_load(conf_path, NULL, NULL, 0);
   start_profile_listeners();
   assert(bind_count == 1);
 
   write_conf("");
-  config_load(conf_path, NULL);
+  config_load(conf_path, NULL, NULL, 0);
   reconcile_profile_listeners();
   assert(close_count == 1);
 
@@ -174,7 +174,7 @@ static void test_inheritance(void) {
   next_fd = 400;
   write_conf("(defprofile base ((def port 12040)))\n"
              "(defprofile child (:inherits base ((def advertise 1))))\n");
-  config_load(conf_path, NULL);
+  config_load(conf_path, NULL, NULL, 0);
   start_profile_listeners();
   assert(bind_count == 1);
   assert(binds[0].port == 12040);

@@ -21,7 +21,10 @@ static void handle_sigterm(int signo) {
 }
 
 int main(int argc, char *argv[]) {
-  wamble_net_init();
+  if (wamble_net_init() != 0) {
+    LOG_FATAL("Network initialization failed");
+    return 1;
+  }
   const char *config_file = "wamble.conf";
   const char *profile = NULL;
 
@@ -55,7 +58,17 @@ int main(int argc, char *argv[]) {
     LOG_INFO("Using default configuration from config file: %s", config_file);
   }
 
-  config_load(config_file, profile);
+  char cfg_status[128];
+  ConfigLoadStatus cfg =
+      config_load(config_file, profile, cfg_status, sizeof(cfg_status));
+  if (cfg == CONFIG_LOAD_DEFAULTS) {
+    LOG_WARN("Config: %s (using defaults)",
+             cfg_status[0] ? cfg_status : "defaults");
+  } else if (cfg == CONFIG_LOAD_PROFILE_NOT_FOUND) {
+    LOG_WARN("Config: %s", cfg_status[0] ? cfg_status : "profile not found");
+  } else if (cfg != CONFIG_LOAD_OK) {
+    LOG_WARN("Config: unexpected status");
+  }
 
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
@@ -162,7 +175,15 @@ int main(int argc, char *argv[]) {
     }
     if (g_reload_requested) {
       LOG_INFO("Reload requested; reloading config and reconciling listeners");
-      config_load(config_file, profile);
+      ConfigLoadStatus rcfg =
+          config_load(config_file, profile, cfg_status, sizeof(cfg_status));
+      if (rcfg == CONFIG_LOAD_DEFAULTS) {
+        LOG_WARN("Config reload: %s (using defaults)",
+                 cfg_status[0] ? cfg_status : "defaults");
+      } else if (rcfg == CONFIG_LOAD_PROFILE_NOT_FOUND) {
+        LOG_WARN("Config reload: %s",
+                 cfg_status[0] ? cfg_status : "profile not found");
+      }
       if (config_profile_count() > 0) {
         reconcile_profile_listeners();
       }
@@ -189,7 +210,7 @@ static void handle_client_hello(int sockfd, const struct WambleMsg *msg,
                                 const struct sockaddr_in *cliaddr) {
   char token_str[TOKEN_LENGTH * 2 + 1];
   format_token_for_url(msg->token, token_str);
-  LOG_INFO("Received Client Hello from token: %s", token_str);
+  LOG_DEBUG("Received Client Hello from token: %s", token_str);
 
   WamblePlayer *player = get_player_by_token(msg->token);
   if (!player) {
@@ -233,8 +254,8 @@ static void handle_player_move(int sockfd, const struct WambleMsg *msg,
                                const struct sockaddr_in *cliaddr) {
   char token_str[TOKEN_LENGTH * 2 + 1];
   format_token_for_url(msg->token, token_str);
-  LOG_INFO("Received Player Move from token: %s for board %lu", token_str,
-           msg->board_id);
+  LOG_DEBUG("Received Player Move from token: %s for board %lu", token_str,
+            msg->board_id);
 
   WamblePlayer *player = get_player_by_token(msg->token);
   if (!player) {
@@ -257,8 +278,12 @@ static void handle_player_move(int sockfd, const struct WambleMsg *msg,
   LOG_DEBUG("Player %s attempting move %s on board %lu", token_str, uci_move,
             board->id);
 
-  if (validate_and_apply_move(board, player, uci_move) == 0) {
-    LOG_INFO("Move %s on board %lu validated and applied", uci_move, board->id);
+  MoveApplyStatus mv_status = MOVE_ERR_INVALID_ARGS;
+  int mv_ok =
+      validate_and_apply_move_status(board, player, uci_move, &mv_status);
+  if (mv_ok == 0) {
+    LOG_INFO("Move %s on board %lu by %s validated and applied", uci_move,
+             board->id, token_str);
 
     LOG_DEBUG("Releasing board %lu after successful move", board->id);
     release_board(board->id);
@@ -296,8 +321,33 @@ static void handle_player_move(int sockfd, const struct WambleMsg *msg,
       LOG_INFO("Player %s moved to new board %lu", token_str, next_board->id);
     }
   } else {
-    LOG_WARN("Invalid move %s on board %lu by player %s", uci_move, board->id,
-             token_str);
+    switch (mv_status) {
+    case MOVE_ERR_INVALID_ARGS:
+      LOG_WARN("Move rejected: invalid arguments for player %s on board %lu",
+               token_str, board->id);
+      break;
+    case MOVE_ERR_NOT_RESERVED:
+      LOG_WARN("Move rejected: board %lu not reserved for player %s (uci %s)",
+               board->id, token_str, uci_move);
+      break;
+    case MOVE_ERR_NOT_TURN:
+      LOG_WARN(
+          "Move rejected: not player's turn on board %lu (player %s, uci %s)",
+          board->id, token_str, uci_move);
+      break;
+    case MOVE_ERR_BAD_UCI:
+      LOG_WARN("Move rejected: invalid UCI '%s' (player %s, board %lu)",
+               uci_move, token_str, board->id);
+      break;
+    case MOVE_ERR_ILLEGAL:
+      LOG_WARN("Move rejected: illegal move %s on board %lu by player %s",
+               uci_move, board->id, token_str);
+      break;
+    default:
+      LOG_WARN("Move rejected: unknown reason for %s on board %lu by %s",
+               uci_move, board->id, token_str);
+      break;
+    }
   }
 }
 
@@ -379,11 +429,15 @@ void handle_message(int sockfd, const struct WambleMsg *msg,
     if (player) {
       response.ctrl = WAMBLE_CTRL_LOGIN_SUCCESS;
       memcpy(response.token, player->token, TOKEN_LENGTH);
+      char token_str[TOKEN_LENGTH * 2 + 1];
+      format_token_for_url(player->token, token_str);
+      LOG_INFO("Login success: player %s", token_str);
     } else {
       response.ctrl = WAMBLE_CTRL_LOGIN_FAILED;
       response.error_code = 1;
       snprintf(response.error_reason, sizeof(response.error_reason),
                "invalid or missing public key");
+      LOG_WARN("Login failed: invalid or missing public key");
     }
     send_reliable_message(sockfd, &response, cliaddr, get_config()->timeout_ms,
                           get_config()->max_retries);
