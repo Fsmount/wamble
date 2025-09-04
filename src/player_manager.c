@@ -38,7 +38,7 @@ void rng_init(void) {
     wamble_mutex_unlock(&rng_mutex);
     return;
   }
-  LOG_INFO("Initializing random number generator");
+  (void)0;
 
   uint64_t seed1 = (uint64_t)time(NULL);
   uint64_t seed2 = (uint64_t)clock();
@@ -66,9 +66,9 @@ void rng_init(void) {
 #endif
     if (have_os_entropy) {
       entropy ^= ur;
-      LOG_DEBUG("Mixed in OS-provided entropy");
+      (void)0;
     } else {
-      LOG_WARN("Could not get OS-provided entropy, RNG will be less secure");
+      (void)0;
     }
   }
 
@@ -78,7 +78,7 @@ void rng_init(void) {
 
   rng_initialized = 1;
   wamble_mutex_unlock(&rng_mutex);
-  LOG_INFO("RNG initialized");
+  (void)0;
 }
 
 uint64_t rng_u64(void) {
@@ -219,7 +219,7 @@ void player_manager_init(void) {
   wamble_mutex_init(&rng_mutex);
   rng_init();
   player_map_init();
-  LOG_INFO("Player manager initialized");
+  (void)0;
 }
 
 WamblePlayer *get_player_by_token(const uint8_t *token) {
@@ -237,7 +237,7 @@ WamblePlayer *get_player_by_token(const uint8_t *token) {
       db_update_session_last_seen(session_id);
     }
 
-    LOG_DEBUG("Found player by token");
+    (void)0;
     wamble_mutex_unlock(&player_mutex);
     return &player_pool[idx];
   }
@@ -325,7 +325,7 @@ WamblePlayer *create_new_player(void) {
     }
     player_map_put(player->token, (int)(player - player_pool));
 
-    LOG_INFO("Created new player");
+    (void)0;
     wamble_mutex_unlock(&player_mutex);
     return player;
   }
@@ -373,7 +373,7 @@ void player_manager_tick(void) {
       memcpy(old_token, player_pool[i].token, 16);
       memset(&player_pool[i], 0, sizeof(WamblePlayer));
       player_map_delete(old_token);
-      LOG_INFO("Expired and removed player");
+      (void)0;
       if (i == num_players - 1) {
         num_players--;
       }

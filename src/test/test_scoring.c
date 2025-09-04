@@ -158,7 +158,7 @@ static int run_case(const TestCase *c) {
 }
 
 int main(int argc, char **argv) {
-  config_load(NULL, NULL);
+  config_load(NULL, NULL, NULL, 0);
   const char *filter = (argc > 1 ? argv[1] : "");
   int pass = 0, total = 0;
 

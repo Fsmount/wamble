@@ -820,37 +820,37 @@ void bitboard_to_fen(const Board *board, char *fen) {
   *fen_ptr = '\0';
 }
 
-int validate_and_apply_move(WambleBoard *wamble_board, WamblePlayer *player,
-                            const char *uci_move) {
+int validate_and_apply_move_status(WambleBoard *wamble_board,
+                                   WamblePlayer *player, const char *uci_move,
+                                   MoveApplyStatus *out_status) {
+  MoveApplyStatus st = MOVE_ERR_INVALID_ARGS;
   if (!wamble_board || !uci_move || !player) {
-    LOG_WARN("validate_and_apply_move called with NULL arguments");
+    if (out_status)
+      *out_status = st;
     return -1;
   }
 
-  char token_str[TOKEN_LENGTH * 2 + 1];
-  format_token_for_url(player->token, token_str);
-  LOG_DEBUG("Validating move '%s' for player %s on board %lu", uci_move,
-            token_str, wamble_board->id);
-
   if (!tokens_equal(wamble_board->reservation_player_token, player->token)) {
-    LOG_WARN("Player %s attempted to move on board %lu, but it is reserved for "
-             "another player",
-             token_str, wamble_board->id);
+    st = MOVE_ERR_NOT_RESERVED;
+    if (out_status)
+      *out_status = st;
     return -1;
   }
 
   bool is_white_turn = (wamble_board->board.turn == 'w');
   if (wamble_board->reserved_for_white != is_white_turn) {
-    LOG_WARN(
-        "Player %s attempted to move on board %lu, but it is not their turn",
-        token_str, wamble_board->id);
+    st = MOVE_ERR_NOT_TURN;
+    if (out_status)
+      *out_status = st;
     return -1;
   }
 
   Board *board = &wamble_board->board;
   int from, to;
   if (uci_to_squares(uci_move, &from, &to) != 0) {
-    LOG_WARN("Invalid UCI move string: %s", uci_move);
+    st = MOVE_ERR_BAD_UCI;
+    if (out_status)
+      *out_status = st;
     return -1;
   }
   char promotion = (strlen(uci_move) == 5) ? tolower(uci_move[4]) : 0;
@@ -868,7 +868,9 @@ int validate_and_apply_move(WambleBoard *wamble_board, WamblePlayer *player,
     }
   }
   if (!move_is_legal) {
-    LOG_WARN("Invalid move %s on board %lu", uci_move, wamble_board->id);
+    st = MOVE_ERR_ILLEGAL;
+    if (out_status)
+      *out_status = st;
     return -1;
   }
 
@@ -887,14 +889,12 @@ int validate_and_apply_move(WambleBoard *wamble_board, WamblePlayer *player,
   update_game_result(wamble_board);
 
   if (wamble_board->result != GAME_RESULT_IN_PROGRESS) {
-    LOG_INFO("Game on board %lu has ended with result %d", wamble_board->id,
-             wamble_board->result);
     update_player_ratings(wamble_board);
     calculate_and_distribute_pot(wamble_board->id);
     archive_board(wamble_board->id);
   }
 
-  LOG_INFO("Validated and applied move %s on board %lu", uci_move,
-           wamble_board->id);
+  if (out_status)
+    *out_status = MOVE_OK;
   return 0;
 }

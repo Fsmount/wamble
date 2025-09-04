@@ -115,7 +115,6 @@ static void *profile_thread_main(void *arg) {
   if (rp->sockfd <= 0) {
     LOG_FATAL("Profile %s missing pre-bound socket", rp->name);
   }
-  LOG_INFO("Profile %s listening on port %d", rp->name, rp->cfg.port);
 
   time_t last_cleanup = time(NULL);
   time_t last_tick = time(NULL);
@@ -124,7 +123,6 @@ static void *profile_thread_main(void *arg) {
     if (rp->needs_update) {
       rp->needs_update = 0;
       set_thread_config(&rp->cfg);
-      LOG_INFO("Profile %s applied updated config", rp->name);
     }
 
     fd_set rfds;

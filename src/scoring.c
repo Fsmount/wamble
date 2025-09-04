@@ -10,15 +10,11 @@ typedef struct {
 WambleBoard *get_board_by_id(uint64_t board_id);
 
 void calculate_and_distribute_pot(uint64_t board_id) {
-  LOG_INFO("Calculating and distributing pot for board %lu", board_id);
   WambleBoard *board = get_board_by_id(board_id);
   if (!board) {
-    LOG_WARN("Board %lu not found for pot distribution", board_id);
     return;
   }
   if (board->result == GAME_RESULT_IN_PROGRESS) {
-    LOG_WARN("Game on board %lu is still in progress, cannot distribute pot",
-             board_id);
     return;
   }
 
@@ -27,7 +23,6 @@ void calculate_and_distribute_pot(uint64_t board_id) {
   int num_moves = db_get_moves_for_board(board_id, moves,
                                          get_config()->max_moves_per_board);
   if (num_moves <= 0) {
-    LOG_WARN("No moves found for board %lu, cannot distribute pot", board_id);
     free(moves);
     return;
   }
@@ -67,7 +62,7 @@ void calculate_and_distribute_pot(uint64_t board_id) {
       }
     }
   }
-  LOG_DEBUG("Found %d contributors for board %lu", num_contributors, board_id);
+  (void)0;
 
   double white_pot = 0.0;
   double black_pot = 0.0;
@@ -80,8 +75,7 @@ void calculate_and_distribute_pot(uint64_t board_id) {
     white_pot = get_config()->max_pot / 2.0;
     black_pot = get_config()->max_pot / 2.0;
   }
-  LOG_DEBUG("Board %lu result: %d, white_pot: %.2f, black_pot: %.2f", board_id,
-            board->result, white_pot, black_pot);
+  (void)0;
 
   for (int i = 0; i < num_contributors; i++) {
     PlayerContribution *contrib = &contributions[i];
@@ -107,12 +101,9 @@ void calculate_and_distribute_pot(uint64_t board_id) {
     if (player) {
       player->score += score;
     }
-    char token_str[TOKEN_LENGTH * 2 + 1];
-    format_token_for_url(contrib->player_token, token_str);
-    LOG_INFO("Player %s awarded %.2f points for board %lu", token_str, score,
-             board_id);
+    (void)0;
   }
-  LOG_INFO("Finished distributing pot for board %lu", board_id);
+  (void)0;
 
   free(moves);
   free(contributions);

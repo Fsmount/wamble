@@ -101,9 +101,7 @@ static inline const char *wamble_strerror(int err);
 static inline int wamble_net_init(void) {
   WSADATA wsaData;
   int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
-  if (result != 0) {
-    LOG_FATAL("WSAStartup failed: %d", result);
-  }
+
   return result;
 }
 
@@ -462,7 +460,15 @@ typedef struct WambleConfig {
   int log_level_scoring;
 } WambleConfig;
 
-void config_load(const char *filename, const char *profile);
+typedef enum {
+  CONFIG_LOAD_OK = 0,
+  CONFIG_LOAD_DEFAULTS = 1,
+  CONFIG_LOAD_IO_ERROR = 2,
+  CONFIG_LOAD_PROFILE_NOT_FOUND = 3,
+} ConfigLoadStatus;
+
+ConfigLoadStatus config_load(const char *filename, const char *profile,
+                             char *status_msg, size_t status_msg_size);
 
 struct WambleProfile {
   char *name;
@@ -630,6 +636,15 @@ typedef enum {
   GAME_RESULT_DRAW
 } GameResult;
 
+typedef enum {
+  MOVE_OK = 0,
+  MOVE_ERR_INVALID_ARGS,
+  MOVE_ERR_NOT_RESERVED,
+  MOVE_ERR_NOT_TURN,
+  MOVE_ERR_BAD_UCI,
+  MOVE_ERR_ILLEGAL,
+} MoveApplyStatus;
+
 #define WAMBLE_PROTO_VERSION 1
 #define WAMBLE_FLAG_UNRELIABLE 0x80
 
@@ -689,8 +704,15 @@ typedef struct WambleClientSession {
   uint32_t next_seq_num;
 } WambleClientSession;
 
-int validate_and_apply_move(WambleBoard *wamble_board, WamblePlayer *player,
-                            const char *uci_move);
+int validate_and_apply_move_status(WambleBoard *wamble_board,
+                                   WamblePlayer *player, const char *uci_move,
+                                   MoveApplyStatus *out_status);
+
+static inline int validate_and_apply_move(WambleBoard *wamble_board,
+                                          WamblePlayer *player,
+                                          const char *uci_move) {
+  return validate_and_apply_move_status(wamble_board, player, uci_move, NULL);
+}
 
 int parse_fen_to_bitboard(const char *fen, Board *board);
 void bitboard_to_fen(const Board *board, char *fen);

@@ -18,8 +18,6 @@ static PGconn *ensure_connection(void) {
   build_conn_string_from_cfg(get_config(), conn, sizeof conn);
   db_conn_tls = PQconnectdb(conn);
   if (PQstatus(db_conn_tls) != CONNECTION_OK) {
-    LOG_ERROR("failed to connect to db (thread): %s",
-              PQerrorMessage(db_conn_tls));
     PQfinish(db_conn_tls);
     db_conn_tls = NULL;
     return NULL;
@@ -87,24 +85,16 @@ static void hex_to_bytes(const char *hex, uint8_t *bytes_out, int len) {
 
 int db_init(const char *connection_string) {
   if (db_initialized) {
-    LOG_WARN("Database already initialized");
     return 0;
   }
 
-  LOG_INFO("Initializing database connection");
   (void)connection_string;
 
   db_initialized = true;
-
-  LOG_INFO("Database initialized (per-thread DB context)");
   return 0;
 }
 
-void db_cleanup(void) {
-  LOG_INFO("Cleaning up database connection");
-  db_initialized = false;
-  LOG_INFO("Database cleanup complete");
-}
+void db_cleanup(void) { db_initialized = false; }
 
 void db_cleanup_thread(void) {
   if (db_conn_tls) {

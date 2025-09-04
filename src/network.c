@@ -423,8 +423,7 @@ static WambleClientSession *find_client_session_by_token(const uint8_t *token) {
 static WambleClientSession *
 create_client_session(const struct sockaddr_in *addr, const uint8_t *token) {
   if (num_sessions >= get_config()->max_client_sessions) {
-    LOG_WARN("Maximum number of client sessions reached (%d)",
-             get_config()->max_client_sessions);
+
     return NULL;
   }
 
@@ -435,10 +434,7 @@ create_client_session(const struct sockaddr_in *addr, const uint8_t *token) {
   session->last_seen = time(NULL);
   session->next_seq_num = 1;
   session_map_put(addr, (int)(session - client_sessions));
-  char ip_str[INET_ADDRSTRLEN];
-  wamble_inet_ntop(AF_INET, &(addr->sin_addr), ip_str, INET_ADDRSTRLEN);
-  LOG_INFO("Created new client session for %s:%d", ip_str,
-           ntohs(addr->sin_port));
+  (void)0;
   return session;
 }
 
@@ -462,12 +458,12 @@ int validate_message(const struct WambleMsg *msg, size_t received_size) {
       msg->ctrl != WAMBLE_CTRL_LOGIN_FAILED &&
       msg->ctrl != WAMBLE_CTRL_GET_PLAYER_STATS &&
       msg->ctrl != WAMBLE_CTRL_PLAYER_STATS_DATA) {
-    LOG_WARN("Invalid message control code: 0x%02x", msg->ctrl);
+    (void)0;
     return -1;
   }
 
   if (msg->uci_len > MAX_UCI_LENGTH) {
-    LOG_WARN("Invalid uci_len: %d (max is %d)", msg->uci_len, MAX_UCI_LENGTH);
+    (void)0;
     return -1;
   }
 
@@ -480,7 +476,7 @@ int validate_message(const struct WambleMsg *msg, size_t received_size) {
       }
     }
     if (!token_valid) {
-      LOG_WARN("Message with empty token received (ctrl=0x%02x)", msg->ctrl);
+      (void)0;
       return -1;
     }
   }
@@ -553,32 +549,22 @@ int create_and_bind_socket(int port) {
   wamble_socket_t sockfd;
   struct sockaddr_in servaddr;
 
-  LOG_DEBUG("Attempting to create socket");
+  (void)0;
   if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) == WAMBLE_INVALID_SOCKET) {
-    LOG_FATAL("socket creation failed: %s",
-              wamble_strerror(wamble_last_error()));
+
     return -1;
   }
-  LOG_INFO("Socket created successfully (sockfd: %d)", (int)sockfd);
+  (void)0;
 
   int optval = 1;
-  if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (const char *)&optval,
-                 sizeof(optval)) < 0) {
-    LOG_WARN("setsockopt SO_REUSEADDR failed: %s",
-             wamble_strerror(wamble_last_error()));
-  }
+  (void)setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (const char *)&optval,
+                   sizeof(optval));
 
   int buffer_size = get_config()->buffer_size;
-  if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (const char *)&buffer_size,
-                 sizeof(buffer_size)) < 0) {
-    LOG_WARN("setsockopt SO_RCVBUF failed: %s",
-             wamble_strerror(wamble_last_error()));
-  }
-  if (setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (const char *)&buffer_size,
-                 sizeof(buffer_size)) < 0) {
-    LOG_WARN("setsockopt SO_SNDBUF failed: %s",
-             wamble_strerror(wamble_last_error()));
-  }
+  (void)setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (const char *)&buffer_size,
+                   sizeof(buffer_size));
+  (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (const char *)&buffer_size,
+                   sizeof(buffer_size));
 
   memset(&servaddr, 0, sizeof(servaddr));
 
@@ -586,22 +572,16 @@ int create_and_bind_socket(int port) {
   servaddr.sin_addr.s_addr = INADDR_ANY;
   servaddr.sin_port = htons(port);
 
-  LOG_DEBUG("Attempting to bind socket to port %d", port);
+  (void)0;
   if (bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
-    LOG_FATAL("bind failed: %s", wamble_strerror(wamble_last_error()));
     wamble_close_socket(sockfd);
     return -1;
   }
-  LOG_INFO("Socket bound successfully to port %d", port);
+  (void)0;
 
-  if (wamble_set_nonblocking(sockfd) != 0) {
-    LOG_WARN("Failed to set socket to non-blocking mode: %s",
-             wamble_strerror(wamble_last_error()));
-  } else {
-    LOG_DEBUG("Socket set to non-blocking mode");
-  }
+  (void)wamble_set_nonblocking(sockfd);
 
-  LOG_DEBUG("Initializing session map");
+  (void)0;
   network_init_thread_state();
 
   return (int)sockfd;
@@ -618,52 +598,36 @@ int receive_message(int sockfd_int, struct WambleMsg *msg,
                (struct sockaddr *)cliaddr, &len);
 
   if (bytes_received <= 0) {
-    if (bytes_received < 0) {
-      int err = wamble_last_error();
-#ifdef WAMBLE_PLATFORM_WINDOWS
-      if (err != WSAEWOULDBLOCK) {
-        LOG_DEBUG("recvfrom failed: %s", wamble_strerror(err));
-      }
-#else
-      if (err != EWOULDBLOCK && err != EAGAIN) {
-        LOG_DEBUG("recvfrom failed: %s", wamble_strerror(err));
-      }
-#endif
-    }
     return (int)bytes_received;
   }
 
-  LOG_DEBUG("Received %zd bytes from client", bytes_received);
+  (void)0;
 
   uint8_t flags = 0;
   if (deserialize_wamble_msg(receive_buffer, (size_t)bytes_received, msg,
                              &flags) != 0) {
-    LOG_WARN("Failed to deserialize message from client");
+
     return -1;
   }
-  LOG_DEBUG("Deserialized message: ctrl=0x%02x, seq=%u", msg->ctrl,
-            msg->seq_num);
+  (void)0;
 
   if (validate_message(msg, (size_t)bytes_received) != 0) {
-    LOG_WARN("Received invalid message from client");
+
     return -1;
   }
-  LOG_DEBUG("Message validated successfully");
+  (void)0;
 
   if (msg->ctrl != WAMBLE_CTRL_ACK &&
       (msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0 &&
       is_duplicate_message(cliaddr, msg->token, msg->seq_num)) {
-    LOG_DEBUG("Received duplicate message (seq %u)", msg->seq_num);
+    (void)0;
     return -1;
   }
 
   if (msg->ctrl != WAMBLE_CTRL_ACK &&
       (msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0) {
     update_client_session(cliaddr, msg->token, msg->seq_num);
-    char ip_str[INET_ADDRSTRLEN];
-    wamble_inet_ntop(AF_INET, &(cliaddr->sin_addr), ip_str, INET_ADDRSTRLEN);
-    LOG_DEBUG("Updated client session for %s:%d (seq: %u)", ip_str,
-              ntohs(cliaddr->sin_port), msg->seq_num);
+    (void)0;
   }
 
   return (int)bytes_received;
@@ -685,15 +649,11 @@ void send_ack(int sockfd_int, const struct WambleMsg *msg,
   size_t serialized_size = 0;
   if (serialize_wamble_msg(&ack_msg, send_buffer, sizeof(send_buffer),
                            &serialized_size, 0) != 0) {
-    LOG_WARN("Failed to serialize ACK");
+
     return;
   }
 
-  char ip_str[INET_ADDRSTRLEN];
-  wamble_inet_ntop(AF_INET, &(cliaddr->sin_addr), ip_str, INET_ADDRSTRLEN);
-  LOG_DEBUG(
-      "Sending ACK for message (ctrl: 0x%02x, seq: %u, board_id: %lu) to %s:%d",
-      msg->ctrl, msg->seq_num, msg->board_id, ip_str, ntohs(cliaddr->sin_port));
+  (void)cliaddr;
 
   sendto(sockfd, (const char *)send_buffer, (int)serialized_size, 0,
          (const struct sockaddr *)cliaddr, sizeof(*cliaddr));
@@ -705,8 +665,8 @@ int wait_for_ack(int sockfd_int, const uint8_t *expected_token,
   fd_set readfds;
   struct timeval timeout;
 
-  LOG_DEBUG("Waiting for ACK with expected sequence %u (timeout: %dms)",
-            expected_seq, timeout_ms);
+  (void)expected_seq;
+  (void)timeout_ms;
 
   timeout.tv_sec = timeout_ms / 1000;
   timeout.tv_usec = (timeout_ms % 1000) * 1000;
@@ -716,12 +676,10 @@ int wait_for_ack(int sockfd_int, const uint8_t *expected_token,
 
   int result = select((int)sockfd + 1, &readfds, NULL, NULL, &timeout);
   if (result == -1) {
-    LOG_WARN("select failed while waiting for ACK: %s",
-             wamble_strerror(wamble_last_error()));
+
     return -1;
   } else if (result == 0) {
-    LOG_DEBUG("select timed out while waiting for ACK for seq %u",
-              expected_seq);
+    (void)0;
     return -1;
   }
 
@@ -740,11 +698,11 @@ int wait_for_ack(int sockfd_int, const uint8_t *expected_token,
                                &flags) == 0 &&
         ack_msg.ctrl == WAMBLE_CTRL_ACK && ack_msg.seq_num == expected_seq &&
         memcmp(ack_msg.token, expected_token, TOKEN_LENGTH) == 0) {
-      LOG_DEBUG("Received ACK for expected sequence %u", expected_seq);
+      (void)0;
       return 0;
     }
   }
-  LOG_DEBUG("Did not receive expected ACK for sequence %u", expected_seq);
+  (void)0;
 
   return -1;
 }
@@ -765,40 +723,31 @@ int send_reliable_message(int sockfd_int, const struct WambleMsg *msg,
   wamble_inet_ntop(AF_INET, &(cliaddr->sin_addr), ip_str, INET_ADDRSTRLEN);
 
   if (!session) {
-    LOG_DEBUG(
-        "No session found for %s:%d, creating new session for reliable message",
-        ip_str, ntohs(cliaddr->sin_port));
+    (void)0;
     session = create_client_session(cliaddr, msg->token);
     if (!session) {
-      LOG_ERROR("Failed to create client session for %s:%d", ip_str,
-                ntohs(cliaddr->sin_port));
+
       reliable_msg.seq_num = global_seq_num++;
       if (global_seq_num > (UINT32_MAX - 1000)) {
         global_seq_num = 1;
       }
     } else {
       reliable_msg.seq_num = session->next_seq_num++;
-      LOG_DEBUG("Created new session for %s:%d, assigned seq_num %u", ip_str,
-                ntohs(cliaddr->sin_port), reliable_msg.seq_num);
+      (void)0;
     }
   } else {
     reliable_msg.seq_num = session->next_seq_num++;
-    LOG_DEBUG("Using existing session for %s:%d, assigned seq_num %u", ip_str,
-              ntohs(cliaddr->sin_port), reliable_msg.seq_num);
+    (void)0;
   }
 
   static uint8_t send_buffer[WAMBLE_MAX_PACKET_SIZE];
   size_t serialized_size = 0;
   if (serialize_wamble_msg(&reliable_msg, send_buffer, sizeof(send_buffer),
                            &serialized_size, 0) != 0) {
-    LOG_ERROR("Failed to serialize reliable message");
     return -1;
   }
 
-  LOG_DEBUG("Attempting to send reliable message (ctrl: 0x%02x, seq: %u, "
-            "board_id: %lu) to %s:%d",
-            reliable_msg.ctrl, reliable_msg.seq_num, reliable_msg.board_id,
-            ip_str, ntohs(cliaddr->sin_port));
+  (void)0;
 
   int current_timeout = timeout_ms;
   for (int attempt = 0; attempt < max_retries; attempt++) {
@@ -807,46 +756,32 @@ int send_reliable_message(int sockfd_int, const struct WambleMsg *msg,
                (const struct sockaddr *)cliaddr, sizeof(*cliaddr));
 
     if (bytes_sent < 0) {
-      LOG_ERROR("sendto failed: %s", wamble_strerror(wamble_last_error()));
       return -1;
     }
-    LOG_DEBUG("Sent %d bytes (attempt %d/%d) for seq %u to %s:%d", bytes_sent,
-              attempt + 1, max_retries, reliable_msg.seq_num, ip_str,
-              ntohs(cliaddr->sin_port));
 
     if (wait_for_ack((int)sockfd, reliable_msg.token, reliable_msg.seq_num,
                      current_timeout) == 0) {
-      LOG_DEBUG("Received ACK for seq %u from %s:%d", reliable_msg.seq_num,
-                ip_str, ntohs(cliaddr->sin_port));
+      (void)0;
       return 0;
     }
 
-    LOG_WARN("Message timeout on attempt %d/%d (seq %u) for %s:%d", attempt + 1,
-             max_retries, reliable_msg.seq_num, ip_str,
-             ntohs(cliaddr->sin_port));
+    (void)0;
     if (current_timeout < 8000) {
       int next = current_timeout * 2;
       current_timeout = next > 8000 ? 8000 : next;
     }
   }
 
-  LOG_ERROR("Failed to send reliable message (ctrl: 0x%02x, seq: %u) to %s:%d "
-            "after %d retries",
-            reliable_msg.ctrl, reliable_msg.seq_num, ip_str,
-            ntohs(cliaddr->sin_port), max_retries);
+  (void)0;
   return -1;
 }
 
-void start_network_listener(void) {
-  LOG_INFO("Network listener started on port %d", get_config()->port);
-  LOG_INFO("Timeout: %dms, Max retries: %d", get_config()->timeout_ms,
-           get_config()->max_retries);
-}
+void start_network_listener(void) { (void)0; }
 
 void send_response(const struct WambleMsg *msg) {
 
-  LOG_INFO("Broadcasting response (ctrl: 0x%02x, seq: %u)", msg->ctrl,
-           msg->seq_num);
+  (void)msg;
+  (void)0;
 }
 
 void cleanup_expired_sessions(void) {
@@ -864,7 +799,6 @@ void cleanup_expired_sessions(void) {
   }
 
   if (write_idx != num_sessions) {
-    LOG_INFO("Cleaned up %d expired client sessions", num_sessions - write_idx);
     num_sessions = write_idx;
     session_map_init();
     for (int i = 0; i < num_sessions; i++) {

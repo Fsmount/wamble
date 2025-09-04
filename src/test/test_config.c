@@ -26,7 +26,7 @@ static void write_config_file(void) {
 
 int main(void) {
   write_config_file();
-  config_load(conf_path, NULL);
+  config_load(conf_path, NULL, NULL, 0);
 
   assert(get_config()->timeout_ms == 42);
   assert(get_config()->max_retries == 4);
