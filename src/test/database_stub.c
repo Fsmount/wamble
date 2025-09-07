@@ -74,7 +74,9 @@ uint64_t db_get_session_by_token(const uint8_t *token) {
   (void)token;
   return 0;
 }
-void db_update_session_last_seen(uint64_t session_id) { (void)session_id; }
+void db_async_update_session_last_seen(uint64_t session_id) {
+  (void)session_id;
+}
 int db_get_session_games_played(uint64_t session_id) {
   (void)session_id;
   return 0;
@@ -87,7 +89,7 @@ uint64_t db_get_player_by_public_key(const uint8_t *public_key) {
   (void)public_key;
   return 1;
 }
-int db_link_session_to_player(uint64_t session_id, uint64_t player_id) {
+int db_async_link_session_to_player(uint64_t session_id, uint64_t player_id) {
   (void)session_id;
   (void)player_id;
   return 0;
@@ -109,7 +111,8 @@ uint64_t db_create_board(const char *fen) {
   return id;
 }
 
-int db_update_board(uint64_t board_id, const char *fen, const char *status) {
+int db_async_update_board(uint64_t board_id, const char *fen,
+                          const char *status) {
   (void)board_id;
   (void)fen;
   (void)status;
@@ -131,8 +134,8 @@ int db_get_boards_by_status(const char *status, uint64_t *board_ids,
   return 0;
 }
 
-int db_record_move(uint64_t board_id, uint64_t session_id, const char *move_uci,
-                   int move_number) {
+int db_async_record_move(uint64_t board_id, uint64_t session_id,
+                         const char *move_uci, int move_number) {
   (void)board_id;
   (void)session_id;
   (void)move_uci;
@@ -169,14 +172,14 @@ int db_get_moves_for_board(uint64_t board_id, WambleMove *moves_out,
   return 0;
 }
 
-int db_create_reservation(uint64_t board_id, uint64_t session_id,
-                          int timeout_seconds) {
+int db_async_create_reservation(uint64_t board_id, uint64_t session_id,
+                                int timeout_seconds) {
   (void)board_id;
   (void)session_id;
   (void)timeout_seconds;
   return 0;
 }
-void db_remove_reservation(uint64_t board_id) { (void)board_id; }
+void db_async_remove_reservation(uint64_t board_id) { (void)board_id; }
 
 void db_expire_reservations(void) {
   time_t now = time(NULL);
@@ -212,40 +215,18 @@ void db_archive_inactive_boards(int timeout_seconds) {
   }
 }
 
-int db_record_game_result(uint64_t board_id, char winning_side) {
+int db_async_record_game_result(uint64_t board_id, char winning_side) {
   (void)board_id;
   (void)winning_side;
   return 0;
 }
 
-int db_record_payout(uint64_t board_id, uint64_t session_id, double points) {
+int db_async_record_payout(uint64_t board_id, uint64_t session_id,
+                           double points) {
   (void)board_id;
   (void)session_id;
   (void)points;
   return 0;
-}
-
-void db_async_update_board(uint64_t board_id, const char *fen,
-                           const char *status) {
-  (void)db_update_board(board_id, fen, status);
-}
-void db_async_create_reservation(uint64_t board_id, uint64_t session_id,
-                                 int timeout_seconds) {
-  (void)db_create_reservation(board_id, session_id, timeout_seconds);
-}
-void db_async_remove_reservation(uint64_t board_id) {
-  db_remove_reservation(board_id);
-}
-void db_async_record_game_result(uint64_t board_id, char winning_side) {
-  (void)db_record_game_result(board_id, winning_side);
-}
-void db_async_record_move(uint64_t board_id, uint64_t session_id,
-                          const char *move_uci, int move_number) {
-  (void)db_record_move(board_id, session_id, move_uci, move_number);
-}
-void db_async_record_payout(uint64_t board_id, uint64_t session_id,
-                            double points) {
-  (void)db_record_payout(board_id, session_id, points);
 }
 
 double db_get_player_total_score(uint64_t session_id) {

@@ -3,10 +3,6 @@
 #include <signal.h>
 #include <string.h>
 
-void handle_message(int sockfd, const struct WambleMsg *msg,
-                    const struct sockaddr_in *cliaddr);
-WamblePlayer *login_player(const uint8_t *public_key);
-
 static volatile sig_atomic_t g_reload_requested = 0;
 static volatile sig_atomic_t g_shutdown_requested = 0;
 
@@ -92,9 +88,6 @@ int main(int argc, char *argv[]) {
   }
   LOG_INFO("Database initialized successfully");
 
-  start_network_listener();
-  LOG_INFO("Network listener started");
-
   int has_profiles = config_profile_count();
   if (has_profiles > 0) {
 
@@ -135,7 +128,12 @@ int main(int argc, char *argv[]) {
       tv.tv_sec = 0;
       tv.tv_usec = get_config()->select_timeout_usec;
 
-      int ready = select(sockfd + 1, &rfds, NULL, NULL, &tv);
+      int ready =
+#ifdef WAMBLE_PLATFORM_WINDOWS
+          select(0, &rfds, NULL, NULL, &tv);
+#else
+          select(sockfd + 1, &rfds, NULL, NULL, &tv);
+#endif
       if (ready == -1) {
         LOG_ERROR("select failed: %s", strerror(errno));
       } else if (ready == 0) {
@@ -353,7 +351,6 @@ static void handle_player_move(int sockfd, const struct WambleMsg *msg,
 
 void handle_message(int sockfd, const struct WambleMsg *msg,
                     const struct sockaddr_in *cliaddr) {
-
   switch (msg->ctrl) {
   case WAMBLE_CTRL_CLIENT_HELLO:
     LOG_DEBUG("Handling CLIENT_HELLO message (seq: %u)", msg->seq_num);

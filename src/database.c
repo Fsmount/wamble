@@ -26,7 +26,6 @@ static PGconn *ensure_connection(void) {
 }
 
 static PGresult *pq_exec_locked(const char *command) {
-  PGresult *res;
   PGconn *c = ensure_connection();
   if (!c)
     return NULL;
@@ -37,7 +36,6 @@ static PGresult *
 pq_exec_params_locked(const char *command, int nParams, const Oid *paramTypes,
                       const char *const *paramValues, const int *paramLengths,
                       const int *paramFormats, int resultFormat) {
-  PGresult *res;
   PGconn *c = ensure_connection();
   if (!c)
     return NULL;
@@ -126,34 +124,6 @@ int db_get_trust_tier_by_token(const uint8_t *token) {
   return trust;
 }
 
-void db_async_update_board(uint64_t board_id, const char *fen,
-                           const char *status) {
-  db_update_board(board_id, fen, status);
-}
-
-void db_async_create_reservation(uint64_t board_id, uint64_t session_id,
-                                 int timeout_seconds) {
-  db_create_reservation(board_id, session_id, timeout_seconds);
-}
-
-void db_async_remove_reservation(uint64_t board_id) {
-  db_remove_reservation(board_id);
-}
-
-void db_async_record_game_result(uint64_t board_id, char winning_side) {
-  db_record_game_result(board_id, winning_side);
-}
-
-void db_async_record_move(uint64_t board_id, uint64_t session_id,
-                          const char *move_uci, int move_number) {
-  db_record_move(board_id, session_id, move_uci, move_number);
-}
-
-void db_async_record_payout(uint64_t board_id, uint64_t session_id,
-                            double points) {
-  db_record_payout(board_id, session_id, points);
-}
-
 uint64_t db_create_session(const uint8_t *token, uint64_t player_id) {
   const char *query = "INSERT INTO sessions (token, player_id) VALUES "
                       "(decode($1, 'hex'), $2) RETURNING id";
@@ -202,7 +172,7 @@ uint64_t db_get_session_by_token(const uint8_t *token) {
   return session_id;
 }
 
-void db_update_session_last_seen(uint64_t session_id) {
+void db_async_update_session_last_seen(uint64_t session_id) {
   const char *query = "UPDATE sessions SET last_seen_at = NOW() WHERE id = $1";
 
   char session_id_str[32];
@@ -234,7 +204,8 @@ uint64_t db_create_board(const char *fen) {
   return board_id;
 }
 
-int db_update_board(uint64_t board_id, const char *fen, const char *status) {
+int db_async_update_board(uint64_t board_id, const char *fen,
+                          const char *status) {
   const char *query = "UPDATE boards SET fen = $2, status = $3, updated_at = "
                       "NOW() WHERE id = $1";
 
@@ -307,8 +278,8 @@ int db_get_boards_by_status(const char *status, uint64_t *board_ids,
   return count;
 }
 
-int db_record_move(uint64_t board_id, uint64_t session_id, const char *move_uci,
-                   int move_number) {
+int db_async_record_move(uint64_t board_id, uint64_t session_id,
+                         const char *move_uci, int move_number) {
   const char *query = "INSERT INTO moves (board_id, session_id, move_uci, "
                       "move_number) VALUES ($1, $2, $3, $4)";
 
@@ -376,7 +347,7 @@ int db_get_moves_for_board(uint64_t board_id, WambleMove *moves_out,
     hex_to_bytes(token_hex, moves_out[i].player_token, TOKEN_LENGTH);
     strncpy(moves_out[i].uci_move, PQgetvalue(res, i, 3), MAX_UCI_LENGTH - 1);
     moves_out[i].uci_move[MAX_UCI_LENGTH - 1] = '\0';
-    moves_out[i].timestamp = strtoull(PQgetvalue(res, i, 4), NULL, 10);
+    moves_out[i].timestamp = (time_t)strtoull(PQgetvalue(res, i, 4), NULL, 10);
 
     char *endptr;
     long move_number = strtol(PQgetvalue(res, i, 5), &endptr, 10);
@@ -391,8 +362,8 @@ int db_get_moves_for_board(uint64_t board_id, WambleMove *moves_out,
   return count;
 }
 
-int db_create_reservation(uint64_t board_id, uint64_t session_id,
-                          int timeout_seconds) {
+int db_async_create_reservation(uint64_t board_id, uint64_t session_id,
+                                int timeout_seconds) {
   const char *query =
       "INSERT INTO reservations (board_id, session_id, expires_at) "
       "VALUES ($1, $2, NOW() + $3 * INTERVAL '1 second') "
@@ -449,7 +420,7 @@ void db_archive_inactive_boards(int timeout_seconds) {
       pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
   PQclear(res);
 }
-void db_remove_reservation(uint64_t board_id) {
+void db_async_remove_reservation(uint64_t board_id) {
   const char *query = "DELETE FROM reservations WHERE board_id = $1";
 
   char board_id_str[32];
@@ -462,7 +433,7 @@ void db_remove_reservation(uint64_t board_id) {
   PQclear(res);
 }
 
-int db_record_game_result(uint64_t board_id, char winning_side) {
+int db_async_record_game_result(uint64_t board_id, char winning_side) {
   const char *query =
       "INSERT INTO game_results (board_id, winning_side) VALUES ($1, $2)";
 
@@ -487,7 +458,8 @@ int db_record_game_result(uint64_t board_id, char winning_side) {
   return 0;
 }
 
-int db_record_payout(uint64_t board_id, uint64_t session_id, double points) {
+int db_async_record_payout(uint64_t board_id, uint64_t session_id,
+                           double points) {
   const char *query = "INSERT INTO payouts (board_id, session_id, "
                       "points_awarded) VALUES ($1, $2, $3)";
 
@@ -656,7 +628,7 @@ uint64_t db_get_player_by_public_key(const uint8_t *public_key) {
   return player_id;
 }
 
-int db_link_session_to_player(uint64_t session_id, uint64_t player_id) {
+int db_async_link_session_to_player(uint64_t session_id, uint64_t player_id) {
   const char *query = "UPDATE sessions SET player_id = $2 WHERE id = $1";
 
   char session_id_str[32];
