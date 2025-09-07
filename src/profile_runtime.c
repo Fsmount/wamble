@@ -1,6 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
 #include "../include/wamble/wamble.h"
-#include <signal.h>
 #include <string.h>
 
 typedef struct RunningProfile {
@@ -34,15 +33,10 @@ static Prebound *preflight_and_bind_all(int *out_count) {
     return NULL;
   }
 
-  const WambleProfile *first_adv = NULL;
   for (int i = 0; i < count; i++) {
     const WambleProfile *pi = config_get_profile(i);
     if (!pi || !pi->advertise)
       continue;
-    if (!first_adv)
-      first_adv = pi;
-    else {
-    }
     for (int j = i + 1; j < count; j++) {
       const WambleProfile *pj = config_get_profile(j);
       if (!pj || !pj->advertise)
@@ -83,7 +77,7 @@ static Prebound *preflight_and_bind_all(int *out_count) {
     memset(&servaddr, 0, sizeof(servaddr));
     servaddr.sin_family = AF_INET;
     servaddr.sin_addr.s_addr = INADDR_ANY;
-    servaddr.sin_port = htons(p->config.port);
+    servaddr.sin_port = htons((uint16_t)p->config.port);
     if (bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr)) <
         0) {
 
@@ -208,19 +202,11 @@ void stop_profile_listeners(void) {
   wamble_mutex_lock(&g_mutex);
   for (int i = 0; i < g_running_count; i++) {
     g_running[i].should_stop = 1;
-  }
-
-  for (int i = 0; i < g_running_count; i++) {
     wamble_thread_join(g_running[i].thread, NULL);
-  }
-
-  for (int i = 0; i < g_running_count; i++) {
     if (g_running[i].sockfd >= 0) {
       close(g_running[i].sockfd);
       g_running[i].sockfd = -1;
     }
-  }
-  for (int i = 0; i < g_running_count; i++) {
     free_running(&g_running[i]);
   }
   free(g_running);
@@ -241,12 +227,11 @@ void reconcile_profile_listeners(void) {
   }
 
   if (desired_adv == 0) {
-    for (int i = 0; i < g_running_count; i++)
+    for (int i = 0; i < g_running_count; i++) {
       g_running[i].should_stop = 1;
-    for (int i = 0; i < g_running_count; i++)
       wamble_thread_join(g_running[i].thread, NULL);
-    for (int i = 0; i < g_running_count; i++)
       free_running(&g_running[i]);
+    }
     free(g_running);
     g_running = NULL;
     g_running_count = 0;

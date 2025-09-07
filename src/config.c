@@ -81,8 +81,6 @@ static LispValue *builtin_do(struct LispEnv *env, LispValue *args);
 static LispValue *builtin_quote(struct LispEnv *env, LispValue *args);
 static LispValue *builtin_defn(struct LispEnv *env, LispValue *args);
 static LispValue *builtin_defmacro(struct LispEnv *env, LispValue *args);
-static LispValue *builtin_make_db_base(struct LispEnv *env, LispValue *args);
-static LispValue *builtin_make_profile(struct LispEnv *env, LispValue *args);
 
 static LispValue *copy_lisp_value(const LispValue *v) {
   if (!v)
@@ -179,7 +177,6 @@ static LispValue *parse_list(Stream *s) {
   while (s->p < s->end && *s->p != ')') {
     skip_whitespace(s);
     if (s->p >= s->end) {
-      (void)0;
       free_lisp_value(head);
       return NULL;
     }
@@ -190,7 +187,6 @@ static LispValue *parse_list(Stream *s) {
     skip_whitespace(s);
   }
   if (s->p >= s->end) {
-    (void)0;
     free_lisp_value(head);
     return NULL;
   }
@@ -205,7 +201,7 @@ static LispValue *parse_string(Stream *s) {
     s->p++;
   }
   LispValue *v = make_value(LISP_VALUE_STRING);
-  v->as.string = strndup(start, s->p - start);
+  v->as.string = strndup(start, (size_t)(s->p - start));
   s->p++;
   return v;
 }
@@ -226,7 +222,7 @@ static LispValue *parse_symbol_or_number(Stream *s) {
     s->p++;
   }
 
-  char *str = strndup(start, s->p - start);
+  char *str = strndup(start, (size_t)(s->p - start));
   if (is_integer) {
     LispValue *v = make_value(LISP_VALUE_INTEGER);
     v->as.integer = atol(str);
@@ -325,7 +321,6 @@ static LispValue *eval_list(LispEnv *env, LispValue *list) {
     free_lisp_value(op_res);
     return result;
   }
-  (void)0;
   free_lisp_value(op_res);
   return make_value(LISP_VALUE_NIL);
 }
@@ -815,9 +810,10 @@ static void populate_config_from_env(LispEnv *env) {
     const ConfigVarMap *item = &config_map[i];
     LispValue sym;
     sym.type = LISP_VALUE_SYMBOL;
-    sym.as.symbol = (char *)item->name;
+    sym.as.symbol = strdup(item->name);
 
     LispValue *val = lisp_env_get(env, &sym);
+    free(sym.as.symbol);
     if (val->type == LISP_VALUE_NIL) {
       free_lisp_value(val);
       continue;
@@ -827,14 +823,14 @@ static void populate_config_from_env(LispEnv *env) {
     switch (item->type) {
     case CONF_INT:
       if (val->type == LISP_VALUE_INTEGER) {
-        *(int *)target = val->as.integer;
+        *(int *)target = (int)val->as.integer;
       }
       break;
     case CONF_DOUBLE:
       if (val->type == LISP_VALUE_FLOAT) {
         *(double *)target = val->as.real;
       } else if (val->type == LISP_VALUE_INTEGER) {
-        *(double *)target = val->as.integer;
+        *(double *)target = (double)val->as.integer;
       }
       break;
     case CONF_STRING:
@@ -848,7 +844,7 @@ static void populate_config_from_env(LispEnv *env) {
   }
 }
 
-static void config_set_defaults() {
+static void config_set_defaults(void) {
   g_config.port = 8888;
   g_config.timeout_ms = 100;
   g_config.max_retries = 3;
@@ -936,8 +932,8 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
   long fsize = ftell(f);
   fseek(f, 0, SEEK_SET);
 
-  char *source = malloc(fsize + 1);
-  fread(source, 1, fsize, f);
+  char *source = malloc((size_t)fsize + 1u);
+  fread(source, 1u, (size_t)fsize, f);
   fclose(f);
   source[fsize] = 0;
 

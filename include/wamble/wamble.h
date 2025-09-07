@@ -573,10 +573,6 @@ static inline void wamble_log(int level, const char *file, int line,
 #define WAMBLE_CTRL_PROFILES_LIST 0x14
 
 #define get_bit(square) (1ULL << (square))
-#define get_square(file, rank) ((rank) * 8 + (file))
-
-#define KINGSIDE_CASTLE (1 << 0)
-#define QUEENSIDE_CASTLE (1 << 1)
 
 typedef unsigned long long Bitboard;
 
@@ -592,9 +588,6 @@ typedef unsigned long long Bitboard;
 #define BLACK_ROOK 9
 #define BLACK_QUEEN 10
 #define BLACK_KING 11
-
-#define WHITE_KING_START 4
-#define BLACK_KING_START 60
 
 typedef struct {
   int from;
@@ -667,12 +660,6 @@ struct WambleMsg {
 #define WAMBLE_MAX_PAYLOAD 1200
 #define WAMBLE_DUP_WINDOW 1024
 
-int serialize_wamble_msg(const struct WambleMsg *msg, uint8_t *buffer,
-                         size_t buffer_capacity, size_t *out_len,
-                         uint8_t flags);
-int deserialize_wamble_msg(const uint8_t *buffer, size_t buffer_size,
-                           struct WambleMsg *msg, uint8_t *out_flags);
-
 typedef struct WamblePlayer {
   uint8_t token[TOKEN_LENGTH];
   uint8_t public_key[32];
@@ -717,9 +704,6 @@ static inline int validate_and_apply_move(WambleBoard *wamble_board,
 int parse_fen_to_bitboard(const char *fen, Board *board);
 void bitboard_to_fen(const Board *board, char *fen);
 
-MoveInfo make_move_bitboard(Board *board, const Move *move);
-void unmake_move_bitboard(Board *board, const Move *move, const MoveInfo *info);
-
 static inline int square_to_index(int file, int rank) {
   return rank * 8 + file;
 }
@@ -751,39 +735,21 @@ WambleBoard *find_board_for_player(WamblePlayer *player);
 void release_board(uint64_t board_id);
 void archive_board(uint64_t board_id);
 void update_player_ratings(WambleBoard *board);
-int get_moves_for_board(uint64_t board_id, WambleMove **moves);
 WambleBoard *get_board_by_id(uint64_t board_id);
-
-WamblePlayer *get_player_by_id(uint64_t player_id);
-int start_board_manager_thread(void);
 
 void calculate_and_distribute_pot(uint64_t board_id);
 
 void player_manager_init(void);
-WamblePlayer *find_player_by_token(const uint8_t *token);
 WamblePlayer *create_new_player(void);
+WamblePlayer *login_player(const uint8_t *public_key);
 void format_token_for_url(const uint8_t *token, char *url_buffer);
 int decode_token_from_url(const char *url_string, uint8_t *token_buffer);
 void player_manager_tick(void);
 
 WamblePlayer *get_player_by_token(const uint8_t *token);
-
-const struct WambleConfig *get_config(void);
-
-void start_network_listener(void);
-void send_response(const struct WambleMsg *msg);
 void network_init_thread_state(void);
 
-int validate_message(const struct WambleMsg *msg, size_t received_size);
-int is_duplicate_message(const struct sockaddr_in *addr, const uint8_t *token,
-                         uint32_t seq_num);
-void update_client_session(const struct sockaddr_in *addr, const uint8_t *token,
-                           uint32_t seq_num);
-
-void set_network_timeouts(int timeout_ms, int max_retries);
 void cleanup_expired_sessions(void);
-
-GamePhase get_game_phase(WambleBoard *board);
 
 int db_init(const char *connection_string);
 void db_cleanup(void);
@@ -791,25 +757,27 @@ void db_tick(void);
 
 uint64_t db_create_session(const uint8_t *token, uint64_t player_id);
 uint64_t db_get_session_by_token(const uint8_t *token);
-void db_update_session_last_seen(uint64_t session_id);
+void db_async_update_session_last_seen(uint64_t session_id);
 
 uint64_t db_create_board(const char *fen);
-int db_update_board(uint64_t board_id, const char *fen, const char *status);
+int db_async_update_board(uint64_t board_id, const char *fen,
+                          const char *status);
 int db_get_board(uint64_t board_id, char *fen_out, char *status_out);
 int db_get_boards_by_status(const char *status, uint64_t *board_ids,
                             int max_boards);
 
-int db_record_move(uint64_t board_id, uint64_t session_id, const char *move_uci,
-                   int move_number);
+int db_async_record_move(uint64_t board_id, uint64_t session_id,
+                         const char *move_uci, int move_number);
 int db_get_moves_for_board(uint64_t board_id, WambleMove *moves_out,
                            int max_moves);
 
-int db_create_reservation(uint64_t board_id, uint64_t session_id,
-                          int timeout_seconds);
-void db_remove_reservation(uint64_t board_id);
+int db_async_create_reservation(uint64_t board_id, uint64_t session_id,
+                                int timeout_seconds);
+void db_async_remove_reservation(uint64_t board_id);
 
-int db_record_game_result(uint64_t board_id, char winning_side);
-int db_record_payout(uint64_t board_id, uint64_t session_id, double points);
+int db_async_record_game_result(uint64_t board_id, char winning_side);
+int db_async_record_payout(uint64_t board_id, uint64_t session_id,
+                           double points);
 double db_get_player_total_score(uint64_t session_id);
 
 int db_get_active_session_count(void);
@@ -818,19 +786,9 @@ int db_get_session_games_played(uint64_t session_id);
 
 uint64_t db_create_player(const uint8_t *public_key);
 uint64_t db_get_player_by_public_key(const uint8_t *public_key);
-int db_link_session_to_player(uint64_t session_id, uint64_t player_id);
+int db_async_link_session_to_player(uint64_t session_id, uint64_t player_id);
 
 void db_expire_reservations(void);
-void db_async_update_board(uint64_t board_id, const char *fen,
-                           const char *status);
-void db_async_create_reservation(uint64_t board_id, uint64_t session_id,
-                                 int timeout_seconds);
-void db_async_remove_reservation(uint64_t board_id);
-void db_async_record_game_result(uint64_t board_id, char winning_side);
-void db_async_record_move(uint64_t board_id, uint64_t session_id,
-                          const char *move_uci, int move_number);
-void db_async_record_payout(uint64_t board_id, uint64_t session_id,
-                            double points);
 
 void db_cleanup_thread(void) WAMBLE_WEAK;
 
@@ -852,8 +810,6 @@ int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
                           int max_retries);
 void handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
                     const struct sockaddr_in *cliaddr);
-int wait_for_ack(wamble_socket_t sockfd, const uint8_t *expected_token,
-                 uint32_t expected_seq, int timeout_ms);
 
 static inline int tokens_equal(const uint8_t *token1, const uint8_t *token2) {
   for (int i = 0; i < TOKEN_LENGTH; i++) {

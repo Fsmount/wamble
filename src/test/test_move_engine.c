@@ -89,7 +89,8 @@ static int run_case(const Case *c) {
 
   wamble_board.reserved_for_white = (wamble_board.board.turn == 'w');
 
-  int rc = validate_and_apply_move(&wamble_board, &test_player, c->uci);
+  int rc =
+      validate_and_apply_move_status(&wamble_board, &test_player, c->uci, NULL);
 
   if (rc != 0 && c->expect_ok) {
     printf("%s FAILED: engine returned %d (expected 0)\n", c->name, rc);

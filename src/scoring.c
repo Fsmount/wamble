@@ -1,15 +1,12 @@
 #include "../include/wamble/wamble.h"
 #include <string.h>
 
-typedef struct {
-  uint8_t player_token[TOKEN_LENGTH];
-  int white_moves;
-  int black_moves;
-} PlayerContribution;
-
-WambleBoard *get_board_by_id(uint64_t board_id);
-
 void calculate_and_distribute_pot(uint64_t board_id) {
+  typedef struct {
+    uint8_t player_token[TOKEN_LENGTH];
+    int white_moves;
+    int black_moves;
+  } PlayerContribution;
   WambleBoard *board = get_board_by_id(board_id);
   if (!board) {
     return;
@@ -19,7 +16,7 @@ void calculate_and_distribute_pot(uint64_t board_id) {
   }
 
   WambleMove *moves =
-      malloc(sizeof(WambleMove) * get_config()->max_moves_per_board);
+      malloc(sizeof(WambleMove) * (size_t)get_config()->max_moves_per_board);
   int num_moves = db_get_moves_for_board(board_id, moves,
                                          get_config()->max_moves_per_board);
   if (num_moves <= 0) {
@@ -27,8 +24,8 @@ void calculate_and_distribute_pot(uint64_t board_id) {
     return;
   }
 
-  PlayerContribution *contributions =
-      malloc(sizeof(PlayerContribution) * get_config()->max_contributors);
+  PlayerContribution *contributions = malloc(
+      sizeof(PlayerContribution) * (size_t)get_config()->max_contributors);
   int num_contributors = 0;
   int total_white_moves = 0;
   int total_black_moves = 0;
@@ -62,7 +59,6 @@ void calculate_and_distribute_pot(uint64_t board_id) {
       }
     }
   }
-  (void)0;
 
   double white_pot = 0.0;
   double black_pot = 0.0;
@@ -75,7 +71,6 @@ void calculate_and_distribute_pot(uint64_t board_id) {
     white_pot = get_config()->max_pot / 2.0;
     black_pot = get_config()->max_pot / 2.0;
   }
-  (void)0;
 
   for (int i = 0; i < num_contributors; i++) {
     PlayerContribution *contrib = &contributions[i];
@@ -101,9 +96,7 @@ void calculate_and_distribute_pot(uint64_t board_id) {
     if (player) {
       player->score += score;
     }
-    (void)0;
   }
-  (void)0;
 
   free(moves);
   free(contributions);

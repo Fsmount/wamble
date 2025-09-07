@@ -53,6 +53,8 @@ static const Bitboard KING_ATTACKS[64] = {
     0x2838000000000000ULL, 0x5070000000000000ULL, 0xa0e0000000000000ULL,
     0x40c0000000000000ULL};
 
+enum { WHITE_KING_START = 4, BLACK_KING_START = 60 };
+
 static inline int ctz64_u64(Bitboard bb) {
 #if defined(_MSC_VER)
   unsigned long idx;
@@ -72,48 +74,10 @@ static inline int ctz64_u64(Bitboard bb) {
 #endif
 }
 
-static inline int get_lsb(Bitboard bb) { return ctz64_u64(bb); }
-
 static inline Bitboard pop_lsb(Bitboard *bb) {
-  int sq = get_lsb(*bb);
+  int sq = ctz64_u64(*bb);
   *bb &= *bb - 1;
   return get_bit(sq);
-}
-
-static inline int popcount64_u64(Bitboard bb) {
-#if defined(_MSC_VER)
-  return (int)__popcnt64((unsigned __int64)bb);
-#elif defined(__GNUC__) || defined(__clang__)
-  return __builtin_popcountll(bb);
-#else
-  int c = 0;
-  while (bb) {
-    bb &= (bb - 1);
-    c++;
-  }
-  return c;
-#endif
-}
-
-static inline int count_bits(Bitboard bb) { return popcount64_u64(bb); }
-
-static int uci_to_squares(const char *uci, int *from, int *to) {
-  if (strlen(uci) < 4)
-    return -1;
-
-  int from_file = uci[0] - 'a';
-  int from_rank = uci[1] - '1';
-  int to_file = uci[2] - 'a';
-  int to_rank = uci[3] - '1';
-
-  if (from_file < 0 || from_file >= 8 || from_rank < 0 || from_rank >= 8 ||
-      to_file < 0 || to_file >= 8 || to_rank < 0 || to_rank >= 8) {
-    return -1;
-  }
-
-  *from = square_to_index(from_file, from_rank);
-  *to = square_to_index(to_file, to_rank);
-  return 0;
 }
 
 static Bitboard generate_rook_attacks(int square, Bitboard occupied) {
@@ -214,7 +178,7 @@ static int is_square_attacked(const Board *board, int square, int by_color) {
   int pawn_piece = (by_color == 0) ? WHITE_PAWN : BLACK_PAWN;
   Bitboard enemy_pawns = board->pieces[pawn_piece];
   while (enemy_pawns) {
-    int pawn_sq = get_lsb(enemy_pawns);
+    int pawn_sq = ctz64_u64(enemy_pawns);
     if (generate_pawn_attacks(pawn_sq, by_color) & get_bit(square)) {
       return 1;
     }
@@ -230,7 +194,7 @@ static int is_square_attacked(const Board *board, int square, int by_color) {
   int queen_piece = (by_color == 0) ? WHITE_QUEEN : BLACK_QUEEN;
   Bitboard attackers = board->pieces[bishop_piece] | board->pieces[queen_piece];
   while (attackers) {
-    int attacker_sq = get_lsb(attackers);
+    int attacker_sq = ctz64_u64(attackers);
     if (generate_bishop_attacks(attacker_sq, occupied) & get_bit(square)) {
       return 1;
     }
@@ -240,7 +204,7 @@ static int is_square_attacked(const Board *board, int square, int by_color) {
   int rook_piece = (by_color == 0) ? WHITE_ROOK : BLACK_ROOK;
   attackers = board->pieces[rook_piece] | board->pieces[queen_piece];
   while (attackers) {
-    int attacker_sq = get_lsb(attackers);
+    int attacker_sq = ctz64_u64(attackers);
     if (generate_rook_attacks(attacker_sq, occupied) & get_bit(square)) {
       return 1;
     }
@@ -253,13 +217,6 @@ static int is_square_attacked(const Board *board, int square, int by_color) {
   }
 
   return 0;
-}
-
-static int is_king_in_check(const Board *board, int color) {
-  int king_piece = (color == 0) ? WHITE_KING : BLACK_KING;
-  Bitboard king_bb = board->pieces[king_piece];
-
-  return is_square_attacked(board, get_lsb(king_bb), 1 - color);
 }
 
 static inline void remove_castling_right(Board *board, char right) {
@@ -279,7 +236,7 @@ static inline void remove_castling_right(Board *board, char right) {
   }
 }
 
-MoveInfo make_move_bitboard(Board *board, const Move *move) {
+static MoveInfo make_move_bitboard(Board *board, const Move *move) {
   MoveInfo info = {.captured_square = -1,
                    .captured_piece_type = -1,
                    .prev_en_passant = "--",
@@ -433,8 +390,8 @@ MoveInfo make_move_bitboard(Board *board, const Move *move) {
     int ep_square = (from + to) / 2;
     int file, rank;
     index_to_square(ep_square, &file, &rank);
-    board->en_passant[0] = 'a' + file;
-    board->en_passant[1] = '1' + rank;
+    board->en_passant[0] = (char)('a' + file);
+    board->en_passant[1] = (char)('1' + rank);
     board->en_passant[2] = '\0';
   }
 
@@ -452,8 +409,8 @@ MoveInfo make_move_bitboard(Board *board, const Move *move) {
   return info;
 }
 
-void unmake_move_bitboard(Board *board, const Move *move,
-                          const MoveInfo *info) {
+static void unmake_move_bitboard(Board *board, const Move *move,
+                                 const MoveInfo *info) {
   int from = move->from;
   int to = move->to;
   int moving_piece_color = info->moving_piece_color;
@@ -545,7 +502,7 @@ static int generate_legal_moves_bitboard(Board *board, Move *moves) {
     Bitboard bb = board->pieces[piece];
 
     while (bb) {
-      const int from = get_lsb(bb);
+      const int from = ctz64_u64(bb);
       Bitboard attacks = 0ULL;
 
       switch (piece % 6) {
@@ -616,7 +573,7 @@ static int generate_legal_moves_bitboard(Board *board, Move *moves) {
       }
 
       while (attacks) {
-        const int to = get_lsb(attacks);
+        const int to = ctz64_u64(attacks);
         const int to_rank = to / 8;
         const bool is_pawn = (piece % 6 == 0);
 
@@ -629,7 +586,9 @@ static int generate_legal_moves_bitboard(Board *board, Move *moves) {
           Move m = {from, to, promo_needed ? promos[v] : 0};
 
           MoveInfo info = make_move_bitboard(board, &m);
-          if (!is_king_in_check(board, color)) {
+          int king_piece = (color == 0) ? WHITE_KING : BLACK_KING;
+          Bitboard king_bb = board->pieces[king_piece];
+          if (!is_square_attacked(board, ctz64_u64(king_bb), 1 - color)) {
             moves[move_count++] = m;
           }
           unmake_move_bitboard(board, &m, &info);
@@ -642,25 +601,6 @@ static int generate_legal_moves_bitboard(Board *board, Move *moves) {
     }
   }
   return move_count;
-}
-
-static void update_game_result(WambleBoard *wamble_board) {
-  Board *board = &wamble_board->board;
-  int color = (board->turn == 'w') ? 0 : 1;
-
-  Move legal_moves[256];
-  int num_legal_moves = generate_legal_moves_bitboard(board, legal_moves);
-
-  if (num_legal_moves == 0) {
-    if (is_king_in_check(board, color)) {
-      wamble_board->result =
-          (color == 0) ? GAME_RESULT_BLACK_WINS : GAME_RESULT_WHITE_WINS;
-    } else {
-      wamble_board->result = GAME_RESULT_DRAW;
-    }
-  } else if (board->halfmove_clock >= 100) {
-    wamble_board->result = GAME_RESULT_DRAW;
-  }
 }
 
 int parse_fen_to_bitboard(const char *fen, Board *board) {
@@ -743,8 +683,11 @@ int parse_fen_to_bitboard(const char *fen, Board *board) {
   board->en_passant[i] = '\0';
   p++;
 
-  board->halfmove_clock = strtol(p, (char **)&p, 10);
-  board->fullmove_number = strtol(p, NULL, 10);
+  const char *p0 = p;
+  char *pend = NULL;
+  board->halfmove_clock = (int)strtol(p0, &pend, 10);
+  p = pend;
+  board->fullmove_number = (int)strtol(p, NULL, 10);
 
   return 0;
 }
@@ -770,7 +713,7 @@ void bitboard_to_fen(const Board *board, char *fen) {
         empty_count++;
       } else {
         if (empty_count > 0) {
-          *fen_ptr++ = empty_count + '0';
+          *fen_ptr++ = (char)(empty_count + '0');
           empty_count = 0;
         }
         *fen_ptr++ = piece;
@@ -778,7 +721,7 @@ void bitboard_to_fen(const Board *board, char *fen) {
     }
 
     if (empty_count > 0) {
-      *fen_ptr++ = empty_count + '0';
+      *fen_ptr++ = (char)(empty_count + '0');
     }
 
     if (rank > 0) {
@@ -847,13 +790,31 @@ int validate_and_apply_move_status(WambleBoard *wamble_board,
 
   Board *board = &wamble_board->board;
   int from, to;
-  if (uci_to_squares(uci_move, &from, &to) != 0) {
+
+  if (strlen(uci_move) < 4) {
     st = MOVE_ERR_BAD_UCI;
     if (out_status)
       *out_status = st;
     return -1;
   }
-  char promotion = (strlen(uci_move) == 5) ? tolower(uci_move[4]) : 0;
+
+  int from_file = uci_move[0] - 'a';
+  int from_rank = uci_move[1] - '1';
+  int to_file = uci_move[2] - 'a';
+  int to_rank = uci_move[3] - '1';
+
+  if (from_file < 0 || from_file >= 8 || from_rank < 0 || from_rank >= 8 ||
+      to_file < 0 || to_file >= 8 || to_rank < 0 || to_rank >= 8) {
+    st = MOVE_ERR_BAD_UCI;
+    if (out_status)
+      *out_status = st;
+    return -1;
+  }
+
+  from = square_to_index(from_file, from_rank);
+  to = square_to_index(to_file, to_rank);
+  char promotion =
+      (char)((strlen(uci_move) == 5) ? tolower((unsigned char)uci_move[4]) : 0);
   Move candidate_move = {from, to, promotion};
 
   Move legal_moves[256];
@@ -886,7 +847,21 @@ int validate_and_apply_move_status(WambleBoard *wamble_board,
 
   db_async_update_board(wamble_board->id, wamble_board->fen, "ACTIVE");
 
-  update_game_result(wamble_board);
+  int color = (board->turn == 'w') ? 0 : 1;
+  num_legal = generate_legal_moves_bitboard(board, legal_moves);
+
+  if (num_legal == 0) {
+    int king_piece = (color == 0) ? WHITE_KING : BLACK_KING;
+    Bitboard king_bb = board->pieces[king_piece];
+    if (is_square_attacked(board, ctz64_u64(king_bb), 1 - color)) {
+      wamble_board->result =
+          (color == 0) ? GAME_RESULT_BLACK_WINS : GAME_RESULT_WHITE_WINS;
+    } else {
+      wamble_board->result = GAME_RESULT_DRAW;
+    }
+  } else if (board->halfmove_clock >= 100) {
+    wamble_board->result = GAME_RESULT_DRAW;
+  }
 
   if (wamble_board->result != GAME_RESULT_IN_PROGRESS) {
     update_player_ratings(wamble_board);

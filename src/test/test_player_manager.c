@@ -41,7 +41,7 @@ static bool test_find_nonexistent_player() {
 
 static bool test_url_token_conversion() {
   uint8_t original_token[TOKEN_LENGTH];
-  generate_new_token(original_token);
+  rng_bytes(original_token, TOKEN_LENGTH);
 
   char url_buffer[32];
   format_token_for_url(original_token, url_buffer);
