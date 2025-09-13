@@ -50,9 +50,25 @@ Control Codes
 - `0x0A` CLIENT_GOODBYE (client→server): Graceful disconnect.
   - Payload: empty.
 - `0x0B` SPECTATE_GAME (client→server): Request to watch a game.
-  - Payload: empty. `board_id` in header specifies the game.
+  - Payload: empty.
+  - Header semantics:
+    - `board_id=0` enters summary mode. The server will push per-board
+      `SPECTATE_UPDATE` packets for eligible boards (ACTIVE+RESERVED), sorted
+      by recency and attractiveness. Immediate unreliable updates are sent on
+      entry, followed by periodic updates at `spectate-summary-hz`.
+    - `board_id>0` focuses a specific board. The server will push
+      `SPECTATE_UPDATE` packets for that board only. Immediate unreliable
+      update is sent on entry, followed by periodic updates at
+      `spectate-focus-hz`.
+- `0x15` SPECTATE_STOP (client→server): Stop spectating.
+  - Payload: empty. Server acknowledges. Puts session in `IDLE` state.
 - `0x0C` SPECTATE_UPDATE (server→client): Board update for spectators.
-  - Payload: `char fen[]`. Typically sent as unreliable.
+  - Header: `board_id` identifies the board for this update (authoritative).
+  - Payload: `char fen[]`.
+  - Typically sent as unreliable (`flags` high bit set). One packet per board.
+  - Richer payloads may be introduced later (e.g., player info, predictions),
+    but `board_id` will always be present in the header and must be used by
+    clients to associate updates with boards.
 - `0x0D` LOGIN_REQUEST (client→server): Authenticate persistent identity.
   - Payload: `uint8 public_key[32]`.
 - `0x0E` LOGOUT (client→server): Disassociate persistent identity.
@@ -84,6 +100,18 @@ Unreliable Messages
 - No sequencing or duplicate filtering is applied by the receiver.
 - `seq_num` should be set to 0 by the sender.
 - Used for non-critical, high-frequency updates (e.g., `SPECTATE_UPDATE`).
+
+Spectator Policy
+- Visibility: spectating requires `sessions.trust_level >= spectate-visibility`.
+- Capacity: the server may cap the number of focused spectators via
+  `max-spectators`. Admin sessions -if configured via `admin-trust-level`-
+  bypass this cap. Summary mode is designed as a scrollable feed and is not
+  restricted to a fixed top-N.
+- Summary modes:
+  - `full`: send all ACTIVE+RESERVED boards.
+  - `changes`: send only boards changed since the last summary tick.
+- Ordering: after filtering, boards are ordered by most recent play and then
+  by an internal “attractiveness” score aligned with board assignment logic.
 
 Sessions
 - A session is identified by a `token` and the client's address:port.

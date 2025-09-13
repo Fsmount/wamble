@@ -89,11 +89,27 @@ int main(int argc, char *argv[]) {
   LOG_INFO("Database initialized successfully");
 
   int has_profiles = config_profile_count();
-  if (has_profiles > 0) {
 
-    int started = start_profile_listeners();
-    if (started <= 0) {
-      LOG_WARN("No profile listeners started; falling back to default port");
+  {
+    char s_init_msg[96] = {0};
+    int sst = spectator_manager_init(s_init_msg, sizeof(s_init_msg));
+    if (sst != 0) {
+      LOG_WARN("Spectator manager init: %s",
+               s_init_msg[0] ? s_init_msg : "failed");
+    } else {
+      LOG_INFO("Spectator manager initialized: %s", s_init_msg);
+    }
+  }
+
+  if (has_profiles > 0) {
+    int started = 0;
+    char pstatus[128] = {0};
+    ProfileStartStatus pst =
+        start_profile_listeners(&started, pstatus, sizeof(pstatus));
+    if (pst != PROFILE_START_OK || started <= 0) {
+      LOG_WARN(
+          "No profile listeners started (%s); falling back to default port",
+          pstatus[0] ? pstatus : "no reason provided");
     } else {
       LOG_INFO("Started %d profile listener(s)", started);
     }
@@ -165,10 +181,49 @@ int main(int argc, char *argv[]) {
     }
 
     if (has_profiles == 0) {
+
       if (now - last_tick > 1) {
         board_manager_tick();
+        spectator_manager_tick();
         db_tick();
         last_tick = now;
+      }
+
+      int cap = get_config()->max_client_sessions;
+      if (cap < 1)
+        cap = 1;
+      SpectatorUpdate *events =
+          (SpectatorUpdate *)malloc(sizeof(SpectatorUpdate) * (size_t)cap);
+      if (events) {
+        int nupd = spectator_collect_updates(events, cap);
+        for (int i = 0; i < nupd; i++) {
+          struct WambleMsg out = {0};
+          out.ctrl = WAMBLE_CTRL_SPECTATE_UPDATE;
+          memcpy(out.token, events[i].token, TOKEN_LENGTH);
+          out.board_id = events[i].board_id;
+          out.seq_num = 0;
+          out.flags = WAMBLE_FLAG_UNRELIABLE;
+          strncpy(out.fen, events[i].fen, FEN_MAX_LENGTH);
+          if (send_unreliable_packet(sockfd, &out, &events[i].addr) != 0) {
+            LOG_WARN("Failed to send spectator update for board %lu",
+                     out.board_id);
+          }
+        }
+        int nnot = spectator_collect_notifications(events, cap);
+        for (int i = 0; i < nnot; i++) {
+          struct WambleMsg out = {0};
+          out.ctrl = WAMBLE_CTRL_SERVER_NOTIFICATION;
+          memcpy(out.token, events[i].token, TOKEN_LENGTH);
+          out.board_id = events[i].board_id;
+          out.seq_num = 0;
+          out.flags = WAMBLE_FLAG_UNRELIABLE;
+          strncpy(out.fen, events[i].fen, FEN_MAX_LENGTH);
+          if (send_unreliable_packet(sockfd, &out, &events[i].addr) != 0) {
+            LOG_WARN("Failed to send spectator notice for board %lu",
+                     out.board_id);
+          }
+        }
+        free(events);
       }
     }
     if (g_reload_requested) {
@@ -198,6 +253,7 @@ int main(int argc, char *argv[]) {
   if (sockfd != WAMBLE_INVALID_SOCKET) {
     wamble_close_socket(sockfd);
   }
+  spectator_manager_shutdown();
   db_cleanup();
 
   wamble_net_cleanup();
@@ -438,6 +494,53 @@ void handle_message(int sockfd, const struct WambleMsg *msg,
     }
     send_reliable_message(sockfd, &response, cliaddr, get_config()->timeout_ms,
                           get_config()->max_retries);
+    break;
+  }
+  case WAMBLE_CTRL_SPECTATE_GAME: {
+    LOG_DEBUG("Handling SPECTATE_GAME message (seq: %u, board=%lu)",
+              msg->seq_num, msg->board_id);
+    if ((msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0)
+      send_ack(sockfd, msg, cliaddr);
+    SpectatorState new_state = SPECTATOR_STATE_IDLE;
+    uint64_t focus_id = 0;
+    char status_msg[128] = {0};
+    SpectatorRequestStatus res = spectator_handle_request(
+        msg, cliaddr, &new_state, &focus_id, status_msg, sizeof(status_msg));
+    if (!(res == SPECTATOR_OK_FOCUS || res == SPECTATOR_OK_SUMMARY ||
+          res == SPECTATOR_OK_STOP)) {
+      struct WambleMsg out = {0};
+      out.ctrl = WAMBLE_CTRL_ERROR;
+      memcpy(out.token, msg->token, TOKEN_LENGTH);
+      out.error_code = 1;
+      if (status_msg[0]) {
+        strncpy(out.error_reason, status_msg, sizeof(out.error_reason));
+        out.error_reason[sizeof(out.error_reason) - 1] = '\0';
+      } else {
+        snprintf(out.error_reason, sizeof(out.error_reason),
+                 "spectate request failed");
+      }
+      (void)send_reliable_message(sockfd, &out, cliaddr,
+                                  get_config()->timeout_ms,
+                                  get_config()->max_retries);
+    } else {
+      if (res == SPECTATOR_OK_FOCUS) {
+        LOG_INFO("Spectator focus set to board %lu", focus_id);
+      } else if (res == SPECTATOR_OK_SUMMARY) {
+        LOG_INFO("Spectator summary mode enabled");
+      }
+    }
+    break;
+  }
+  case WAMBLE_CTRL_SPECTATE_STOP: {
+    LOG_DEBUG("Handling SPECTATE_STOP message (seq: %u)", msg->seq_num);
+    if ((msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0)
+      send_ack(sockfd, msg, cliaddr);
+    SpectatorState new_state = SPECTATOR_STATE_IDLE;
+    uint64_t focus_id = 0;
+    char status_msg[128] = {0};
+    (void)spectator_handle_request(msg, cliaddr, &new_state, &focus_id,
+                                   status_msg, sizeof(status_msg));
+    LOG_INFO("Spectator stopped; state now IDLE");
     break;
   }
   case WAMBLE_CTRL_GET_PLAYER_STATS: {

@@ -33,6 +33,7 @@ Core Options (common defaults)
 - `experienced-player-end-phase-mult` (double, 2.0): Payout multiplier for experienced players in the late game.
 - `db-host`, `db-user`, `db-pass`, `db-name` (string, defaults
   localhost/wamble/wamble/wamble): Database connection.
+- `admin-trust-level` (int, -1): Optional admin threshold. If set to a non-negative trust tier, sessions with `trust >= admin-trust-level` can do admin things. 
 Database Connections
 - Each profile listener runs in its own thread and opens its own DB connection
   using that profile's `db-host`, `db-user`, `db-pass`, `db-name`.
@@ -40,7 +41,15 @@ Database Connections
 - `cleanup-interval-sec` (int, 60): Session cleanup cadence.
 - `max-token-attempts` / `max-token-local-attempts` (int, 1000 / 100): Token
   generation limits.
- 
+Spectator Settings
+- `max-spectators` (int, 1024; -1 for no cap): Capacity limit for focused spectators at the server. Admins (see `admin-trust-level`) may bypass this cap.
+- `spectator-visibility` (int, 0): Minimum trust tier required to spectate (summary or focus). Requests below this threshold are rejected.
+- `spectator-summary-hz` (int, 2): Target max update rate (per second) for summary mode. Best-effort; updates are sent over UDP and may be batched by the main loop cadence.
+- `spectator-focus-hz` (int, 20): Target max update rate (per second) for focused board updates. Best-effort over UDP.
+- `spectator-max-focus-per-session` (int, 1): Focus enable switch. Current implementation supports 0 (disabled) or 1 (single focus). Values >1 behave as 1.
+- `spectator-summary-mode` (string, "changes"): Summary filtering mode:
+  - `full`: send all ACTIVE+RESERVED boards.
+  - `changes`: send only boards whose state changed since the last summary tick.
 
 Logging Verbosity
 - `log-level` (int, 0..4; default 3=INFO): Global default (0=FATAL, 4=DEBUG).

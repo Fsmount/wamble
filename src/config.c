@@ -774,6 +774,7 @@ static const ConfigVarMap config_map[] = {
     CONF_ITEM("max-pot", CONF_DOUBLE, max_pot),
     CONF_ITEM("max-moves-per-board", CONF_INT, max_moves_per_board),
     CONF_ITEM("max-contributors", CONF_INT, max_contributors),
+    CONF_ITEM("admin-trust-level", CONF_INT, admin_trust_level),
     CONF_ITEM("db-host", CONF_STRING, db_host),
     CONF_ITEM("db-user", CONF_STRING, db_user),
     CONF_ITEM("db-pass", CONF_STRING, db_pass),
@@ -803,7 +804,14 @@ static const ConfigVarMap config_map[] = {
     CONF_ITEM("log-level-player-manager", CONF_INT, log_level_player_manager),
     CONF_ITEM("log-level-move-engine", CONF_INT, log_level_move_engine),
     CONF_ITEM("log-level-scoring", CONF_INT, log_level_scoring),
-};
+
+    CONF_ITEM("max-spectators", CONF_INT, max_spectators),
+    CONF_ITEM("spectator-visibility", CONF_INT, spectator_visibility),
+    CONF_ITEM("spectator-summary-hz", CONF_INT, spectator_summary_hz),
+    CONF_ITEM("spectator-focus-hz", CONF_INT, spectator_focus_hz),
+    CONF_ITEM("spectator-max-focus-per-session", CONF_INT,
+              spectator_max_focus_per_session),
+    CONF_ITEM("spectator-summary-mode", CONF_STRING, spectator_summary_mode)};
 
 static void populate_config_from_env(LispEnv *env) {
   for (size_t i = 0; i < sizeof(config_map) / sizeof(config_map[0]); i++) {
@@ -871,6 +879,7 @@ static void config_set_defaults(void) {
   g_config.cleanup_interval_sec = 60;
   g_config.max_token_attempts = 1000;
   g_config.max_token_local_attempts = 100;
+  g_config.admin_trust_level = -1;
 
   g_config.new_player_early_phase_mult = 2.0;
   g_config.new_player_mid_phase_mult = 1.0;
@@ -886,6 +895,13 @@ static void config_set_defaults(void) {
   g_config.log_level_player_manager = -1;
   g_config.log_level_move_engine = -1;
   g_config.log_level_scoring = -1;
+
+  g_config.max_spectators = 1024;
+  g_config.spectator_visibility = 0;
+  g_config.spectator_summary_hz = 2;
+  g_config.spectator_focus_hz = 20;
+  g_config.spectator_max_focus_per_session = 1;
+  g_config.spectator_summary_mode = strdup("changes");
 }
 
 static void free_profiles(void) {
@@ -912,6 +928,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
   free(g_config.db_user);
   free(g_config.db_pass);
   free(g_config.db_name);
+  free(g_config.spectator_summary_mode);
   config_set_defaults();
   free_profiles();
 
