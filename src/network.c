@@ -215,8 +215,8 @@ static int serialize_wamble_msg(const struct WambleMsg *msg, uint8_t *buffer,
     break;
   }
   case WAMBLE_CTRL_LOGIN_REQUEST: {
-
-    payload_len = 0;
+    memcpy(payload, msg->login_pubkey, 32);
+    payload_len = 32;
     break;
   }
   case WAMBLE_CTRL_PLAYER_STATS_DATA: {
@@ -724,6 +724,27 @@ int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
   }
 
   return -1;
+}
+
+int send_unreliable_packet(wamble_socket_t sockfd, const struct WambleMsg *msg,
+                           const struct sockaddr_in *cliaddr) {
+  if (!msg || !cliaddr)
+    return -1;
+  uint8_t buffer[WAMBLE_MAX_PACKET_SIZE];
+  size_t serialized_size = 0;
+  if (serialize_wamble_msg(msg, buffer, sizeof(buffer), &serialized_size,
+                           WAMBLE_FLAG_UNRELIABLE) != 0) {
+    return -1;
+  }
+#ifdef WAMBLE_PLATFORM_WINDOWS
+  int rc = sendto(sockfd, (const char *)buffer, (int)serialized_size, 0,
+                  (const struct sockaddr *)cliaddr, (int)sizeof(*cliaddr));
+#else
+  ssize_t rc = sendto(sockfd, (const char *)buffer, (size_t)serialized_size, 0,
+                      (const struct sockaddr *)cliaddr,
+                      (wamble_socklen_t)sizeof(*cliaddr));
+#endif
+  return (rc >= 0) ? 0 : -1;
 }
 
 void cleanup_expired_sessions(void) {

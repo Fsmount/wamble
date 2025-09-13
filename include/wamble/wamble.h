@@ -458,6 +458,15 @@ typedef struct WambleConfig {
   int log_level_player_manager;
   int log_level_move_engine;
   int log_level_scoring;
+
+  int max_spectators;
+  int spectator_visibility;
+  int spectator_summary_hz;
+  int spectator_focus_hz;
+  int spectator_max_focus_per_session;
+
+  char *spectator_summary_mode;
+  int admin_trust_level;
 } WambleConfig;
 
 typedef enum {
@@ -572,7 +581,15 @@ static inline void wamble_log(int level, const char *file, int line,
 #define WAMBLE_CTRL_GET_PROFILE_INFO 0x13
 #define WAMBLE_CTRL_PROFILES_LIST 0x14
 
+#define WAMBLE_CTRL_SPECTATE_STOP 0x15
+
 #define get_bit(square) (1ULL << (square))
+
+typedef enum {
+  SPECTATOR_STATE_IDLE,
+  SPECTATOR_STATE_SUMMARY,
+  SPECTATOR_STATE_FOCUS,
+} SpectatorState;
 
 typedef unsigned long long Bitboard;
 
@@ -808,8 +825,39 @@ void send_ack(wamble_socket_t sockfd, const struct WambleMsg *msg,
 int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
                           const struct sockaddr_in *cliaddr, int timeout_ms,
                           int max_retries);
+int send_unreliable_packet(wamble_socket_t sockfd, const struct WambleMsg *msg,
+                           const struct sockaddr_in *cliaddr);
 void handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
                     const struct sockaddr_in *cliaddr);
+
+int spectator_manager_init(char *status_msg, size_t status_msg_size);
+void spectator_manager_shutdown(void);
+void spectator_manager_tick(void);
+typedef enum {
+  SPECTATOR_OK_SUMMARY = 0,
+  SPECTATOR_OK_FOCUS = 1,
+  SPECTATOR_OK_STOP = 2,
+  SPECTATOR_ERR_VISIBILITY = 100,
+  SPECTATOR_ERR_BUSY = 101,
+  SPECTATOR_ERR_FULL = 102,
+  SPECTATOR_ERR_FOCUS_DISABLED = 103,
+  SPECTATOR_ERR_NOT_AVAILABLE = 104,
+} SpectatorRequestStatus;
+
+typedef struct SpectatorUpdate {
+  uint8_t token[TOKEN_LENGTH];
+  uint64_t board_id;
+  char fen[FEN_MAX_LENGTH];
+  struct sockaddr_in addr;
+} SpectatorUpdate;
+
+SpectatorRequestStatus spectator_handle_request(
+    const struct WambleMsg *msg, const struct sockaddr_in *cliaddr,
+    SpectatorState *out_state, uint64_t *out_focus_board_id, char *status_msg,
+    size_t status_msg_size);
+
+int spectator_collect_updates(struct SpectatorUpdate *out, int max);
+int spectator_collect_notifications(struct SpectatorUpdate *out, int max);
 
 static inline int tokens_equal(const uint8_t *token1, const uint8_t *token2) {
   for (int i = 0; i < TOKEN_LENGTH; i++) {

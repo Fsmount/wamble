@@ -144,9 +144,43 @@ static void *profile_thread_main(void *arg) {
     if (now - last_tick > 1) {
 #ifndef TEST_PROFILE_RUNTIME
       board_manager_tick();
+      spectator_manager_tick();
 #endif
       last_tick = now;
     }
+
+#ifndef TEST_PROFILE_RUNTIME
+    int cap = get_config()->max_client_sessions;
+    if (cap < 1)
+      cap = 1;
+    SpectatorUpdate *events =
+        (SpectatorUpdate *)malloc(sizeof(SpectatorUpdate) * (size_t)cap);
+    if (events) {
+      int nupd = spectator_collect_updates(events, cap);
+      for (int i = 0; i < nupd; i++) {
+        struct WambleMsg out = {0};
+        out.ctrl = WAMBLE_CTRL_SPECTATE_UPDATE;
+        memcpy(out.token, events[i].token, TOKEN_LENGTH);
+        out.board_id = events[i].board_id;
+        out.seq_num = 0;
+        out.flags = WAMBLE_FLAG_UNRELIABLE;
+        strncpy(out.fen, events[i].fen, FEN_MAX_LENGTH);
+        (void)send_unreliable_packet(rp->sockfd, &out, &events[i].addr);
+      }
+      int nnot = spectator_collect_notifications(events, cap);
+      for (int i = 0; i < nnot; i++) {
+        struct WambleMsg out = {0};
+        out.ctrl = WAMBLE_CTRL_SERVER_NOTIFICATION;
+        memcpy(out.token, events[i].token, TOKEN_LENGTH);
+        out.board_id = events[i].board_id;
+        out.seq_num = 0;
+        out.flags = WAMBLE_FLAG_UNRELIABLE;
+        strncpy(out.fen, events[i].fen, FEN_MAX_LENGTH);
+        (void)send_unreliable_packet(rp->sockfd, &out, &events[i].addr);
+      }
+      free(events);
+    }
+#endif
   }
 
   close(rp->sockfd);
