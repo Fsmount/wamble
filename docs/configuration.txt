@@ -52,11 +52,9 @@ Spectator Settings
   - `changes`: send only boards whose state changed since the last summary tick.
 
 Logging Verbosity
-- `log-level` (int, 0..4; default 3=INFO): Global default (0=FATAL, 4=DEBUG).
-- Per-module overrides (inherit with -1; default -1 for all):
-  - `log-level-main`, `log-level-network`, `log-level-database`,
-    `log-level-board-manager`, `log-level-player-manager`,
-    `log-level-move-engine`, `log-level-scoring`.
+- `log-level` (int, 0..4; default 3=INFO): Global verbosity
+  (0=FATAL, 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG).
+  Per-module log levels are not supported at this time.
 
 Builtins for Computed and Conditional Values
 - Arithmetic: `(+ a b ...)`, `(- a [b ...])`, `(* a b ...)`, `(/ a b ...)`.
@@ -111,13 +109,11 @@ Examples: Functions and Macros
   `(defprofile base ((def db-name "wamble_base") (def log-level 2)))`
   `(inherit canary base 8891)`
 
-- Per-module verbosity via functions/macros:
+- Example of toggling global verbosity via helpers:
   
-  `(defn dbg-if (flag level) (if (= flag 1) level -1))`
-  `(def debug-modules 1)`
-  `(def log-level 3)`
-  `(def log-level-network (dbg-if debug-modules 4))  ; DEBUG only if flag=1`
-  `(def log-level-database 2)`
+  `(defn dbg-if (flag) (if (= flag 1) 4 3))`
+  `(def debug-enabled 1)`
+  `(def log-level (dbg-if debug-enabled))  ; 4=DEBUG when enabled, else 3=INFO`
 
 - Quoting and sequencing utilities:
   
@@ -130,11 +126,11 @@ Examples
   `(def session-timeout (* 3 timeout-ms))`
 - Conditional by env:
   `(def db-host (if (= (getenv "WAMBLE_ENV") "production") "prod.db" "localhost"))`
-- Per-module verbosity:
+- Global verbosity examples:
   `(def log-level 3)`
-  `(def log-level-network 2)`
-  `(defn dbg (x) (if (= log-level 4) x 0))
-  `(def log-level-database (dbg 4))`
+  `(defn dbg (flag) (if (= flag 1) 4 3))`
+  `(def debug 0)`
+  `(def log-level (dbg debug))`
 
 Profiles
 - Define a profile with grouped overrides:

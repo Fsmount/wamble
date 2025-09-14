@@ -1,7 +1,7 @@
 #include "../include/wamble/wamble.h"
 #include <string.h>
 
-void calculate_and_distribute_pot(uint64_t board_id) {
+ScoringStatus calculate_and_distribute_pot(uint64_t board_id) {
   typedef struct {
     uint8_t player_token[TOKEN_LENGTH];
     int white_moves;
@@ -9,20 +9,18 @@ void calculate_and_distribute_pot(uint64_t board_id) {
   } PlayerContribution;
   WambleBoard *board = get_board_by_id(board_id);
   if (!board) {
-    return;
+    return SCORING_ERR_INVALID;
   }
   if (board->result == GAME_RESULT_IN_PROGRESS) {
-    return;
+    return SCORING_NONE;
   }
 
-  WambleMove *moves =
-      malloc(sizeof(WambleMove) * (size_t)get_config()->max_moves_per_board);
-  int num_moves = db_get_moves_for_board(board_id, moves,
-                                         get_config()->max_moves_per_board);
-  if (num_moves <= 0) {
-    free(moves);
-    return;
+  DbMovesResult mres = db_get_moves_for_board(board_id);
+  if (mres.status < 0 || mres.count <= 0) {
+    return SCORING_NONE;
   }
+  const WambleMove *moves = mres.rows;
+  int num_moves = mres.count;
 
   PlayerContribution *contributions = malloc(
       sizeof(PlayerContribution) * (size_t)get_config()->max_contributors);
@@ -31,7 +29,7 @@ void calculate_and_distribute_pot(uint64_t board_id) {
   int total_black_moves = 0;
 
   for (int i = 0; i < num_moves; i++) {
-    WambleMove *move = &moves[i];
+    const WambleMove *move = &moves[i];
     int contributor_index = -1;
     for (int j = 0; j < num_contributors; j++) {
       if (tokens_equal(contributions[j].player_token, move->player_token)) {
@@ -98,6 +96,6 @@ void calculate_and_distribute_pot(uint64_t board_id) {
     }
   }
 
-  free(moves);
   free(contributions);
+  return SCORING_OK;
 }

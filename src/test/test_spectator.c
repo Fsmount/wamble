@@ -28,9 +28,9 @@ static void init_board(uint64_t id, const char *fen, BoardState st) {
 }
 
 static int test_summary_and_focus_flow(void) {
-  char status[128] = {0};
-  if (spectator_manager_init(status, sizeof(status)) != 0) {
-    printf("spectator init failed: %s\n", status);
+  SpectatorInitStatus si = spectator_manager_init();
+  if (si != SPECTATOR_INIT_OK) {
+    printf("spectator init failed: %d\n", (int)si);
     return 0;
   }
 
@@ -66,9 +66,8 @@ static int test_summary_and_focus_flow(void) {
   msum.board_id = 0;
   SpectatorState st = SPECTATOR_STATE_IDLE;
   uint64_t focus = 0;
-  char smsg[64] = {0};
   SpectatorRequestStatus rs =
-      spectator_handle_request(&msum, &addr, &st, &focus, smsg, sizeof(smsg));
+      spectator_handle_request(&msum, &addr, &st, &focus);
   if (rs != SPECTATOR_OK_SUMMARY || st != SPECTATOR_STATE_SUMMARY) {
     printf("summary request failed: rs=%d st=%d\n", rs, (int)st);
     return 0;
@@ -80,8 +79,7 @@ static int test_summary_and_focus_flow(void) {
   mfoc.board_id = 1;
   st = SPECTATOR_STATE_IDLE;
   focus = 0;
-  memset(smsg, 0, sizeof(smsg));
-  rs = spectator_handle_request(&mfoc, &addr, &st, &focus, smsg, sizeof(smsg));
+  rs = spectator_handle_request(&mfoc, &addr, &st, &focus);
   if (rs != SPECTATOR_OK_FOCUS || st != SPECTATOR_STATE_FOCUS || focus != 1) {
     printf("focus request failed: rs=%d st=%d focus=%llu\n", rs, (int)st,
            focus);
@@ -119,9 +117,9 @@ static int test_summary_and_focus_flow(void) {
 }
 
 static int test_visibility_and_capacity(void) {
-  char status[64] = {0};
-  if (spectator_manager_init(status, sizeof(status)) != 0) {
-    printf("spectator init failed: %s\n", status);
+  SpectatorInitStatus si = spectator_manager_init();
+  if (si != SPECTATOR_INIT_OK) {
+    printf("spectator init failed: %d\n", (int)si);
     return 0;
   }
   static WambleConfig cfg_local;
@@ -140,9 +138,7 @@ static int test_visibility_and_capacity(void) {
   m.board_id = 0;
   SpectatorState st = SPECTATOR_STATE_IDLE;
   uint64_t focus = 0;
-  char smsg[64] = {0};
-  SpectatorRequestStatus rs =
-      spectator_handle_request(&m, &addr, &st, &focus, smsg, sizeof(smsg));
+  SpectatorRequestStatus rs = spectator_handle_request(&m, &addr, &st, &focus);
   if (rs != SPECTATOR_ERR_VISIBILITY) {
     printf("expected visibility error, got %d\n", rs);
     spectator_manager_shutdown();
@@ -166,8 +162,7 @@ static int test_visibility_and_capacity(void) {
   memcpy(mf2.token, t2, TOKEN_LENGTH);
   st = SPECTATOR_STATE_IDLE;
   focus = 0;
-  smsg[0] = '\0';
-  rs = spectator_handle_request(&mf1, &addr, &st, &focus, smsg, sizeof(smsg));
+  rs = spectator_handle_request(&mf1, &addr, &st, &focus);
   if (rs != SPECTATOR_OK_FOCUS) {
     printf("first focus not ok\n");
     spectator_manager_shutdown();
@@ -175,8 +170,7 @@ static int test_visibility_and_capacity(void) {
   }
   st = SPECTATOR_STATE_IDLE;
   focus = 0;
-  smsg[0] = '\0';
-  rs = spectator_handle_request(&mf2, &addr, &st, &focus, smsg, sizeof(smsg));
+  rs = spectator_handle_request(&mf2, &addr, &st, &focus);
   if (rs != SPECTATOR_ERR_FULL) {
     printf("expected full, got %d\n", rs);
     spectator_manager_shutdown();

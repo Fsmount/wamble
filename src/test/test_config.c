@@ -9,7 +9,6 @@ static const char *conf_path = "build/test_config.conf";
 
 static void write_config_file(void) {
   const char *cfg = "(def log-level 3)\n"
-                    "(def log-level-network 4)\n"
                     "(defn add2 (a b) (+ a b))\n"
                     "(def timeout-ms (add2 40 2))\n"
                     "(defmacro inc (x) (do (+ x 1)))\n"
@@ -32,7 +31,6 @@ int main(void) {
   assert(get_config()->max_retries == 4);
 
   assert(get_config()->log_level == 3);
-  assert(get_config()->log_level_network == 4);
 
   int n = config_profile_count();
   assert(n >= 2);

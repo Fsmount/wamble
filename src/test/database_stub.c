@@ -119,19 +119,20 @@ int db_async_update_board(uint64_t board_id, const char *fen,
   return 0;
 }
 
-int db_get_board(uint64_t board_id, char *fen_out, char *status_out) {
+DbBoardResult db_get_board(uint64_t board_id) {
   (void)board_id;
-  (void)fen_out;
-  (void)status_out;
-  return -1;
+  DbBoardResult r = {0};
+  r.status = DB_NOT_FOUND;
+  return r;
 }
 
-int db_get_boards_by_status(const char *status, uint64_t *board_ids,
-                            int max_boards) {
+DbBoardIdList db_list_boards_by_status(const char *status) {
   (void)status;
-  (void)board_ids;
-  (void)max_boards;
-  return 0;
+  DbBoardIdList list = {0};
+  list.status = DB_OK;
+  list.ids = NULL;
+  list.count = 0;
+  return list;
 }
 
 int db_async_record_move(uint64_t board_id, uint64_t session_id,
@@ -143,33 +144,50 @@ int db_async_record_move(uint64_t board_id, uint64_t session_id,
   return 0;
 }
 
-int db_get_moves_for_board(uint64_t board_id, WambleMove *moves_out,
-                           int max_moves) {
+DbMovesResult db_get_moves_for_board(uint64_t board_id) {
+  DbMovesResult out = {0};
+  out.status = DB_OK;
+  out.rows = NULL;
+  out.count = 0;
   int count = 0;
   if (stub_move_count > 0) {
-    for (int i = 0; i < stub_move_count && count < max_moves; i++) {
+    for (int i = 0; i < stub_move_count; i++) {
       if (stub_moves[i].board_id == board_id) {
-        moves_out[count++] = stub_moves[i];
+        count++;
       }
     }
-    return count;
+    if (count > 0) {
+      static WambleMove tls_rows[STUB_MAX_MOVES];
+      int w = 0;
+      for (int i = 0; i < stub_move_count; i++) {
+        if (stub_moves[i].board_id == board_id) {
+          tls_rows[w++] = stub_moves[i];
+        }
+      }
+      out.rows = tls_rows;
+      out.count = count;
+    }
+    return out;
   }
-  if (board_id == 1 && max_moves >= 2) {
-    memset(&moves_out[0], 0, sizeof(WambleMove));
-    moves_out[0].id = 1;
-    moves_out[0].board_id = 1;
-    moves_out[0].is_white_move = true;
-    moves_out[0].player_token[0] = 2;
-    strncpy(moves_out[0].uci_move, "e2e4", MAX_UCI_LENGTH - 1);
-    memset(&moves_out[1], 0, sizeof(WambleMove));
-    moves_out[1].id = 2;
-    moves_out[1].board_id = 1;
-    moves_out[1].is_white_move = false;
-    moves_out[1].player_token[0] = 3;
-    strncpy(moves_out[1].uci_move, "e7e5", MAX_UCI_LENGTH - 1);
-    return 2;
+  if (board_id == 1) {
+    static WambleMove tls_rows2[2];
+    memset(&tls_rows2[0], 0, sizeof(WambleMove));
+    tls_rows2[0].id = 1;
+    tls_rows2[0].board_id = 1;
+    tls_rows2[0].is_white_move = true;
+    tls_rows2[0].player_token[0] = 2;
+    strncpy(tls_rows2[0].uci_move, "e2e4", MAX_UCI_LENGTH - 1);
+    memset(&tls_rows2[1], 0, sizeof(WambleMove));
+    tls_rows2[1].id = 2;
+    tls_rows2[1].board_id = 1;
+    tls_rows2[1].is_white_move = false;
+    tls_rows2[1].player_token[0] = 3;
+    strncpy(tls_rows2[1].uci_move, "e7e5", MAX_UCI_LENGTH - 1);
+    out.rows = tls_rows2;
+    out.count = 2;
+    return out;
   }
-  return 0;
+  return out;
 }
 
 int db_async_create_reservation(uint64_t board_id, uint64_t session_id,

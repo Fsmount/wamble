@@ -1,7 +1,6 @@
 #include "../include/wamble/wamble.h"
 #include <math.h>
 #include <string.h>
-#include <unistd.h>
 
 static WAMBLE_THREAD_LOCAL WambleBoard *board_pool;
 static WAMBLE_THREAD_LOCAL int num_boards = 0;
@@ -70,16 +69,15 @@ void board_manager_init(void) {
   for (int i = 0; i < BOARD_MAP_SIZE; i++)
     board_index_map[i] = -1;
 
-  uint64_t board_ids[(size_t)get_config()->max_boards];
-  int dormant_count =
-      db_get_boards_by_status("DORMANT", board_ids, get_config()->max_boards);
-
+  DbBoardIdList dormant = db_list_boards_by_status("DORMANT");
+  int dormant_count = dormant.count;
   for (int i = 0; i < dormant_count && i < get_config()->max_boards; i++) {
     WambleBoard *board = &board_pool[num_boards++];
-    board->id = board_ids[i];
+    board->id = dormant.ids[i];
 
-    char status[17];
-    if (db_get_board(board->id, board->fen, status) == 0) {
+    DbBoardResult br = db_get_board(board->id);
+    if (br.status == DB_OK) {
+      strncpy(board->fen, br.fen, FEN_MAX_LENGTH);
       parse_fen_to_bitboard(board->fen, &board->board);
       board->state = BOARD_STATE_DORMANT;
       board->result = GAME_RESULT_IN_PROGRESS;
@@ -309,10 +307,9 @@ void archive_board(uint64_t board_id) {
 }
 
 void update_player_ratings(WambleBoard *board) {
-  WambleMove *moves =
-      malloc(sizeof(WambleMove) * (size_t)get_config()->max_moves_per_board);
-  int num_moves = db_get_moves_for_board(board->id, moves,
-                                         get_config()->max_moves_per_board);
+  DbMovesResult mres = db_get_moves_for_board(board->id);
+  const WambleMove *moves = mres.rows;
+  int num_moves = mres.count;
 
   WamblePlayer *white_player = NULL;
   WamblePlayer *black_player = NULL;
@@ -331,7 +328,6 @@ void update_player_ratings(WambleBoard *board) {
       break;
     }
   }
-  free(moves);
 
   double white_rating =
       white_player ? white_player->score : get_config()->default_rating;

@@ -1,4 +1,3 @@
-#define _POSIX_C_SOURCE 200809L
 #include "../include/wamble/wamble.h"
 #include <stdbool.h>
 #include <stdlib.h>
@@ -797,13 +796,6 @@ static const ConfigVarMap config_map[] = {
               experienced_player_end_phase_mult),
 
     CONF_ITEM("log-level", CONF_INT, log_level),
-    CONF_ITEM("log-level-main", CONF_INT, log_level_main),
-    CONF_ITEM("log-level-network", CONF_INT, log_level_network),
-    CONF_ITEM("log-level-database", CONF_INT, log_level_database),
-    CONF_ITEM("log-level-board-manager", CONF_INT, log_level_board_manager),
-    CONF_ITEM("log-level-player-manager", CONF_INT, log_level_player_manager),
-    CONF_ITEM("log-level-move-engine", CONF_INT, log_level_move_engine),
-    CONF_ITEM("log-level-scoring", CONF_INT, log_level_scoring),
 
     CONF_ITEM("max-spectators", CONF_INT, max_spectators),
     CONF_ITEM("spectator-visibility", CONF_INT, spectator_visibility),
@@ -888,13 +880,6 @@ static void config_set_defaults(void) {
   g_config.experienced_player_mid_phase_mult = 1.0;
   g_config.experienced_player_end_phase_mult = 2.0;
   g_config.log_level = LOG_LEVEL_INFO;
-  g_config.log_level_main = -1;
-  g_config.log_level_network = -1;
-  g_config.log_level_database = -1;
-  g_config.log_level_board_manager = -1;
-  g_config.log_level_player_manager = -1;
-  g_config.log_level_move_engine = -1;
-  g_config.log_level_scoring = -1;
 
   g_config.max_spectators = 1024;
   g_config.spectator_visibility = 0;

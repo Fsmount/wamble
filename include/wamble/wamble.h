@@ -1,6 +1,12 @@
 #ifndef WAMBLE_H
 #define WAMBLE_H
 
+#if !defined(_WIN32)
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#endif
+
 #if defined(_WIN32)
 #define WAMBLE_PLATFORM_WINDOWS
 #elif defined(__unix__) || defined(__APPLE__)
@@ -43,6 +49,30 @@
 #define WAMBLE_WEAK
 #else
 #define WAMBLE_WEAK __attribute__((weak))
+#endif
+
+#if defined(WAMBLE_PLATFORM_WINDOWS)
+static inline int gmtime_w(struct tm *out_tm, const time_t *timer) {
+  return (gmtime_s(out_tm, timer) == 0) ? 1 : 0;
+}
+#elif defined(WAMBLE_PLATFORM_POSIX)
+static inline int gmtime_w(struct tm *out_tm, const time_t *timer) {
+#if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
+  return (gmtime_r(timer, out_tm) != NULL) ? 1 : 0;
+#else
+  struct tm *tmp = gmtime(timer);
+  if (!tmp)
+    return 0;
+  *out_tm = *tmp;
+  return 1;
+#endif
+}
+#else
+static inline int gmtime_w(struct tm *out_tm, const time_t *timer) {
+  (void)out_tm;
+  (void)timer;
+  return 0;
+}
 #endif
 
 #ifdef WAMBLE_PLATFORM_WINDOWS
@@ -451,13 +481,6 @@ typedef struct WambleConfig {
   double experienced_player_mid_phase_mult;
   double experienced_player_end_phase_mult;
   int log_level;
-  int log_level_main;
-  int log_level_network;
-  int log_level_database;
-  int log_level_board_manager;
-  int log_level_player_manager;
-  int log_level_move_engine;
-  int log_level_scoring;
 
   int max_spectators;
   int spectator_visibility;
@@ -472,8 +495,8 @@ typedef struct WambleConfig {
 typedef enum {
   CONFIG_LOAD_OK = 0,
   CONFIG_LOAD_DEFAULTS = 1,
-  CONFIG_LOAD_IO_ERROR = 2,
-  CONFIG_LOAD_PROFILE_NOT_FOUND = 3,
+  CONFIG_LOAD_PROFILE_NOT_FOUND = -1,
+  CONFIG_LOAD_IO_ERROR = -2,
 } ConfigLoadStatus;
 
 ConfigLoadStatus config_load(const char *filename, const char *profile,
@@ -491,9 +514,58 @@ int config_profile_count(void);
 const WambleProfile *config_get_profile(int index);
 const WambleProfile *config_find_profile(const char *name);
 
-int start_profile_listeners(void);
+typedef enum {
+  PROFILE_START_OK = 0,
+  PROFILE_START_NONE = 1,
+  PROFILE_START_CONFLICT = 2,
+  PROFILE_START_SOCKET_ERROR = 3,
+  PROFILE_START_BIND_ERROR = 4,
+  PROFILE_START_THREAD_ERROR = 5,
+  PROFILE_START_NO_SOCKET = 6,
+} ProfileStartStatus;
+
+typedef enum {
+  DB_OK = 0,
+  DB_NOT_FOUND = 1,
+  DB_ERR_CONN = -1,
+  DB_ERR_EXEC = -2,
+  DB_ERR_BAD_DATA = -3,
+} DbStatus;
+
+typedef enum {
+  NET_OK = 0,
+  NET_ERR_INVALID = -1,
+  NET_ERR_TRUNCATED = -2,
+  NET_ERR_IO = -3,
+  NET_ERR_TIMEOUT = -4,
+} NetworkStatus;
+
+typedef enum {
+  PLAYER_OK = 0,
+  PLAYER_ERR_BUSY = -1,
+  PLAYER_ERR_DB = -2,
+  PLAYER_ERR_INVALID = -3,
+  PLAYER_ERR_NOT_FOUND = -4,
+} PlayerStatus;
+
+typedef enum {
+  BOARD_OK = 0,
+  BOARD_ERR_NOT_FOUND = -1,
+  BOARD_ERR_BUSY = -2,
+  BOARD_ERR_DB = -3,
+  BOARD_ERR_INVALID = -4,
+} BoardStatus;
+
+typedef enum {
+  SCORING_OK = 0,
+  SCORING_NONE = 1,
+  SCORING_ERR_DB = -1,
+  SCORING_ERR_INVALID = -2,
+} ScoringStatus;
+
+ProfileStartStatus start_profile_listeners(int *out_started);
 void stop_profile_listeners(void);
-void reconcile_profile_listeners(void);
+ProfileStartStatus reconcile_profile_listeners(void);
 
 static inline void wamble_log(int level, const char *file, int line,
                               const char *func, const char *level_str,
@@ -503,33 +575,6 @@ static inline void wamble_log(int level, const char *file, int line,
     const struct WambleConfig *cfg = get_config();
     if (cfg)
       effective = cfg->log_level;
-    if (cfg && file) {
-      if (strstr(file, "/network.c") || strstr(file, "network.c")) {
-        if (cfg->log_level_network >= 0)
-          effective = cfg->log_level_network;
-      } else if (strstr(file, "/database.c") || strstr(file, "database.c")) {
-        if (cfg->log_level_database >= 0)
-          effective = cfg->log_level_database;
-      } else if (strstr(file, "/board_manager.c") ||
-                 strstr(file, "board_manager.c")) {
-        if (cfg->log_level_board_manager >= 0)
-          effective = cfg->log_level_board_manager;
-      } else if (strstr(file, "/player_manager.c") ||
-                 strstr(file, "player_manager.c")) {
-        if (cfg->log_level_player_manager >= 0)
-          effective = cfg->log_level_player_manager;
-      } else if (strstr(file, "/move_engine.c") ||
-                 strstr(file, "move_engine.c")) {
-        if (cfg->log_level_move_engine >= 0)
-          effective = cfg->log_level_move_engine;
-      } else if (strstr(file, "/scoring.c") || strstr(file, "scoring.c")) {
-        if (cfg->log_level_scoring >= 0)
-          effective = cfg->log_level_scoring;
-      } else if (strstr(file, "/main.c") || strstr(file, "main.c")) {
-        if (cfg->log_level_main >= 0)
-          effective = cfg->log_level_main;
-      }
-    }
   }
   if (level > effective) {
     return;
@@ -537,7 +582,12 @@ static inline void wamble_log(int level, const char *file, int line,
 
   time_t now = time(NULL);
   char time_buf[21];
-  strftime(time_buf, 21, "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
+  struct tm tm_utc;
+  if (gmtime_w(&tm_utc, &now)) {
+    strftime(time_buf, sizeof time_buf, "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+  } else {
+    snprintf(time_buf, sizeof time_buf, "0000-00-00T00:00:00Z");
+  }
 
   FILE *output_stream = (level <= LOG_LEVEL_WARN) ? stderr : stdout;
   fprintf(output_stream, "%s [%s] %s:%d:%s(): ", time_buf, level_str, file,
@@ -712,12 +762,6 @@ int validate_and_apply_move_status(WambleBoard *wamble_board,
                                    WamblePlayer *player, const char *uci_move,
                                    MoveApplyStatus *out_status);
 
-static inline int validate_and_apply_move(WambleBoard *wamble_board,
-                                          WamblePlayer *player,
-                                          const char *uci_move) {
-  return validate_and_apply_move_status(wamble_board, player, uci_move, NULL);
-}
-
 int parse_fen_to_bitboard(const char *fen, Board *board);
 void bitboard_to_fen(const Board *board, char *fen);
 
@@ -754,7 +798,7 @@ void archive_board(uint64_t board_id);
 void update_player_ratings(WambleBoard *board);
 WambleBoard *get_board_by_id(uint64_t board_id);
 
-void calculate_and_distribute_pot(uint64_t board_id);
+ScoringStatus calculate_and_distribute_pot(uint64_t board_id);
 
 void player_manager_init(void);
 WamblePlayer *create_new_player(void);
@@ -779,14 +823,33 @@ void db_async_update_session_last_seen(uint64_t session_id);
 uint64_t db_create_board(const char *fen);
 int db_async_update_board(uint64_t board_id, const char *fen,
                           const char *status);
-int db_get_board(uint64_t board_id, char *fen_out, char *status_out);
-int db_get_boards_by_status(const char *status, uint64_t *board_ids,
-                            int max_boards);
+
+typedef struct {
+  DbStatus status;
+  char fen[FEN_MAX_LENGTH];
+  char status_text[STATUS_MAX_LENGTH];
+} DbBoardResult;
+
+DbBoardResult db_get_board(uint64_t board_id);
+
+typedef struct {
+  DbStatus status;
+  const uint64_t *ids;
+  int count;
+} DbBoardIdList;
+
+DbBoardIdList db_list_boards_by_status(const char *status);
 
 int db_async_record_move(uint64_t board_id, uint64_t session_id,
                          const char *move_uci, int move_number);
-int db_get_moves_for_board(uint64_t board_id, WambleMove *moves_out,
-                           int max_moves);
+
+typedef struct {
+  DbStatus status;
+  const WambleMove *rows;
+  int count;
+} DbMovesResult;
+
+DbMovesResult db_get_moves_for_board(uint64_t board_id);
 
 int db_async_create_reservation(uint64_t board_id, uint64_t session_id,
                                 int timeout_seconds);
@@ -830,18 +893,24 @@ int send_unreliable_packet(wamble_socket_t sockfd, const struct WambleMsg *msg,
 void handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
                     const struct sockaddr_in *cliaddr);
 
-int spectator_manager_init(char *status_msg, size_t status_msg_size);
+typedef enum {
+  SPECTATOR_INIT_OK = 0,
+  SPECTATOR_INIT_ERR_NO_CAPACITY = -1,
+  SPECTATOR_INIT_ERR_ALLOC = -2,
+} SpectatorInitStatus;
+
+SpectatorInitStatus spectator_manager_init(void);
 void spectator_manager_shutdown(void);
 void spectator_manager_tick(void);
 typedef enum {
   SPECTATOR_OK_SUMMARY = 0,
   SPECTATOR_OK_FOCUS = 1,
   SPECTATOR_OK_STOP = 2,
-  SPECTATOR_ERR_VISIBILITY = 100,
-  SPECTATOR_ERR_BUSY = 101,
-  SPECTATOR_ERR_FULL = 102,
-  SPECTATOR_ERR_FOCUS_DISABLED = 103,
-  SPECTATOR_ERR_NOT_AVAILABLE = 104,
+  SPECTATOR_ERR_VISIBILITY = -1,
+  SPECTATOR_ERR_BUSY = -2,
+  SPECTATOR_ERR_FULL = -3,
+  SPECTATOR_ERR_FOCUS_DISABLED = -4,
+  SPECTATOR_ERR_NOT_AVAILABLE = -5,
 } SpectatorRequestStatus;
 
 typedef struct SpectatorUpdate {
@@ -853,8 +922,7 @@ typedef struct SpectatorUpdate {
 
 SpectatorRequestStatus spectator_handle_request(
     const struct WambleMsg *msg, const struct sockaddr_in *cliaddr,
-    SpectatorState *out_state, uint64_t *out_focus_board_id, char *status_msg,
-    size_t status_msg_size);
+    SpectatorState *out_state, uint64_t *out_focus_board_id);
 
 int spectator_collect_updates(struct SpectatorUpdate *out, int max);
 int spectator_collect_notifications(struct SpectatorUpdate *out, int max);

@@ -5,7 +5,10 @@
 
 void update_player_ratings(WambleBoard *board) { (void)board; }
 void archive_board(uint64_t board_id) { (void)board_id; }
-void calculate_and_distribute_pot(uint64_t board_id) { (void)board_id; }
+ScoringStatus calculate_and_distribute_pot(uint64_t board_id) {
+  (void)board_id;
+  return SCORING_OK;
+}
 WamblePlayer *get_player_by_token(const uint8_t *token) {
   (void)token;
   return NULL;

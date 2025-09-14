@@ -117,11 +117,12 @@ static inline uint64_t net_to_host64(uint64_t x) {
 }
 #endif
 
-static int serialize_wamble_msg(const struct WambleMsg *msg, uint8_t *buffer,
-                                size_t buffer_capacity, size_t *out_len,
-                                uint8_t flags) {
+static NetworkStatus serialize_wamble_msg(const struct WambleMsg *msg,
+                                          uint8_t *buffer,
+                                          size_t buffer_capacity,
+                                          size_t *out_len, uint8_t flags) {
   if (!buffer || buffer_capacity < WAMBLE_HEADER_SIZE)
-    return -1;
+    return NET_ERR_INVALID;
 
   WambleHeader hdr = {0};
   hdr.ctrl = msg->ctrl;
@@ -147,7 +148,7 @@ static int serialize_wamble_msg(const struct WambleMsg *msg, uint8_t *buffer,
   case WAMBLE_CTRL_PLAYER_MOVE: {
     size_t need = 1 + (size_t)msg->uci_len;
     if (need > WAMBLE_MAX_PAYLOAD)
-      return -1;
+      return NET_ERR_TRUNCATED;
     payload[0] = msg->uci_len;
     memcpy(&payload[1], msg->uci, msg->uci_len);
     payload_len = need;
@@ -159,7 +160,7 @@ static int serialize_wamble_msg(const struct WambleMsg *msg, uint8_t *buffer,
   case WAMBLE_CTRL_SPECTATE_UPDATE: {
     size_t len = strnlen(msg->fen, FEN_MAX_LENGTH);
     if (len > WAMBLE_MAX_PAYLOAD)
-      return -1;
+      return NET_ERR_TRUNCATED;
     memcpy(payload, msg->fen, len);
     payload_len = len;
     break;
@@ -168,7 +169,7 @@ static int serialize_wamble_msg(const struct WambleMsg *msg, uint8_t *buffer,
 
     size_t len = strnlen(msg->fen, FEN_MAX_LENGTH);
     if (len > WAMBLE_MAX_PAYLOAD)
-      return -1;
+      return NET_ERR_TRUNCATED;
     memcpy(payload, msg->fen, len);
     payload_len = len;
     break;
@@ -177,7 +178,7 @@ static int serialize_wamble_msg(const struct WambleMsg *msg, uint8_t *buffer,
 
     size_t need = 1 + (size_t)msg->uci_len;
     if (need > WAMBLE_MAX_PAYLOAD)
-      return -1;
+      return NET_ERR_TRUNCATED;
     payload[0] = msg->uci_len;
     if (msg->uci_len)
       memcpy(&payload[1], msg->uci, msg->uci_len);
@@ -188,7 +189,7 @@ static int serialize_wamble_msg(const struct WambleMsg *msg, uint8_t *buffer,
 
     size_t len = strnlen(msg->fen, FEN_MAX_LENGTH);
     if (len > WAMBLE_MAX_PAYLOAD)
-      return -1;
+      return NET_ERR_TRUNCATED;
     memcpy(payload, msg->fen, len);
     payload_len = len;
     break;
@@ -200,7 +201,7 @@ static int serialize_wamble_msg(const struct WambleMsg *msg, uint8_t *buffer,
     if (reason_len > 255)
       reason_len = 255;
     if (3 + reason_len > WAMBLE_MAX_PAYLOAD)
-      return -1;
+      return NET_ERR_TRUNCATED;
     payload[0] = (uint8_t)(code_net >> 8);
     payload[1] = (uint8_t)(code_net & 0xFF);
     payload[2] = (uint8_t)reason_len;
@@ -243,7 +244,7 @@ static int serialize_wamble_msg(const struct WambleMsg *msg, uint8_t *buffer,
     if (reason_len > 255)
       reason_len = 255;
     if (3 + reason_len > WAMBLE_MAX_PAYLOAD)
-      return -1;
+      return NET_ERR_TRUNCATED;
     payload[0] = (uint8_t)(code_net >> 8);
     payload[1] = (uint8_t)(code_net & 0xFF);
     payload[2] = (uint8_t)reason_len;
@@ -261,25 +262,27 @@ static int serialize_wamble_msg(const struct WambleMsg *msg, uint8_t *buffer,
   hdr.payload_len = htons((uint16_t)payload_len);
 
   if (WAMBLE_HEADER_SIZE + payload_len > buffer_capacity)
-    return -1;
+    return NET_ERR_TRUNCATED;
 
   memcpy(buffer, &hdr, sizeof(hdr));
   if (payload_len > 0)
     memcpy(buffer + WAMBLE_HEADER_SIZE, payload, payload_len);
   if (out_len)
     *out_len = WAMBLE_HEADER_SIZE + payload_len;
-  return 0;
+  return NET_OK;
 }
 
-static int deserialize_wamble_msg(const uint8_t *buffer, size_t buffer_size,
-                                  struct WambleMsg *msg, uint8_t *out_flags) {
+static NetworkStatus deserialize_wamble_msg(const uint8_t *buffer,
+                                            size_t buffer_size,
+                                            struct WambleMsg *msg,
+                                            uint8_t *out_flags) {
   if (!buffer || buffer_size < WAMBLE_HEADER_SIZE || !msg)
-    return -1;
+    return NET_ERR_INVALID;
   WambleHeader hdr;
   memcpy(&hdr, buffer, sizeof(hdr));
   size_t payload_len = ntohs(hdr.payload_len);
   if (buffer_size < WAMBLE_HEADER_SIZE + payload_len)
-    return -1;
+    return NET_ERR_TRUNCATED;
 
   memset(msg, 0, sizeof(*msg));
   msg->ctrl = hdr.ctrl;
@@ -303,11 +306,11 @@ static int deserialize_wamble_msg(const uint8_t *buffer, size_t buffer_size,
     break;
   case WAMBLE_CTRL_PLAYER_MOVE: {
     if (payload_len < 1)
-      return -1;
+      return NET_ERR_TRUNCATED;
     msg->uci_len = payload[0];
     if ((size_t)msg->uci_len > MAX_UCI_LENGTH ||
         (size_t)msg->uci_len > payload_len - 1)
-      return -1;
+      return NET_ERR_INVALID;
     memcpy(msg->uci, &payload[1], msg->uci_len);
     break;
   }
@@ -320,11 +323,11 @@ static int deserialize_wamble_msg(const uint8_t *buffer, size_t buffer_size,
 
     if (hdr.ctrl == WAMBLE_CTRL_ERROR) {
       if (payload_len < 3)
-        return -1;
+        return NET_ERR_TRUNCATED;
       uint16_t code_net = (uint16_t)((payload[0] << 8) | payload[1]);
       uint8_t rlen = payload[2];
       if ((size_t)3 + rlen > payload_len)
-        return -1;
+        return NET_ERR_TRUNCATED;
       msg->error_code = ntohs(code_net);
       size_t copy = rlen < FEN_MAX_LENGTH - 1 ? rlen : (FEN_MAX_LENGTH - 1);
       if (copy)
@@ -340,11 +343,11 @@ static int deserialize_wamble_msg(const uint8_t *buffer, size_t buffer_size,
   }
   case WAMBLE_CTRL_LOGIN_FAILED: {
     if (payload_len < 3)
-      return -1;
+      return NET_ERR_TRUNCATED;
     uint16_t code_net = (uint16_t)((payload[0] << 8) | payload[1]);
     uint8_t rlen = payload[2];
     if ((size_t)3 + rlen > payload_len)
-      return -1;
+      return NET_ERR_TRUNCATED;
     msg->error_code = ntohs(code_net);
     size_t copy = rlen < FEN_MAX_LENGTH - 1 ? rlen : (FEN_MAX_LENGTH - 1);
     if (copy)
@@ -363,18 +366,18 @@ static int deserialize_wamble_msg(const uint8_t *buffer, size_t buffer_size,
   case WAMBLE_CTRL_GET_PROFILE_INFO: {
 
     if (payload_len < 1)
-      return -1;
+      return NET_ERR_TRUNCATED;
     msg->uci_len = payload[0];
     if ((size_t)msg->uci_len > MAX_UCI_LENGTH ||
         (size_t)msg->uci_len > payload_len - 1)
-      return -1;
+      return NET_ERR_INVALID;
     if (msg->uci_len)
       memcpy(msg->uci, &payload[1], msg->uci_len);
     break;
   }
   case WAMBLE_CTRL_PLAYER_STATS_DATA: {
     if (payload_len < 12)
-      return -1;
+      return NET_ERR_TRUNCATED;
     uint64_t be = 0;
     for (int i = 0; i < 8; i++) {
       be = (be << 8) | payload[i];
@@ -401,7 +404,7 @@ static int deserialize_wamble_msg(const uint8_t *buffer, size_t buffer_size,
   default:
     break;
   }
-  return 0;
+  return NET_OK;
 }
 
 static WambleClientSession *
@@ -526,7 +529,7 @@ int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
 
   uint8_t flags = 0;
   if (deserialize_wamble_msg(receive_buffer, (size_t)bytes_received, msg,
-                             &flags) != 0) {
+                             &flags) != NET_OK) {
 
     return -1;
   }
@@ -611,7 +614,7 @@ void send_ack(wamble_socket_t sockfd, const struct WambleMsg *msg,
   static uint8_t send_buffer[WAMBLE_MAX_PACKET_SIZE];
   size_t serialized_size = 0;
   if (serialize_wamble_msg(&ack_msg, send_buffer, sizeof(send_buffer),
-                           &serialized_size, 0) != 0) {
+                           &serialized_size, 0) != NET_OK) {
 
     return;
   }
@@ -657,7 +660,7 @@ int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
   static uint8_t send_buffer[WAMBLE_MAX_PACKET_SIZE];
   size_t serialized_size = 0;
   if (serialize_wamble_msg(&reliable_msg, send_buffer, sizeof(send_buffer),
-                           &serialized_size, 0) != 0) {
+                           &serialized_size, 0) != NET_OK) {
     return -1;
   }
 
@@ -708,7 +711,7 @@ int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
       if (rcv > 0) {
         uint8_t ack_flags = 0;
         if (deserialize_wamble_msg(ack_buffer, (size_t)rcv, &ack_msg,
-                                   &ack_flags) == 0 &&
+                                   &ack_flags) == NET_OK &&
             ack_msg.ctrl == WAMBLE_CTRL_ACK &&
             ack_msg.seq_num == reliable_msg.seq_num &&
             memcmp(ack_msg.token, reliable_msg.token, TOKEN_LENGTH) == 0) {
@@ -733,7 +736,7 @@ int send_unreliable_packet(wamble_socket_t sockfd, const struct WambleMsg *msg,
   uint8_t buffer[WAMBLE_MAX_PACKET_SIZE];
   size_t serialized_size = 0;
   if (serialize_wamble_msg(msg, buffer, sizeof(buffer), &serialized_size,
-                           WAMBLE_FLAG_UNRELIABLE) != 0) {
+                           WAMBLE_FLAG_UNRELIABLE) != NET_OK) {
     return -1;
   }
 #ifdef WAMBLE_PLATFORM_WINDOWS
