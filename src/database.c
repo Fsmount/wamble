@@ -94,10 +94,25 @@ int db_init(const char *connection_string) {
 
 void db_cleanup(void) { db_initialized = false; }
 
+static WAMBLE_THREAD_LOCAL uint64_t *tls_ids;
+static WAMBLE_THREAD_LOCAL int tls_ids_cap;
+static WAMBLE_THREAD_LOCAL WambleMove *tls_moves;
+static WAMBLE_THREAD_LOCAL int tls_moves_cap;
+
 void db_cleanup_thread(void) {
   if (db_conn_tls) {
     PQfinish(db_conn_tls);
     db_conn_tls = NULL;
+  }
+  if (tls_ids) {
+    free(tls_ids);
+    tls_ids = NULL;
+    tls_ids_cap = 0;
+  }
+  if (tls_moves) {
+    free(tls_moves);
+    tls_moves = NULL;
+    tls_moves_cap = 0;
   }
 }
 
@@ -226,7 +241,9 @@ int db_async_update_board(uint64_t board_id, const char *fen,
   return 0;
 }
 
-int db_get_board(uint64_t board_id, char *fen_out, char *status_out) {
+DbBoardResult db_get_board(uint64_t board_id) {
+  DbBoardResult out = {0};
+  out.status = DB_NOT_FOUND;
   const char *query = "SELECT fen, status FROM boards WHERE id = $1";
 
   char board_id_str[32];
@@ -236,46 +253,73 @@ int db_get_board(uint64_t board_id, char *fen_out, char *status_out) {
 
   PGresult *res =
       pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
-
-  if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+  if (!res) {
+    out.status = DB_ERR_CONN;
+    return out;
+  }
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    out.status = DB_ERR_EXEC;
     PQclear(res);
-    return -1;
+    return out;
+  }
+  if (PQntuples(res) == 0) {
+    out.status = DB_NOT_FOUND;
+    PQclear(res);
+    return out;
   }
 
-  snprintf(fen_out, FEN_MAX_LENGTH, "%s", PQgetvalue(res, 0, 0));
-  strncpy(status_out, PQgetvalue(res, 0, 1), STATUS_MAX_LENGTH - 1);
-  status_out[STATUS_MAX_LENGTH - 1] = '\0';
-
+  snprintf(out.fen, FEN_MAX_LENGTH, "%s", PQgetvalue(res, 0, 0));
+  strncpy(out.status_text, PQgetvalue(res, 0, 1), STATUS_MAX_LENGTH - 1);
+  out.status_text[STATUS_MAX_LENGTH - 1] = '\0';
+  out.status = DB_OK;
   PQclear(res);
-  return 0;
+  return out;
 }
 
-int db_get_boards_by_status(const char *status, uint64_t *board_ids,
-                            int max_boards) {
+DbBoardIdList db_list_boards_by_status(const char *status) {
+  DbBoardIdList out = {0};
+  out.status = DB_ERR_EXEC;
   const char *query =
       "SELECT id FROM boards WHERE status = $1 ORDER BY created_at";
-
   const char *paramValues[] = {status};
-
   PGresult *res =
       pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
-
+  if (!res) {
+    out.status = DB_ERR_CONN;
+    return out;
+  }
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    out.status = DB_ERR_EXEC;
     PQclear(res);
-    return -1;
+    return out;
   }
-
   int count = PQntuples(res);
-  if (count > max_boards) {
-    count = max_boards;
+  if (count <= 0) {
+    out.status = DB_OK;
+    out.ids = NULL;
+    out.count = 0;
+    PQclear(res);
+    return out;
   }
-
+  if (tls_ids_cap < count) {
+    uint64_t *newbuf =
+        (uint64_t *)realloc(tls_ids, (size_t)count * sizeof(uint64_t));
+    if (!newbuf) {
+      out.status = DB_ERR_EXEC;
+      PQclear(res);
+      return out;
+    }
+    tls_ids = newbuf;
+    tls_ids_cap = count;
+  }
+  out.count = count;
   for (int i = 0; i < count; i++) {
-    board_ids[i] = strtoull(PQgetvalue(res, i, 0), NULL, 10);
+    tls_ids[i] = strtoull(PQgetvalue(res, i, 0), NULL, 10);
   }
-
+  out.ids = tls_ids;
+  out.status = DB_OK;
   PQclear(res);
-  return count;
+  return out;
 }
 
 int db_async_record_move(uint64_t board_id, uint64_t session_id,
@@ -306,8 +350,9 @@ int db_async_record_move(uint64_t board_id, uint64_t session_id,
   return 0;
 }
 
-int db_get_moves_for_board(uint64_t board_id, WambleMove *moves_out,
-                           int max_moves) {
+DbMovesResult db_get_moves_for_board(uint64_t board_id) {
+  DbMovesResult out = {0};
+  out.status = DB_ERR_EXEC;
   const char *query =
       "SELECT m.id, m.board_id, encode(s.token, 'hex'), m.move_uci, "
       "EXTRACT(EPOCH FROM m.timestamp)::bigint, m.move_number "
@@ -323,43 +368,60 @@ int db_get_moves_for_board(uint64_t board_id, WambleMove *moves_out,
 
   PGresult *res =
       pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
-
+  if (!res) {
+    out.status = DB_ERR_CONN;
+    return out;
+  }
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    out.status = DB_ERR_EXEC;
     PQclear(res);
-    return -1;
+    return out;
   }
-
   int count = PQntuples(res);
-  if (count == 0) {
+  if (count <= 0) {
+    out.status = DB_OK;
+    out.rows = NULL;
+    out.count = 0;
     PQclear(res);
-    return 0;
+    return out;
   }
-
-  if (count > max_moves) {
-    count = max_moves;
+  if (tls_moves_cap < count) {
+    WambleMove *newbuf =
+        (WambleMove *)realloc(tls_moves, (size_t)count * sizeof(WambleMove));
+    if (!newbuf) {
+      out.status = DB_ERR_EXEC;
+      PQclear(res);
+      return out;
+    }
+    tls_moves = newbuf;
+    tls_moves_cap = count;
   }
-
+  out.count = count;
   for (int i = 0; i < count; i++) {
-    moves_out[i].id = strtoull(PQgetvalue(res, i, 0), NULL, 10);
-    moves_out[i].board_id = strtoull(PQgetvalue(res, i, 1), NULL, 10);
+    tls_moves[i].id = strtoull(PQgetvalue(res, i, 0), NULL, 10);
+    tls_moves[i].board_id = strtoull(PQgetvalue(res, i, 1), NULL, 10);
 
     const char *token_hex = PQgetvalue(res, i, 2);
-    hex_to_bytes(token_hex, moves_out[i].player_token, TOKEN_LENGTH);
-    strncpy(moves_out[i].uci_move, PQgetvalue(res, i, 3), MAX_UCI_LENGTH - 1);
-    moves_out[i].uci_move[MAX_UCI_LENGTH - 1] = '\0';
-    moves_out[i].timestamp = (time_t)strtoull(PQgetvalue(res, i, 4), NULL, 10);
+    hex_to_bytes(token_hex, tls_moves[i].player_token, TOKEN_LENGTH);
+    strncpy(tls_moves[i].uci_move, PQgetvalue(res, i, 3), MAX_UCI_LENGTH - 1);
+    tls_moves[i].uci_move[MAX_UCI_LENGTH - 1] = '\0';
+    tls_moves[i].timestamp = (time_t)strtoull(PQgetvalue(res, i, 4), NULL, 10);
 
     char *endptr;
     long move_number = strtol(PQgetvalue(res, i, 5), &endptr, 10);
     if (*endptr != '\0' || move_number < 0) {
+      out.rows = NULL;
+      out.count = 0;
+      out.status = DB_ERR_BAD_DATA;
       PQclear(res);
-      return -1;
+      return out;
     }
-    moves_out[i].is_white_move = (move_number % 2 == 1);
+    tls_moves[i].is_white_move = (move_number % 2 == 1);
   }
-
+  out.rows = tls_moves;
+  out.status = DB_OK;
   PQclear(res);
-  return count;
+  return out;
 }
 
 int db_async_create_reservation(uint64_t board_id, uint64_t session_id,

@@ -126,7 +126,7 @@ static SpectatorEntry *ensure_spectator(const struct sockaddr_in *addr,
   return e;
 }
 
-int spectator_manager_init(char *status_msg, size_t status_msg_size) {
+SpectatorInitStatus spectator_manager_init(void) {
   wamble_mutex_init(&spectators_mutex);
   wamble_mutex_lock(&spectators_mutex);
   if (spectators) {
@@ -137,17 +137,13 @@ int spectator_manager_init(char *status_msg, size_t status_msg_size) {
 
   spectators_capacity = get_config()->max_client_sessions;
   if (spectators_capacity <= 0) {
-    if (status_msg && status_msg_size)
-      snprintf(status_msg, status_msg_size, "no capacity configured");
-    return -1;
+    wamble_mutex_unlock(&spectators_mutex);
+    return SPECTATOR_INIT_ERR_NO_CAPACITY;
   }
   spectators = calloc((size_t)spectators_capacity, sizeof(SpectatorEntry));
   if (!spectators) {
-    if (status_msg && status_msg_size)
-      snprintf(status_msg, status_msg_size, "allocation failed for %d entries",
-               spectators_capacity);
     wamble_mutex_unlock(&spectators_mutex);
-    return -1;
+    return SPECTATOR_INIT_ERR_ALLOC;
   }
 
   if (summary_cache) {
@@ -157,11 +153,8 @@ int spectator_manager_init(char *status_msg, size_t status_msg_size) {
   summary_cache_capacity = 0;
   summary_cache_count = 0;
   summary_cache_built_wall = 0;
-  if (status_msg && status_msg_size)
-    snprintf(status_msg, status_msg_size, "initialized %d entries",
-             spectators_capacity);
   wamble_mutex_unlock(&spectators_mutex);
-  return 0;
+  return SPECTATOR_INIT_OK;
 }
 
 void spectator_manager_shutdown(void) {
@@ -319,22 +312,16 @@ int spectator_collect_notifications(struct SpectatorUpdate *out, int max) {
 
 SpectatorRequestStatus spectator_handle_request(
     const struct WambleMsg *msg, const struct sockaddr_in *cliaddr,
-    SpectatorState *out_state, uint64_t *out_focus_board_id, char *status_msg,
-    size_t status_msg_size) {
+    SpectatorState *out_state, uint64_t *out_focus_board_id) {
   wamble_mutex_lock(&spectators_mutex);
   int trust = db_get_trust_tier_by_token(msg->token);
   if (trust < get_config()->spectator_visibility) {
-    if (status_msg && status_msg_size)
-      snprintf(status_msg, status_msg_size,
-               "spectating isn't available for your account");
     wamble_mutex_unlock(&spectators_mutex);
     return SPECTATOR_ERR_VISIBILITY;
   }
 
   SpectatorEntry *e = ensure_spectator(cliaddr, msg->token, trust);
   if (!e) {
-    if (status_msg && status_msg_size)
-      snprintf(status_msg, status_msg_size, "server is busy, please try again");
     wamble_mutex_unlock(&spectators_mutex);
     return SPECTATOR_ERR_BUSY;
   }
@@ -363,9 +350,6 @@ SpectatorRequestStatus spectator_handle_request(
       int thr = get_config()->admin_trust_level;
       int is_admin = (thr >= 0) && (trust >= thr);
       if (cap >= 0 && active_focus >= cap && !is_admin) {
-        if (status_msg && status_msg_size)
-          snprintf(status_msg, status_msg_size,
-                   "spectator seats are full right now");
         wamble_mutex_unlock(&spectators_mutex);
         return SPECTATOR_ERR_FULL;
       }
@@ -384,17 +368,12 @@ SpectatorRequestStatus spectator_handle_request(
       return SPECTATOR_OK_SUMMARY;
     } else {
       if (get_config()->spectator_max_focus_per_session <= 0) {
-        if (status_msg && status_msg_size)
-          snprintf(status_msg, status_msg_size,
-                   "focusing games is currently disabled");
         wamble_mutex_unlock(&spectators_mutex);
         return SPECTATOR_ERR_FOCUS_DISABLED;
       }
 
       WambleBoard *target = get_board_by_id(msg->board_id);
       if (!target || !is_board_eligible(target)) {
-        if (status_msg && status_msg_size)
-          snprintf(status_msg, status_msg_size, "board not available");
         wamble_mutex_unlock(&spectators_mutex);
         return SPECTATOR_ERR_NOT_AVAILABLE;
       }

@@ -11,7 +11,10 @@
 #define INACTIVITY_TIMEOUT 300
 #define RESERVATION_TIMEOUT 2
 
-void calculate_and_distribute_pot(uint64_t board_id) { (void)board_id; }
+ScoringStatus calculate_and_distribute_pot(uint64_t board_id) {
+  (void)board_id;
+  return SCORING_OK;
+}
 
 #include "../board_manager.c"
 #include "../move_engine.c"

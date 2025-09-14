@@ -1,4 +1,3 @@
-#define _POSIX_C_SOURCE 200809L
 #include "../include/wamble/wamble.h"
 #include <signal.h>
 #include <string.h>
@@ -57,13 +56,8 @@ int main(int argc, char *argv[]) {
   char cfg_status[128];
   ConfigLoadStatus cfg =
       config_load(config_file, profile, cfg_status, sizeof(cfg_status));
-  if (cfg == CONFIG_LOAD_DEFAULTS) {
-    LOG_WARN("Config: %s (using defaults)",
-             cfg_status[0] ? cfg_status : "defaults");
-  } else if (cfg == CONFIG_LOAD_PROFILE_NOT_FOUND) {
-    LOG_WARN("Config: %s", cfg_status[0] ? cfg_status : "profile not found");
-  } else if (cfg != CONFIG_LOAD_OK) {
-    LOG_WARN("Config: unexpected status");
+  if (cfg != CONFIG_LOAD_OK) {
+    LOG_WARN("Config load status=%d", (int)cfg);
   }
 
   struct sigaction sa;
@@ -91,25 +85,21 @@ int main(int argc, char *argv[]) {
   int has_profiles = config_profile_count();
 
   {
-    char s_init_msg[96] = {0};
-    int sst = spectator_manager_init(s_init_msg, sizeof(s_init_msg));
-    if (sst != 0) {
-      LOG_WARN("Spectator manager init: %s",
-               s_init_msg[0] ? s_init_msg : "failed");
+    SpectatorInitStatus sst = spectator_manager_init();
+    if (sst != SPECTATOR_INIT_OK) {
+      LOG_WARN("Spectator manager init failed status=%d", (int)sst);
     } else {
-      LOG_INFO("Spectator manager initialized: %s", s_init_msg);
+      LOG_INFO("Spectator manager initialized");
     }
   }
 
   if (has_profiles > 0) {
     int started = 0;
-    char pstatus[128] = {0};
-    ProfileStartStatus pst =
-        start_profile_listeners(&started, pstatus, sizeof(pstatus));
+    ProfileStartStatus pst = start_profile_listeners(&started);
     if (pst != PROFILE_START_OK || started <= 0) {
-      LOG_WARN(
-          "No profile listeners started (%s); falling back to default port",
-          pstatus[0] ? pstatus : "no reason provided");
+      LOG_WARN("No profile listeners started (status=%d); falling back to "
+               "default port",
+               (int)pst);
     } else {
       LOG_INFO("Started %d profile listener(s)", started);
     }
@@ -230,15 +220,17 @@ int main(int argc, char *argv[]) {
       LOG_INFO("Reload requested; reloading config and reconciling listeners");
       ConfigLoadStatus rcfg =
           config_load(config_file, profile, cfg_status, sizeof(cfg_status));
-      if (rcfg == CONFIG_LOAD_DEFAULTS) {
-        LOG_WARN("Config reload: %s (using defaults)",
-                 cfg_status[0] ? cfg_status : "defaults");
-      } else if (rcfg == CONFIG_LOAD_PROFILE_NOT_FOUND) {
-        LOG_WARN("Config reload: %s",
-                 cfg_status[0] ? cfg_status : "profile not found");
+      if (rcfg != CONFIG_LOAD_OK) {
+        LOG_WARN("Config reload status=%d", (int)rcfg);
       }
       if (config_profile_count() > 0) {
-        reconcile_profile_listeners();
+        ProfileStartStatus rst = reconcile_profile_listeners();
+        if (rst == PROFILE_START_THREAD_ERROR) {
+          LOG_FATAL("Failed to start thread for one or more profiles");
+        }
+        if (rst != PROFILE_START_OK && rst != PROFILE_START_NONE) {
+          LOG_WARN("Listener reconcile failed (status=%d)", (int)rst);
+        }
       }
       g_reload_requested = 0;
     }
@@ -503,22 +495,15 @@ void handle_message(int sockfd, const struct WambleMsg *msg,
       send_ack(sockfd, msg, cliaddr);
     SpectatorState new_state = SPECTATOR_STATE_IDLE;
     uint64_t focus_id = 0;
-    char status_msg[128] = {0};
-    SpectatorRequestStatus res = spectator_handle_request(
-        msg, cliaddr, &new_state, &focus_id, status_msg, sizeof(status_msg));
+    SpectatorRequestStatus res =
+        spectator_handle_request(msg, cliaddr, &new_state, &focus_id);
     if (!(res == SPECTATOR_OK_FOCUS || res == SPECTATOR_OK_SUMMARY ||
           res == SPECTATOR_OK_STOP)) {
       struct WambleMsg out = {0};
       out.ctrl = WAMBLE_CTRL_ERROR;
       memcpy(out.token, msg->token, TOKEN_LENGTH);
-      out.error_code = 1;
-      if (status_msg[0]) {
-        strncpy(out.error_reason, status_msg, sizeof(out.error_reason));
-        out.error_reason[sizeof(out.error_reason) - 1] = '\0';
-      } else {
-        snprintf(out.error_reason, sizeof(out.error_reason),
-                 "spectate request failed");
-      }
+      out.error_code = (uint16_t)(-res);
+      out.error_reason[0] = '\0';
       (void)send_reliable_message(sockfd, &out, cliaddr,
                                   get_config()->timeout_ms,
                                   get_config()->max_retries);
@@ -537,9 +522,7 @@ void handle_message(int sockfd, const struct WambleMsg *msg,
       send_ack(sockfd, msg, cliaddr);
     SpectatorState new_state = SPECTATOR_STATE_IDLE;
     uint64_t focus_id = 0;
-    char status_msg[128] = {0};
-    (void)spectator_handle_request(msg, cliaddr, &new_state, &focus_id,
-                                   status_msg, sizeof(status_msg));
+    (void)spectator_handle_request(msg, cliaddr, &new_state, &focus_id);
     LOG_INFO("Spectator stopped; state now IDLE");
     break;
   }

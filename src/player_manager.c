@@ -1,6 +1,5 @@
 #include "../include/wamble/wamble.h"
 #include <string.h>
-#include <unistd.h>
 #if defined(__linux__)
 #include <sys/random.h>
 #endif
