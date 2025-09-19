@@ -838,6 +838,61 @@ void handle_message(int sockfd, const struct WambleMsg *msg,
     }
     break;
   }
+  case WAMBLE_CTRL_GET_LEGAL_MOVES: {
+    LOG_DEBUG("Handling GET_LEGAL_MOVES message (seq: %u, board=%lu, square=%u)",
+              msg->seq_num, msg->board_id, (unsigned)msg->move_square);
+    WamblePlayer *player = get_player_by_token(msg->token);
+    if (!player) {
+      LOG_WARN("Legal move request from unknown player token");
+      break;
+    }
+
+    WambleBoard *board = get_board_by_id(msg->board_id);
+    if (!board) {
+      LOG_WARN("Legal move request for unknown board: %lu", msg->board_id);
+      break;
+    }
+
+    struct WambleMsg response = {0};
+    response.ctrl = WAMBLE_CTRL_LEGAL_MOVES;
+    memcpy(response.token, msg->token, TOKEN_LENGTH);
+    response.board_id = msg->board_id;
+    response.move_square = msg->move_square;
+
+    if (!tokens_equal(board->reservation_player_token, player->token)) {
+      LOG_DEBUG("Player token mismatch for board %lu when requesting legal moves",
+                board->id);
+      response.move_count = 0;
+    } else if (msg->move_square >= 64) {
+      LOG_WARN("Invalid square %u in legal move request for board %lu",
+               (unsigned)msg->move_square, board->id);
+      response.move_count = 0;
+    } else {
+      Move moves[WAMBLE_MAX_LEGAL_MOVES];
+      int count =
+          get_legal_moves_for_square(&board->board, msg->move_square, moves,
+                                     WAMBLE_MAX_LEGAL_MOVES);
+      if (count < 0) {
+        LOG_WARN("Failed to compute legal moves for board %lu square %u",
+                 board->id, (unsigned)msg->move_square);
+        response.move_count = 0;
+      } else {
+        if (count > WAMBLE_MAX_LEGAL_MOVES)
+          count = WAMBLE_MAX_LEGAL_MOVES;
+        response.move_count = (uint8_t)count;
+        for (int i = 0; i < count; i++) {
+          response.moves[i].from = (uint8_t)moves[i].from;
+          response.moves[i].to = (uint8_t)moves[i].to;
+          response.moves[i].promotion = (int8_t)moves[i].promotion;
+        }
+      }
+    }
+
+    (void)send_reliable_message(sockfd, &response, cliaddr,
+                                get_config()->timeout_ms,
+                                get_config()->max_retries);
+    break;
+  }
   case WAMBLE_CTRL_ACK:
     LOG_DEBUG("Handling ACK message (seq: %u)", msg->seq_num);
     break;

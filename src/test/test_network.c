@@ -581,6 +581,88 @@ static int test_capability_flags_roundtrip(void) {
   return 1;
 }
 
+static int test_get_legal_moves_roundtrip(void) {
+  struct WambleMsg in = {0};
+  in.ctrl = WAMBLE_CTRL_GET_LEGAL_MOVES;
+  in.board_id = 314;
+  in.move_square = 27;
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    in.token[i] = (uint8_t)(0x20 + i);
+
+  uint8_t buf[WAMBLE_MAX_PACKET_SIZE];
+  size_t out_len = 0;
+  if (serialize_wamble_msg(&in, buf, sizeof buf, &out_len, 0) != 0) {
+    printf("get_legal_moves_roundtrip FAILED: serialize error\n");
+    return 0;
+  }
+
+  struct WambleMsg out = {0};
+  if (deserialize_wamble_msg(buf, out_len, &out, NULL) != 0) {
+    printf("get_legal_moves_roundtrip FAILED: deserialize error\n");
+    return 0;
+  }
+  if (out.ctrl != WAMBLE_CTRL_GET_LEGAL_MOVES || out.board_id != in.board_id ||
+      out.move_square != in.move_square) {
+    printf("get_legal_moves_roundtrip FAILED: header mismatch\n");
+    return 0;
+  }
+  if (memcmp(out.token, in.token, TOKEN_LENGTH) != 0) {
+    printf("get_legal_moves_roundtrip FAILED: token mismatch\n");
+    return 0;
+  }
+  return 1;
+}
+
+static int test_legal_moves_payload_roundtrip(void) {
+  struct WambleMsg in = {0};
+  in.ctrl = WAMBLE_CTRL_LEGAL_MOVES;
+  in.board_id = 2718;
+  in.move_square = 12;
+  in.move_count = 3;
+  in.moves[0].from = 12;
+  in.moves[0].to = 20;
+  in.moves[0].promotion = 0;
+  in.moves[1].from = 12;
+  in.moves[1].to = 28;
+  in.moves[1].promotion = 0;
+  in.moves[2].from = 12;
+  in.moves[2].to = 21;
+  in.moves[2].promotion = 'q';
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    in.token[i] = (uint8_t)(0xA0 + i);
+
+  uint8_t buf[WAMBLE_MAX_PACKET_SIZE];
+  size_t out_len = 0;
+  if (serialize_wamble_msg(&in, buf, sizeof buf, &out_len, 0) != 0) {
+    printf("legal_moves_payload_roundtrip FAILED: serialize error\n");
+    return 0;
+  }
+
+  struct WambleMsg out = {0};
+  if (deserialize_wamble_msg(buf, out_len, &out, NULL) != 0) {
+    printf("legal_moves_payload_roundtrip FAILED: deserialize error\n");
+    return 0;
+  }
+  if (out.ctrl != WAMBLE_CTRL_LEGAL_MOVES || out.board_id != in.board_id ||
+      out.move_square != in.move_square || out.move_count != in.move_count) {
+    printf("legal_moves_payload_roundtrip FAILED: header mismatch\n");
+    return 0;
+  }
+  for (uint8_t i = 0; i < out.move_count; i++) {
+    if (out.moves[i].from != in.moves[i].from ||
+        out.moves[i].to != in.moves[i].to ||
+        out.moves[i].promotion != in.moves[i].promotion) {
+      printf("legal_moves_payload_roundtrip FAILED: move %u mismatch\n", i);
+      return 0;
+    }
+  }
+  if (memcmp(out.token, in.token, TOKEN_LENGTH) != 0) {
+    printf("legal_moves_payload_roundtrip FAILED: token mismatch\n");
+    return 0;
+  }
+  return 1;
+}
+
 static int test_ack_roundtrip(void) {
   struct WambleMsg in = {0};
   in.ctrl = WAMBLE_CTRL_ACK;
@@ -681,6 +763,8 @@ int main(int argc, char **argv) {
       {"error_payload_truncation", test_error_payload_truncation},
       {"server_notification_unreliable_flag",
        test_server_notification_unreliable_flag},
+      {"get_legal_moves_roundtrip", test_get_legal_moves_roundtrip},
+      {"legal_moves_payload_roundtrip", test_legal_moves_payload_roundtrip},
       {"ack_roundtrip", test_ack_roundtrip},
       {"token_base64url_roundtrip", test_token_base64url_roundtrip},
       {"header_endianness", test_header_endianness},

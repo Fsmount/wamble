@@ -763,6 +763,30 @@ void bitboard_to_fen(const Board *board, char *fen) {
   *fen_ptr = '\0';
 }
 
+int get_legal_moves_for_square(const Board *board, int square, Move *moves,
+                               int max_moves) {
+  if (!board || !moves || max_moves < 0)
+    return -1;
+  if (square < 0 || square >= 64)
+    return -1;
+  if (max_moves == 0)
+    return 0;
+
+  Board tmp = *board;
+  Move legal_moves[256];
+  int total = generate_legal_moves_bitboard(&tmp, legal_moves);
+  if (total <= 0)
+    return 0;
+
+  int count = 0;
+  for (int i = 0; i < total && count < max_moves; i++) {
+    if (legal_moves[i].from == square) {
+      moves[count++] = legal_moves[i];
+    }
+  }
+  return count;
+}
+
 int validate_and_apply_move_status(WambleBoard *wamble_board,
                                    WamblePlayer *player, const char *uci_move,
                                    MoveApplyStatus *out_status) {
