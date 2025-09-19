@@ -176,6 +176,31 @@ Concurrent Profiles
   its own connection. If two advertised profiles both set `db-isolated=1` they
   must not point to the same DB.
 
+Hot Reload and Exec Handoff
+- `SIGHUP`: rereads the configuration file and reconciles running profile
+  threads without restarting the process. Listener threads receive updated
+  settings or are shut down/spawned as needed.
+- `SIGUSR2` (POSIX only): triggers an exec-based hot reload. The server exports
+  active listener sockets (`WAMBLE_PROFILES_INHERITED`) and optional state file
+  paths (`WAMBLE_STATE_FILE`/`WAMBLE_STATE_FILES`) before re-execing itself.
+- Hot reload sets `WAMBLE_HOT_RELOAD=1` in the environment to instruct the new
+  process to adopt inherited sockets and reload persisted state via
+  `state_load_from_file`.
+- When no profiles are active, the main listener socket is inherited via
+  `WAMBLE_INHERITED_SOCKFD`. With profiles, `profile_runtime` handles socket
+  adoption per advertised profile.
+- After a successful exec reload, temporary state files are removed and
+  environment markers are cleared.
+
+Profile Runtime Notes
+- `profile_runtime` owns one thread per advertised profile, mirroring each
+  profile's `WambleConfig` and keeping per-thread `libpq` connections.
+- `start_profile_listeners` is invoked if at least one profile is defined;
+  otherwise the main thread hosts the default listener using process-wide
+  defaults.
+- During `SIGUSR2` exec reloads, profile threads mark themselves ready so only
+  sockets that acknowledged export participate in the restart.
+
 Visibility and Discovery
 - LIST_PROFILES returns only advertised profiles whose `visibility` is less
   than or equal to the requesting client's trust tier,
