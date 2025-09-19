@@ -21,6 +21,9 @@
 #include <ws2tcpip.h>
 
 #include <bcrypt.h>
+#include <fcntl.h>
+#include <io.h>
+#include <sys/stat.h>
 #elif defined(WAMBLE_PLATFORM_POSIX)
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -80,6 +83,25 @@ static inline int gmtime_w(struct tm *out_tm, const time_t *timer) {
 #else
 #include <unistd.h>
 #define wamble_getpid() getpid()
+#endif
+
+#ifdef WAMBLE_PLATFORM_WINDOWS
+static inline int wamble_mkstemp(char *tmpl) {
+  if (!tmpl)
+    return -1;
+  size_t len = strlen(tmpl);
+  if (len == 0)
+    return -1;
+  if (_mktemp_s(tmpl, len + 1) != 0)
+    return -1;
+  int fd = _open(tmpl, _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY,
+                 _S_IREAD | _S_IWRITE);
+  return fd;
+}
+static inline int wamble_unlink(const char *path) { return _unlink(path); }
+#else
+#define wamble_mkstemp mkstemp
+#define wamble_unlink unlink
 #endif
 
 #if defined(_MSC_VER) && _MSC_VER < 1900
@@ -525,6 +547,13 @@ typedef enum {
 } ProfileStartStatus;
 
 typedef enum {
+  PROFILE_EXPORT_OK = 0,
+  PROFILE_EXPORT_EMPTY = 1,
+  PROFILE_EXPORT_BUFFER_TOO_SMALL = -1,
+  PROFILE_EXPORT_NOT_READY = -2,
+} ProfileExportStatus;
+
+typedef enum {
   DB_OK = 0,
   DB_NOT_FOUND = 1,
   DB_ERR_CONN = -1,
@@ -566,6 +595,16 @@ typedef enum {
 ProfileStartStatus start_profile_listeners(int *out_started);
 void stop_profile_listeners(void);
 ProfileStartStatus reconcile_profile_listeners(void);
+
+int state_save_to_file(const char *path);
+int state_load_from_file(const char *path);
+
+ProfileExportStatus profile_export_inherited_sockets(char *out_buf,
+                                                     size_t out_buf_size,
+                                                     int *out_count);
+void profile_mark_sockets_inheritable(void);
+ProfileExportStatus profile_prepare_state_save_and_inherit(
+    char *out_state_map, size_t out_state_map_size, int *out_count);
 
 static inline void wamble_log(int level, const char *file, int line,
                               const char *func, const char *level_str,
@@ -706,12 +745,19 @@ typedef enum {
 } MoveApplyStatus;
 
 #define WAMBLE_PROTO_VERSION 1
+#define WAMBLE_MIN_CLIENT_VERSION 1
+#define WAMBLE_CAPABILITY_MASK 0x7F
+#define WAMBLE_CAP_HOT_RELOAD 0x01
+#define WAMBLE_CAP_PROFILE_STATE 0x02
+#define WAMBLE_ERR_UNSUPPORTED_VERSION 1000
+
 #define WAMBLE_FLAG_UNRELIABLE 0x80
 
 #pragma pack(push, 1)
 struct WambleMsg {
   uint8_t ctrl;
   uint8_t flags;
+  uint8_t header_version;
   uint8_t token[TOKEN_LENGTH];
   uint64_t board_id;
   uint32_t seq_num;

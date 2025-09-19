@@ -1,6 +1,7 @@
 #ifdef TEST_PROFILE_RUNTIME
 
 #include <assert.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <string.h>
 #include <sys/time.h>
@@ -95,6 +96,56 @@ static void write_conf(const char *content) {
   assert(f);
   fwrite(content, 1, strlen(content), f);
   fclose(f);
+}
+
+static void clear_manual_profiles(void) {
+  ensure_mutex_init();
+  wamble_mutex_lock(&g_mutex);
+  RunningProfile *profiles = g_running;
+  int count = g_running_count;
+  g_running = NULL;
+  g_running_count = 0;
+  g_prepare_exec = 0;
+  wamble_mutex_unlock(&g_mutex);
+  if (!profiles)
+    return;
+  for (int i = 0; i < count; i++) {
+    free(profiles[i].name);
+    free(profiles[i].state_path);
+  }
+  free(profiles);
+}
+
+static void install_manual_profiles(int count, char **names, char **states) {
+  clear_manual_profiles();
+  ensure_mutex_init();
+  wamble_mutex_lock(&g_mutex);
+  g_running = calloc((size_t)count, sizeof(RunningProfile));
+  g_running_count = count;
+  for (int i = 0; i < count; i++) {
+    g_running[i].name = strdup(names[i]);
+    g_running[i].sockfd = (wamble_socket_t)(100 + i);
+    g_running[i].state_path = states ? strdup(states[i]) : NULL;
+    g_running[i].ready_for_exec = 1;
+  }
+  g_prepare_exec = 0;
+  wamble_mutex_unlock(&g_mutex);
+}
+
+static void *ready_marker_thread(void *arg) {
+  (void)arg;
+  for (int i = 0; i < 200; i++) {
+    if (g_prepare_exec) {
+      wamble_mutex_lock(&g_mutex);
+      for (int j = 0; j < g_running_count; j++) {
+        g_running[j].ready_for_exec = 1;
+      }
+      wamble_mutex_unlock(&g_mutex);
+      break;
+    }
+    usleep(1000);
+  }
+  return NULL;
 }
 
 static void test_lifecycle(void) {
@@ -204,6 +255,132 @@ static void test_inheritance(void) {
   assert(close_count == 1);
 }
 
+static void test_export_many_profiles(void) {
+  stop_profile_listeners();
+  const int count = 32;
+  char **names = calloc((size_t)count, sizeof(char *));
+  char **states = calloc((size_t)count, sizeof(char *));
+  assert(names && states);
+  for (int i = 0; i < count; i++) {
+    char name_buf[32];
+    char state_buf[32];
+    snprintf(name_buf, sizeof(name_buf), "prof_%02d", i);
+    snprintf(state_buf, sizeof(state_buf), "/tmp/state_%02d", i);
+    names[i] = strdup(name_buf);
+    states[i] = strdup(state_buf);
+    assert(names[i] && states[i]);
+  }
+
+  install_manual_profiles(count, names, states);
+
+  char small[64];
+  int small_count = 0;
+  ProfileExportStatus rc =
+      profile_export_inherited_sockets(small, sizeof(small), &small_count);
+  assert(rc == PROFILE_EXPORT_BUFFER_TOO_SMALL);
+  assert(small_count == 0);
+  assert(strlen(small) < sizeof(small));
+
+  pthread_t ready;
+  assert(pthread_create(&ready, NULL, ready_marker_thread, NULL) == 0);
+  char state_small[64];
+  int small_state_count = 0;
+  ProfileExportStatus state_rc = profile_prepare_state_save_and_inherit(
+      state_small, sizeof(state_small), &small_state_count);
+  assert(pthread_join(ready, NULL) == 0);
+  assert(state_rc == PROFILE_EXPORT_BUFFER_TOO_SMALL);
+  assert(small_state_count == 0);
+
+  char large[4096];
+  int large_count = 0;
+  ProfileExportStatus ok =
+      profile_export_inherited_sockets(large, sizeof(large), &large_count);
+  assert(ok == PROFILE_EXPORT_OK);
+  assert(large_count == count);
+  char expect_last[32];
+  snprintf(expect_last, sizeof(expect_last), "prof_%02d=", count - 1);
+  assert(strstr(large, expect_last) != NULL);
+
+  assert(pthread_create(&ready, NULL, ready_marker_thread, NULL) == 0);
+  char state_large[4096];
+  int large_state_count = 0;
+  ProfileExportStatus ok_state = profile_prepare_state_save_and_inherit(
+      state_large, sizeof(state_large), &large_state_count);
+  assert(pthread_join(ready, NULL) == 0);
+  assert(ok_state == PROFILE_EXPORT_OK);
+  assert(large_state_count == count);
+  snprintf(expect_last, sizeof(expect_last), "state_%02d", count - 1);
+  assert(strstr(state_large, expect_last) != NULL);
+
+  clear_manual_profiles();
+  for (int i = 0; i < count; i++) {
+    free(names[i]);
+    free(states[i]);
+  }
+  free(names);
+  free(states);
+}
+
+static void test_export_long_names(void) {
+  stop_profile_listeners();
+
+  const int count = 2;
+  char **names = calloc((size_t)count, sizeof(char *));
+  char **states = calloc((size_t)count, sizeof(char *));
+  assert(names && states);
+
+  const char *base =
+      "profile_with_a_very_long_name_exercising_hot_reload_behavior_";
+  const char *state_base =
+      "/tmp/state_with_a_surprisingly_verbose_file_name_for_testing_";
+
+  for (int i = 0; i < count; i++) {
+    char name_buf[256];
+    char state_buf[256];
+    snprintf(name_buf, sizeof(name_buf), "%s%02d", base, i);
+    snprintf(state_buf, sizeof(state_buf), "%s%02d", state_base, i);
+    names[i] = strdup(name_buf);
+    states[i] = strdup(state_buf);
+    assert(names[i] && states[i]);
+  }
+
+  install_manual_profiles(count, names, states);
+
+  char tight[64];
+  int tight_count = 0;
+  ProfileExportStatus tight_rc =
+      profile_export_inherited_sockets(tight, sizeof(tight), &tight_count);
+  assert(tight_rc == PROFILE_EXPORT_BUFFER_TOO_SMALL);
+  assert(tight_count == 0);
+
+  char buf[2048];
+  int ok_count = 0;
+  ProfileExportStatus ok =
+      profile_export_inherited_sockets(buf, sizeof(buf), &ok_count);
+  assert(ok == PROFILE_EXPORT_OK);
+  assert(ok_count == count);
+  assert(strstr(buf, base) != NULL);
+
+  pthread_t ready;
+  assert(pthread_create(&ready, NULL, ready_marker_thread, NULL) == 0);
+  char state_buf_out[2048];
+  int state_count = 0;
+  ProfileExportStatus state_ok = profile_prepare_state_save_and_inherit(
+      state_buf_out, sizeof(state_buf_out), &state_count);
+  assert(pthread_join(ready, NULL) == 0);
+  assert(state_ok == PROFILE_EXPORT_OK);
+  assert(state_count == count);
+  assert(strstr(state_buf_out, state_base) != NULL);
+
+  clear_manual_profiles();
+  for (int i = 0; i < count; i++) {
+    free(names[i]);
+    free(states[i]);
+  }
+  free(names);
+  free(states);
+}
+
 typedef struct {
   const char *name;
   void (*func)(void);
@@ -214,6 +391,8 @@ static const Case cases[] = {
     {"overlapping config", test_overlap},
     {"empty config", test_empty_config},
     {"inheritance", test_inheritance},
+    {"export many profiles", test_export_many_profiles},
+    {"export long names", test_export_long_names},
 };
 
 int main(int argc, char **argv) {

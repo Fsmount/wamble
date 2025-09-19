@@ -1,9 +1,207 @@
 #include "../include/wamble/wamble.h"
+#include <errno.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <string.h>
+#ifdef WAMBLE_PLATFORM_POSIX
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+#ifdef WAMBLE_PLATFORM_WINDOWS
+#include <process.h>
+#endif
+
+#if defined(_MSC_VER) && !defined(strtoull)
+#define strtoull _strtoui64
+#endif
 
 static volatile sig_atomic_t g_reload_requested = 0;
 static volatile sig_atomic_t g_shutdown_requested = 0;
+static volatile sig_atomic_t g_exec_reload_requested = 0;
+
+static void wamble_set_env(const char *key, const char *value) {
+#ifdef WAMBLE_PLATFORM_WINDOWS
+  if (value)
+    _putenv_s(key, value);
+  else
+    _putenv_s(key, "");
+#else
+  if (value)
+    setenv(key, value, 1);
+  else
+    unsetenv(key);
+#endif
+}
+
+static void clear_hot_reload_env(void) {
+  wamble_set_env("WAMBLE_HOT_RELOAD", NULL);
+  wamble_set_env("WAMBLE_INHERITED_SOCKFD", NULL);
+  wamble_set_env("WAMBLE_PROFILES_INHERITED", NULL);
+  wamble_set_env("WAMBLE_STATE_FILES", NULL);
+  wamble_set_env("WAMBLE_STATE_FILE", NULL);
+}
+
+static void configure_inherited_socket(wamble_socket_t sockfd) {
+  if (sockfd == WAMBLE_INVALID_SOCKET)
+    return;
+  (void)wamble_set_nonblocking(sockfd);
+  int buffer_size = get_config()->buffer_size;
+  (void)setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (const char *)&buffer_size,
+                   sizeof(buffer_size));
+  (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (const char *)&buffer_size,
+                   sizeof(buffer_size));
+}
+
+static void unlink_state_map_entries(const char *state_map) {
+  if (!state_map || !*state_map)
+    return;
+  const char *cursor = state_map;
+  while (*cursor) {
+    const char *next = strchr(cursor, ',');
+    size_t seg_len = next ? (size_t)(next - cursor) : strlen(cursor);
+    const char *eq = memchr(cursor, '=', seg_len);
+    if (eq && (eq > cursor) && (size_t)(eq - cursor) < seg_len - 1) {
+      size_t path_len = seg_len - (size_t)(eq - cursor) - 1;
+      char *path = (char *)malloc(path_len + 1);
+      if (path) {
+        memcpy(path, eq + 1, path_len);
+        path[path_len] = '\0';
+        wamble_unlink(path);
+        free(path);
+      }
+    }
+    if (!next)
+      break;
+    cursor = next + 1;
+  }
+}
+
+static int make_socket_inheritable(wamble_socket_t sockfd) {
+#ifdef WAMBLE_PLATFORM_WINDOWS
+  HANDLE h = (HANDLE)sockfd;
+  if (!SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT))
+    return -1;
+  return 0;
+#else
+  int flags = fcntl(sockfd, F_GETFD);
+  if (flags < 0)
+    return -1;
+  if (fcntl(sockfd, F_SETFD, flags & ~FD_CLOEXEC) < 0)
+    return -1;
+  return 0;
+#endif
+}
+
+static int save_process_state_snapshot(char *out_path, size_t out_path_len) {
+#ifdef WAMBLE_PLATFORM_WINDOWS
+  const char *tmpl = "wamble_state_XXXXXX";
+#else
+  const char *tmpl = "/tmp/wamble_state_XXXXXX";
+#endif
+  size_t tmpl_len = strlen(tmpl);
+  if (!out_path || out_path_len <= tmpl_len)
+    return -1;
+  memcpy(out_path, tmpl, tmpl_len + 1);
+  int fd = wamble_mkstemp(out_path);
+  if (fd < 0)
+    return -1;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+  _close(fd);
+#else
+  close(fd);
+#endif
+  if (state_save_to_file(out_path) != 0)
+    return -1;
+  return 0;
+}
+
+static int exec_self(char *argv[]) {
+#ifdef WAMBLE_PLATFORM_WINDOWS
+  _execvp(argv[0], argv);
+  return errno;
+#else
+  execvp(argv[0], argv);
+  return wamble_last_error();
+#endif
+}
+
+static int perform_profile_exec_reload(char *argv[]) {
+  char statebuf[2048];
+  char mapbuf[1024];
+  int scnt = 0;
+  ProfileExportStatus state_status =
+      profile_prepare_state_save_and_inherit(statebuf, sizeof(statebuf), &scnt);
+  if (state_status == PROFILE_EXPORT_BUFFER_TOO_SMALL) {
+    LOG_WARN("Hot reload requested but state export truncated");
+    return -1;
+  }
+  if (state_status == PROFILE_EXPORT_NOT_READY) {
+    LOG_WARN("Hot reload requested but profile state not ready");
+    return -1;
+  }
+
+  int cnt = 0;
+  ProfileExportStatus sock_status =
+      profile_export_inherited_sockets(mapbuf, sizeof(mapbuf), &cnt);
+  if (sock_status == PROFILE_EXPORT_BUFFER_TOO_SMALL) {
+    LOG_WARN("Hot reload requested but socket export truncated");
+    return -1;
+  }
+  if (sock_status == PROFILE_EXPORT_NOT_READY) {
+    LOG_WARN("Hot reload requested but socket export unavailable");
+    return -1;
+  }
+  if (sock_status == PROFILE_EXPORT_EMPTY || cnt == 0) {
+    LOG_WARN("Hot reload requested but no active profile sockets");
+    return -1;
+  }
+  wamble_set_env("WAMBLE_PROFILES_INHERITED", mapbuf);
+  if (state_status == PROFILE_EXPORT_OK && scnt > 0) {
+    wamble_set_env("WAMBLE_STATE_FILES", statebuf);
+  }
+  wamble_set_env("WAMBLE_HOT_RELOAD", "1");
+  LOG_INFO("Exec-based hot reload (profiles=%d)", cnt);
+  int err = exec_self(argv);
+  LOG_ERROR("execvp failed: %s", wamble_strerror(err));
+  if (scnt > 0)
+    unlink_state_map_entries(statebuf);
+  clear_hot_reload_env();
+  return -1;
+}
+
+static int perform_server_exec_reload(wamble_socket_t sockfd, char *argv[]) {
+  if (sockfd == WAMBLE_INVALID_SOCKET) {
+    LOG_WARN("Hot reload requested but no active socket");
+    return -1;
+  }
+  if (make_socket_inheritable(sockfd) != 0) {
+    LOG_WARN("Failed to mark socket inheritable for hot reload");
+    return -1;
+  }
+
+  char state_path[512];
+  int have_state =
+      (save_process_state_snapshot(state_path, sizeof(state_path)) == 0);
+  if (have_state) {
+    wamble_set_env("WAMBLE_STATE_FILE", state_path);
+  } else {
+    LOG_WARN("Failed to save state before hot reload");
+  }
+
+  char fdstr[32];
+  unsigned long long sock_val = (unsigned long long)sockfd;
+  snprintf(fdstr, sizeof(fdstr), "%llu", sock_val);
+  wamble_set_env("WAMBLE_HOT_RELOAD", "1");
+  wamble_set_env("WAMBLE_INHERITED_SOCKFD", fdstr);
+  LOG_INFO("Exec-based hot reload starting (socket=%s)", fdstr);
+  int err = exec_self(argv);
+  LOG_ERROR("execvp failed: %s", wamble_strerror(err));
+  if (have_state) {
+    wamble_unlink(state_path);
+  }
+  clear_hot_reload_env();
+  return -1;
+}
 
 static void handle_sighup(int signo) {
   (void)signo;
@@ -14,6 +212,13 @@ static void handle_sigterm(int signo) {
   (void)signo;
   g_shutdown_requested = 1;
 }
+
+#ifdef WAMBLE_PLATFORM_POSIX
+static void handle_sigusr2(int signo) {
+  (void)signo;
+  g_exec_reload_requested = 1;
+}
+#endif
 
 int main(int argc, char *argv[]) {
   if (wamble_net_init() != 0) {
@@ -60,6 +265,7 @@ int main(int argc, char *argv[]) {
     LOG_WARN("Config load status=%d", (int)cfg);
   }
 
+#ifdef WAMBLE_PLATFORM_POSIX
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
   sa.sa_handler = handle_sighup;
@@ -70,6 +276,17 @@ int main(int argc, char *argv[]) {
   sb.sa_handler = handle_sigterm;
   sigaction(SIGINT, &sb, NULL);
   sigaction(SIGTERM, &sb, NULL);
+#else
+  signal(SIGINT, handle_sigterm);
+  signal(SIGTERM, handle_sigterm);
+#endif
+
+#ifdef WAMBLE_PLATFORM_POSIX
+  struct sigaction sc;
+  memset(&sc, 0, sizeof(sc));
+  sc.sa_handler = handle_sigusr2;
+  sigaction(SIGUSR2, &sc, NULL);
+#endif
 
   char db_conn_str[256];
   snprintf(db_conn_str, sizeof(db_conn_str),
@@ -106,19 +323,58 @@ int main(int argc, char *argv[]) {
   }
 
   wamble_socket_t sockfd = WAMBLE_INVALID_SOCKET;
+  wamble_socket_t inherited_sockfd = WAMBLE_INVALID_SOCKET;
+#if defined(WAMBLE_PLATFORM_POSIX) || defined(WAMBLE_PLATFORM_WINDOWS)
+  const char *env_reload = getenv("WAMBLE_HOT_RELOAD");
+  const char *env_fd = getenv("WAMBLE_INHERITED_SOCKFD");
+  const char *env_state = getenv("WAMBLE_STATE_FILE");
+  if (env_reload && strcmp(env_reload, "1") == 0 && env_fd && *env_fd) {
+    char *endptr = NULL;
+    unsigned long long fd_val = strtoull(env_fd, &endptr, 10);
+    if (endptr && *endptr == '\0') {
+      inherited_sockfd = (wamble_socket_t)fd_val;
+      if (inherited_sockfd != WAMBLE_INVALID_SOCKET) {
+        LOG_INFO("Hot reload: adopting inherited socket handle=%llu",
+                 (unsigned long long)inherited_sockfd);
+      }
+    }
+  }
+#else
+  const char *env_state = NULL;
+#endif
   if (has_profiles == 0) {
 
     player_manager_init();
     LOG_INFO("Player manager initialized");
     board_manager_init();
     LOG_INFO("Board manager initialized");
-    sockfd = create_and_bind_socket(get_config()->port);
-    if (sockfd == WAMBLE_INVALID_SOCKET) {
-      LOG_FATAL("Failed to create and bind socket");
-      return 1;
+    if (inherited_sockfd != WAMBLE_INVALID_SOCKET) {
+      sockfd = inherited_sockfd;
+      configure_inherited_socket(sockfd);
+      LOG_INFO("Server adopted existing listening socket (id=%llu)",
+               (unsigned long long)sockfd);
+    } else {
+      sockfd = create_and_bind_socket(get_config()->port);
+      if (sockfd == WAMBLE_INVALID_SOCKET) {
+        LOG_FATAL("Failed to create and bind socket");
+        return 1;
+      }
+      LOG_INFO("Server listening on port %d", get_config()->port);
     }
-    LOG_INFO("Server listening on port %d", get_config()->port);
   }
+
+#if defined(WAMBLE_PLATFORM_POSIX) || defined(WAMBLE_PLATFORM_WINDOWS)
+
+  if (env_reload && strcmp(env_reload, "1") == 0 && env_state && *env_state) {
+    if (state_load_from_file(env_state) == 0) {
+      LOG_INFO("Restored in-memory state from %s", env_state);
+      wamble_unlink(env_state);
+      wamble_set_env("WAMBLE_STATE_FILE", NULL);
+    } else {
+      LOG_WARN("Failed to restore state from %s", env_state);
+    }
+  }
+#endif
 
   time_t last_cleanup = time(NULL);
   time_t last_tick = time(NULL);
@@ -157,9 +413,12 @@ int main(int argc, char *argv[]) {
         }
       }
     } else {
-
+#ifdef WAMBLE_PLATFORM_POSIX
       struct timespec ts = {.tv_sec = 0, .tv_nsec = 10000000};
       nanosleep(&ts, NULL);
+#else
+      Sleep(10);
+#endif
     }
 
     time_t now = time(NULL);
@@ -235,6 +494,17 @@ int main(int argc, char *argv[]) {
       g_reload_requested = 0;
     }
 
+    if (g_exec_reload_requested) {
+      int exec_rc;
+      if (config_profile_count() > 0) {
+        exec_rc = perform_profile_exec_reload(argv);
+      } else {
+        exec_rc = perform_server_exec_reload(sockfd, argv);
+      }
+      if (exec_rc != 0)
+        g_exec_reload_requested = 0;
+    }
+
     LOG_DEBUG("Main loop iteration end");
   }
   LOG_INFO("Server main loop ending");
@@ -258,6 +528,32 @@ static void handle_client_hello(int sockfd, const struct WambleMsg *msg,
   format_token_for_url(msg->token, token_str);
   LOG_DEBUG("Received Client Hello from token: %s", token_str);
 
+  uint32_t client_version = msg->seq_num;
+  if (client_version < WAMBLE_MIN_CLIENT_VERSION)
+    client_version = WAMBLE_MIN_CLIENT_VERSION;
+
+  if (client_version > WAMBLE_PROTO_VERSION) {
+    struct WambleMsg err = {0};
+    err.ctrl = WAMBLE_CTRL_ERROR;
+    memcpy(err.token, msg->token, TOKEN_LENGTH);
+    err.error_code = WAMBLE_ERR_UNSUPPORTED_VERSION;
+    snprintf(err.error_reason, sizeof(err.error_reason),
+             "upgrade required (client=%u server=%u)", client_version,
+             WAMBLE_PROTO_VERSION);
+    (void)send_reliable_message(sockfd, &err, cliaddr, get_config()->timeout_ms,
+                                get_config()->max_retries);
+    LOG_WARN("Rejected client %s: protocol version %u unsupported", token_str,
+             client_version);
+    return;
+  }
+
+  const uint8_t supported_caps =
+      (uint8_t)(WAMBLE_CAP_HOT_RELOAD | WAMBLE_CAP_PROFILE_STATE);
+  uint8_t requested_caps = (uint8_t)(msg->flags & WAMBLE_CAPABILITY_MASK);
+  uint8_t negotiated_caps = requested_caps
+                                ? (uint8_t)(requested_caps & supported_caps)
+                                : supported_caps;
+
   WamblePlayer *player = get_player_by_token(msg->token);
   if (!player) {
     LOG_DEBUG("Player not found for token %s, creating new player", token_str);
@@ -278,15 +574,18 @@ static void handle_client_hello(int sockfd, const struct WambleMsg *msg,
   }
   LOG_DEBUG("Found board %lu for player %s", board->id, token_str);
 
-  struct WambleMsg response;
+  struct WambleMsg response = {0};
   response.ctrl = WAMBLE_CTRL_SERVER_HELLO;
+  response.flags = negotiated_caps;
+  response.header_version = (uint8_t)client_version;
   memcpy(response.token, player->token, TOKEN_LENGTH);
   response.board_id = board->id;
-  response.seq_num = 0;
-  response.uci_len = 0;
+  response.seq_num = WAMBLE_PROTO_VERSION;
   strncpy(response.fen, board->fen, FEN_MAX_LENGTH);
   LOG_DEBUG("Sending Server Hello response (board_id: %lu, fen: %s)",
             response.board_id, response.fen);
+  LOG_DEBUG("Negotiated protocol version %u with caps 0x%02x for %s",
+            client_version, negotiated_caps, token_str);
 
   if (send_reliable_message(sockfd, &response, cliaddr,
                             get_config()->timeout_ms,

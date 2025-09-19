@@ -543,6 +543,44 @@ static int test_server_notification_unreliable_flag(void) {
   return 1;
 }
 
+static int test_capability_flags_roundtrip(void) {
+  struct WambleMsg in = {0};
+  in.ctrl = WAMBLE_CTRL_SERVER_HELLO;
+  in.flags = (uint8_t)(WAMBLE_CAP_HOT_RELOAD | WAMBLE_CAP_PROFILE_STATE);
+  in.header_version = 3;
+  strncpy(in.fen, "cap", FEN_MAX_LENGTH);
+
+  uint8_t buf[WAMBLE_MAX_PACKET_SIZE];
+  size_t out_len = 0;
+  if (serialize_wamble_msg(&in, buf, sizeof buf, &out_len, in.flags) != 0) {
+    printf("capability_flags_roundtrip FAILED: serialize error\n");
+    return 0;
+  }
+  struct WambleMsg out = {0};
+  uint8_t flags = 0;
+  if (deserialize_wamble_msg(buf, out_len, &out, &flags) != 0) {
+    printf("capability_flags_roundtrip FAILED: deserialize error\n");
+    return 0;
+  }
+  uint8_t expected =
+      (uint8_t)(WAMBLE_CAP_HOT_RELOAD | WAMBLE_CAP_PROFILE_STATE);
+  if (flags != expected) {
+    printf(
+        "capability_flags_roundtrip FAILED: expected flags 0x%02x got 0x%02x\n",
+        expected, flags);
+    return 0;
+  }
+  if (out.ctrl != WAMBLE_CTRL_SERVER_HELLO) {
+    printf("capability_flags_roundtrip FAILED: ctrl mismatch\n");
+    return 0;
+  }
+  if (out.header_version != 3) {
+    printf("capability_flags_roundtrip FAILED: header version mismatch\n");
+    return 0;
+  }
+  return 1;
+}
+
 static int test_ack_roundtrip(void) {
   struct WambleMsg in = {0};
   in.ctrl = WAMBLE_CTRL_ACK;
@@ -646,6 +684,7 @@ int main(int argc, char **argv) {
       {"ack_roundtrip", test_ack_roundtrip},
       {"token_base64url_roundtrip", test_token_base64url_roundtrip},
       {"header_endianness", test_header_endianness},
+      {"capability_flags_roundtrip", test_capability_flags_roundtrip},
   };
 
   for (size_t i = 0; i < (sizeof(cases) / sizeof((cases)[0])); ++i) {
