@@ -129,6 +129,47 @@ void board_manager_init(void) {
   }
 }
 
+int board_manager_export(WambleBoard *out, int max, int *out_count,
+                         uint64_t *out_next_id) {
+  if (!out_count || max < 0)
+    return -1;
+  wamble_mutex_lock(&board_mutex);
+  int n = num_boards;
+  if (n > max)
+    n = max;
+  for (int i = 0; i < n; i++) {
+    out[i] = board_pool[i];
+  }
+  if (out_count)
+    *out_count = n;
+  if (out_next_id)
+    *out_next_id = next_board_id;
+  wamble_mutex_unlock(&board_mutex);
+  return 0;
+}
+
+int board_manager_import(const WambleBoard *in, int count, uint64_t next_id) {
+  if ((count > 0 && !in) || count < 0)
+    return -1;
+  int capacity = get_config()->max_boards;
+  if (count > capacity)
+    count = capacity;
+
+  wamble_mutex_lock(&board_mutex);
+
+  memset(board_pool, 0, sizeof(WambleBoard) * (size_t)capacity);
+  for (int i = 0; i < BOARD_MAP_SIZE; i++)
+    board_index_map[i] = -1;
+  for (int i = 0; i < count; i++) {
+    board_pool[i] = in[i];
+    board_map_put(board_pool[i].id, i);
+  }
+  num_boards = count;
+  next_board_id = (next_id > 0) ? next_id : (uint64_t)(count + 1);
+  wamble_mutex_unlock(&board_mutex);
+  return 0;
+}
+
 WambleBoard *find_board_for_player(WamblePlayer *player) {
   time_t now = time(NULL);
 

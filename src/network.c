@@ -127,7 +127,9 @@ static NetworkStatus serialize_wamble_msg(const struct WambleMsg *msg,
   WambleHeader hdr = {0};
   hdr.ctrl = msg->ctrl;
   hdr.flags = flags;
-  hdr.version = WAMBLE_PROTO_VERSION;
+  uint8_t header_version =
+      (msg->header_version != 0) ? msg->header_version : WAMBLE_PROTO_VERSION;
+  hdr.version = header_version;
   hdr.reserved = 0;
   memcpy(hdr.token, msg->token, TOKEN_LENGTH);
   hdr.board_id = host_to_net64(msg->board_id);
@@ -290,6 +292,7 @@ static NetworkStatus deserialize_wamble_msg(const uint8_t *buffer,
   memcpy(msg->token, hdr.token, TOKEN_LENGTH);
   msg->board_id = net_to_host64(hdr.board_id);
   msg->seq_num = ntohl(hdr.seq_num);
+  msg->header_version = hdr.version;
   if (out_flags)
     *out_flags = hdr.flags;
 
@@ -659,8 +662,9 @@ int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
 
   static uint8_t send_buffer[WAMBLE_MAX_PACKET_SIZE];
   size_t serialized_size = 0;
+  uint8_t send_flags = reliable_msg.flags;
   if (serialize_wamble_msg(&reliable_msg, send_buffer, sizeof(send_buffer),
-                           &serialized_size, 0) != NET_OK) {
+                           &serialized_size, send_flags) != NET_OK) {
     return -1;
   }
 
