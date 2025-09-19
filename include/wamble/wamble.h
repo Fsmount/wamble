@@ -672,6 +672,9 @@ static inline void wamble_log(int level, const char *file, int line,
 
 #define WAMBLE_CTRL_SPECTATE_STOP 0x15
 
+#define WAMBLE_CTRL_GET_LEGAL_MOVES 0x16
+#define WAMBLE_CTRL_LEGAL_MOVES 0x17
+
 #define get_bit(square) (1ULL << (square))
 
 typedef enum {
@@ -753,6 +756,14 @@ typedef enum {
 
 #define WAMBLE_FLAG_UNRELIABLE 0x80
 
+#define WAMBLE_MAX_LEGAL_MOVES 218
+
+typedef struct {
+  uint8_t from;
+  uint8_t to;
+  int8_t promotion;
+} WambleNetMove;
+
 #pragma pack(push, 1)
 struct WambleMsg {
   uint8_t ctrl;
@@ -767,6 +778,9 @@ struct WambleMsg {
   uint16_t error_code;
   char error_reason[FEN_MAX_LENGTH];
   uint8_t login_pubkey[32];
+  uint8_t move_square;
+  uint8_t move_count;
+  WambleNetMove moves[WAMBLE_MAX_LEGAL_MOVES];
 };
 #pragma pack(pop)
 
@@ -807,6 +821,9 @@ typedef struct WambleClientSession {
 int validate_and_apply_move_status(WambleBoard *wamble_board,
                                    WamblePlayer *player, const char *uci_move,
                                    MoveApplyStatus *out_status);
+
+int get_legal_moves_for_square(const Board *board, int square, Move *moves,
+                               int max_moves);
 
 int parse_fen_to_bitboard(const char *fen, Board *board);
 void bitboard_to_fen(const Board *board, char *fen);

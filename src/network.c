@@ -187,6 +187,14 @@ static NetworkStatus serialize_wamble_msg(const struct WambleMsg *msg,
     payload_len = need;
     break;
   }
+  case WAMBLE_CTRL_GET_LEGAL_MOVES: {
+    size_t need = 1;
+    if (need > WAMBLE_MAX_PAYLOAD)
+      return NET_ERR_TRUNCATED;
+    payload[0] = msg->move_square;
+    payload_len = need;
+    break;
+  }
   case WAMBLE_CTRL_PROFILES_LIST: {
 
     size_t len = strnlen(msg->fen, FEN_MAX_LENGTH);
@@ -194,6 +202,23 @@ static NetworkStatus serialize_wamble_msg(const struct WambleMsg *msg,
       return NET_ERR_TRUNCATED;
     memcpy(payload, msg->fen, len);
     payload_len = len;
+    break;
+  }
+  case WAMBLE_CTRL_LEGAL_MOVES: {
+    if (msg->move_count > WAMBLE_MAX_LEGAL_MOVES)
+      return NET_ERR_INVALID;
+    size_t need = 2 + (size_t)msg->move_count * 3;
+    if (need > WAMBLE_MAX_PAYLOAD)
+      return NET_ERR_TRUNCATED;
+    payload[0] = msg->move_square;
+    payload[1] = msg->move_count;
+    size_t offset = 2;
+    for (uint8_t i = 0; i < msg->move_count; i++) {
+      payload[offset++] = msg->moves[i].from;
+      payload[offset++] = msg->moves[i].to;
+      payload[offset++] = (uint8_t)msg->moves[i].promotion;
+    }
+    payload_len = need;
     break;
   }
   case WAMBLE_CTRL_ERROR: {
@@ -378,6 +403,12 @@ static NetworkStatus deserialize_wamble_msg(const uint8_t *buffer,
       memcpy(msg->uci, &payload[1], msg->uci_len);
     break;
   }
+  case WAMBLE_CTRL_GET_LEGAL_MOVES: {
+    if (payload_len < 1)
+      return NET_ERR_TRUNCATED;
+    msg->move_square = payload[0];
+    break;
+  }
   case WAMBLE_CTRL_PLAYER_STATS_DATA: {
     if (payload_len < 12)
       return NET_ERR_TRUNCATED;
@@ -401,6 +432,24 @@ static NetworkStatus deserialize_wamble_msg(const uint8_t *buffer,
   case WAMBLE_CTRL_LOGIN_REQUEST: {
     if (payload_len == 32) {
       memcpy(msg->login_pubkey, payload, 32);
+    }
+    break;
+  }
+  case WAMBLE_CTRL_LEGAL_MOVES: {
+    if (payload_len < 2)
+      return NET_ERR_TRUNCATED;
+    msg->move_square = payload[0];
+    msg->move_count = payload[1];
+    if (msg->move_count > WAMBLE_MAX_LEGAL_MOVES)
+      return NET_ERR_INVALID;
+    size_t expected = 2 + (size_t)msg->move_count * 3;
+    if (payload_len < expected)
+      return NET_ERR_TRUNCATED;
+    size_t offset = 2;
+    for (uint8_t i = 0; i < msg->move_count; i++) {
+      msg->moves[i].from = payload[offset++];
+      msg->moves[i].to = payload[offset++];
+      msg->moves[i].promotion = (int8_t)payload[offset++];
     }
     break;
   }
@@ -555,7 +604,9 @@ int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
       msg->ctrl != WAMBLE_CTRL_LOGIN_SUCCESS &&
       msg->ctrl != WAMBLE_CTRL_LOGIN_FAILED &&
       msg->ctrl != WAMBLE_CTRL_GET_PLAYER_STATS &&
-      msg->ctrl != WAMBLE_CTRL_PLAYER_STATS_DATA) {
+      msg->ctrl != WAMBLE_CTRL_PLAYER_STATS_DATA &&
+      msg->ctrl != WAMBLE_CTRL_GET_LEGAL_MOVES &&
+      msg->ctrl != WAMBLE_CTRL_LEGAL_MOVES) {
     return -1;
   }
   if (msg->uci_len > MAX_UCI_LENGTH) {
@@ -606,6 +657,7 @@ int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
 void send_ack(wamble_socket_t sockfd, const struct WambleMsg *msg,
               const struct sockaddr_in *cliaddr) {
   struct WambleMsg ack_msg;
+  memset(&ack_msg, 0, sizeof(ack_msg));
   ack_msg.ctrl = WAMBLE_CTRL_ACK;
   memcpy(ack_msg.token, msg->token, TOKEN_LENGTH);
   ack_msg.board_id = msg->board_id;

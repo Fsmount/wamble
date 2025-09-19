@@ -124,6 +124,55 @@ static int run_case(const Case *c) {
   return 1;
 }
 
+static int test_get_legal_moves_helper_basic(void) {
+  Board board;
+  const char *fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+  parse_fen_to_bitboard(fen, &board);
+
+  Move moves[WAMBLE_MAX_LEGAL_MOVES];
+  int square = square_to_index(4, 1);
+  int count = get_legal_moves_for_square(&board, square, moves, 16);
+  if (count != 2) {
+    printf("legal_moves_helper_basic FAILED: expected 2 moves, got %d\n", count);
+    return 0;
+  }
+
+  int found_single = 0;
+  int found_double = 0;
+  for (int i = 0; i < count; i++) {
+    if (moves[i].promotion != 0) {
+      printf("legal_moves_helper_basic FAILED: unexpected promotion flag\n");
+      return 0;
+    }
+    if (moves[i].to == square + 8)
+      found_single = 1;
+    else if (moves[i].to == square + 16)
+      found_double = 1;
+  }
+  if (!found_single || !found_double) {
+    printf("legal_moves_helper_basic FAILED: missing pawn push targets\n");
+    return 0;
+  }
+  return 1;
+}
+
+static int test_get_legal_moves_helper_enemy_turn(void) {
+  Board board;
+  const char *fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+  parse_fen_to_bitboard(fen, &board);
+
+  Move moves[WAMBLE_MAX_LEGAL_MOVES];
+  int square = square_to_index(4, 6);
+  int count = get_legal_moves_for_square(&board, square, moves, 16);
+  if (count != 0) {
+    printf(
+        "legal_moves_helper_enemy_turn FAILED: expected 0 moves for opponent, got %d\n",
+        count);
+    return 0;
+  }
+  return 1;
+}
+
 int main(int argc, char **argv) {
   const char *filter = (argc > 1 ? argv[1] : "");
   int pass = 0, total = 0;
@@ -138,6 +187,23 @@ int main(int argc, char **argv) {
       ++pass;
     }
   }
+
+  const char *extra_names[] = {"legal_moves_helper_basic",
+                               "legal_moves_helper_enemy_turn"};
+  int (*extra_tests[])(void) = {test_get_legal_moves_helper_basic,
+                                test_get_legal_moves_helper_enemy_turn};
+  for (size_t i = 0; i < (sizeof(extra_tests) / sizeof(extra_tests[0])); ++i) {
+    if (*filter && !strstr(extra_names[i], filter))
+      continue;
+    ++total;
+    if (extra_tests[i]()) {
+      printf("%s PASSED\n", extra_names[i]);
+      ++pass;
+    } else {
+      printf("%s FAILED\n", extra_names[i]);
+    }
+  }
+
   printf("%d/%d passed\n", pass, total);
   return (pass == total) ? 0 : 1;
 }
