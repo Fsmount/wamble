@@ -85,6 +85,15 @@ Control Codes
   - Payload: `uint8 name_len; char name[name_len]`.
 - `0x14` PROFILES_LIST (server→client): Response to LIST_PROFILES.
   - Payload: `char csv[]` (comma-separated profile names).
+- `0x16` GET_LEGAL_MOVES (client→server): Request legal moves for a square.
+  - Payload: `uint8 square_index` (0–63, 0 = a1).
+  - Header: `board_id` must reference the board assignment for the player.
+  - Authorization: server validates the requesting token still owns the reservation; otherwise the response is an empty `LEGAL_MOVES` packet.
+- `0x17` LEGAL_MOVES (server→client): Response to GET_LEGAL_MOVES.
+  - Payload: `uint8 square_index; uint8 move_count; struct { uint8 from; uint8 to; int8 promotion; } moves[move_count]`.
+  - `move_count` is capped at 218 and only includes moves originating from `square_index`.
+  - Promotion is encoded as ASCII lowercase (`'q'`, `'r'`, `'b'`, `'n'`) or 0 for non-promotions.
+  - Typically sent reliably so clients can pre-populate hover highlights.
 
 Reliability
 - Reliable messages are sent with a sequence number (`seq_num`).
