@@ -839,8 +839,9 @@ void handle_message(int sockfd, const struct WambleMsg *msg,
     break;
   }
   case WAMBLE_CTRL_GET_LEGAL_MOVES: {
-    LOG_DEBUG("Handling GET_LEGAL_MOVES message (seq: %u, board=%lu, square=%u)",
-              msg->seq_num, msg->board_id, (unsigned)msg->move_square);
+    LOG_DEBUG(
+        "Handling GET_LEGAL_MOVES message (seq: %u, board=%lu, square=%u)",
+        msg->seq_num, msg->board_id, (unsigned)msg->move_square);
     WamblePlayer *player = get_player_by_token(msg->token);
     if (!player) {
       LOG_WARN("Legal move request from unknown player token");
@@ -860,8 +861,9 @@ void handle_message(int sockfd, const struct WambleMsg *msg,
     response.move_square = msg->move_square;
 
     if (!tokens_equal(board->reservation_player_token, player->token)) {
-      LOG_DEBUG("Player token mismatch for board %lu when requesting legal moves",
-                board->id);
+      LOG_DEBUG(
+          "Player token mismatch for board %lu when requesting legal moves",
+          board->id);
       response.move_count = 0;
     } else if (msg->move_square >= 64) {
       LOG_WARN("Invalid square %u in legal move request for board %lu",
@@ -869,9 +871,8 @@ void handle_message(int sockfd, const struct WambleMsg *msg,
       response.move_count = 0;
     } else {
       Move moves[WAMBLE_MAX_LEGAL_MOVES];
-      int count =
-          get_legal_moves_for_square(&board->board, msg->move_square, moves,
-                                     WAMBLE_MAX_LEGAL_MOVES);
+      int count = get_legal_moves_for_square(&board->board, msg->move_square,
+                                             moves, WAMBLE_MAX_LEGAL_MOVES);
       if (count < 0) {
         LOG_WARN("Failed to compute legal moves for board %lu square %u",
                  board->id, (unsigned)msg->move_square);

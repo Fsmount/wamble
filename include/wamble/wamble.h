@@ -860,6 +860,9 @@ void release_board(uint64_t board_id);
 void archive_board(uint64_t board_id);
 void update_player_ratings(WambleBoard *board);
 WambleBoard *get_board_by_id(uint64_t board_id);
+int board_manager_export(WambleBoard *out, int max, int *out_count,
+                         uint64_t *out_next_id);
+int board_manager_import(const WambleBoard *in, int count, uint64_t next_id);
 
 ScoringStatus calculate_and_distribute_pot(uint64_t board_id);
 

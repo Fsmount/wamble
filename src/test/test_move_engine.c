@@ -133,7 +133,8 @@ static int test_get_legal_moves_helper_basic(void) {
   int square = square_to_index(4, 1);
   int count = get_legal_moves_for_square(&board, square, moves, 16);
   if (count != 2) {
-    printf("legal_moves_helper_basic FAILED: expected 2 moves, got %d\n", count);
+    printf("legal_moves_helper_basic FAILED: expected 2 moves, got %d\n",
+           count);
     return 0;
   }
 
@@ -165,9 +166,9 @@ static int test_get_legal_moves_helper_enemy_turn(void) {
   int square = square_to_index(4, 6);
   int count = get_legal_moves_for_square(&board, square, moves, 16);
   if (count != 0) {
-    printf(
-        "legal_moves_helper_enemy_turn FAILED: expected 0 moves for opponent, got %d\n",
-        count);
+    printf("legal_moves_helper_enemy_turn FAILED: expected 0 moves for "
+           "opponent, got %d\n",
+           count);
     return 0;
   }
   return 1;
