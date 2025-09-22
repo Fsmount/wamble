@@ -856,10 +856,15 @@ typedef struct WambleMove {
 void board_manager_init(void);
 void board_manager_tick(void);
 WambleBoard *find_board_for_player(WamblePlayer *player);
-void release_board(uint64_t board_id);
-void archive_board(uint64_t board_id);
+void board_move_played(uint64_t board_id);
+void board_game_completed(uint64_t board_id, GameResult result);
+bool board_is_reserved_for_player(uint64_t board_id,
+                                  const uint8_t *player_token);
+void board_release_reservation(uint64_t board_id);
+void board_archive(uint64_t board_id);
 void update_player_ratings(WambleBoard *board);
 WambleBoard *get_board_by_id(uint64_t board_id);
+int get_total_board_count_public(void);
 int board_manager_export(WambleBoard *out, int max, int *out_count,
                          uint64_t *out_next_id);
 int board_manager_import(const WambleBoard *in, int count, uint64_t next_id);
@@ -889,11 +894,13 @@ void db_async_update_session_last_seen(uint64_t session_id);
 uint64_t db_create_board(const char *fen);
 int db_async_update_board(uint64_t board_id, const char *fen,
                           const char *status);
+int db_async_update_board_assignment_time(uint64_t board_id);
 
 typedef struct {
   DbStatus status;
   char fen[FEN_MAX_LENGTH];
   char status_text[STATUS_MAX_LENGTH];
+  time_t last_assignment_time;
 } DbBoardResult;
 
 DbBoardResult db_get_board(uint64_t board_id);

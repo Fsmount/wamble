@@ -869,7 +869,7 @@ int validate_and_apply_move_status(WambleBoard *wamble_board,
 
   bitboard_to_fen(board, wamble_board->fen);
 
-  db_async_update_board(wamble_board->id, wamble_board->fen, "ACTIVE");
+  board_move_played(wamble_board->id);
 
   int color = (board->turn == 'w') ? 0 : 1;
   num_legal = generate_legal_moves_bitboard(board, legal_moves);
@@ -890,7 +890,7 @@ int validate_and_apply_move_status(WambleBoard *wamble_board,
   if (wamble_board->result != GAME_RESULT_IN_PROGRESS) {
     update_player_ratings(wamble_board);
     calculate_and_distribute_pot(wamble_board->id);
-    archive_board(wamble_board->id);
+    board_archive(wamble_board->id);
   }
 
   if (out_status)

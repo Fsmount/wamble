@@ -1,4 +1,3 @@
-
 #ifdef TEST_BOARD_MANAGER
 
 #include <assert.h>
@@ -8,8 +7,6 @@
 #include "../../include/wamble/wamble.h"
 
 #define MIN_BOARDS 4
-#define INACTIVITY_TIMEOUT 300
-#define RESERVATION_TIMEOUT 2
 
 ScoringStatus calculate_and_distribute_pot(uint64_t board_id) {
   (void)board_id;
@@ -21,8 +18,11 @@ ScoringStatus calculate_and_distribute_pot(uint64_t board_id) {
 
 static WamblePlayer *white_player_mock;
 static WamblePlayer *black_player_mock;
+static WamblePlayer test_player;
 
 WamblePlayer *get_player_by_token(const uint8_t *token) {
+  if (token[0] == 1)
+    return &test_player;
   if (token[0] == 2)
     return white_player_mock;
   if (token[0] == 3)
@@ -36,7 +36,10 @@ typedef enum {
   ACTION_RELEASE_BOARD,
   ACTION_ARCHIVE_BOARD,
   ACTION_TICK,
-  ACTION_UPDATE_RATINGS
+  ACTION_UPDATE_RATINGS,
+  ACTION_MARK_MOVE_PLAYED,
+  ACTION_COMPLETE_GAME,
+  ACTION_CHECK_RESERVATION
 } TestCaseAction;
 
 typedef struct {
@@ -50,9 +53,8 @@ typedef struct {
   bool expect_board_found;
   double expected_white_rating;
   double expected_black_rating;
+  bool expected_reservation_result;
 } TestCase;
-
-static WamblePlayer test_player;
 
 static void setup_test_player(int games_played) {
   memset(&test_player, 0, sizeof(WamblePlayer));
@@ -63,7 +65,7 @@ static void setup_test_player(int games_played) {
 
 static void reset_mocks() { board_manager_init(); }
 
-static bool run_case(const TestCase *c) {
+static bool run_case(TestCase *c) {
   WambleBoard *board = NULL;
 
   switch (c->action) {
@@ -90,7 +92,7 @@ static bool run_case(const TestCase *c) {
     }
     if (!target)
       return false;
-    release_board(target->id);
+    board_release_reservation(target->id);
     board = get_board_by_id(target->id);
     return board && board->state == c->expected_board_state;
   }
@@ -105,22 +107,80 @@ static bool run_case(const TestCase *c) {
     }
     if (!target)
       return false;
-    archive_board(target->id);
+    board_archive(target->id);
     board = get_board_by_id(target->id);
     return board && board->state == c->expected_board_state;
   }
-  case ACTION_TICK: {
+  case ACTION_MARK_MOVE_PLAYED: {
+
     WambleBoard *target = NULL;
     for (uint64_t id = 1; id < 1000; ++id) {
       WambleBoard *b = get_board_by_id(id);
-      if (b && (b->state == BOARD_STATE_RESERVED ||
-                b->state == BOARD_STATE_ACTIVE)) {
+      if (b && b->state == BOARD_STATE_RESERVED) {
         target = b;
         break;
       }
     }
     if (!target)
       return false;
+    time_t old_time = target->last_move_time;
+    board_move_played(target->id);
+    board = get_board_by_id(target->id);
+    return board && board->state == BOARD_STATE_ACTIVE &&
+           board->last_move_time > old_time;
+  }
+  case ACTION_COMPLETE_GAME: {
+    WambleBoard *target = NULL;
+    for (uint64_t id = 1; id < 1000; ++id) {
+      WambleBoard *b = get_board_by_id(id);
+      if (b && b->state != BOARD_STATE_ARCHIVED) {
+        target = b;
+        break;
+      }
+    }
+    if (!target)
+      return false;
+    board_game_completed(target->id, c->expected_game_result);
+    board = get_board_by_id(target->id);
+    return board && board->state == BOARD_STATE_ARCHIVED &&
+           board->result == c->expected_game_result;
+  }
+  case ACTION_CHECK_RESERVATION: {
+    WambleBoard *target = get_board_by_id(c->board_id_arg);
+    if (!target)
+      return false;
+    bool result = board_is_reserved_for_player(target->id, test_player.token);
+    return result == c->expected_reservation_result;
+  }
+  case ACTION_TICK: {
+    WambleBoard *target = NULL;
+
+    if (c->board_id_arg == 4) {
+      for (uint64_t id = 1; id < 1000; ++id) {
+        WambleBoard *b = get_board_by_id(id);
+        if (b && b->state == BOARD_STATE_RESERVED) {
+          board_move_played(b->id);
+          target = b;
+          break;
+        }
+      }
+    } else {
+      for (uint64_t id = 1; id < 1000; ++id) {
+        WambleBoard *b = get_board_by_id(id);
+        if (b && (b->state == BOARD_STATE_RESERVED ||
+                  b->state == BOARD_STATE_ACTIVE)) {
+          if (c->board_id_arg == 3 && b->state != BOARD_STATE_RESERVED) {
+            continue;
+          }
+          target = b;
+          break;
+        }
+      }
+    }
+
+    if (!target) {
+      return false;
+    }
     if (c->expected_board_state == BOARD_STATE_DORMANT &&
         target->state == BOARD_STATE_RESERVED) {
       target->reservation_time -= c->time_travel_seconds;
@@ -157,19 +217,28 @@ int main(int argc, char **argv) {
        BOARD_STATE_RESERVED, GAME_RESULT_IN_PROGRESS, true},
       {"find board for experienced player", ACTION_FIND_BOARD, 20, 0, 0,
        BOARD_STATE_RESERVED, GAME_RESULT_IN_PROGRESS, true},
-      {"release board", ACTION_RELEASE_BOARD, 0, 1, 0, BOARD_STATE_ACTIVE},
+      {"release board", ACTION_RELEASE_BOARD, 0, 1, 0, BOARD_STATE_DORMANT},
       {"archive board", ACTION_ARCHIVE_BOARD, 0, 2, 0, BOARD_STATE_ARCHIVED},
-      {"reservation expiry", ACTION_TICK, 0, 3, RESERVATION_TIMEOUT + 1,
-       BOARD_STATE_DORMANT},
-      {"inactivity timeout", ACTION_TICK, 0, 4, INACTIVITY_TIMEOUT + 1,
-       BOARD_STATE_DORMANT},
+      {"mark move played", ACTION_MARK_MOVE_PLAYED, 0, 0, 0,
+       BOARD_STATE_ACTIVE},
+      {"complete game with white win", ACTION_COMPLETE_GAME, 0, 0, 0,
+       BOARD_STATE_ARCHIVED, GAME_RESULT_WHITE_WINS, false},
+      {"complete game with black win", ACTION_COMPLETE_GAME, 0, 0, 0,
+       BOARD_STATE_ARCHIVED, GAME_RESULT_BLACK_WINS, false},
+      {"complete game with draw", ACTION_COMPLETE_GAME, 0, 0, 0,
+       BOARD_STATE_ARCHIVED, GAME_RESULT_DRAW, false},
+      {"check valid reservation", ACTION_CHECK_RESERVATION, 0, 0, 0,
+       BOARD_STATE_RESERVED, GAME_RESULT_IN_PROGRESS, false, 0, 0, true},
+      {"reservation timeout", ACTION_TICK, 0, 3,
+       (int)get_config()->reservation_timeout + 1, BOARD_STATE_DORMANT},
+      {"inactivity timeout", ACTION_TICK, 0, 4,
+       (int)get_config()->inactivity_timeout + 1, BOARD_STATE_DORMANT},
       {"rating update white wins", ACTION_UPDATE_RATINGS, 0, 0, 0, 0,
        GAME_RESULT_WHITE_WINS, false, 1216.0, 1184.0},
       {"rating update black wins", ACTION_UPDATE_RATINGS, 0, 0, 0, 0,
        GAME_RESULT_BLACK_WINS, false, 1184.0, 1216.0},
       {"rating update draw", ACTION_UPDATE_RATINGS, 0, 0, 0, 0,
-       GAME_RESULT_DRAW, false, 1200.0, 1200.0},
-  };
+       GAME_RESULT_DRAW, false, 1200.0, 1200.0}};
 
   for (size_t i = 0; i < (sizeof(cases) / sizeof((cases)[0])); ++i) {
     if (*filter && !strstr(cases[i].name, filter))
@@ -179,13 +248,16 @@ int main(int argc, char **argv) {
     reset_mocks();
     setup_test_player(0);
 
-    if (cases[i].action != ACTION_INIT) {
-      find_board_for_player(&test_player);
-      find_board_for_player(&test_player);
-      WambleBoard *b3 = find_board_for_player(&test_player);
-      b3->state = BOARD_STATE_RESERVED;
-      WambleBoard *b4 = find_board_for_player(&test_player);
-      release_board(b4->id);
+    if (cases[i].action != ACTION_INIT &&
+        cases[i].action != ACTION_UPDATE_RATINGS) {
+
+      WambleBoard *b1 = find_board_for_player(&test_player);
+      if (cases[i].action == ACTION_CHECK_RESERVATION) {
+        cases[i].board_id_arg = b1->id;
+      }
+      (void)find_board_for_player(&test_player);
+      (void)find_board_for_player(&test_player);
+      (void)find_board_for_player(&test_player);
     }
 
     if (run_case(&cases[i])) {

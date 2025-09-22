@@ -241,10 +241,32 @@ int db_async_update_board(uint64_t board_id, const char *fen,
   return 0;
 }
 
+int db_async_update_board_assignment_time(uint64_t board_id) {
+  const char *query =
+      "UPDATE boards SET last_assignment_time = NOW() WHERE id = $1";
+
+  char board_id_str[32];
+  snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
+
+  const char *paramValues[] = {board_id_str};
+
+  PGresult *res =
+      pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
+
+  if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+    PQclear(res);
+    return -1;
+  }
+
+  PQclear(res);
+  return 0;
+}
+
 DbBoardResult db_get_board(uint64_t board_id) {
   DbBoardResult out = {0};
   out.status = DB_NOT_FOUND;
-  const char *query = "SELECT fen, status FROM boards WHERE id = $1";
+  const char *query = "SELECT fen, status, EXTRACT(EPOCH FROM "
+                      "last_assignment_time)::bigint FROM boards WHERE id = $1";
 
   char board_id_str[32];
   snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
@@ -271,6 +293,7 @@ DbBoardResult db_get_board(uint64_t board_id) {
   snprintf(out.fen, FEN_MAX_LENGTH, "%s", PQgetvalue(res, 0, 0));
   strncpy(out.status_text, PQgetvalue(res, 0, 1), STATUS_MAX_LENGTH - 1);
   out.status_text[STATUS_MAX_LENGTH - 1] = '\0';
+  out.last_assignment_time = (time_t)strtoull(PQgetvalue(res, 0, 2), NULL, 10);
   out.status = DB_OK;
   PQclear(res);
   return out;

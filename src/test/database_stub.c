@@ -28,7 +28,13 @@ void rng_bytes(uint8_t *out, size_t len) {
 }
 
 #define STUB_MAX_BOARDS 4096
-static uint64_t stub_boards[STUB_MAX_BOARDS];
+typedef struct {
+  uint64_t id;
+  char fen[FEN_MAX_LENGTH];
+  char status[STATUS_MAX_LENGTH];
+  time_t last_assignment_time;
+} StubBoard;
+static StubBoard stub_boards[STUB_MAX_BOARDS];
 static int stub_board_count = 0;
 static uint64_t stub_next_board_id = 1;
 
@@ -103,35 +109,66 @@ int db_get_active_session_count(void) { return 2; }
 int db_get_longest_game_moves(void) { return 10; }
 
 uint64_t db_create_board(const char *fen) {
-  (void)fen;
   if (stub_board_count >= STUB_MAX_BOARDS)
     return 0;
   uint64_t id = stub_next_board_id++;
-  stub_boards[stub_board_count++] = id;
+  StubBoard *sb = &stub_boards[stub_board_count++];
+  sb->id = id;
+  strncpy(sb->fen, fen ? fen : "", FEN_MAX_LENGTH - 1);
+  sb->fen[FEN_MAX_LENGTH - 1] = '\0';
+  strncpy(sb->status, "DORMANT", STATUS_MAX_LENGTH - 1);
+  sb->status[STATUS_MAX_LENGTH - 1] = '\0';
+  sb->last_assignment_time = time(NULL);
   return id;
 }
 
 int db_async_update_board(uint64_t board_id, const char *fen,
                           const char *status) {
-  (void)board_id;
-  (void)fen;
-  (void)status;
-  return 0;
+  for (int i = 0; i < stub_board_count; i++) {
+    if (stub_boards[i].id == board_id) {
+      if (fen) {
+        strncpy(stub_boards[i].fen, fen, FEN_MAX_LENGTH - 1);
+        stub_boards[i].fen[FEN_MAX_LENGTH - 1] = '\0';
+      }
+      if (status) {
+        strncpy(stub_boards[i].status, status, STATUS_MAX_LENGTH - 1);
+        stub_boards[i].status[STATUS_MAX_LENGTH - 1] = '\0';
+      }
+      return 0;
+    }
+  }
+  return -1;
 }
 
 DbBoardResult db_get_board(uint64_t board_id) {
-  (void)board_id;
   DbBoardResult r = {0};
   r.status = DB_NOT_FOUND;
+  for (int i = 0; i < stub_board_count; i++) {
+    if (stub_boards[i].id == board_id) {
+      r.status = DB_OK;
+      strncpy(r.fen, stub_boards[i].fen, FEN_MAX_LENGTH - 1);
+      r.fen[FEN_MAX_LENGTH - 1] = '\0';
+      strncpy(r.status_text, stub_boards[i].status, STATUS_MAX_LENGTH - 1);
+      r.status_text[STATUS_MAX_LENGTH - 1] = '\0';
+      r.last_assignment_time = stub_boards[i].last_assignment_time;
+      break;
+    }
+  }
   return r;
 }
 
 DbBoardIdList db_list_boards_by_status(const char *status) {
-  (void)status;
+  static uint64_t ids[STUB_MAX_BOARDS];
+  int count = 0;
+  for (int i = 0; i < stub_board_count; i++) {
+    if (strncmp(stub_boards[i].status, status, STATUS_MAX_LENGTH) == 0) {
+      ids[count++] = stub_boards[i].id;
+    }
+  }
   DbBoardIdList list = {0};
   list.status = DB_OK;
-  list.ids = NULL;
-  list.count = 0;
+  list.ids = (count > 0) ? ids : NULL;
+  list.count = count;
   return list;
 }
 
@@ -204,7 +241,7 @@ void db_expire_reservations(void) {
   if (!get_board_by_id)
     return;
   for (int i = 0; i < stub_board_count; i++) {
-    uint64_t id = stub_boards[i];
+    uint64_t id = stub_boards[i].id;
     WambleBoard *b = get_board_by_id(id);
     if (!b)
       continue;
@@ -221,7 +258,7 @@ void db_archive_inactive_boards(int timeout_seconds) {
   if (!get_board_by_id)
     return;
   for (int i = 0; i < stub_board_count; i++) {
-    uint64_t id = stub_boards[i];
+    uint64_t id = stub_boards[i].id;
     WambleBoard *b = get_board_by_id(id);
     if (!b)
       continue;
@@ -250,4 +287,14 @@ int db_async_record_payout(uint64_t board_id, uint64_t session_id,
 double db_get_player_total_score(uint64_t session_id) {
   (void)session_id;
   return 0.0;
+}
+
+int db_async_update_board_assignment_time(uint64_t board_id) {
+  for (int i = 0; i < stub_board_count; i++) {
+    if (stub_boards[i].id == board_id) {
+      stub_boards[i].last_assignment_time = time(NULL);
+      return 0;
+    }
+  }
+  return -1;
 }

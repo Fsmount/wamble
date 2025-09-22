@@ -855,7 +855,7 @@ static void config_set_defaults(void) {
   g_config.max_boards = 1024;
   g_config.min_boards = 4;
   g_config.inactivity_timeout = 300;
-  g_config.reservation_timeout = 2;
+  g_config.reservation_timeout = 14 * 24 * 60 * 60;
   g_config.k_factor = 32;
   g_config.default_rating = 1200;
   g_config.max_players = 1024;
