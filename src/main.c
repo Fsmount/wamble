@@ -631,7 +631,7 @@ static void handle_player_move(int sockfd, const struct WambleMsg *msg,
              board->id, token_str);
 
     LOG_DEBUG("Releasing board %lu after successful move", board->id);
-    release_board(board->id);
+    board_release_reservation(board->id);
 
     if (board->result != GAME_RESULT_IN_PROGRESS) {
       LOG_INFO("Game on board %lu has ended. Result: %d", board->id,

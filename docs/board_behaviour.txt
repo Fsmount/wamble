@@ -1,0 +1,35 @@
+Wamble Board Behavior
+======================
+
+Overview
+The server manages a dynamic pool of game boards, assigning them to players based on an attractiveness score. The lifecycle of a board is managed through a state machine. RESERVED, ACTIVE, and DORMANT boards count towards the configured board limit.
+The server also proactively maintains a target number of boards `max-boards`. This target is dynamically calculated based on `longest_game_moves * active_players`, but will not be less than `min-boards`. The board manager will periodically create new boards to meet this target.
+
+Board States
+- `RESERVED`: A board temporarily assigned to a player who is actively playing. This state prevents other players from being assigned to the board.
+- `ACTIVE`: A board that is currently in-play and held in the server's cache for quick access. Players can be assigned to active games.
+- `DORMANT`: A board that is available for play but is not currently in the cache, residing only in the database. Players can be assigned to dormant games.
+- `ARCHIVED`: A board representing a completed or illegal game, kept for historical and analytical purposes.
+
+Board Lifecycle and State Transitions
+- A game is `RESERVED` until a move is made or until a configurable timeout `reservation-timeout` is reached (default: 2 weeks).
+- A reservation is initially for the current session. If that session times out, the reservation is persisted to the database if and only if the user has a public key (i.e., a persistent identity).
+- If a game remains reserved in the database for the full duration of the timeout, it is released as `DORMANT`.
+- When a board is completed, pot scoring should be distributed, game removed from cache, ratings updated, and released as `ARCHIVED`
+- An `ACTIVE` board is removed from the cache and becomes `DORMANT` after a configurable period of inactivity `inactivity-timeout` (default: 5 minutes) to ensure the cache holds recently played games.
+
+Board Assignment
+- Aims to match players with appropriate and interesting game situations.
+- Applies to both `DORMANT` and `ACTIVE` boards.
+- An attractiveness score is calculated for each eligible board based on:
+  - Game Phase: `early-game`, `mid-game`, `late-game`. Determined by move count.
+  - Player Experience: New vs. experienced players, based on `NEW_PLAYER_GAMES_THRESHOLD`.
+  - Recency: Time since the board was last assigned.
+- Configuration multipliers are used to weigh the score:
+  - `new-player-early-phase-mult`
+  - `new-player-mid-phase-mult`
+  - `new-player-end-phase-mult`
+  - `experienced-player-early-phase-mult`
+  - `experienced-player-mid-phase-mult`
+  - `experienced-player-end-phase-mult`
+- If no suitable board is found, a new one may be created if the pool is smaller than `max-boards`.

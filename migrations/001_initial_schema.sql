@@ -17,6 +17,7 @@ CREATE TABLE boards (
     id BIGSERIAL PRIMARY KEY,
     fen VARCHAR(90) NOT NULL,
     status VARCHAR(16) NOT NULL CHECK (status IN ('ACTIVE', 'RESERVED', 'DORMANT', 'ARCHIVED')),
+    last_assignment_time TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
