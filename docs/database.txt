@@ -15,6 +15,7 @@ Tables
 - players
   - `id BIGSERIAL PRIMARY KEY`
   - `public_key BYTEA UNIQUE NOT NULL` (32 bytes)
+  - `rating DECIMAL(10,4) NOT NULL`
   - `created_at TIMESTAMPTZ DEFAULT NOW()`
 
 - sessions

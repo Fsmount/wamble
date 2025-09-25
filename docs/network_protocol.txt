@@ -81,6 +81,7 @@ Control Codes
   - Payload: empty.
 - `0x12` PLAYER_STATS_DATA (server→client): Player statistics.
   - Payload: `double score_be; int32 games_played_be`.
+  - Note: Rating is tracked separately from score and is not currently included in this payload.
 - `0x13` GET_PROFILE_INFO (client→server): Request info for a specific profile.
   - Payload: `uint8 name_len; char name[name_len]`.
 - `0x14` PROFILES_LIST (server→client): Response to LIST_PROFILES.

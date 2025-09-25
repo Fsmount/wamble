@@ -766,7 +766,6 @@ static const ConfigVarMap config_map[] = {
     CONF_ITEM("min-boards", CONF_INT, min_boards),
     CONF_ITEM("inactivity-timeout", CONF_INT, inactivity_timeout),
     CONF_ITEM("reservation-timeout", CONF_INT, reservation_timeout),
-    CONF_ITEM("k-factor", CONF_INT, k_factor),
     CONF_ITEM("default-rating", CONF_INT, default_rating),
     CONF_ITEM("max-players", CONF_INT, max_players),
     CONF_ITEM("token-expiration", CONF_INT, token_expiration),
@@ -856,7 +855,6 @@ static void config_set_defaults(void) {
   g_config.min_boards = 4;
   g_config.inactivity_timeout = 300;
   g_config.reservation_timeout = 14 * 24 * 60 * 60;
-  g_config.k_factor = 32;
   g_config.default_rating = 1200;
   g_config.max_players = 1024;
   g_config.token_expiration = 86400;

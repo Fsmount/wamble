@@ -237,8 +237,9 @@ WamblePlayer *get_player_by_token(const uint8_t *token) {
       memset(player->public_key, 0, 32);
       player->has_persistent_identity = false;
       player->last_seen_time = time(NULL);
-      player->score =
-          db_get_player_total_score(session_id) + get_config()->default_rating;
+      player->score = db_get_player_total_score(session_id);
+      double r = db_get_player_rating(session_id);
+      player->rating = (r > 0.0) ? r : (double)get_config()->default_rating;
       player->games_played = db_get_session_games_played(session_id);
       player_map_put(player->token, (int)(player - player_pool));
       db_async_update_session_last_seen(session_id);
@@ -300,7 +301,8 @@ WamblePlayer *create_new_player(void) {
     memset(player->public_key, 0, 32);
     player->has_persistent_identity = 0;
     player->last_seen_time = time(NULL);
-    player->score = get_config()->default_rating;
+    player->score = 0.0;
+    player->rating = (double)get_config()->default_rating;
     player->games_played = 0;
     uint64_t session_id = db_create_session(candidate_token, 0);
     if (session_id == 0) {

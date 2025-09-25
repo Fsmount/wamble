@@ -18,7 +18,6 @@ Core Options (common defaults)
 - `max-boards` / `min-boards` (int, 1024 / 4): Board pool sizing.
 - `inactivity-timeout` (int, 300): Archive inactive boards (sec).
 - `reservation-timeout` (int, 2): Board reservation lease (sec).
-- `k-factor` (int, 32): Elo K factor.
 - `default-rating` (int, 1200): Starting rating for new players.
 - `max-players` (int, 1024): Player capacity.
 - `token-expiration` (int, 86400): Token TTL (sec).

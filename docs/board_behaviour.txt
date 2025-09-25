@@ -15,7 +15,7 @@ Board Lifecycle and State Transitions
 - A game is `RESERVED` until a move is made or until a configurable timeout `reservation-timeout` is reached (default: 2 weeks).
 - A reservation is initially for the current session. If that session times out, the reservation is persisted to the database if and only if the user has a public key (i.e., a persistent identity).
 - If a game remains reserved in the database for the full duration of the timeout, it is released as `DORMANT`.
-- When a board is completed, pot scoring should be distributed, game removed from cache, ratings updated, and released as `ARCHIVED`
+- When a board is completed, pot scoring is distributed, game removed from cache, ratings should be updated (currently a placeholder), and released as `ARCHIVED`
 - An `ACTIVE` board is removed from the cache and becomes `DORMANT` after a configurable period of inactivity `inactivity-timeout` (default: 5 minutes) to ensure the cache holds recently played games.
 
 Board Assignment

@@ -481,7 +481,6 @@ typedef struct WambleConfig {
   int min_boards;
   int inactivity_timeout;
   int reservation_timeout;
-  int k_factor;
   int default_rating;
   int max_players;
   int token_expiration;
@@ -793,6 +792,7 @@ typedef struct WamblePlayer {
   bool has_persistent_identity;
   time_t last_seen_time;
   double score;
+  double rating;
   int games_played;
 } WamblePlayer;
 
@@ -932,6 +932,8 @@ int db_async_record_game_result(uint64_t board_id, char winning_side);
 int db_async_record_payout(uint64_t board_id, uint64_t session_id,
                            double points);
 double db_get_player_total_score(uint64_t session_id);
+double db_get_player_rating(uint64_t session_id);
+int db_async_update_player_rating(uint64_t session_id, double rating);
 
 int db_get_active_session_count(void);
 int db_get_longest_game_moves(void);

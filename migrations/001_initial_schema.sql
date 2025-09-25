@@ -1,6 +1,7 @@
 CREATE TABLE players (
     id BIGSERIAL PRIMARY KEY,
     public_key BYTEA UNIQUE NOT NULL CHECK (LENGTH(public_key) = 32),
+    rating DECIMAL(10, 4) NOT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
