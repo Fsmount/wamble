@@ -597,6 +597,56 @@ double db_get_player_total_score(uint64_t session_id) {
   return total;
 }
 
+double db_get_player_rating(uint64_t session_id) {
+  const char *query = "SELECT COALESCE(p.rating, 0) FROM players p "
+                      "JOIN sessions s ON s.player_id = p.id WHERE s.id = $1";
+
+  char session_id_str[32];
+  snprintf(session_id_str, sizeof(session_id_str), "%lu", session_id);
+
+  const char *paramValues[] = {session_id_str};
+
+  PGresult *res =
+      pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
+
+  if (!res || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+    if (res)
+      PQclear(res);
+    return 0.0;
+  }
+
+  char *endptr;
+  double rating = strtod(PQgetvalue(res, 0, 0), &endptr);
+  if (*endptr != '\0') {
+    PQclear(res);
+    return 0.0;
+  }
+  PQclear(res);
+  return rating;
+}
+
+int db_async_update_player_rating(uint64_t session_id, double rating) {
+  const char *query = "UPDATE players SET rating = $2 WHERE id = (SELECT "
+                      "player_id FROM sessions WHERE id = $1)";
+
+  char session_id_str[32];
+  char rating_str[32];
+  snprintf(session_id_str, sizeof(session_id_str), "%lu", session_id);
+  snprintf(rating_str, sizeof(rating_str), "%.4f", rating);
+
+  const char *paramValues[] = {session_id_str, rating_str};
+
+  PGresult *res =
+      pq_exec_params_locked(query, 2, NULL, paramValues, NULL, NULL, 0);
+  if (!res || PQresultStatus(res) != PGRES_COMMAND_OK) {
+    if (res)
+      PQclear(res);
+    return -1;
+  }
+  PQclear(res);
+  return 0;
+}
+
 int db_get_active_session_count(void) {
   const char *query = "SELECT COUNT(*) FROM sessions WHERE last_seen_at > "
                       "NOW() - INTERVAL '5 minutes'";

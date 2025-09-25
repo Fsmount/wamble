@@ -289,6 +289,17 @@ double db_get_player_total_score(uint64_t session_id) {
   return 0.0;
 }
 
+double db_get_player_rating(uint64_t session_id) {
+  (void)session_id;
+  return 0.0;
+}
+
+int db_async_update_player_rating(uint64_t session_id, double rating) {
+  (void)session_id;
+  (void)rating;
+  return 0;
+}
+
 int db_async_update_board_assignment_time(uint64_t board_id) {
   for (int i = 0; i < stub_board_count; i++) {
     if (stub_boards[i].id == board_id) {

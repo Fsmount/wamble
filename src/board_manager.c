@@ -646,64 +646,6 @@ static int create_new_board_for_player(WamblePlayer *player) {
   return cache_slot;
 }
 
-void update_player_ratings(WambleBoard *board) {
-  DbMovesResult mres = db_get_moves_for_board(board->id);
-  const WambleMove *moves = mres.rows;
-  int num_moves = mres.count;
-
-  WamblePlayer *white_player = NULL;
-  WamblePlayer *black_player = NULL;
-
-  for (int i = 0; i < num_moves; i++) {
-    if (moves[i].is_white_move) {
-      if (!white_player) {
-        white_player = get_player_by_token(moves[i].player_token);
-      }
-    } else {
-      if (!black_player) {
-        black_player = get_player_by_token(moves[i].player_token);
-      }
-    }
-    if (white_player && black_player) {
-      break;
-    }
-  }
-
-  double white_rating =
-      white_player ? white_player->score : get_config()->default_rating;
-  double black_rating =
-      black_player ? black_player->score : get_config()->default_rating;
-
-  double expected_white =
-      1.0 / (1.0 + pow(10.0, (black_rating - white_rating) / 400.0));
-  double expected_black =
-      1.0 / (1.0 + pow(10.0, (white_rating - black_rating) / 400.0));
-
-  double actual_white, actual_black;
-
-  if (board->result == GAME_RESULT_WHITE_WINS) {
-    actual_white = 1.0;
-    actual_black = 0.0;
-  } else if (board->result == GAME_RESULT_BLACK_WINS) {
-    actual_white = 0.0;
-    actual_black = 1.0;
-  } else {
-    actual_white = 0.5;
-    actual_black = 0.5;
-  }
-
-  if (white_player) {
-    white_player->score +=
-        get_config()->k_factor * (actual_white - expected_white);
-    white_player->games_played++;
-  }
-  if (black_player) {
-    black_player->score +=
-        get_config()->k_factor * (actual_black - expected_black);
-    black_player->games_played++;
-  }
-}
-
 WambleBoard *get_board_by_id(uint64_t board_id) {
   wamble_mutex_lock(&board_mutex);
   int idx = board_map_get(board_id);
