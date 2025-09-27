@@ -860,16 +860,7 @@ int validate_and_apply_move_status(WambleBoard *wamble_board,
   }
 
   make_move_bitboard(board, &candidate_move);
-
-  uint64_t session_id = db_get_session_by_token(player->token);
-  if (session_id > 0) {
-    db_async_record_move(wamble_board->id, session_id, uci_move,
-                         board->fullmove_number);
-  }
-
   bitboard_to_fen(board, wamble_board->fen);
-
-  board_move_played(wamble_board->id);
 
   int color = (board->turn == 'w') ? 0 : 1;
   num_legal = generate_legal_moves_bitboard(board, legal_moves);
@@ -885,12 +876,6 @@ int validate_and_apply_move_status(WambleBoard *wamble_board,
     }
   } else if (board->halfmove_clock >= 100) {
     wamble_board->result = GAME_RESULT_DRAW;
-  }
-
-  if (wamble_board->result != GAME_RESULT_IN_PROGRESS) {
-    update_player_ratings(wamble_board);
-    calculate_and_distribute_pot(wamble_board->id);
-    board_archive(wamble_board->id);
   }
 
   if (out_status)
