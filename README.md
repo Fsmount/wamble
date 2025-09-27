@@ -29,18 +29,52 @@ Wamble is a multiplayer chess variant where after every move you're switched to 
 
 ### Building Wamble
 
+Use the C build driver to build the static core library, the server, and the unified test binary.
+
+1. Build the build driver:
+
 ```sh
-gcc -o wamble src/*.c -Iinclude -lpq -lpthread -lm
+c99 -O2 -std=c99 -o build/wamble_build tools/wamble_build.c
 ```
 
-This will create an executable named `wamble` in the root directory.
+2. Build the server (requires libpq):
+
+```sh
+build/wamble_build --server [--warn]
+```
+
+3. Build and run the unified tests (optional):
+
+```sh
+build/wamble_build --tests --run-tests [--with-db] [--warn]
+```
+
+To include DB-backed code in tests, add `--with-db`:
+
+```sh
+build/wamble_build --tests --run-tests --with-db
+```
+
+You can pass arguments to the test runner after `--`, for example:
+
+```sh
+build/wamble_build --tests --run-tests -- --module network --timeout-ms 8000 --seed 42
+```
+
+Clean build artifacts:
+
+```sh
+build/wamble_build --clean
+```
+
+Artifacts are placed under `build/`
 
 ## How to Run
 
 Once you've built the server, you can run it with:
 
 ```sh
-./wamble
+build/wamble
 ```
 
 The server will start listening for connections on the default port (8888).
@@ -48,3 +82,7 @@ The server will start listening for connections on the default port (8888).
 ## Configuring
 
 Lisp like configuration run server with `--help` and read docs/configuration.txt for details.
+
+```
+
+```

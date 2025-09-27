@@ -376,8 +376,8 @@ int main(int argc, char *argv[]) {
   }
 #endif
 
-  time_t last_cleanup = time(NULL);
-  time_t last_tick = time(NULL);
+  time_t last_cleanup = wamble_now_wall();
+  time_t last_tick = wamble_now_wall();
 
   LOG_INFO("Server main loop starting");
   while (!g_shutdown_requested) {
@@ -421,7 +421,7 @@ int main(int argc, char *argv[]) {
 #endif
     }
 
-    time_t now = time(NULL);
+    time_t now = wamble_now_wall();
     if (now - last_cleanup > get_config()->cleanup_interval_sec) {
       LOG_INFO("Cleaning up expired client sessions");
       cleanup_expired_sessions();
@@ -452,7 +452,11 @@ int main(int argc, char *argv[]) {
           out.board_id = events[i].board_id;
           out.seq_num = 0;
           out.flags = WAMBLE_FLAG_UNRELIABLE;
-          strncpy(out.fen, events[i].fen, FEN_MAX_LENGTH);
+          {
+            size_t __len = strnlen(events[i].fen, FEN_MAX_LENGTH - 1);
+            memcpy(out.fen, events[i].fen, __len);
+            out.fen[__len] = '\0';
+          }
           if (send_unreliable_packet(sockfd, &out, &events[i].addr) != 0) {
             LOG_WARN("Failed to send spectator update for board %lu",
                      out.board_id);
@@ -466,7 +470,11 @@ int main(int argc, char *argv[]) {
           out.board_id = events[i].board_id;
           out.seq_num = 0;
           out.flags = WAMBLE_FLAG_UNRELIABLE;
-          strncpy(out.fen, events[i].fen, FEN_MAX_LENGTH);
+          {
+            size_t __len = strnlen(events[i].fen, FEN_MAX_LENGTH - 1);
+            memcpy(out.fen, events[i].fen, __len);
+            out.fen[__len] = '\0';
+          }
           if (send_unreliable_packet(sockfd, &out, &events[i].addr) != 0) {
             LOG_WARN("Failed to send spectator notice for board %lu",
                      out.board_id);
@@ -581,7 +589,11 @@ static void handle_client_hello(int sockfd, const struct WambleMsg *msg,
   memcpy(response.token, player->token, TOKEN_LENGTH);
   response.board_id = board->id;
   response.seq_num = WAMBLE_PROTO_VERSION;
-  strncpy(response.fen, board->fen, FEN_MAX_LENGTH);
+  {
+    size_t __len = strnlen(board->fen, FEN_MAX_LENGTH - 1);
+    memcpy(response.fen, board->fen, __len);
+    response.fen[__len] = '\0';
+  }
   LOG_DEBUG("Sending Server Hello response (board_id: %lu, fen: %s)",
             response.board_id, response.fen);
   LOG_DEBUG("Negotiated protocol version %u with caps 0x%02x for %s",
@@ -667,7 +679,11 @@ static void handle_player_move(int sockfd, const struct WambleMsg *msg,
     response.board_id = next_board->id;
     response.seq_num = 0;
     response.uci_len = 0;
-    strncpy(response.fen, next_board->fen, FEN_MAX_LENGTH);
+    {
+      size_t __len = strnlen(next_board->fen, FEN_MAX_LENGTH - 1);
+      memcpy(response.fen, next_board->fen, __len);
+      response.fen[__len] = '\0';
+    }
     LOG_DEBUG(
         "Sending Board Update response (board_id: %lu, fen: %s) to player %s",
         response.board_id, response.fen, token_str);

@@ -37,7 +37,7 @@ void rng_init(void) {
     return;
   }
 
-  uint64_t seed1 = (uint64_t)time(NULL);
+  uint64_t seed1 = (uint64_t)wamble_now_wall();
   uint64_t seed2 = (uint64_t)clock();
   uint64_t seed3 = (uint64_t)wamble_getpid();
   uint64_t seed4 = (uint64_t)(uintptr_t)&seed1;
@@ -98,6 +98,15 @@ void rng_bytes(uint8_t *out, size_t len) {
       r >>= 8;
     }
   }
+}
+
+void rng_seed(uint64_t hi, uint64_t lo) {
+  wamble_mutex_lock(&rng_mutex);
+  pcg_state = (hi << 32) ^ lo ^ 0x853c49e6748fea9bULL;
+  pcg_inc = ((lo << 1) | 1ULL) ^ 0xda3e39cb94b95bdbULL;
+  (void)pcg32_random_r();
+  rng_initialized = 1;
+  wamble_mutex_unlock(&rng_mutex);
 }
 
 #define PLAYER_MAP_SIZE (get_config()->max_players * 2)
@@ -218,7 +227,7 @@ WamblePlayer *get_player_by_token(const uint8_t *token) {
 
   int idx = player_map_get(token);
   if (idx >= 0) {
-    player_pool[idx].last_seen_time = time(NULL);
+    player_pool[idx].last_seen_time = wamble_now_wall();
 
     uint64_t session_id = db_get_session_by_token(token);
     if (session_id > 0) {
@@ -236,7 +245,7 @@ WamblePlayer *get_player_by_token(const uint8_t *token) {
       memcpy(player->token, token, TOKEN_LENGTH);
       memset(player->public_key, 0, 32);
       player->has_persistent_identity = false;
-      player->last_seen_time = time(NULL);
+      player->last_seen_time = wamble_now_wall();
       player->score = db_get_player_total_score(session_id);
       double r = db_get_player_rating(session_id);
       player->rating = (r > 0.0) ? r : (double)get_config()->default_rating;
@@ -300,7 +309,7 @@ WamblePlayer *create_new_player(void) {
     memcpy(player->token, candidate_token, TOKEN_LENGTH);
     memset(player->public_key, 0, 32);
     player->has_persistent_identity = 0;
-    player->last_seen_time = time(NULL);
+    player->last_seen_time = wamble_now_wall();
     player->score = 0.0;
     player->rating = (double)get_config()->default_rating;
     player->games_played = 0;
@@ -339,7 +348,7 @@ WamblePlayer *login_player(const uint8_t *public_key) {
 }
 
 void player_manager_tick(void) {
-  time_t now = time(NULL);
+  time_t now = wamble_now_wall();
 
   wamble_mutex_lock(&player_mutex);
 

@@ -54,29 +54,7 @@
 #define WAMBLE_WEAK __attribute__((weak))
 #endif
 
-#if defined(WAMBLE_PLATFORM_WINDOWS)
-static inline int gmtime_w(struct tm *out_tm, const time_t *timer) {
-  return (gmtime_s(out_tm, timer) == 0) ? 1 : 0;
-}
-#elif defined(WAMBLE_PLATFORM_POSIX)
-static inline int gmtime_w(struct tm *out_tm, const time_t *timer) {
-#if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
-  return (gmtime_r(timer, out_tm) != NULL) ? 1 : 0;
-#else
-  struct tm *tmp = gmtime(timer);
-  if (!tmp)
-    return 0;
-  *out_tm = *tmp;
-  return 1;
-#endif
-}
-#else
-static inline int gmtime_w(struct tm *out_tm, const time_t *timer) {
-  (void)out_tm;
-  (void)timer;
-  return 0;
-}
-#endif
+int gmtime_w(struct tm *out_tm, const time_t *timer);
 
 #ifdef WAMBLE_PLATFORM_WINDOWS
 #define wamble_getpid() GetCurrentProcessId()
@@ -232,55 +210,55 @@ static inline const char *wamble_strerror(int err) { return strerror(err); }
 struct WambleConfig;
 const struct WambleConfig *get_config(void);
 void set_thread_config(const struct WambleConfig *cfg);
+void wamble_config_push(const struct WambleConfig *cfg);
+void wamble_config_pop(void);
 typedef struct WambleProfile WambleProfile;
 
 static inline void wamble_log(int level, const char *file, int line,
                               const char *func, const char *level_str,
                               const char *format, ...);
 
-#define LOG_FATAL(format, ...)                                                 \
+#define LOG_FATAL(...)                                                         \
   do {                                                                         \
-    wamble_log(LOG_LEVEL_FATAL, __FILE__, __LINE__, __func__, "FATAL", format, \
-               ##__VA_ARGS__);                                                 \
+    wamble_log(LOG_LEVEL_FATAL, __FILE__, __LINE__, __func__, "FATAL",         \
+               __VA_ARGS__);                                                   \
     exit(1);                                                                   \
   } while (0)
 
 #if LOG_LEVEL >= LOG_LEVEL_ERROR
-#define LOG_ERROR(format, ...)                                                 \
-  wamble_log(LOG_LEVEL_ERROR, __FILE__, __LINE__, __func__, "ERROR", format,   \
-             ##__VA_ARGS__)
+#define LOG_ERROR(...)                                                         \
+  wamble_log(LOG_LEVEL_ERROR, __FILE__, __LINE__, __func__, "ERROR",           \
+             __VA_ARGS__)
 #else
-#define LOG_ERROR(format, ...)                                                 \
+#define LOG_ERROR(...)                                                         \
   do {                                                                         \
   } while (0)
 #endif
 
 #if LOG_LEVEL >= LOG_LEVEL_WARN
-#define LOG_WARN(format, ...)                                                  \
-  wamble_log(LOG_LEVEL_WARN, __FILE__, __LINE__, __func__, "WARN", format,     \
-             ##__VA_ARGS__)
+#define LOG_WARN(...)                                                          \
+  wamble_log(LOG_LEVEL_WARN, __FILE__, __LINE__, __func__, "WARN", __VA_ARGS__)
 #else
-#define LOG_WARN(format, ...)                                                  \
+#define LOG_WARN(...)                                                          \
   do {                                                                         \
   } while (0)
 #endif
 
 #if LOG_LEVEL >= LOG_LEVEL_INFO
-#define LOG_INFO(format, ...)                                                  \
-  wamble_log(LOG_LEVEL_INFO, __FILE__, __LINE__, __func__, "INFO", format,     \
-             ##__VA_ARGS__)
+#define LOG_INFO(...)                                                          \
+  wamble_log(LOG_LEVEL_INFO, __FILE__, __LINE__, __func__, "INFO", __VA_ARGS__)
 #else
-#define LOG_INFO(format, ...)                                                  \
+#define LOG_INFO(...)                                                          \
   do {                                                                         \
   } while (0)
 #endif
 
 #if LOG_LEVEL >= LOG_LEVEL_DEBUG
-#define LOG_DEBUG(format, ...)                                                 \
-  wamble_log(LOG_LEVEL_DEBUG, __FILE__, __LINE__, __func__, "DEBUG", format,   \
-             ##__VA_ARGS__)
+#define LOG_DEBUG(...)                                                         \
+  wamble_log(LOG_LEVEL_DEBUG, __FILE__, __LINE__, __func__, "DEBUG",           \
+             __VA_ARGS__)
 #else
-#define LOG_DEBUG(format, ...)                                                 \
+#define LOG_DEBUG(...)                                                         \
   do {                                                                         \
   } while (0)
 #endif
@@ -605,6 +583,9 @@ void profile_mark_sockets_inheritable(void);
 ProfileExportStatus profile_prepare_state_save_and_inherit(
     char *out_state_map, size_t out_state_map_size, int *out_count);
 
+uint64_t wamble_now_mono_millis(void);
+time_t wamble_now_wall(void);
+
 static inline void wamble_log(int level, const char *file, int line,
                               const char *func, const char *level_str,
                               const char *format, ...) {
@@ -618,7 +599,7 @@ static inline void wamble_log(int level, const char *file, int line,
     return;
   }
 
-  time_t now = time(NULL);
+  time_t now = wamble_now_wall();
   char time_buf[21];
   struct tm tm_utc;
   if (gmtime_w(&tm_utc, &now)) {
@@ -945,7 +926,7 @@ int db_async_link_session_to_player(uint64_t session_id, uint64_t player_id);
 
 void db_expire_reservations(void);
 
-void db_cleanup_thread(void) WAMBLE_WEAK;
+void db_cleanup_thread(void);
 
 int db_get_trust_tier_by_token(const uint8_t *token);
 
@@ -953,6 +934,7 @@ void rng_init(void);
 uint64_t rng_u64(void);
 double rng_double(void);
 void rng_bytes(uint8_t *out, size_t len);
+void rng_seed(uint64_t hi, uint64_t lo);
 void db_archive_inactive_boards(int timeout_seconds);
 
 wamble_socket_t create_and_bind_socket(int port);
