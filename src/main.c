@@ -630,12 +630,27 @@ static void handle_player_move(int sockfd, const struct WambleMsg *msg,
     LOG_INFO("Move %s on board %lu by %s validated and applied", uci_move,
              board->id, token_str);
 
+    uint64_t session_id = db_get_session_by_token(player->token);
+    if (session_id > 0) {
+      db_async_record_move(board->id, session_id, uci_move,
+                           board->board.fullmove_number);
+      LOG_DEBUG("Persisted move for session %lu on board %lu (move #%d)",
+                session_id, board->id, board->board.fullmove_number);
+    } else {
+      LOG_WARN("No session found for player %s; skipping move persistence",
+               token_str);
+    }
+
+    board_move_played(board->id);
+    LOG_DEBUG("Recorded move played event for board %lu", board->id);
+
     LOG_DEBUG("Releasing board %lu after successful move", board->id);
     board_release_reservation(board->id);
 
     if (board->result != GAME_RESULT_IN_PROGRESS) {
       LOG_INFO("Game on board %lu has ended. Result: %d", board->id,
                board->result);
+      board_game_completed(board->id, board->result);
     }
 
     WambleBoard *next_board = find_board_for_player(player);
