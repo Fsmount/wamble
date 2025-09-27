@@ -66,7 +66,7 @@ static void transition_reserved_to_dormant(WambleBoard *board);
 void board_manager_tick() {
   wamble_mutex_lock(&board_mutex);
 
-  time_t now = time(NULL);
+  time_t now = wamble_now_wall();
   static time_t last_count_update = 0;
 
   for (int i = num_cached_boards - 1; i >= 0; i--) {
@@ -194,7 +194,7 @@ static bool is_board_eligible_for_assignment(const WambleBoard *board) {
 
 static double calculate_board_attractiveness(const WambleBoard *board,
                                              const WamblePlayer *player) {
-  time_t now = time(NULL);
+  time_t now = wamble_now_wall();
   double score = 1.0;
 
   GamePhase phase;
@@ -241,7 +241,7 @@ static double calculate_board_attractiveness(const WambleBoard *board,
 
 static void apply_reservation_to_board(WambleBoard *board,
                                        WamblePlayer *player) {
-  time_t now = time(NULL);
+  time_t now = wamble_now_wall();
 
   board->state = BOARD_STATE_RESERVED;
   board->reservation_time = now;
@@ -275,12 +275,16 @@ static WambleBoard *load_board_into_cache(uint64_t board_id) {
 
   WambleBoard *board = &board_cached[cache_slot];
   board->id = board_id;
-  strncpy(board->fen, br.fen, FEN_MAX_LENGTH);
+  {
+    size_t __len = strnlen(br.fen, FEN_MAX_LENGTH - 1);
+    memcpy(board->fen, br.fen, __len);
+    board->fen[__len] = '\0';
+  }
   parse_fen_to_bitboard(board->fen, &board->board);
   board->state = board_state_from_string(br.status_text);
   board->result = GAME_RESULT_IN_PROGRESS;
   board->last_move_time = 0;
-  board->creation_time = time(NULL);
+  board->creation_time = wamble_now_wall();
   board->last_assignment_time = br.last_assignment_time;
   memset(board->reservation_player_token, 0, TOKEN_LENGTH);
   board->reservation_time = 0;
@@ -358,7 +362,7 @@ void board_move_played(uint64_t board_id) {
 
     if (board->state == BOARD_STATE_RESERVED) {
       board->state = BOARD_STATE_ACTIVE;
-      board->last_move_time = time(NULL);
+      board->last_move_time = wamble_now_wall();
 
       db_async_update_board(board->id, board->fen, "ACTIVE");
       db_async_remove_reservation(board->id);
@@ -367,7 +371,7 @@ void board_move_played(uint64_t board_id) {
       board->reservation_time = 0;
       board->reserved_for_white = false;
     } else if (board->state == BOARD_STATE_ACTIVE) {
-      board->last_move_time = time(NULL);
+      board->last_move_time = wamble_now_wall();
     }
   }
 
@@ -544,7 +548,11 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
 
     WambleBoard temp_board = {0};
     temp_board.id = board_id;
-    strncpy(temp_board.fen, br.fen, FEN_MAX_LENGTH);
+    {
+      size_t __len = strnlen(br.fen, FEN_MAX_LENGTH - 1);
+      memcpy(temp_board.fen, br.fen, __len);
+      temp_board.fen[__len] = '\0';
+    }
     parse_fen_to_bitboard(temp_board.fen, &temp_board.board);
     temp_board.state = BOARD_STATE_DORMANT;
     temp_board.result = GAME_RESULT_IN_PROGRESS;
@@ -597,7 +605,7 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
 }
 
 static int create_new_board_for_player(WamblePlayer *player) {
-  time_t now = time(NULL);
+  time_t now = wamble_now_wall();
 
   int longest_game = db_get_longest_game_moves();
   int players = db_get_active_session_count();

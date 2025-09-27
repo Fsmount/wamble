@@ -7,6 +7,12 @@ static WambleConfig g_config;
 static WAMBLE_THREAD_LOCAL const WambleConfig *g_thread_config = NULL;
 static WambleProfile *g_profiles = NULL;
 static int g_profile_count = 0;
+typedef struct {
+  const WambleConfig **data;
+  int count;
+  int cap;
+} CfgStack;
+static WAMBLE_THREAD_LOCAL CfgStack g_cfg_stack = {0};
 
 typedef enum {
   LISP_VALUE_NIL,
@@ -63,6 +69,37 @@ const WambleConfig *get_config(void) {
 }
 
 void set_thread_config(const WambleConfig *cfg) { g_thread_config = cfg; }
+
+static void cfg_stack_reserve(CfgStack *s, int need) {
+  if (s->cap >= need)
+    return;
+  int ncap = s->cap ? s->cap * 2 : 8;
+  while (ncap < need)
+    ncap *= 2;
+  const WambleConfig **nd =
+      realloc((void *)s->data, (size_t)ncap * sizeof(*nd));
+  if (!nd) {
+    fprintf(stderr, "[config] OOM\n");
+    abort();
+  }
+  s->data = nd;
+  s->cap = ncap;
+}
+
+void wamble_config_push(const WambleConfig *cfg) {
+  cfg_stack_reserve(&g_cfg_stack, g_cfg_stack.count + 1);
+  g_cfg_stack.data[g_cfg_stack.count++] = g_thread_config;
+  g_thread_config = cfg;
+}
+
+void wamble_config_pop(void) {
+  if (g_cfg_stack.count <= 0) {
+    g_thread_config = NULL;
+    return;
+  }
+  const WambleConfig *prev = g_cfg_stack.data[--g_cfg_stack.count];
+  g_thread_config = prev;
+}
 
 static LispValue *parse_expr(Stream *s);
 static LispValue *lisp_env_get(LispEnv *env, LispValue *symbol);

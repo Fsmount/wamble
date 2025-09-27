@@ -486,7 +486,7 @@ create_client_session(const struct sockaddr_in *addr, const uint8_t *token) {
   session->addr = *addr;
   memcpy(session->token, token, TOKEN_LENGTH);
   session->last_seq_num = 0;
-  session->last_seen = time(NULL);
+  session->last_seen = wamble_now_wall();
   session->next_seq_num = 1;
   session_map_put(addr, (int)(session - client_sessions));
   return session;
@@ -512,7 +512,7 @@ static void update_client_session(const struct sockaddr_in *addr,
   }
 
   session->last_seq_num = seq_num;
-  session->last_seen = time(NULL);
+  session->last_seen = wamble_now_wall();
   memcpy(session->token, token, TOKEN_LENGTH);
 }
 
@@ -807,7 +807,7 @@ int send_unreliable_packet(wamble_socket_t sockfd, const struct WambleMsg *msg,
 }
 
 void cleanup_expired_sessions(void) {
-  time_t now = time(NULL);
+  time_t now = wamble_now_wall();
   int write_idx = 0;
 
   for (int read_idx = 0; read_idx < num_sessions; read_idx++) {

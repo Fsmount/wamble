@@ -365,8 +365,8 @@ static void *profile_thread_main(void *arg) {
     return NULL;
   }
 
-  time_t last_cleanup = time(NULL);
-  time_t last_tick = time(NULL);
+  time_t last_cleanup = wamble_now_wall();
+  time_t last_tick = wamble_now_wall();
   while (!rp->should_stop) {
 
 #if defined(WAMBLE_PLATFORM_POSIX)
@@ -458,7 +458,7 @@ static void *profile_thread_main(void *arg) {
       }
     }
 
-    time_t now = time(NULL);
+    time_t now = wamble_now_wall();
     if (now - last_cleanup > get_config()->cleanup_interval_sec) {
       cleanup_expired_sessions();
       last_cleanup = now;
@@ -486,7 +486,11 @@ static void *profile_thread_main(void *arg) {
         out.board_id = events[i].board_id;
         out.seq_num = 0;
         out.flags = WAMBLE_FLAG_UNRELIABLE;
-        strncpy(out.fen, events[i].fen, FEN_MAX_LENGTH);
+        {
+          size_t __len = strnlen(events[i].fen, FEN_MAX_LENGTH - 1);
+          memcpy(out.fen, events[i].fen, __len);
+          out.fen[__len] = '\0';
+        }
         (void)send_unreliable_packet(rp->sockfd, &out, &events[i].addr);
       }
       int nnot = spectator_collect_notifications(events, cap);
@@ -497,7 +501,11 @@ static void *profile_thread_main(void *arg) {
         out.board_id = events[i].board_id;
         out.seq_num = 0;
         out.flags = WAMBLE_FLAG_UNRELIABLE;
-        strncpy(out.fen, events[i].fen, FEN_MAX_LENGTH);
+        {
+          size_t __len = strnlen(events[i].fen, FEN_MAX_LENGTH - 1);
+          memcpy(out.fen, events[i].fen, __len);
+          out.fen[__len] = '\0';
+        }
         (void)send_unreliable_packet(rp->sockfd, &out, &events[i].addr);
       }
       free(events);
