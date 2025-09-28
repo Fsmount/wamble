@@ -515,9 +515,7 @@ static void *profile_thread_main(void *arg) {
 
   wamble_close_socket(rp->sockfd);
   rp->sockfd = WAMBLE_INVALID_SOCKET;
-  if (db_cleanup_thread) {
-    db_cleanup_thread();
-  }
+  db_cleanup_thread();
   return NULL;
 }
 

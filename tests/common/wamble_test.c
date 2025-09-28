@@ -2,14 +2,26 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 #include "wamble_test.h"
+#include "wamble/wamble.h"
+
+#if defined(__GNUC__)
+__attribute__((weak)) void wamble_register_tests(void) {}
+#else
+void wamble_register_tests(void) {}
+#endif
 
 #include <errno.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <time.h>
+#if defined(WAMBLE_PLATFORM_POSIX)
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <time.h>
 #include <unistd.h>
+#endif
+#if defined(WAMBLE_PLATFORM_WINDOWS)
+#include <windows.h>
+#endif
 
 static wamble_test_case g_cases[1024];
 static int g_case_count = 0;
@@ -104,6 +116,7 @@ static int tag_has_kv(const char *tags, const char *key, const char *val) {
 }
 
 static double monotime_sec(void) {
+#if defined(WAMBLE_PLATFORM_POSIX)
   struct timespec ts;
 #ifdef CLOCK_MONOTONIC
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -111,11 +124,16 @@ static double monotime_sec(void) {
   clock_gettime(CLOCK_REALTIME, &ts);
 #endif
   return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+#else
+
+  return (double)wamble_now_wall();
+#endif
 }
 
 static int run_one_isolated(const wamble_test_case *tc, int timeout_ms,
                             double *duration_out) {
   double start = monotime_sec();
+#if defined(WAMBLE_PLATFORM_POSIX)
   int status = 0;
   pid_t pid = fork();
   if (pid < 0) {
@@ -123,14 +141,12 @@ static int run_one_isolated(const wamble_test_case *tc, int timeout_ms,
     return -1;
   }
   if (pid == 0) {
-
     fprintf(stdout, "=== RUN %s%s%s timeout=%dms seed=%lu\n", tc->name,
             (tc->tags && *tc->tags) ? " tags=" : "",
             (tc->tags && *tc->tags) ? tc->tags : "",
             (timeout_ms > 0 ? timeout_ms
                             : (tc->timeout_ms > 0 ? tc->timeout_ms : 5000)),
             g_seed);
-
     if (g_seed != 0) {
       srand((unsigned)g_seed);
     }
@@ -186,6 +202,59 @@ static int run_one_isolated(const wamble_test_case *tc, int timeout_ms,
     return 2;
   }
   return 1;
+#elif defined(WAMBLE_PLATFORM_WINDOWS)
+  int index = (int)(tc - g_cases);
+  char exe_path[MAX_PATH];
+  DWORD n = GetModuleFileNameA(NULL, exe_path, (DWORD)sizeof exe_path);
+  if (n == 0 || n >= sizeof exe_path) {
+    *duration_out = 0.0;
+    return -1;
+  }
+  int effective_timeout = timeout_ms > 0
+                              ? timeout_ms
+                              : (tc->timeout_ms > 0 ? tc->timeout_ms : 5000);
+  char cmdline[512];
+  if (g_seed != 0) {
+    _snprintf(cmdline, sizeof cmdline,
+              "\"%s\" --run-one %d --timeout-ms %d --seed %lu", exe_path, index,
+              effective_timeout, g_seed);
+  } else {
+    _snprintf(cmdline, sizeof cmdline, "\"%s\" --run-one %d --timeout-ms %d",
+              exe_path, index, effective_timeout);
+  }
+  STARTUPINFOA si;
+  PROCESS_INFORMATION pi;
+  ZeroMemory(&si, sizeof(si));
+  si.cb = sizeof(si);
+  ZeroMemory(&pi, sizeof(pi));
+  if (!CreateProcessA(NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si,
+                      &pi)) {
+    *duration_out = 0.0;
+    return -1;
+  }
+  DWORD wait_rc = WaitForSingleObject(pi.hProcess, (DWORD)effective_timeout);
+  int result;
+  if (wait_rc == WAIT_TIMEOUT) {
+    TerminateProcess(pi.hProcess, 137);
+    result = -2;
+  } else if (wait_rc == WAIT_FAILED) {
+    result = -1;
+  } else {
+    DWORD exit_code = 1;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    if (exit_code == 0) {
+      result = 0;
+    } else if (exit_code == 100) {
+      result = 1;
+    } else {
+      result = 2;
+    }
+  }
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  *duration_out = monotime_sec() - start;
+  return result;
+#endif
 }
 
 int wamble_test_main(int argc, char **argv) {
@@ -201,9 +270,12 @@ int wamble_test_main(int argc, char **argv) {
   const char *skip_suite[32];
   int only_suite_n = 0, skip_suite_n = 0;
 
+  int run_one = -1;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--list") == 0) {
       list_only = 1;
+    } else if (strcmp(argv[i], "--run-one") == 0 && i + 1 < argc) {
+      run_one = atoi(argv[++i]);
     } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
       printf("Usage: %s [--list] [--verbose] [--timeout-ms N] [--seed N] "
              "[--name SUBSTR] [--not-name SUBSTR] "
@@ -309,8 +381,32 @@ int wamble_test_main(int argc, char **argv) {
   }
 
   extern void wamble_register_tests(void);
-  if (wamble_register_tests) {
-    wamble_register_tests();
+
+  wamble_register_tests();
+
+  if (run_one >= 0) {
+    if (run_one < 0 || run_one >= g_case_count) {
+      return 100;
+    }
+    const wamble_test_case *tc = &g_cases[run_one];
+    fprintf(stdout, "=== RUN %s%s%s timeout=%dms seed=%lu\n", tc->name,
+            (tc->tags && *tc->tags) ? " tags=" : "",
+            (tc->tags && *tc->tags) ? tc->tags : "",
+            (timeout_ms > 0 ? timeout_ms
+                            : (tc->timeout_ms > 0 ? tc->timeout_ms : 5000)),
+            g_seed);
+    if (g_seed != 0)
+      srand((unsigned)g_seed);
+    if (tc->setup)
+      tc->setup();
+    int rc = 1;
+    if (tc->fn)
+      rc = tc->fn();
+    else if (tc->param_fn)
+      rc = tc->param_fn(tc->param_data);
+    if (tc->teardown)
+      tc->teardown();
+    return rc == 0 ? 0 : 100;
   }
 
   if (list_only) {
