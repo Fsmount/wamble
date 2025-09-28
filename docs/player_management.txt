@@ -1,0 +1,32 @@
+Wamble Player Management
+=======================
+
+Overview
+- Keeps an in-memory table of active players and their session tokens.
+- Supports ephemeral sessions and sessions linked to a persistent public key.
+- Reads and writes the bits that belong in the database.
+
+Tokens
+- 16 raw bytes per session. Logged as a 22-char base64url string.
+- Generated with a simple PCG RNG and extra OS entropy where available.
+- We check for collisions in memory and in `sessions.token` before accepting.
+
+Creating Players
+- Ephemeral: `create_new_player()` mints a token, creates a DB session, sets defaults (rating, score, timers).
+- Persistent: `login_player(pubkey)` ensures a row in `players`, creates a session, and links them.
+
+Lookups
+- `get_player_by_token(token)` returns a known player. If only the DB knows about the token, we rehydrate a minimal player (score, rating, games) and update last-seen.
+
+Expiration
+- `player_manager_tick()` drops idle entries after `token-expiration` seconds and removes the token from the index.
+
+Config
+- `max-players`, `token-expiration`, `default-rating`, `max-token-attempts`, `max-token-local-attempts`.
+
+API
+- `player_manager_init()`, `get_player_by_token()`, `create_new_player()`, `login_player()`, `player_manager_tick()`.
+
+References
+- Config (see docs/configuration.txt): `max-players`, `token-expiration`, `default-rating`, `max-token-attempts`, `max-token-local-attempts`.
+- Protocol (see docs/network_protocol.txt): `LOGIN_REQUEST`, `LOGIN_SUCCESS`, `LOGIN_FAILED`, `GET_PLAYER_STATS`, `PLAYER_STATS_DATA`.

@@ -1,0 +1,51 @@
+Wamble Profile Runtime and State
+================================
+
+Overview
+- Runs multiple advertised profiles inside one process. One UDP socket and one thread per profile.
+- Supports config reload and exec handoff without dropping sockets.
+
+Profiles
+- Defined in the config with `defprofile`.
+- Each has a `name`, `config`, `advertise`, `visibility`, `db-isolated`.
+
+Start/Stop
+- `start_profile_listeners()` pre-binds all sockets (checks for port clashes) and starts threads.
+- `stop_profile_listeners()` asks threads to stop, closes sockets, and joins.
+
+Reconcile
+- On config reload, `reconcile_profile_listeners()` compares current vs. desired.
+- If names match, threads keep running and just pick up updated config.
+- If not, sockets are re-bound and threads are restarted.
+
+Thread Loop
+- Per thread: set thread-local config, init network state, players, boards.
+- `select()` on the UDP socket; on readable, `receive_message()` then `handle_message()`.
+- Every second: `board_manager_tick()`, `spectator_manager_tick()`.
+- Periodically: `cleanup_expired_sessions()`.
+- Sends `SPECTATE_UPDATE`/`SERVER_NOTIFICATION` for its own port.
+
+Exec Handoff
+- Export phase:
+  - `profile_mark_sockets_inheritable()` clears close-on-exec.
+  - `profile_prepare_state_save_and_inherit()` asks threads to save a small per-profile state file and reports a `name=path` CSV.
+  - `profile_export_inherited_sockets()` reports `name=socket_handle` CSV.
+- Environment used by the new process:
+  - `WAMBLE_HOT_RELOAD=1`
+  - `WAMBLE_PROFILES_INHERITED=name=fd,...`
+  - `WAMBLE_STATE_FILES=name=/tmp/file,...`
+- Adoption: new process starts threads with the inherited sockets and loads state files once, then unlinks them.
+
+State Files
+- Written by `state_save_to_file()` and read by `state_load_from_file()`.
+- Simple header + an array of `WambleBoard` from the board cache.
+
+DB and Config
+- Each thread uses `get_config()` to build its own `libpq` connection on demand.
+
+Errors
+- `ProfileStartStatus` and `ProfileExportStatus` report bind failures, not ready, or buffer limits.
+
+References
+- Config (see docs/configuration.txt): `advertise`, `visibility`, per-profile `port`, `buffer-size`, `select-timeout-usec`, `cleanup-interval-sec`, `db-*`, `state-dir`.
+- Protocol (see docs/network_protocol.txt): `LIST_PROFILES`, `PROFILES_LIST`, `GET_PROFILE_INFO`, `PROFILE_INFO`, and all runtime message handling delegated to the main server loop.

@@ -1,0 +1,27 @@
+Wamble Move Engine
+==================
+
+Overview
+- Bitboard move generator and validator for standard chess rules.
+- Maintains a `Board` and a FEN string on the `WambleBoard` wrapper.
+
+Types
+- `Board`: piece bitboards, side occupancy, turn, castling, en-passant, clocks.
+- `Move {from,to,promotion}`: 0-63 squares, optional `q/r/b/n`.
+
+Legal Moves
+- `get_legal_moves_for_square(board, square, moves, max)` returns moves that start on `square`.
+
+Apply a Move
+- `validate_and_apply_move_status(wamble_board, player, uci, *status)`.
+- Checks reservation and side to move.
+- Parses UCI (`e2e4`, `e7e8q`), confirms it appears in the generated legal set.
+- Applies, updates clocks/FEN, flips side.
+- Sets `result` on checkmate/stalemate or 50-move rule.
+
+Protocol
+- Serves `GET_LEGAL_MOVES` using the per-square generator.
+- After a valid move the server replies with a `BOARD_UPDATE` and the next assignment.
+
+References
+- Protocol (see docs/network_protocol.txt): `PLAYER_MOVE`, `BOARD_UPDATE`, `GET_LEGAL_MOVES`, `LEGAL_MOVES`.

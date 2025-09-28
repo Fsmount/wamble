@@ -1,0 +1,36 @@
+Wamble Spectator Management
+==========================
+
+Overview
+- Lets a session watch games in two modes: a rotating summary or a single focused board.
+- Uses `SPECTATE_UPDATE` packets over UDP (usually unreliable).
+
+States
+- `IDLE`: not watching.
+- `SUMMARY`: periodic batches of interesting boards.
+- `FOCUS`: periodic updates about one board.
+
+Config
+- `max-spectators`, `spectator-visibility`, `spectator-summary-hz`, `spectator-focus-hz`, `spectator-max-focus-per-session`, `spectator-summary-mode`.
+
+Requests
+- Summary: send `SPECTATE_GAME` with `board_id=0` -> `SPECTATOR_OK_SUMMARY`.
+- Focus: send `SPECTATE_GAME` with `board_id>0` -> `SPECTATOR_OK_FOCUS` if eligible.
+- Stop: `SPECTATE_STOP` -> `SPECTATOR_OK_STOP`.
+- Low trust or capacity issues return an error (see enum values).
+
+Updates
+- Collected by `spectator_collect_updates()` at the configured rate per mode.
+- Ordering favors recent boards, then a simple attractiveness score.
+- If a focused game ends, we queue a small text notice and switch back to summary.
+
+Port Affinity
+- Entries are tied to the listener port that created them; only that thread emits updates for that entry.
+
+API
+- `spectator_manager_init()`, `spectator_manager_shutdown()`, `spectator_manager_tick()`.
+- `spectator_handle_request()`, `spectator_collect_updates()`, `spectator_collect_notifications()`.
+
+References
+- Config (see docs/configuration.txt): `max-spectators`, `spectator-visibility`, `spectator-summary-hz`, `spectator-focus-hz`, `spectator-max-focus-per-session`, `spectator-summary-mode`.
+- Protocol (see docs/network_protocol.txt): `SPECTATE_GAME`, `SPECTATE_UPDATE`, `SPECTATE_STOP`, `SERVER_NOTIFICATION`.
