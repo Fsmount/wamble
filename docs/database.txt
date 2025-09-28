@@ -88,3 +88,11 @@ Operational Notes
 Examples
 - Promote a session to trust level 10 by hex token:
   UPDATE sessions SET trust_level = 10 WHERE token = decode('<hex>', 'hex');
+
+References
+- Config (see docs/configuration.txt): `db-host`, `db-user`, `db-pass`, `db-name`.
+- Player management (see docs/player_management.txt): token creation, lookup, last-seen updates.
+- Board behavior (see docs/board_behaviour.txt): board statuses and lifecycle.
+- Move engine (see docs/move_engine.txt): move storage and flow.
+- Scoring (see docs/scoring.txt): payouts written to `payouts`.
+- Spectators (see docs/spectator_management.txt): trust gating via `sessions.trust_level`.

@@ -1,0 +1,33 @@
+Wamble Scoring
+==============
+
+Overview
+- Divides a small "pot" among the sessions that contributed moves to a finished game.
+- Runs when a board transitions out of `IN_PROGRESS`.
+
+Inputs
+- Move list from `db_get_moves_for_board(board_id)`.
+- Final result on the board (`white`, `black`, or `draw`).
+
+Pot Split
+- Win: full `max-pot` to the winning side.
+- Draw: `max-pot` split 50/50 between sides.
+
+Per-Player Share
+- Count moves per session per side.
+- Proportional share within each side's pot.
+- If a session played both sides, halve the total to discourage self-play.
+
+Writes
+- Positive scores are written with `db_async_record_payout()`.
+- Also bumps the in-memory `player->score` when available.
+
+Return Values
+- `SCORING_OK`, `SCORING_NONE`, `SCORING_ERR_INVALID`.
+
+API
+- `calculate_and_distribute_pot(board_id)`.
+
+References
+- Config (see docs/configuration.txt): `max-pot`, `max-contributors`.
+- Database (see docs/database.txt): tables `moves`, `payouts`, `sessions`.

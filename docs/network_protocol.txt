@@ -28,28 +28,28 @@ Message Layout
 - Token URL form: 22-char base64url string (no padding).
 
 Control Codes
-- `0x01` CLIENT_HELLO (client→server): Initial connection request.
+- `0x01` CLIENT_HELLO (client to server): Initial connection request.
   - Payload: empty.
-- `0x02` SERVER_HELLO (server→client): Response to HELLO.
+- `0x02` SERVER_HELLO (server to client): Response to HELLO.
   - Payload: `char fen[]` (current board state).
-- `0x03` PLAYER_MOVE (client→server): Submit a move.
+- `0x03` PLAYER_MOVE (client to server): Submit a move.
   - Payload: `uint8 uci_len; char uci[uci_len]` (max 6 bytes).
-- `0x04` BOARD_UPDATE (server→client): Board state has changed.
+- `0x04` BOARD_UPDATE (server to client): Board state has changed.
   - Payload: `char fen[]`.
 - `0x05` ACK (bidirectional): Acknowledges a reliable packet.
   - Payload: empty. Header `seq_num` matches the packet being ACKed.
-- `0x06` LIST_PROFILES (client→server): Request available profiles.
+- `0x06` LIST_PROFILES (client to server): Request available profiles.
   - Payload: empty.
-- `0x07` PROFILE_INFO (server→client): Response to GET_PROFILE_INFO.
+- `0x07` PROFILE_INFO (server to client): Response to GET_PROFILE_INFO.
   - Payload: `name;port;advertise;visibility` or `NOTFOUND;<name>`.
-- `0x08` ERROR (server→client): Reports an error.
+- `0x08` ERROR (server to client): Reports an error.
   - Payload: `uint16 code; uint8 reason_len; char reason[reason_len]`.
   - Reliable by default.
-- `0x09` SERVER_NOTIFICATION (server→client): Broadcast message.
+- `0x09` SERVER_NOTIFICATION (server to client): Broadcast message.
   - Payload: `char text[]`. Often sent as unreliable.
-- `0x0A` CLIENT_GOODBYE (client→server): Graceful disconnect.
+- `0x0A` CLIENT_GOODBYE (client to server): Graceful disconnect.
   - Payload: empty.
-- `0x0B` SPECTATE_GAME (client→server): Request to watch a game.
+- `0x0B` SPECTATE_GAME (client to server): Request to watch a game.
   - Payload: empty.
   - Header semantics:
     - `board_id=0` enters summary mode. The server will push per-board
@@ -60,37 +60,37 @@ Control Codes
       `SPECTATE_UPDATE` packets for that board only. Immediate unreliable
       update is sent on entry, followed by periodic updates at
       `spectate-focus-hz`.
-- `0x15` SPECTATE_STOP (client→server): Stop spectating.
+- `0x15` SPECTATE_STOP (client to server): Stop spectating.
   - Payload: empty. Server acknowledges. Puts session in `IDLE` state.
-- `0x0C` SPECTATE_UPDATE (server→client): Board update for spectators.
+- `0x0C` SPECTATE_UPDATE (server to client): Board update for spectators.
   - Header: `board_id` identifies the board for this update (authoritative).
   - Payload: `char fen[]`.
   - Typically sent as unreliable (`flags` high bit set). One packet per board.
   - Richer payloads may be introduced later (e.g., player info, predictions),
     but `board_id` will always be present in the header and must be used by
     clients to associate updates with boards.
-- `0x0D` LOGIN_REQUEST (client→server): Authenticate persistent identity.
+- `0x0D` LOGIN_REQUEST (client to server): Authenticate persistent identity.
   - Payload: `uint8 public_key[32]`.
-- `0x0E` LOGOUT (client→server): Disassociate persistent identity.
+- `0x0E` LOGOUT (client to server): Disassociate persistent identity.
   - Payload: empty.
-- `0x0F` LOGIN_SUCCESS (server→client): Successful login.
+- `0x0F` LOGIN_SUCCESS (server to client): Successful login.
   - Payload: empty.
-- `0x10` LOGIN_FAILED (server→client): Failed login.
+- `0x10` LOGIN_FAILED (server to client): Failed login.
   - Payload: `uint16 code; uint8 reason_len; char reason[reason_len]`.
-- `0x11` GET_PLAYER_STATS (client→server): Request player statistics.
+- `0x11` GET_PLAYER_STATS (client to server): Request player statistics.
   - Payload: empty.
-- `0x12` PLAYER_STATS_DATA (server→client): Player statistics.
+- `0x12` PLAYER_STATS_DATA (server to client): Player statistics.
   - Payload: `double score_be; int32 games_played_be`.
   - Note: Rating is tracked separately from score and is not currently included in this payload.
-- `0x13` GET_PROFILE_INFO (client→server): Request info for a specific profile.
+- `0x13` GET_PROFILE_INFO (client to server): Request info for a specific profile.
   - Payload: `uint8 name_len; char name[name_len]`.
-- `0x14` PROFILES_LIST (server→client): Response to LIST_PROFILES.
+- `0x14` PROFILES_LIST (server to client): Response to LIST_PROFILES.
   - Payload: `char csv[]` (comma-separated profile names).
-- `0x16` GET_LEGAL_MOVES (client→server): Request legal moves for a square.
-  - Payload: `uint8 square_index` (0–63, 0 = a1).
+- `0x16` GET_LEGAL_MOVES (client to server): Request legal moves for a square.
+  - Payload: `uint8 square_index` (0-63, 0 = a1).
   - Header: `board_id` must reference the board assignment for the player.
   - Authorization: server validates the requesting token still owns the reservation; otherwise the response is an empty `LEGAL_MOVES` packet.
-- `0x17` LEGAL_MOVES (server→client): Response to GET_LEGAL_MOVES.
+- `0x17` LEGAL_MOVES (server to client): Response to GET_LEGAL_MOVES.
   - Payload: `uint8 square_index; uint8 move_count; struct { uint8 from; uint8 to; int8 promotion; } moves[move_count]`.
   - `move_count` is capped at 218 and only includes moves originating from `square_index`.
   - Promotion is encoded as ASCII lowercase (`'q'`, `'r'`, `'b'`, `'n'`) or 0 for non-promotions.
@@ -121,7 +121,7 @@ Spectator Policy
   - `full`: send all ACTIVE+RESERVED boards.
   - `changes`: send only boards changed since the last summary tick.
 - Ordering: after filtering, boards are ordered by most recent play and then
-  by an internal “attractiveness” score aligned with board assignment logic.
+  by an internal "attractiveness" score aligned with board assignment logic.
 
 Sessions
 - A session is identified by a `token` and the client's address:port.
@@ -135,3 +135,9 @@ Profiles
 - `LIST_PROFILES` returns profiles where `profile.visibility <= sessions.trust_level`.
 - `GET_PROFILE_INFO` requests details for a named profile.
 - On SIGHUP, config is reloaded and listeners are restarted.
+
+References
+- Spectators: docs/spectator_management.txt (SPECTATE_GAME, SPECTATE_UPDATE, SPECTATE_STOP)
+- Players: docs/player_management.txt (LOGIN_REQUEST, LOGIN_*, GET_PLAYER_STATS, PLAYER_STATS_DATA)
+- Move engine: docs/move_engine.txt (PLAYER_MOVE, BOARD_UPDATE, GET_LEGAL_MOVES, LEGAL_MOVES)
+- Profiles runtime: docs/profile_runtime_and_state.txt (LIST_PROFILES, PROFILES_LIST, GET_PROFILE_INFO, PROFILE_INFO)

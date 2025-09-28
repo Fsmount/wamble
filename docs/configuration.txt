@@ -17,7 +17,7 @@ Core Options (common defaults)
 - `session-timeout` (int, 300): Idle session timeout (sec).
 - `max-boards` / `min-boards` (int, 1024 / 4): Board pool sizing.
 - `inactivity-timeout` (int, 300): Archive inactive boards (sec).
-- `reservation-timeout` (int, 2): Board reservation lease (sec).
+- `reservation-timeout` (int, 1209600): Board reservation lease (sec).
 - `default-rating` (int, 1200): Starting rating for new players.
 - `max-players` (int, 1024): Player capacity.
 - `token-expiration` (int, 86400): Token TTL (sec).
@@ -212,3 +212,10 @@ Notes
 - Strings must be quoted. Numbers parse as integers unless they contain a dot.
 - Unknown names in `def` are ignored by the engine unless referenced by code; 
   they remain available for user logic inside the config.
+
+References
+- Players (see docs/player_management.txt): `max-players`, `token-expiration`, `default-rating`, `max-token-attempts`, `max-token-local-attempts`
+- Spectators (see docs/spectator_management.txt): `max-spectators`, `spectator-visibility`, `spectator-summary-hz`, `spectator-focus-hz`, `spectator-max-focus-per-session`, `spectator-summary-mode`
+- Scoring (see docs/scoring.txt): `max-pot`, `max-contributors`
+- Move engine (see docs/move_engine.txt and docs/board_behaviour.txt): `max-moves-per-board`, board behavior
+- Profiles runtime/state (see docs/profile_runtime_and_state.txt): `state-dir`, per-profile `port`, `buffer-size`, `select-timeout-usec`, `cleanup-interval-sec`, `db-*`, `advertise`, `visibility`
