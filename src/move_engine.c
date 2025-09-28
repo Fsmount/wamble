@@ -5,6 +5,14 @@
 #include <intrin.h>
 #endif
 
+static inline void copy_str_trunc(char *dst, size_t dstsz, const char *src) {
+  if (!dst || dstsz == 0)
+    return;
+  size_t n = strnlen(src ? src : "", dstsz - 1);
+  memcpy(dst, src ? src : "", n);
+  dst[n] = '\0';
+}
+
 static const Bitboard KNIGHT_ATTACKS[64] = {
     0x0000000000020400ULL, 0x0000000000050800ULL, 0x00000000000a1100ULL,
     0x0000000000142200ULL, 0x0000000000284400ULL, 0x0000000000508800ULL,
@@ -247,9 +255,10 @@ static MoveInfo make_move_bitboard(Board *board, const Move *move) {
 
   info.prev_halfmove_clock = board->halfmove_clock;
   info.prev_fullmove_number = board->fullmove_number;
-  strncpy(info.prev_en_passant, board->en_passant,
-          sizeof(info.prev_en_passant) - 1);
-  strncpy(info.prev_castling, board->castling, sizeof(info.prev_castling) - 1);
+  copy_str_trunc(info.prev_en_passant, sizeof(info.prev_en_passant),
+                 board->en_passant);
+  copy_str_trunc(info.prev_castling, sizeof(info.prev_castling),
+                 board->castling);
 
   int from = move->from;
   int to = move->to;
@@ -420,9 +429,9 @@ static void unmake_move_bitboard(Board *board, const Move *move,
   board->halfmove_clock = info->prev_halfmove_clock;
   board->fullmove_number = info->prev_fullmove_number;
 
-  strncpy(board->en_passant, info->prev_en_passant,
-          sizeof(board->en_passant) - 1);
-  strncpy(board->castling, info->prev_castling, sizeof(board->castling) - 1);
+  copy_str_trunc(board->en_passant, sizeof(board->en_passant),
+                 info->prev_en_passant);
+  copy_str_trunc(board->castling, sizeof(board->castling), info->prev_castling);
 
   int piece_type_at_to = -1;
   for (int i = 0; i < 12; i++) {

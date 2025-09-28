@@ -1,5 +1,6 @@
 #include "../include/wamble/wamble.h"
 #include <libpq-fe.h>
+#include <stdlib.h>
 #include <string.h>
 
 static WAMBLE_THREAD_LOCAL PGconn *db_conn_tls = NULL;
@@ -15,8 +16,20 @@ static PGconn *ensure_connection(void) {
   if (db_conn_tls)
     return db_conn_tls;
   char conn[256];
+#ifdef WAMBLE_TEST_ONLY
+  {
+    const char *env_dsn = getenv("WAMBLE_TEST_DSN");
+    if (env_dsn && *env_dsn) {
+      db_conn_tls = PQconnectdb(env_dsn);
+    } else {
+      build_conn_string_from_cfg(get_config(), conn, sizeof conn);
+      db_conn_tls = PQconnectdb(conn);
+    }
+  }
+#else
   build_conn_string_from_cfg(get_config(), conn, sizeof conn);
   db_conn_tls = PQconnectdb(conn);
+#endif
   if (PQstatus(db_conn_tls) != CONNECTION_OK) {
     PQfinish(db_conn_tls);
     db_conn_tls = NULL;

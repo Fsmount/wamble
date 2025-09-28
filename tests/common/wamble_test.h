@@ -7,6 +7,8 @@
 #include <string.h>
 #include <time.h>
 
+#include "wamble_test_helpers.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -47,12 +49,36 @@ void wamble_param_register(const char *base_name, const char *tags,
   wamble_test_register_ex(#name, tags, name, setup, teardown, timeout_ms)
 #define WAMBLE_TESTS_END() }
 
+#define WAMBLE_TESTS_BEGIN_DB()                                                \
+  void wamble_register_tests(void) {                                           \
+    if (wamble_should_skip_db_tests())                                         \
+      return;
+
 #define WAMBLE_PARAM_TEST(type, name) static int name(const type *tc)
 #define WAMBLE_PARAM_REGISTER(type, fn, base_name, tags, arr, timeout_ms)      \
   wamble_param_register(base_name, tags, (wamble_param_test_fn)(fn),           \
                         (const void *)(arr), sizeof(type),                     \
                         (int)(sizeof(arr) / sizeof((arr)[0])), timeout_ms,     \
                         NULL, NULL)
+
+#define WAMBLE_MK_TAGS(suite_lit, module_lit)                                  \
+  "suite=" suite_lit " module=" module_lit
+
+#define WAMBLE_TESTS_ADD_SM(name, suite_lit, module_lit)                       \
+  wamble_test_register_ex(#name, WAMBLE_MK_TAGS(suite_lit, module_lit), name,  \
+                          NULL, NULL, 0)
+
+#define WAMBLE_TESTS_ADD_EX_SM(name, suite_lit, module_lit, setup, teardown,   \
+                               timeout_ms)                                     \
+  wamble_test_register_ex(#name, WAMBLE_MK_TAGS(suite_lit, module_lit), name,  \
+                          setup, teardown, timeout_ms)
+
+#define WAMBLE_PARAM_REGISTER_SM(type, fn, base_name, suite_lit, module_lit,   \
+                                 arr, timeout_ms)                              \
+  wamble_param_register(base_name, WAMBLE_MK_TAGS(suite_lit, module_lit),      \
+                        (wamble_param_test_fn)(fn), (const void *)(arr),       \
+                        sizeof(type), (int)(sizeof(arr) / sizeof((arr)[0])),   \
+                        timeout_ms, NULL, NULL)
 
 #define T_FAIL(fmt, ...)                                                       \
   do {                                                                         \

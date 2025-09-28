@@ -61,6 +61,12 @@ You can pass arguments to the test runner after `--`, for example:
 build/wamble_build --tests --run-tests -- --module network --timeout-ms 8000 --seed 42
 ```
 
+List available tests without running them:
+
+```sh
+build/wamble_build --tests --list-tests
+```
+
 Clean build artifacts:
 
 ```sh
@@ -68,6 +74,15 @@ build/wamble_build --clean
 ```
 
 Artifacts are placed under `build/`
+
+### Test Fixtures
+
+- Set `WAMBLE_TEST_DSN` to point tests/tools at a Postgres instance, e.g. `export WAMBLE_TEST_DSN=postgres://user:pass@localhost:5432/wamble_test`.
+- To temporarily skip DB-backed tests, set `WAMBLE_SKIP_DB_TESTS=1`.
+- A helper tool `build/wamble_db_tool` is built when `--with-db` is used. Examples:
+  - Migrate schema: `WAMBLE_TEST_DSN=... build/wamble_db_tool --schema test_schema --migrate`
+  - Load fixtures: `WAMBLE_TEST_DSN=... build/wamble_db_tool --schema test_schema --fixture`
+  - Reset tables: `WAMBLE_TEST_DSN=... build/wamble_db_tool --schema test_schema --reset`
 
 ## How to Run
 
@@ -82,7 +97,3 @@ The server will start listening for connections on the default port (8888).
 ## Configuring
 
 Lisp like configuration run server with `--help` and read docs/configuration.txt for details.
-
-```
-
-```
