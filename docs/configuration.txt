@@ -24,6 +24,8 @@ Core Options (common defaults)
 - `max-pot` (double, 20.0): Scoring pot cap per board.
 - `max-moves-per-board` (int, 1000): Move history cap per board.
 - `max-contributors` (int, 100): Max contributors per board for scoring.
+- `state-dir` (string, unset): Directory for hot-reload state snapshots. If
+  unset, the server uses a platform-specific temp location (`/tmp` on POSIX).
 - `new-player-early-phase-mult` (double, 2.0): Payout multiplier for new players in the early game.
 - `new-player-mid-phase-mult` (double, 1.0): Payout multiplier for new players in the mid game.
 - `new-player-end-phase-mult` (double, 0.5): Payout multiplier for new players in the late game.

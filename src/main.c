@@ -94,14 +94,23 @@ static int make_socket_inheritable(wamble_socket_t sockfd) {
 
 static int save_process_state_snapshot(char *out_path, size_t out_path_len) {
 #ifdef WAMBLE_PLATFORM_WINDOWS
-  const char *tmpl = "wamble_state_XXXXXX";
+  const char *default_tmpl = "wamble_state_XXXXXX";
 #else
-  const char *tmpl = "/tmp/wamble_state_XXXXXX";
+  const char *default_tmpl = "/tmp/wamble_state_XXXXXX";
 #endif
-  size_t tmpl_len = strlen(tmpl);
-  if (!out_path || out_path_len <= tmpl_len)
-    return -1;
-  memcpy(out_path, tmpl, tmpl_len + 1);
+  const char *cfg_dir = get_config() ? get_config()->state_dir : NULL;
+  if (cfg_dir && *cfg_dir) {
+    const char *fname = "wamble_state_XXXXXX";
+    size_t need = strlen(cfg_dir) + 1 + strlen(fname) + 1;
+    if (!out_path || out_path_len < need)
+      return -1;
+    snprintf(out_path, out_path_len, "%s/%s", cfg_dir, fname);
+  } else {
+    size_t tmpl_len = strlen(default_tmpl);
+    if (!out_path || out_path_len <= tmpl_len)
+      return -1;
+    memcpy(out_path, default_tmpl, tmpl_len + 1);
+  }
   int fd = wamble_mkstemp(out_path);
   if (fd < 0)
     return -1;

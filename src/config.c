@@ -839,7 +839,8 @@ static const ConfigVarMap config_map[] = {
     CONF_ITEM("spectator-focus-hz", CONF_INT, spectator_focus_hz),
     CONF_ITEM("spectator-max-focus-per-session", CONF_INT,
               spectator_max_focus_per_session),
-    CONF_ITEM("spectator-summary-mode", CONF_STRING, spectator_summary_mode)};
+    CONF_ITEM("spectator-summary-mode", CONF_STRING, spectator_summary_mode),
+    CONF_ITEM("state-dir", CONF_STRING, state_dir)};
 
 static void populate_config_from_env(LispEnv *env) {
   for (size_t i = 0; i < sizeof(config_map) / sizeof(config_map[0]); i++) {
@@ -922,6 +923,7 @@ static void config_set_defaults(void) {
   g_config.spectator_focus_hz = 20;
   g_config.spectator_max_focus_per_session = 1;
   g_config.spectator_summary_mode = strdup("changes");
+  g_config.state_dir = NULL;
 }
 
 static void free_profiles(void) {
@@ -934,6 +936,8 @@ static void free_profiles(void) {
     free(g_profiles[i].config.db_user);
     free(g_profiles[i].config.db_pass);
     free(g_profiles[i].config.db_name);
+    free(g_profiles[i].config.spectator_summary_mode);
+    free(g_profiles[i].config.state_dir);
   }
   free(g_profiles);
   g_profiles = NULL;
@@ -949,6 +953,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
   free(g_config.db_pass);
   free(g_config.db_name);
   free(g_config.spectator_summary_mode);
+  free(g_config.state_dir);
   config_set_defaults();
   free_profiles();
 
@@ -1112,6 +1117,11 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
           cfg.db_user = strdup(base_cfg.db_user);
           cfg.db_pass = strdup(base_cfg.db_pass);
           cfg.db_name = strdup(base_cfg.db_name);
+          if (base_cfg.spectator_summary_mode)
+            cfg.spectator_summary_mode =
+                strdup(base_cfg.spectator_summary_mode);
+          if (base_cfg.state_dir)
+            cfg.state_dir = strdup(base_cfg.state_dir);
 
           WambleConfig saved = g_config;
           g_config = cfg;
@@ -1171,6 +1181,8 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
             free(g_profiles[i].config.db_user);
             free(g_profiles[i].config.db_pass);
             free(g_profiles[i].config.db_name);
+            free(g_profiles[i].config.spectator_summary_mode);
+            free(g_profiles[i].config.state_dir);
           }
         }
         free(g_profiles);

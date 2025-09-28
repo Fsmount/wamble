@@ -489,6 +489,8 @@ typedef struct WambleConfig {
 
   char *spectator_summary_mode;
   int admin_trust_level;
+
+  char *state_dir;
 } WambleConfig;
 
 typedef enum {
