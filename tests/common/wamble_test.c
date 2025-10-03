@@ -23,6 +23,10 @@ void wamble_register_tests(void) {}
 #include <windows.h>
 #endif
 
+WAMBLE_TEST_THREAD_LOCAL char g_wamble_test_fail_msg[1024];
+WAMBLE_TEST_THREAD_LOCAL const char *g_wamble_test_fail_file = NULL;
+WAMBLE_TEST_THREAD_LOCAL int g_wamble_test_fail_line = 0;
+
 static wamble_test_case g_cases[1024];
 static int g_case_count = 0;
 static int g_verbose = 0;
@@ -157,6 +161,12 @@ static int run_one_isolated(const wamble_test_case *tc, int timeout_ms,
       rc = tc->fn();
     else if (tc->param_fn)
       rc = tc->param_fn(tc->param_data);
+    if (rc != 0) {
+      if (g_wamble_test_fail_file) {
+        fprintf(stderr, "    FAIL %s:%d: %s\n", g_wamble_test_fail_file,
+                g_wamble_test_fail_line, g_wamble_test_fail_msg);
+      }
+    }
     if (tc->teardown)
       tc->teardown();
     _exit(rc == 0 ? 0 : 100);
@@ -280,7 +290,7 @@ int wamble_test_main(int argc, char **argv) {
       printf("Usage: %s [--list] [--verbose] [--timeout-ms N] [--seed N] "
              "[--name SUBSTR] [--not-name SUBSTR] "
              "[--module M1[,M2...]] [--not-module M1[,M2...]] "
-             "[--suite S1[,S2...]] [--Suite S1[,S2...]]\n",
+             "[--suite S1[,S2...]] [--not-suite S1[,S2...]]\n",
              argv[0]);
       return 0;
     } else if (strcmp(argv[i], "--timeout-ms") == 0 && i + 1 < argc) {
@@ -360,7 +370,9 @@ int wamble_test_main(int argc, char **argv) {
           break;
         p = comma + 1;
       }
-    } else if (strcmp(argv[i], "--Suite") == 0 && i + 1 < argc) {
+    } else if ((strcmp(argv[i], "--not-suite") == 0 ||
+                strcmp(argv[i], "--Suite") == 0) &&
+               i + 1 < argc) {
       char *val = argv[++i];
       char *p = val;
       while (p && *p) {
@@ -404,6 +416,12 @@ int wamble_test_main(int argc, char **argv) {
       rc = tc->fn();
     else if (tc->param_fn)
       rc = tc->param_fn(tc->param_data);
+    if (rc != 0) {
+      if (g_wamble_test_fail_file) {
+        fprintf(stderr, "    FAIL %s:%d: %s\n", g_wamble_test_fail_file,
+                g_wamble_test_fail_line, g_wamble_test_fail_msg);
+      }
+    }
     if (tc->teardown)
       tc->teardown();
     return rc == 0 ? 0 : 100;

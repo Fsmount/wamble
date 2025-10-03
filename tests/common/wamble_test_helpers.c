@@ -127,6 +127,18 @@ static void wamble_set_env_kv(const char *key, const char *val) {
 #endif
 }
 
+void wamble_metric(const char *name, const char *fmt, ...) {
+  if (!name)
+    name = "metric";
+  fprintf(stdout, "metric: %s ", name);
+  va_list ap;
+  va_start(ap, fmt);
+  if (fmt && *fmt)
+    vfprintf(stdout, fmt, ap);
+  va_end(ap);
+  fprintf(stdout, "\n");
+}
+
 int wamble_test_mkstemp_file(char *out, size_t out_len, const char *subdir,
                              const char *prefix) {
   char dir[512];
