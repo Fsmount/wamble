@@ -22,6 +22,8 @@ int wamble_test_state_dir(char *out, size_t out_len);
 int wamble_test_set_state_env(void);
 int wamble_test_set_state_dir_env(void);
 
+void wamble_metric(const char *name, const char *fmt, ...);
+
 int test_db_create_schema_if_needed(const char *schema_name);
 int test_db_set_search_path(const char *schema_name);
 int test_db_apply_sql_file(const char *sql_path);

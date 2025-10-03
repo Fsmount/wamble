@@ -13,6 +13,18 @@
 extern "C" {
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+#define WAMBLE_TEST_THREAD_LOCAL __thread
+#elif defined(_MSC_VER)
+#define WAMBLE_TEST_THREAD_LOCAL __declspec(thread)
+#else
+#define WAMBLE_TEST_THREAD_LOCAL
+#endif
+
+extern WAMBLE_TEST_THREAD_LOCAL char g_wamble_test_fail_msg[1024];
+extern WAMBLE_TEST_THREAD_LOCAL const char *g_wamble_test_fail_file;
+extern WAMBLE_TEST_THREAD_LOCAL int g_wamble_test_fail_line;
+
 typedef int (*wamble_test_fn)(void);
 typedef void (*wamble_hook_fn)(void);
 typedef int (*wamble_param_test_fn)(const void *case_data);
@@ -43,6 +55,7 @@ void wamble_param_register(const char *base_name, const char *tags,
 #define WAMBLE_TEST(name) static int name(void)
 
 #define WAMBLE_TESTS_BEGIN() void wamble_register_tests(void) {
+#define WAMBLE_TESTS_BEGIN_NAMED(fnname) void fnname(void) {
 #define WAMBLE_TESTS_ADD(name)                                                 \
   wamble_test_register_ex(#name, NULL, name, NULL, NULL, 0)
 #define WAMBLE_TESTS_ADD_EX(name, tags, setup, teardown, timeout_ms)           \
@@ -80,10 +93,24 @@ void wamble_param_register(const char *base_name, const char *tags,
                         sizeof(type), (int)(sizeof(arr) / sizeof((arr)[0])),   \
                         timeout_ms, NULL, NULL)
 
+#define WAMBLE_SUITE_FUNCTIONAL "functional"
+#define WAMBLE_SUITE_PERFORMANCE "performance"
+#define WAMBLE_SUITE_SPEED "speed"
+#define WAMBLE_SUITE_STRESS "stress"
+
+#define WAMBLE_TESTS_ADD_FM(name, module_lit)                                  \
+  WAMBLE_TESTS_ADD_SM(name, WAMBLE_SUITE_FUNCTIONAL, module_lit)
+
+#define WAMBLE_TESTS_ADD_EX_FM(name, module_lit, setup, teardown, timeout_ms)  \
+  WAMBLE_TESTS_ADD_EX_SM(name, WAMBLE_SUITE_FUNCTIONAL, module_lit, setup,     \
+                         teardown, timeout_ms)
+
 #define T_FAIL(fmt, ...)                                                       \
   do {                                                                         \
-    fprintf(stderr, "FAIL %s:%d: " fmt "\n", __FILE__, __LINE__,               \
-            ##__VA_ARGS__);                                                    \
+    g_wamble_test_fail_file = __FILE__;                                        \
+    g_wamble_test_fail_line = __LINE__;                                        \
+    snprintf(g_wamble_test_fail_msg, sizeof(g_wamble_test_fail_msg), fmt,      \
+             ##__VA_ARGS__);                                                   \
     return 1;                                                                  \
   } while (0)
 
@@ -105,6 +132,21 @@ void wamble_param_register(const char *base_name, const char *tags,
     const char *_aa = (a), *_bb = (b);                                         \
     if (!_aa || !_bb || strcmp(_aa, _bb) != 0)                                 \
       T_FAIL("Expected strings equal");                                        \
+  } while (0)
+
+#define T_ASSERT_STATUS_OK(status)                                             \
+  do {                                                                         \
+    int _s = (int)(status);                                                    \
+    if (_s != 0)                                                               \
+      T_FAIL("Expected status OK (0), but got %d for %s", _s, #status);        \
+  } while (0)
+
+#define T_ASSERT_STATUS(status, expected)                                      \
+  do {                                                                         \
+    int _s = (int)(status);                                                    \
+    int _e = (int)(expected);                                                  \
+    if (_s != _e)                                                              \
+      T_FAIL("Expected status %d, but got %d for %s", _e, _s, #status);        \
   } while (0)
 
 #ifdef __cplusplus

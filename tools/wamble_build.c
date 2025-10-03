@@ -577,6 +577,8 @@ int main(int argc, char **argv) {
       sv_push(&targs, "tests/common/wamble_net_helpers.c");
       if (with_db) {
         sv_push(&targs, "src/database.c");
+      } else {
+        sv_push(&targs, "src/test/database_stub.c");
       }
       collect_ctx tcollect = {&targs, "build/obj/", ".obj"};
       iterate_dir("build/obj", collect_with_suffix_cb, &tcollect);
@@ -605,6 +607,8 @@ int main(int argc, char **argv) {
       sv_push(&targs, "tests/common/wamble_net_helpers.c");
       if (with_db) {
         sv_push(&targs, "src/database.c");
+      } else {
+        sv_push(&targs, "src/test/database_stub.c");
       }
     }
     test_src_ctx tctx = {&targs};
@@ -645,13 +649,9 @@ int main(int argc, char **argv) {
       sv_push(&runv_args, "build/tests/wamble_tests");
       if (list_tests) {
         sv_push(&runv_args, "--list");
-      } else {
-        sv_push(&runv_args, "--verbose");
-        sv_push(&runv_args, "--timeout-ms");
-        sv_push(&runv_args, "5000");
-        for (int i = 0; i < test_args.count; i++) {
-          sv_push(&runv_args, test_args.data[i]);
-        }
+      }
+      for (int i = 0; i < test_args.count; i++) {
+        sv_push(&runv_args, test_args.data[i]);
       }
       if (runv(NULL, runv_args.data) != 0) {
         sv_free(&runv_args);
