@@ -3,19 +3,19 @@
 uint64_t wamble_now_mono_millis(void) {
 #if defined(WAMBLE_PLATFORM_WINDOWS)
   LARGE_INTEGER freq, counter;
-  if (!QueryPerformanceFrequency(&freq) || !QueryPerformanceCounter(&counter))
-    return 0;
-  return (uint64_t)((counter.QuadPart * 1000ULL) / (uint64_t)freq.QuadPart);
+  if (QueryPerformanceFrequency(&freq) && QueryPerformanceCounter(&counter)) {
+    return (uint64_t)((counter.QuadPart * 1000ULL) / (uint64_t)freq.QuadPart);
+  }
+  return (uint64_t)GetTickCount64();
 #else
   struct timespec ts;
 #ifdef CLOCK_MONOTONIC
-  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
-    return 0;
-#else
-  if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
-    return 0;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
 #endif
-  return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+  if (clock_gettime(CLOCK_REALTIME, &ts) == 0)
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+  return (uint64_t)time(NULL) * 1000ULL;
 #endif
 }
 
