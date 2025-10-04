@@ -205,12 +205,20 @@ void player_manager_init(void) {
     wamble_mutex_destroy(&player_mutex);
     wamble_mutex_destroy(&rng_mutex);
   }
-  player_pool =
-      malloc(sizeof(WamblePlayer) * (size_t)get_config()->max_players);
-  player_index_map =
-      malloc(sizeof(int) * (size_t)(get_config()->max_players * 2));
-  memset(player_pool, 0,
-         sizeof(WamblePlayer) * (size_t)get_config()->max_players);
+  if (get_config()->max_players <= 0)
+    return;
+  size_t nplayers = (size_t)get_config()->max_players;
+  size_t nmap = (size_t)(get_config()->max_players * 2);
+  player_pool = malloc(sizeof(WamblePlayer) * nplayers);
+  player_index_map = malloc(sizeof(int) * nmap);
+  if (!player_pool || !player_index_map) {
+    free(player_pool);
+    free(player_index_map);
+    player_pool = NULL;
+    player_index_map = NULL;
+    return;
+  }
+  memset(player_pool, 0, sizeof(WamblePlayer) * nplayers);
   num_players = 0;
   wamble_mutex_init(&player_mutex);
   wamble_mutex_init(&rng_mutex);
