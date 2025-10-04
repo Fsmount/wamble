@@ -307,6 +307,9 @@ static NetworkStatus deserialize_wamble_msg(const uint8_t *buffer,
     return NET_ERR_INVALID;
   WambleHeader hdr;
   memcpy(&hdr, buffer, sizeof(hdr));
+  if (hdr.reserved != 0) {
+    return NET_ERR_INVALID;
+  }
   size_t payload_len = ntohs(hdr.payload_len);
   if (buffer_size < WAMBLE_HEADER_SIZE + payload_len)
     return NET_ERR_TRUNCATED;
@@ -329,6 +332,7 @@ static NetworkStatus deserialize_wamble_msg(const uint8_t *buffer,
   case WAMBLE_CTRL_LIST_PROFILES:
   case WAMBLE_CTRL_CLIENT_GOODBYE:
   case WAMBLE_CTRL_SPECTATE_GAME:
+  case WAMBLE_CTRL_SPECTATE_STOP:
   case WAMBLE_CTRL_LOGOUT:
 
     break;
@@ -598,6 +602,7 @@ int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
       msg->ctrl != WAMBLE_CTRL_SERVER_NOTIFICATION &&
       msg->ctrl != WAMBLE_CTRL_CLIENT_GOODBYE &&
       msg->ctrl != WAMBLE_CTRL_SPECTATE_GAME &&
+      msg->ctrl != WAMBLE_CTRL_SPECTATE_STOP &&
       msg->ctrl != WAMBLE_CTRL_SPECTATE_UPDATE &&
       msg->ctrl != WAMBLE_CTRL_LOGIN_REQUEST &&
       msg->ctrl != WAMBLE_CTRL_LOGOUT &&

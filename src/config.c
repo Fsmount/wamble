@@ -948,14 +948,23 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
                              char *status_msg, size_t status_msg_size) {
   if (status_msg && status_msg_size)
     status_msg[0] = '\0';
-  free(g_config.db_host);
-  free(g_config.db_user);
-  free(g_config.db_pass);
-  free(g_config.db_name);
-  free(g_config.spectator_summary_mode);
-  free(g_config.state_dir);
+  if (g_profiles) {
+    free_profiles();
+    g_config.db_host = NULL;
+    g_config.db_user = NULL;
+    g_config.db_pass = NULL;
+    g_config.db_name = NULL;
+    g_config.spectator_summary_mode = NULL;
+    g_config.state_dir = NULL;
+  } else {
+    free(g_config.db_host);
+    free(g_config.db_user);
+    free(g_config.db_pass);
+    free(g_config.db_name);
+    free(g_config.spectator_summary_mode);
+    free(g_config.state_dir);
+  }
   config_set_defaults();
-  free_profiles();
 
   if (!filename) {
     if (status_msg && status_msg_size)
