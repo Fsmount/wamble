@@ -629,7 +629,7 @@ WAMBLE_TEST(player_move_uci_len_guard) {
   return 0;
 }
 
-WAMBLE_TESTS_BEGIN()
+WAMBLE_TESTS_BEGIN_NAMED(wamble_register_tests_network)
 WAMBLE_TESTS_ADD_SM(token_base64url_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
 WAMBLE_TESTS_ADD_SM(spectate_update_roundtrip, WAMBLE_SUITE_FUNCTIONAL,

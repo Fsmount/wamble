@@ -618,6 +618,78 @@ int main(int argc, char **argv) {
       return 1;
     }
 
+    strvec regs;
+    sv_init(&regs);
+    DIR *d = opendir("tests");
+    if (!d) {
+      perror("opendir tests");
+      sv_free(&targs);
+      return 1;
+    }
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+      if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+        continue;
+      if (strncmp(e->d_name, "common", 6) == 0 ||
+          strncmp(e->d_name, "harness", 7) == 0)
+        continue;
+      if (!has_suffix(e->d_name, ".c"))
+        continue;
+      char rel[512];
+      snprintf(rel, sizeof rel, "tests/%s", e->d_name);
+      FILE *f = fopen(rel, "rb");
+      if (!f)
+        continue;
+      fseek(f, 0, SEEK_END);
+      long sz = ftell(f);
+      fseek(f, 0, SEEK_SET);
+      if (sz > 0) {
+        char *buf = (char *)malloc((size_t)sz + 1u);
+        if (buf) {
+          fread(buf, 1u, (size_t)sz, f);
+          buf[sz] = '\0';
+          const char *needle = "WAMBLE_TESTS_BEGIN_NAMED(";
+          char *p = strstr(buf, needle);
+          if (p) {
+            p += (int)strlen(needle);
+            while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+              p++;
+            char name[256];
+            int w = 0;
+            while (*p && *p != ')' && w < (int)sizeof(name) - 1) {
+              if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+                break;
+              name[w++] = *p++;
+            }
+            name[w] = '\0';
+            if (w > 0)
+              sv_push(&regs, name);
+          }
+          free(buf);
+        }
+      }
+      fclose(f);
+    }
+    closedir(d);
+
+    if (regs.count > 0) {
+      FILE *rf = fopen("build/tests/_registry.c", "wb");
+      if (!rf) {
+        perror("fopen build/tests/_registry.c");
+        sv_free(&regs);
+        sv_free(&targs);
+        return 1;
+      }
+      fprintf(rf, "void wamble_register_tests(void) {\n");
+      for (int i = 0; i < regs.count; i++)
+        fprintf(rf, "  extern void %s(void); %s();\n", regs.data[i],
+                regs.data[i]);
+      fprintf(rf, "}\n");
+      fclose(rf);
+      sv_push(&targs, "build/tests/_registry.c");
+      sv_free(&regs);
+    }
+
 #if defined(WAMBLE_BUILD_WINDOWS)
     if (msvc) {
     } else {
