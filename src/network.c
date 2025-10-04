@@ -753,18 +753,20 @@ int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
         select(sockfd + 1, &readfds, NULL, NULL, &timeout);
 #endif
     if (sel > 0) {
-      static uint8_t ack_buffer[WAMBLE_MAX_PACKET_SIZE];
-      struct WambleMsg ack_msg;
-      struct sockaddr_in ack_cliaddr;
-      wamble_socklen_t ack_len = sizeof(ack_cliaddr);
-      ssize_t rcv = recvfrom(sockfd, (char *)ack_buffer,
+      for (int drained = 0; drained < 64; drained++) {
+        static uint8_t ack_buffer[WAMBLE_MAX_PACKET_SIZE];
+        struct WambleMsg ack_msg;
+        struct sockaddr_in ack_cliaddr;
+        wamble_socklen_t ack_len = sizeof(ack_cliaddr);
+        ssize_t rcv = recvfrom(sockfd, (char *)ack_buffer,
 #ifdef WAMBLE_PLATFORM_WINDOWS
-                             (int)WAMBLE_MAX_PACKET_SIZE,
+                               (int)WAMBLE_MAX_PACKET_SIZE,
 #else
-                             (size_t)WAMBLE_MAX_PACKET_SIZE,
+                               (size_t)WAMBLE_MAX_PACKET_SIZE,
 #endif
-                             0, (struct sockaddr *)&ack_cliaddr, &ack_len);
-      if (rcv > 0) {
+                               0, (struct sockaddr *)&ack_cliaddr, &ack_len);
+        if (rcv <= 0)
+          break;
         uint8_t ack_flags = 0;
         if (deserialize_wamble_msg(ack_buffer, (size_t)rcv, &ack_msg,
                                    &ack_flags) == NET_OK &&
@@ -798,12 +800,25 @@ int send_unreliable_packet(wamble_socket_t sockfd, const struct WambleMsg *msg,
 #ifdef WAMBLE_PLATFORM_WINDOWS
   int rc = sendto(sockfd, (const char *)buffer, (int)serialized_size, 0,
                   (const struct sockaddr *)cliaddr, (int)sizeof(*cliaddr));
-#else
-  ssize_t rc = sendto(sockfd, (const char *)buffer, (size_t)serialized_size, 0,
-                      (const struct sockaddr *)cliaddr,
-                      (wamble_socklen_t)sizeof(*cliaddr));
-#endif
   return (rc >= 0) ? 0 : -1;
+#else
+  int tries = 0;
+  while (tries < 4) {
+    ssize_t rc = sendto(sockfd, (const char *)buffer, (size_t)serialized_size,
+                        MSG_DONTWAIT, (const struct sockaddr *)cliaddr,
+                        (wamble_socklen_t)sizeof(*cliaddr));
+    if (rc >= 0)
+      return 0;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      struct timespec ts = {0, 1000000L};
+      nanosleep(&ts, NULL);
+      tries++;
+      continue;
+    }
+    break;
+  }
+  return -1;
+#endif
 }
 
 void cleanup_expired_sessions(void) {

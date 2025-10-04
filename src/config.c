@@ -886,7 +886,7 @@ static void config_set_defaults(void) {
   g_config.timeout_ms = 100;
   g_config.max_retries = 3;
   g_config.max_message_size = 126;
-  g_config.buffer_size = 65536;
+  g_config.buffer_size = 32768;
   g_config.max_client_sessions = 1024;
   g_config.session_timeout = 300;
   g_config.max_boards = 1024;

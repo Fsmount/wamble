@@ -410,15 +410,15 @@ int main(int argc, char *argv[]) {
       } else if (ready == 0) {
         LOG_DEBUG("select timed out, no activity");
       } else if (FD_ISSET(sockfd, &rfds)) {
-        struct WambleMsg msg;
-        struct sockaddr_in cliaddr;
-        int n = receive_message(sockfd, &msg, &cliaddr);
-        if (n > 0) {
-          handle_message(sockfd, &msg, &cliaddr);
-        } else if (n == 0) {
-          LOG_WARN("Received 0 bytes from socket, client disconnected?");
-        } else {
-          LOG_ERROR("receive_message failed: %s", strerror(errno));
+        for (int drained = 0; drained < 64; drained++) {
+          struct WambleMsg msg;
+          struct sockaddr_in cliaddr;
+          int n = receive_message(sockfd, &msg, &cliaddr);
+          if (n > 0) {
+            handle_message(sockfd, &msg, &cliaddr);
+            continue;
+          }
+          break;
         }
       }
     } else {

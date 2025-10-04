@@ -450,11 +450,15 @@ static void *profile_thread_main(void *arg) {
         select(rp->sockfd + 1, &rfds, NULL, NULL, &tv);
 #endif
     if (ready > 0 && FD_ISSET(rp->sockfd, &rfds)) {
-      struct WambleMsg msg;
-      struct sockaddr_in cliaddr;
-      int n = receive_message(rp->sockfd, &msg, &cliaddr);
-      if (n > 0) {
-        handle_message(rp->sockfd, &msg, &cliaddr);
+      for (int drained = 0; drained < 64; drained++) {
+        struct WambleMsg msg;
+        struct sockaddr_in cliaddr;
+        int n = receive_message(rp->sockfd, &msg, &cliaddr);
+        if (n > 0) {
+          handle_message(rp->sockfd, &msg, &cliaddr);
+          continue;
+        }
+        break;
       }
     }
 
