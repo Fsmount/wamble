@@ -519,6 +519,136 @@ WAMBLE_TEST(unknown_ctrl_rejected) {
   return 0;
 }
 
+WAMBLE_TEST(spectate_stop_accept) {
+  config_load(NULL, NULL, NULL, 0);
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+  struct sockaddr_in dst;
+  T_ASSERT_STATUS_OK(fill_server_addr(srv, &dst));
+
+  enum { H = 34 };
+  uint8_t buf[H];
+  memset(buf, 0, sizeof buf);
+  buf[0] = WAMBLE_CTRL_SPECTATE_STOP;
+  buf[1] = 0x00;
+  buf[2] = WAMBLE_PROTO_VERSION;
+  buf[3] = 0x00;
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    buf[4 + i] = (uint8_t)(i + 1);
+
+  buf[31] = 1;
+
+  T_ASSERT(sendto(cli, (const char *)buf, sizeof buf, 0,
+                  (struct sockaddr *)&dst, sizeof dst) >= 0);
+  struct WambleMsg in;
+  struct sockaddr_in from;
+  int rc = receive_message(srv, &in, &from);
+  T_ASSERT(rc > 0);
+  T_ASSERT_EQ_INT(in.ctrl, WAMBLE_CTRL_SPECTATE_STOP);
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(reserved_nonzero_rejected) {
+  config_load(NULL, NULL, NULL, 0);
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+  struct sockaddr_in dst;
+  T_ASSERT_STATUS_OK(fill_server_addr(srv, &dst));
+
+  enum { H = 34 };
+  uint8_t buf[H];
+  memset(buf, 0, sizeof buf);
+  buf[0] = WAMBLE_CTRL_CLIENT_HELLO;
+  buf[1] = 0x00;
+  buf[2] = WAMBLE_PROTO_VERSION;
+  buf[3] = 0x7F;
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    buf[4 + i] = (uint8_t)(0xAA);
+  buf[31] = 1;
+
+  T_ASSERT(sendto(cli, (const char *)buf, sizeof buf, 0,
+                  (struct sockaddr *)&dst, sizeof dst) >= 0);
+  struct WambleMsg in;
+  struct sockaddr_in from;
+  int rc = receive_message(srv, &in, &from);
+  T_ASSERT_STATUS(rc, -1);
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(legal_moves_count_guard) {
+  config_load(NULL, NULL, NULL, 0);
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+  struct sockaddr_in dst;
+  T_ASSERT_STATUS_OK(fill_server_addr(srv, &dst));
+
+  enum { H = 34 };
+  enum { MC = WAMBLE_MAX_LEGAL_MOVES + 1 };
+  enum { PL = 2 + (MC * 3) };
+  uint8_t buf[H + PL];
+  memset(buf, 0, sizeof buf);
+  buf[0] = WAMBLE_CTRL_LEGAL_MOVES;
+  buf[1] = 0x00;
+  buf[2] = WAMBLE_PROTO_VERSION;
+  buf[3] = 0x00;
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    buf[4 + i] = (uint8_t)(i + 1);
+
+  buf[31] = 1;
+  buf[32] = (uint8_t)((PL >> 8) & 0xFF);
+  buf[33] = (uint8_t)(PL & 0xFF);
+  buf[34] = 0;
+  buf[35] = (uint8_t)MC;
+  for (int i = 0; i < MC; i++) {
+    size_t off = 36 + (size_t)i * 3;
+    buf[off + 0] = (uint8_t)(i & 63);
+    buf[off + 1] = (uint8_t)((i + 1) & 63);
+    buf[off + 2] = 0;
+  }
+
+  T_ASSERT(sendto(cli, (const char *)buf, sizeof buf, 0,
+                  (struct sockaddr *)&dst, sizeof dst) >= 0);
+  struct WambleMsg in;
+  struct sockaddr_in from;
+  int rc = receive_message(srv, &in, &from);
+  T_ASSERT_STATUS(rc, -1);
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(token_base64url_invalid) {
+  uint8_t token[TOKEN_LENGTH];
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    token[i] = (uint8_t)(i * 13 + 7);
+  char url[23];
+  format_token_for_url(token, url);
+  url[5] = '=';
+  uint8_t out[TOKEN_LENGTH];
+  int rc = decode_token_from_url(url, out);
+  T_ASSERT(rc == -1);
+  return 0;
+}
+
+WAMBLE_TEST(token_base64url_wrong_length) {
+  const char *shorty = "ABCDEFGHIJKLMNOPQRSTU";
+  uint8_t out[TOKEN_LENGTH];
+  int rc = decode_token_from_url(shorty, out);
+  T_ASSERT(rc == -1);
+  return 0;
+}
+
 WAMBLE_TEST(zero_token_rejected) {
   config_load(NULL, NULL, NULL, 0);
   wamble_socket_t srv = create_and_bind_socket(0);
@@ -643,6 +773,11 @@ WAMBLE_TESTS_ADD_SM(player_move_uci_len_guard, WAMBLE_SUITE_FUNCTIONAL,
 WAMBLE_TESTS_ADD_SM(zero_token_rejected, WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(player_move_valid_uci_accept, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
+WAMBLE_TESTS_ADD_SM(spectate_stop_accept, WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(reserved_nonzero_rejected, WAMBLE_SUITE_FUNCTIONAL,
+                    "network");
+WAMBLE_TESTS_ADD_SM(legal_moves_count_guard, WAMBLE_SUITE_FUNCTIONAL,
+                    "network");
 WAMBLE_TESTS_ADD_EX_SM(perf_unreliable_throughput_local,
                        WAMBLE_SUITE_PERFORMANCE, "network", NULL, NULL, 10000);
 WAMBLE_TESTS_ADD_EX_SM(perf_reliable_ack_latency, WAMBLE_SUITE_PERFORMANCE,
@@ -650,4 +785,8 @@ WAMBLE_TESTS_ADD_EX_SM(perf_reliable_ack_latency, WAMBLE_SUITE_PERFORMANCE,
 WAMBLE_TESTS_ADD_EX_SM(stress_unreliable_burst, WAMBLE_SUITE_STRESS, "network",
                        NULL, NULL, 60000);
 WAMBLE_TESTS_ADD_SM(speed_token_encode_decode, WAMBLE_SUITE_SPEED, "network");
+WAMBLE_TESTS_ADD_SM(token_base64url_invalid, WAMBLE_SUITE_FUNCTIONAL,
+                    "network");
+WAMBLE_TESTS_ADD_SM(token_base64url_wrong_length, WAMBLE_SUITE_FUNCTIONAL,
+                    "network");
 WAMBLE_TESTS_END()
