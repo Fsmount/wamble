@@ -2,6 +2,27 @@
 
 Wamble is a multiplayer chess variant where after every move you're switched to a new board. The goal is to keep it fast, small, and with minimal deps.
 
+## Features
+
+### Host facing
+
+- Single config file with a small Lisp inspired syntax.
+- Hot reloading on POSIX without dropping sockets or cached boards is achieved by sending `SIGHUP` to reload.
+- Run multiple profiles in one process. Each profile has its own port, DB creds/connection, and visibility tier; advertised profiles get their own UDP listener thread.
+- PostgreSQL stores everything?
+- Compact UDP based protocol with ACKs, retries, and NAT session binding.
+- Board pool manager sizes itself, keeps some games in memory, and archives idle/finished boards.
+
+### Player facing
+
+- After every move you're switched to a new board from the shared pool.
+- Matching weights game phase and experience so new players get new-ish games and veterans get middle/end game positions.
+- Spectate a summary feed or lock onto one board.
+- Play anonymously or for persistentcy attach a key.
+- Legal move hints, UCI is validated by a bitboard engine.
+- Scored by pot rewarding contributors of each board.
+- [planned] skill level rating
+
 ## Getting Started
 
 ### Prerequisites
