@@ -139,6 +139,32 @@ void wamble_metric(const char *name, const char *fmt, ...) {
   fprintf(stdout, "\n");
 }
 
+uint64_t wamble_now_nanos(void) {
+#if defined(WAMBLE_PLATFORM_WINDOWS)
+  LARGE_INTEGER freq, counter;
+  if (QueryPerformanceFrequency(&freq) && QueryPerformanceCounter(&counter)) {
+    uint64_t f = (uint64_t)freq.QuadPart;
+    uint64_t c = (uint64_t)counter.QuadPart;
+    uint64_t sec = c / f;
+    uint64_t rem = c % f;
+    uint64_t nanos = sec * 1000000000ULL + (rem * 1000000000ULL) / f;
+    return nanos;
+  }
+  return (uint64_t)GetTickCount64() * 1000000ULL;
+#elif defined(WAMBLE_PLATFORM_POSIX)
+  struct timespec ts;
+#ifdef CLOCK_MONOTONIC
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
+  if (clock_gettime(CLOCK_REALTIME, &ts) == 0)
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+  return (uint64_t)time(NULL) * 1000000000ULL;
+#else
+  return (uint64_t)time(NULL) * 1000000000ULL;
+#endif
+}
+
 int wamble_test_mkstemp_file(char *out, size_t out_len, const char *subdir,
                              const char *prefix) {
   char dir[512];

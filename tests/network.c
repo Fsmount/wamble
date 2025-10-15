@@ -217,7 +217,7 @@ WAMBLE_TEST(perf_unreliable_throughput_local) {
   T_ASSERT(wamble_thread_create(&th, (wamble_thread_func_t)recv_many, &ctx) ==
            0);
 
-  uint64_t start_ms = wamble_now_mono_millis();
+  uint64_t start_ns = wamble_now_nanos();
   for (int i = 0; i < ctx.target; i++) {
     struct WambleMsg out;
     memset(&out, 0, sizeof(out));
@@ -233,15 +233,16 @@ WAMBLE_TEST(perf_unreliable_throughput_local) {
 
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
 
-  uint64_t end_ms = wamble_now_mono_millis();
-  uint64_t elapsed = end_ms - start_ms;
+  uint64_t end_ns = wamble_now_nanos();
+  uint64_t elapsed_ns = end_ns - start_ns;
   double throughput =
-      (elapsed > 0) ? ((double)ctx.count * 1000.0 / (double)elapsed) : 0.0;
+      (elapsed_ns > 0) ? ((double)ctx.count * 1e9 / (double)elapsed_ns) : 0.0;
   wamble_metric("perf_unreliable_throughput",
-                "msgs=%d received=%d elapsed_ms=%llu throughput=%.2f msg/s",
-                ctx.target, ctx.count, (unsigned long long)elapsed, throughput);
+                "msgs=%d received=%d elapsed_ns=%llu throughput=%.2f msg/s",
+                ctx.target, ctx.count, (unsigned long long)elapsed_ns,
+                throughput);
   T_ASSERT(ctx.count >= (ctx.target * 98) / 100);
-  T_ASSERT(elapsed < 2500);
+  T_ASSERT(elapsed_ns < (uint64_t)2500 * 1000000ULL);
 
   wamble_close_socket(cli);
   wamble_close_socket(srv);
@@ -308,25 +309,25 @@ WAMBLE_TEST(perf_reliable_ack_latency) {
   msg.board_id = 77;
   strncpy(msg.fen, "fen-data", FEN_MAX_LENGTH);
 
-  uint64_t start_ms = wamble_now_mono_millis();
+  uint64_t start_ns = wamble_now_nanos();
   for (int i = 0; i < iters; i++) {
     int rc =
         send_reliable_message(srv, &msg, &cliaddr, get_config()->timeout_ms,
                               get_config()->max_retries);
     T_ASSERT_STATUS_OK(rc);
   }
-  uint64_t end_ms = wamble_now_mono_millis();
+  uint64_t end_ns = wamble_now_nanos();
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
 
-  uint64_t elapsed = end_ms - start_ms;
-  double avg_ms = (iters > 0) ? ((double)elapsed / (double)iters) : 0.0;
+  uint64_t elapsed_ns = end_ns - start_ns;
+  double avg_ns = (iters > 0) ? ((double)elapsed_ns / (double)iters) : 0.0;
   double tput =
-      (elapsed > 0) ? ((double)iters * 1000.0 / (double)elapsed) : 0.0;
+      (elapsed_ns > 0) ? ((double)iters * 1e9 / (double)elapsed_ns) : 0.0;
   wamble_metric("perf_reliable_ack_latency",
-                "iters=%d elapsed_ms=%llu avg_ms=%.3f throughput=%.2f msg/s",
-                iters, (unsigned long long)elapsed, avg_ms, tput);
+                "iters=%d elapsed_ns=%llu avg_ns=%.0f throughput=%.2f msg/s",
+                iters, (unsigned long long)elapsed_ns, avg_ns, tput);
 
-  T_ASSERT(elapsed < 3000);
+  T_ASSERT(elapsed_ns < (uint64_t)3000 * 1000000ULL);
 
   wamble_close_socket(cli);
   wamble_close_socket(srv);
@@ -439,20 +440,21 @@ WAMBLE_TEST(speed_token_encode_decode) {
     token[i] = (uint8_t)(i * 7 + 3);
   char url[23];
   uint8_t out[TOKEN_LENGTH];
-  double start = (double)wamble_now_wall();
+  uint64_t start_ns = wamble_now_nanos();
   int iters = 20000;
   for (int i = 0; i < iters; i++) {
     format_token_for_url(token, url);
     T_ASSERT_STATUS_OK(decode_token_from_url(url, out));
     T_ASSERT_EQ_INT((int)strlen(url), 22);
   }
-  double end = (double)wamble_now_wall();
-  double ms = (end - start) * 1000.0;
-  double ops_per_sec = (ms > 0.0) ? ((double)iters * 1000.0 / ms) : 0.0;
+  uint64_t end_ns = wamble_now_nanos();
+  uint64_t elapsed_ns = end_ns - start_ns;
+  double ops_per_sec =
+      (elapsed_ns > 0) ? ((double)iters * 1e9 / (double)elapsed_ns) : 0.0;
   wamble_metric("speed_token_encode_decode",
-                "iters=%d elapsed_ms=%.2f ops_per_sec=%.2f", iters, ms,
-                ops_per_sec);
-  T_ASSERT(ms < 2000.0);
+                "iters=%d elapsed_ns=%llu ops_per_sec=%.2f", iters,
+                (unsigned long long)elapsed_ns, ops_per_sec);
+  T_ASSERT(elapsed_ns < (uint64_t)2e9);
   return 0;
 }
 
