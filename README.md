@@ -67,10 +67,10 @@ build/wamble_build --server [--warn]
 3. Build and run the unified tests (optional):
 
 ```sh
-build/wamble_build --tests --run-tests [--with-db] [--warn]
+build/wamble_build --tests --run-tests [--with-no-db] [--warn]
 ```
 
-To include DB-backed code in tests, add `--with-db`:
+To remove DB-backed code in tests, add `--with-db`:
 
 ```sh
 build/wamble_build --tests --run-tests --with-db
