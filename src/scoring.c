@@ -16,7 +16,13 @@ ScoringStatus calculate_and_distribute_pot(uint64_t board_id) {
   }
 
   DbMovesResult mres = db_get_moves_for_board(board_id);
-  if (mres.status < 0 || mres.count <= 0) {
+  if (mres.status != DB_OK) {
+    if (mres.status == DB_NOT_FOUND) {
+      return SCORING_NONE;
+    }
+    return SCORING_ERR_DB;
+  }
+  if (mres.count <= 0 || !mres.rows) {
     return SCORING_NONE;
   }
   const WambleMove *moves = mres.rows;
@@ -24,6 +30,9 @@ ScoringStatus calculate_and_distribute_pot(uint64_t board_id) {
 
   PlayerContribution *contributions = malloc(
       sizeof(PlayerContribution) * (size_t)get_config()->max_contributors);
+  if (!contributions) {
+    return SCORING_ERR_DB;
+  }
   int num_contributors = 0;
   int total_white_moves = 0;
   int total_black_moves = 0;
