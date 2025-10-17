@@ -417,7 +417,7 @@ int main(int argc, char **argv) {
   int build_tests = 0;
   int build_server = 0;
   int run_tests = 0;
-  int with_db = 0;
+  int with_db = 1;
   const char *cc = "c99";
   int clean = 0;
   int warn = 0;
@@ -435,8 +435,8 @@ int main(int argc, char **argv) {
       build_server = 1;
     } else if (strcmp(argv[i], "--run-tests") == 0) {
       run_tests = 1;
-    } else if (strcmp(argv[i], "--with-db") == 0) {
-      with_db = 1;
+    } else if (strcmp(argv[i], "--with-no-db") == 0) {
+      with_db = 0;
     } else if (strcmp(argv[i], "--clean") == 0) {
       clean = 1;
     } else if (strcmp(argv[i], "--warn") == 0) {
@@ -457,7 +457,7 @@ int main(int argc, char **argv) {
       printf("  --tests       Build unified test binary\n");
       printf("  --run-tests   Execute tests after building\n");
       printf("  --list-tests  Build tests and list them (no run)\n");
-      printf("  --with-db     Include database.c and link -lpq for tests\n");
+      printf("  --with-no-db  Build tests without a real database backend\n");
       printf("  --warn        Enable extra compiler warnings\n");
       printf("  --cc=CC       Use custom C compiler (default: c99 or $CC)\n");
       printf("  --clean       Remove build artifacts (lib, objs, bins)\n");
