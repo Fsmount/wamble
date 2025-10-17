@@ -1,6 +1,8 @@
 #ifndef WAMBLE_TEST_H
 #define WAMBLE_TEST_H
 
+#include "wamble/wamble.h"
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -138,7 +140,9 @@ void wamble_param_register(const char *base_name, const char *tags,
   do {                                                                         \
     int _s = (int)(status);                                                    \
     if (_s != 0)                                                               \
-      T_FAIL("Expected status OK (0), but got %d for %s", _s, #status);        \
+      T_FAIL("Expected status OK (0), but got %d for %s (errno=%d %s)", _s,    \
+             #status, wamble_last_error(),                                     \
+             wamble_strerror(wamble_last_error()));                            \
   } while (0)
 
 #define T_ASSERT_STATUS(status, expected)                                      \
