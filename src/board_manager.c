@@ -96,32 +96,36 @@ void board_manager_tick() {
     DbBoardIdList dormant = db_list_boards_by_status("DORMANT");
     DbBoardIdList active = db_list_boards_by_status("ACTIVE");
     DbBoardIdList reserved = db_list_boards_by_status("RESERVED");
+    bool lists_ok = (dormant.status == DB_OK && active.status == DB_OK &&
+                     reserved.status == DB_OK);
 
-    total_boards = dormant.count + active.count + reserved.count;
-    last_count_update = now;
+    if (lists_ok) {
+      total_boards = dormant.count + active.count + reserved.count;
+      last_count_update = now;
 
-    int longest_game = db_get_longest_game_moves();
-    int players = db_get_active_session_count();
-    int target_boards = longest_game * players;
-    if (target_boards < get_config()->min_boards) {
-      target_boards = get_config()->min_boards;
-    }
-    if (target_boards > get_config()->max_boards) {
-      target_boards = get_config()->max_boards;
-    }
+      int longest_game = db_get_longest_game_moves();
+      int players = db_get_active_session_count();
+      int target_boards = longest_game * players;
+      if (target_boards < get_config()->min_boards) {
+        target_boards = get_config()->min_boards;
+      }
+      if (target_boards > get_config()->max_boards) {
+        target_boards = get_config()->max_boards;
+      }
 
-    int boards_to_create = target_boards - total_boards;
-    if (boards_to_create > 0) {
-      for (int i = 0; i < boards_to_create; i++) {
-        if (total_boards >= get_config()->max_boards) {
-          break;
-        }
-        uint64_t new_board_id = db_create_board(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
-        if (new_board_id > 0) {
-          total_boards++;
-          if (new_board_id >= next_board_id) {
-            next_board_id = new_board_id + 1;
+      int boards_to_create = target_boards - total_boards;
+      if (boards_to_create > 0) {
+        for (int i = 0; i < boards_to_create; i++) {
+          if (total_boards >= get_config()->max_boards) {
+            break;
+          }
+          uint64_t new_board_id = db_create_board(
+              "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+          if (new_board_id > 0) {
+            total_boards++;
+            if (new_board_id >= next_board_id) {
+              next_board_id = new_board_id + 1;
+            }
           }
         }
       }
@@ -153,18 +157,22 @@ void board_manager_init(void) {
   DbBoardIdList dormant = db_list_boards_by_status("DORMANT");
   DbBoardIdList active = db_list_boards_by_status("ACTIVE");
   DbBoardIdList reserved = db_list_boards_by_status("RESERVED");
+  bool lists_ok = (dormant.status == DB_OK && active.status == DB_OK &&
+                   reserved.status == DB_OK);
 
-  total_boards = dormant.count + active.count + reserved.count;
+  if (lists_ok) {
+    total_boards = dormant.count + active.count + reserved.count;
 
-  int boards_to_create = get_config()->min_boards - total_boards;
-  if (boards_to_create > 0) {
-    for (int i = 0; i < boards_to_create; i++) {
-      uint64_t new_board_id = db_create_board(
-          "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
-      if (new_board_id >= next_board_id) {
-        next_board_id = new_board_id + 1;
+    int boards_to_create = get_config()->min_boards - total_boards;
+    if (boards_to_create > 0) {
+      for (int i = 0; i < boards_to_create; i++) {
+        uint64_t new_board_id = db_create_board(
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        if (new_board_id >= next_board_id) {
+          next_board_id = new_board_id + 1;
+        }
+        total_boards++;
       }
-      total_boards++;
     }
   }
 }
@@ -532,40 +540,42 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
   }
 
   DbBoardIdList dormant = db_list_boards_by_status("DORMANT");
-  for (int i = 0;
-       i < dormant.count && eligible_count < get_config()->max_boards * 2;
-       i++) {
-    uint64_t board_id = dormant.ids[i];
+  if (dormant.status == DB_OK && dormant.ids) {
+    for (int i = 0;
+         i < dormant.count && eligible_count < get_config()->max_boards * 2;
+         i++) {
+      uint64_t board_id = dormant.ids[i];
 
-    if (board_map_get(board_id) >= 0) {
-      continue;
+      if (board_map_get(board_id) >= 0) {
+        continue;
+      }
+
+      DbBoardResult br = db_get_board(board_id);
+      if (br.status != DB_OK) {
+        continue;
+      }
+
+      WambleBoard temp_board = (WambleBoard){0};
+      temp_board.id = board_id;
+      {
+        size_t __len = strnlen(br.fen, FEN_MAX_LENGTH - 1);
+        memcpy(temp_board.fen, br.fen, __len);
+        temp_board.fen[__len] = '\0';
+      }
+      parse_fen_to_bitboard(temp_board.fen, &temp_board.board);
+      temp_board.state = BOARD_STATE_DORMANT;
+      temp_board.result = GAME_RESULT_IN_PROGRESS;
+      temp_board.last_assignment_time = br.last_assignment_time;
+
+      double score = calculate_board_attractiveness(&temp_board, player);
+
+      eligible_boards[eligible_count].board = NULL;
+      eligible_boards[eligible_count].score = score;
+      eligible_boards[eligible_count].is_cached = false;
+      eligible_boards[eligible_count].board_id = board_id;
+      total_score += score;
+      eligible_count++;
     }
-
-    DbBoardResult br = db_get_board(board_id);
-    if (br.status != DB_OK) {
-      continue;
-    }
-
-    WambleBoard temp_board = {0};
-    temp_board.id = board_id;
-    {
-      size_t __len = strnlen(br.fen, FEN_MAX_LENGTH - 1);
-      memcpy(temp_board.fen, br.fen, __len);
-      temp_board.fen[__len] = '\0';
-    }
-    parse_fen_to_bitboard(temp_board.fen, &temp_board.board);
-    temp_board.state = BOARD_STATE_DORMANT;
-    temp_board.result = GAME_RESULT_IN_PROGRESS;
-    temp_board.last_assignment_time = br.last_assignment_time;
-
-    double score = calculate_board_attractiveness(&temp_board, player);
-
-    eligible_boards[eligible_count].board = NULL;
-    eligible_boards[eligible_count].score = score;
-    eligible_boards[eligible_count].is_cached = false;
-    eligible_boards[eligible_count].board_id = board_id;
-    total_score += score;
-    eligible_count++;
   }
 
   WambleBoard *selected_board = NULL;
