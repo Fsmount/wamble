@@ -70,10 +70,10 @@ build/wamble_build --server [--warn]
 build/wamble_build --tests --run-tests [--with-no-db] [--warn]
 ```
 
-To remove DB-backed code in tests, add `--with-db`:
+By default tests are built with the real database backend enabled. To disable DB-backed code in tests and use the in-repo stub instead, add `--with-no-db`:
 
 ```sh
-build/wamble_build --tests --run-tests --with-db
+build/wamble_build --tests --run-tests --with-no-db
 ```
 
 You can pass arguments to the test runner after `--`, for example:
