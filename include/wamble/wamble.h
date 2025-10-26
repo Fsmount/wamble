@@ -874,6 +874,7 @@ void db_tick(void);
 
 uint64_t db_create_session(const uint8_t *token, uint64_t player_id);
 uint64_t db_get_session_by_token(const uint8_t *token);
+uint64_t db_get_persistent_session_by_token(const uint8_t *token);
 void db_async_update_session_last_seen(uint64_t session_id);
 
 uint64_t db_create_board(const char *fen);

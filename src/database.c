@@ -200,6 +200,29 @@ uint64_t db_get_session_by_token(const uint8_t *token) {
   return session_id;
 }
 
+uint64_t db_get_persistent_session_by_token(const uint8_t *token) {
+  const char *query =
+      "SELECT id FROM sessions WHERE token = decode($1, 'hex') AND "
+      "player_id IS NOT NULL";
+
+  char token_hex[33];
+  bytes_to_hex(token, TOKEN_LENGTH, token_hex);
+
+  const char *paramValues[] = {token_hex};
+
+  PGresult *res =
+      pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
+
+  if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+    PQclear(res);
+    return 0;
+  }
+
+  uint64_t session_id = strtoull(PQgetvalue(res, 0, 0), NULL, 10);
+  PQclear(res);
+  return session_id;
+}
+
 void db_async_update_session_last_seen(uint64_t session_id) {
   const char *query = "UPDATE sessions SET last_seen_at = NOW() WHERE id = $1";
 

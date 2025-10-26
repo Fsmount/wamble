@@ -245,14 +245,14 @@ WamblePlayer *get_player_by_token(const uint8_t *token) {
     return &player_pool[idx];
   }
 
-  uint64_t session_id = db_get_session_by_token(token);
+#if !defined(WAMBLE_TEST_ONLY)
+  uint64_t session_id = db_get_persistent_session_by_token(token);
   if (session_id > 0) {
-
     WamblePlayer *player = find_empty_player_slot();
     if (player) {
       memcpy(player->token, token, TOKEN_LENGTH);
       memset(player->public_key, 0, 32);
-      player->has_persistent_identity = false;
+      player->has_persistent_identity = true;
       player->last_seen_time = wamble_now_wall();
       player->score = db_get_player_total_score(session_id);
       double r = db_get_player_rating(session_id);
@@ -265,6 +265,7 @@ WamblePlayer *get_player_by_token(const uint8_t *token) {
       return player;
     }
   }
+#endif
 
   wamble_mutex_unlock(&player_mutex);
   return NULL;
@@ -373,8 +374,8 @@ void player_manager_tick(void) {
                          get_config()->token_expiration) {
       uint8_t old_token[TOKEN_LENGTH];
       memcpy(old_token, player_pool[i].token, TOKEN_LENGTH);
-      memset(&player_pool[i], 0, sizeof(WamblePlayer));
       player_map_delete(old_token);
+      memset(&player_pool[i], 0, sizeof(WamblePlayer));
       if (i == num_players - 1) {
         num_players--;
       }
