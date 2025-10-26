@@ -107,12 +107,21 @@ void wamble_param_register(const char *base_name, const char *tags,
   WAMBLE_TESTS_ADD_EX_SM(name, WAMBLE_SUITE_FUNCTIONAL, module_lit, setup,     \
                          teardown, timeout_ms)
 
+#define T_FAIL_SIMPLE(msg)                                                     \
+  do {                                                                         \
+    g_wamble_test_fail_file = __FILE__;                                        \
+    g_wamble_test_fail_line = __LINE__;                                        \
+    snprintf(g_wamble_test_fail_msg, sizeof(g_wamble_test_fail_msg), "%s",     \
+             (msg));                                                           \
+    return 1;                                                                  \
+  } while (0)
+
 #define T_FAIL(fmt, ...)                                                       \
   do {                                                                         \
     g_wamble_test_fail_file = __FILE__;                                        \
     g_wamble_test_fail_line = __LINE__;                                        \
-    snprintf(g_wamble_test_fail_msg, sizeof(g_wamble_test_fail_msg), fmt,      \
-             ##__VA_ARGS__);                                                   \
+    snprintf(g_wamble_test_fail_msg, sizeof(g_wamble_test_fail_msg), (fmt),    \
+             __VA_ARGS__);                                                     \
     return 1;                                                                  \
   } while (0)
 
@@ -133,7 +142,7 @@ void wamble_param_register(const char *base_name, const char *tags,
   do {                                                                         \
     const char *_aa = (a), *_bb = (b);                                         \
     if (!_aa || !_bb || strcmp(_aa, _bb) != 0)                                 \
-      T_FAIL("Expected strings equal");                                        \
+      T_FAIL_SIMPLE("Expected strings equal");                                 \
   } while (0)
 
 #define T_ASSERT_STATUS_OK(status)                                             \
