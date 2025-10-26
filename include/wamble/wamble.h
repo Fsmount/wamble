@@ -588,6 +588,8 @@ ProfileExportStatus profile_prepare_state_save_and_inherit(
 uint64_t wamble_now_mono_millis(void);
 time_t wamble_now_wall(void);
 
+uint64_t wamble_now_nanos(void);
+
 static inline void wamble_log(int level, const char *file, int line,
                               const char *func, const char *level_str,
                               const char *format, ...) {
