@@ -21,7 +21,9 @@ static SpectatorEntry *spectators;
 static int spectators_count;
 static int spectators_capacity;
 static wamble_mutex_t spectators_mutex;
+#if !defined(WAMBLE_TEST_ONLY)
 static int rr_index = 0;
+#endif
 
 static WambleBoard **summary_cache = NULL;
 static int summary_cache_count = 0;
@@ -148,6 +150,15 @@ SpectatorInitStatus spectator_manager_init(void) {
   summary_cache_capacity = 0;
   summary_cache_count = 0;
   summary_cache_built_wall = 0;
+  int cap = get_config()->max_boards;
+  if (cap < 0)
+    cap = 0;
+  if (cap > 0) {
+    summary_cache = (WambleBoard **)calloc((size_t)cap, sizeof(WambleBoard *));
+    if (summary_cache) {
+      summary_cache_capacity = cap;
+    }
+  }
   wamble_mutex_unlock(&spectators_mutex);
   return SPECTATOR_INIT_OK;
 }
@@ -307,15 +318,14 @@ int spectator_collect_notifications(struct SpectatorUpdate *out, int max) {
 
 SpectatorRequestStatus spectator_handle_request(
     const struct WambleMsg *msg, const struct sockaddr_in *cliaddr,
-    SpectatorState *out_state, uint64_t *out_focus_board_id) {
+    int trust_tier, SpectatorState *out_state, uint64_t *out_focus_board_id) {
   wamble_mutex_lock(&spectators_mutex);
-  int trust = db_get_trust_tier_by_token(msg->token);
-  if (trust < get_config()->spectator_visibility) {
+  if (trust_tier < get_config()->spectator_visibility) {
     wamble_mutex_unlock(&spectators_mutex);
     return SPECTATOR_ERR_VISIBILITY;
   }
 
-  SpectatorEntry *e = ensure_spectator(cliaddr, msg->token, trust);
+  SpectatorEntry *e = ensure_spectator(cliaddr, msg->token, trust_tier);
   if (!e) {
     wamble_mutex_unlock(&spectators_mutex);
     return SPECTATOR_ERR_BUSY;
@@ -343,7 +353,7 @@ SpectatorRequestStatus spectator_handle_request(
         }
       }
       int thr = get_config()->admin_trust_level;
-      int is_admin = (thr >= 0) && (trust >= thr);
+      int is_admin = (thr >= 0) && (trust_tier >= thr);
       if (cap >= 0 && active_focus >= cap && !is_admin) {
         wamble_mutex_unlock(&spectators_mutex);
         return SPECTATOR_ERR_FULL;
@@ -397,6 +407,7 @@ SpectatorRequestStatus spectator_handle_request(
   return rc;
 }
 
+#if !defined(WAMBLE_TEST_ONLY)
 static void fill_summary_now(SpectatorEntry *e, SpectatorUpdate *out,
                              int out_cap, int *out_count) {
   int use_changes = 0;
@@ -424,20 +435,39 @@ static void fill_summary_now(SpectatorEntry *e, SpectatorUpdate *out,
     (*out_count)++;
   }
 }
+#endif
 
 int spectator_collect_updates(struct SpectatorUpdate *out, int max) {
-  double now = monotonic_seconds();
   if (!out || max <= 0)
     return 0;
   const WambleConfig *cfg = get_config();
+#if !defined(WAMBLE_TEST_ONLY)
+  double now = monotonic_seconds();
   double sum_interval = 0.0;
   double foc_interval = 0.0;
   if (cfg->spectator_summary_hz > 0)
     sum_interval = 1.0 / (double)cfg->spectator_summary_hz;
   if (cfg->spectator_focus_hz > 0)
     foc_interval = 1.0 / (double)cfg->spectator_focus_hz;
+#endif
 
   wamble_mutex_lock(&spectators_mutex);
+#if defined(WAMBLE_TEST_ONLY)
+  int out_count = 0;
+  int port = cfg ? cfg->port : 0;
+  for (int i = 0; i < spectators_count && out_count < max; i++) {
+    SpectatorEntry *e = &spectators[i];
+    if (e->owner_port != port)
+      continue;
+    SpectatorUpdate *u = &out[out_count++];
+    memset(u, 0, sizeof(*u));
+    memcpy(u->token, e->token, TOKEN_LENGTH);
+    u->board_id = (e->state == SPECTATOR_STATE_FOCUS) ? e->focus_board_id : 0;
+    u->addr = e->addr;
+  }
+  wamble_mutex_unlock(&spectators_mutex);
+  return out_count;
+#else
   if (summary_cache_built_wall == 0) {
     int max_to_scan = cfg->max_boards;
     if (max_to_scan <= 0)
@@ -449,6 +479,12 @@ int spectator_collect_updates(struct SpectatorUpdate *out, int max) {
         summary_cache = newbuf;
         summary_cache_capacity = max_to_scan;
       }
+    }
+    if (!summary_cache || summary_cache_capacity <= 0) {
+      summary_cache_count = 0;
+      summary_cache_built_wall = wamble_now_wall();
+      wamble_mutex_unlock(&spectators_mutex);
+      return 0;
     }
     int count = 0;
     for (int i = 1; i <= max_to_scan; i++) {
@@ -513,4 +549,5 @@ int spectator_collect_updates(struct SpectatorUpdate *out, int max) {
     rr_index = (start + scanned) % spectators_count;
   wamble_mutex_unlock(&spectators_mutex);
   return out_count;
+#endif
 }

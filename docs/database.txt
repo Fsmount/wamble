@@ -5,6 +5,7 @@ Overview
 - Backend: PostgreSQL.
 - Purpose: Persist players/sessions, boards, moves, reservations, results, payouts, and predictions.
 - Profiles: Each advertised profile uses its own per-thread database connection.
+- Access: Runtime code reads via a small `WambleQueryService` interface and writes by enqueueing persistence intents which are flushed to the database in batches.
 
 Connections
 - Per-thread per-listener: Each listener thread opens its own DB connection using
@@ -84,6 +85,7 @@ Trust and Visibility
 
 Operational Notes
 - Multiple advertised profiles within one process may point to different databases.
+- Persistence intents are applied periodically in the main loop and per-profile threads.
 
 Examples
 - Promote a session to trust level 10 by hex token:

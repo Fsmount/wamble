@@ -67,13 +67,7 @@ build/wamble_build --server [--warn]
 3. Build and run the unified tests (optional):
 
 ```sh
-build/wamble_build --tests --run-tests [--with-no-db] [--warn]
-```
-
-By default tests are built with the real database backend enabled. To disable DB-backed code in tests and use the in-repo stub instead, add `--with-no-db`:
-
-```sh
-build/wamble_build --tests --run-tests --with-no-db
+build/wamble_build --tests --run-tests [--warn]
 ```
 
 You can pass arguments to the test runner after `--`, for example:
@@ -99,11 +93,13 @@ Artifacts are placed under `build/`
 ### Test Fixtures
 
 - Set `WAMBLE_TEST_DSN` to point tests/tools at a Postgres instance, e.g. `export WAMBLE_TEST_DSN=postgres://user:pass@localhost:5432/wamble_test`.
-- To temporarily skip DB-backed tests, set `WAMBLE_SKIP_DB_TESTS=1`.
-- A helper tool `build/wamble_db_tool` is built when `--with-db` is used. Examples:
+- To temporarily skip DB-backed tests without rebuilding, set `WAMBLE_SKIP_DB_TESTS=1`.
+- The helper tool `build/wamble_db_tool` is built when DB support is enabled (default). Examples:
   - Migrate schema: `WAMBLE_TEST_DSN=... build/wamble_db_tool --schema test_schema --migrate`
   - Load fixtures: `WAMBLE_TEST_DSN=... build/wamble_db_tool --schema test_schema --fixture`
   - Reset tables: `WAMBLE_TEST_DSN=... build/wamble_db_tool --schema test_schema --reset`
+
+DB-backed tests are automatically skipped if `WAMBLE_TEST_DSN` is not set.
 
 ## How to Run
 

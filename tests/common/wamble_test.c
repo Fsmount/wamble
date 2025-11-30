@@ -38,6 +38,8 @@ WAMBLE_TEST_THREAD_LOCAL char g_wamble_test_fail_msg[1024];
 WAMBLE_TEST_THREAD_LOCAL const char *g_wamble_test_fail_file = NULL;
 WAMBLE_TEST_THREAD_LOCAL int g_wamble_test_fail_line = 0;
 
+static int tag_has_kv(const char *tags, const char *key, const char *val);
+
 static wamble_test_case g_cases[1024];
 static int g_case_count = 0;
 static int g_verbose = 0;
@@ -388,6 +390,10 @@ static int run_one_concurrent(const wamble_test_case *tc, int timeout_ms,
 void wamble_test_register_ex(const char *name, const char *tags,
                              wamble_test_fn fn, wamble_hook_fn setup,
                              wamble_hook_fn teardown, int timeout_ms) {
+  if (tags && tag_has_kv(tags, "requires_db", "1")) {
+    if (wamble_should_skip_db_tests())
+      return;
+  }
   if (g_case_count >= (int)(sizeof(g_cases) / sizeof(g_cases[0]))) {
     fprintf(stderr, "[harness] too many tests registered\n");
     exit(2);
@@ -405,6 +411,10 @@ void wamble_param_register(const char *base_name, const char *tags,
                            wamble_param_test_fn fn, const void *cases,
                            size_t case_size, int count, int timeout_ms,
                            wamble_hook_fn setup, wamble_hook_fn teardown) {
+  if (tags && tag_has_kv(tags, "requires_db", "1")) {
+    if (wamble_should_skip_db_tests())
+      return;
+  }
   for (int i = 0; i < count; i++) {
     const char *const *name_ptr =
         (const char *const *)((const char *)cases + (size_t)i * case_size);

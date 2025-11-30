@@ -9,7 +9,7 @@ Overview
 Tokens
 - 16 raw bytes per session. Logged as a 22-char base64url string.
 - Generated with a simple PCG RNG and extra OS entropy where available.
-- We check for collisions in memory and in `sessions.token` before accepting.
+- We check for collisions in memory, and the persistence layer treats tokens as `UNIQUE`.
 
 Creating Players
 - Ephemeral: `create_new_player()` mints a token, creates a DB session, sets defaults (rating, score, timers).
