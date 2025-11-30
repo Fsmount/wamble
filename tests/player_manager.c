@@ -1,4 +1,5 @@
 #include "common/wamble_test.h"
+#include "common/wamble_test_helpers.h"
 #include "wamble/wamble.h"
 
 WAMBLE_TEST(player_pool_capacity_limit) {
@@ -27,10 +28,6 @@ WAMBLE_TEST(player_token_expiration_removes_entry) {
 }
 
 WAMBLE_TESTS_BEGIN_NAMED(wamble_register_tests_player_manager)
-WAMBLE_TESTS_ADD_EX(player_pool_capacity_limit,
-                    "suite=functional module=player_manager type=unit", NULL,
-                    NULL, 0);
-WAMBLE_TESTS_ADD_EX(player_token_expiration_removes_entry,
-                    "suite=functional module=player_manager type=unit", NULL,
-                    NULL, 0);
+WAMBLE_TESTS_ADD_FM(player_pool_capacity_limit, "player_manager");
+WAMBLE_TESTS_ADD_FM(player_token_expiration_removes_entry, "player_manager");
 WAMBLE_TESTS_END()

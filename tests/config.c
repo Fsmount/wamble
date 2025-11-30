@@ -247,32 +247,20 @@ WAMBLE_TEST(config_env_getenv_unset) {
 }
 
 WAMBLE_TESTS_BEGIN_NAMED(wamble_register_tests_config)
-WAMBLE_TESTS_ADD_EX(config_basic_eval,
-                    "suite=functional module=config type=unit", NULL, NULL, 0);
-WAMBLE_TESTS_ADD_EX(config_defaults_no_file,
-                    "suite=functional module=config type=unit", NULL, NULL, 0);
-WAMBLE_TESTS_ADD_EX(config_env_getenv,
-                    "suite=functional module=config type=unit", NULL, NULL, 0);
-WAMBLE_TESTS_ADD_EX(config_push_pop_stack,
-                    "suite=functional module=config type=unit", NULL, NULL, 0);
-WAMBLE_TESTS_ADD_EX(config_profile_inheritance,
-                    "suite=functional module=config type=integration", NULL,
-                    NULL, 0);
-WAMBLE_TESTS_ADD_EX(config_speed_parse_minimal, "suite=speed module=config",
-                    NULL, NULL, 5000);
-WAMBLE_TESTS_ADD_EX(config_perf_parse_medium, "suite=performance module=config",
-                    NULL, NULL, 10000);
-WAMBLE_TESTS_ADD_EX(config_stress_many_profiles, "suite=stress module=config",
-                    NULL, NULL, 15000);
-WAMBLE_TESTS_ADD_EX(config_parse_doubles_and_strings,
-                    "suite=functional module=config type=unit", NULL, NULL, 0);
-WAMBLE_TESTS_ADD_EX(config_profile_select_and_not_found,
-                    "suite=functional module=config type=integration", NULL,
-                    NULL, 0);
-WAMBLE_TESTS_ADD_EX(config_profile_inheritance_variants,
-                    "suite=functional module=config type=unit", NULL, NULL, 0);
-WAMBLE_TESTS_ADD_EX(config_profile_missing_base_skipped,
-                    "suite=functional module=config type=unit", NULL, NULL, 0);
-WAMBLE_TESTS_ADD_EX(config_env_getenv_unset,
-                    "suite=functional module=config type=unit", NULL, NULL, 0);
+WAMBLE_TESTS_ADD_FM(config_basic_eval, "config");
+WAMBLE_TESTS_ADD_FM(config_defaults_no_file, "config");
+WAMBLE_TESTS_ADD_FM(config_env_getenv, "config");
+WAMBLE_TESTS_ADD_FM(config_push_pop_stack, "config");
+WAMBLE_TESTS_ADD_FM(config_profile_inheritance, "config");
+WAMBLE_TESTS_ADD_EX_SM(config_speed_parse_minimal, WAMBLE_SUITE_SPEED, "config",
+                       NULL, NULL, 5000);
+WAMBLE_TESTS_ADD_EX_SM(config_perf_parse_medium, WAMBLE_SUITE_PERFORMANCE,
+                       "config", NULL, NULL, 10000);
+WAMBLE_TESTS_ADD_EX_SM(config_stress_many_profiles, WAMBLE_SUITE_STRESS,
+                       "config", NULL, NULL, 15000);
+WAMBLE_TESTS_ADD_FM(config_parse_doubles_and_strings, "config");
+WAMBLE_TESTS_ADD_FM(config_profile_select_and_not_found, "config");
+WAMBLE_TESTS_ADD_FM(config_profile_inheritance_variants, "config");
+WAMBLE_TESTS_ADD_FM(config_profile_missing_base_skipped, "config");
+WAMBLE_TESTS_ADD_FM(config_env_getenv_unset, "config");
 WAMBLE_TESTS_END()

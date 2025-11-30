@@ -1,32 +1,19 @@
 #include "../include/wamble/wamble.h"
 #include <string.h>
 
-ScoringStatus calculate_and_distribute_pot(uint64_t board_id) {
-  typedef struct {
-    uint8_t player_token[TOKEN_LENGTH];
-    int white_moves;
-    int black_moves;
-  } PlayerContribution;
-  WambleBoard *board = get_board_by_id(board_id);
-  if (!board) {
-    return SCORING_ERR_INVALID;
-  }
-  if (board->result == GAME_RESULT_IN_PROGRESS) {
-    return SCORING_NONE;
-  }
+typedef struct {
+  uint8_t player_token[TOKEN_LENGTH];
+  int white_moves;
+  int black_moves;
+} PlayerContribution;
 
-  DbMovesResult mres = db_get_moves_for_board(board_id);
-  if (mres.status != DB_OK) {
-    if (mres.status == DB_NOT_FOUND) {
-      return SCORING_NONE;
-    }
-    return SCORING_ERR_DB;
-  }
-  if (mres.count <= 0 || !mres.rows) {
+static ScoringStatus calculate_and_distribute_pot_for_moves_internal(
+    uint64_t board_id, WambleBoard *board, const WambleMove *moves,
+    int num_moves) {
+  if (!board)
+    return SCORING_ERR_INVALID;
+  if (!moves || num_moves <= 0)
     return SCORING_NONE;
-  }
-  const WambleMove *moves = mres.rows;
-  int num_moves = mres.count;
 
   PlayerContribution *contributions = malloc(
       sizeof(PlayerContribution) * (size_t)get_config()->max_contributors);
@@ -94,9 +81,8 @@ ScoringStatus calculate_and_distribute_pot(uint64_t board_id) {
       score /= 2.0;
     }
 
-    uint64_t session_id = db_get_session_by_token(contrib->player_token);
-    if (session_id > 0 && score > 0.0) {
-      db_async_record_payout(board_id, session_id, score);
+    if (score > 0.0) {
+      wamble_emit_record_payout(board_id, contrib->player_token, score);
     }
 
     WamblePlayer *player = get_player_by_token(contrib->player_token);
@@ -107,4 +93,39 @@ ScoringStatus calculate_and_distribute_pot(uint64_t board_id) {
 
   free(contributions);
   return SCORING_OK;
+}
+
+ScoringStatus calculate_and_distribute_pot_for_moves(WambleBoard *board,
+                                                     const WambleMove *moves,
+                                                     int num_moves) {
+  uint64_t board_id = board ? board->id : 0;
+  if (!board)
+    return SCORING_ERR_INVALID;
+  if (board->result == GAME_RESULT_IN_PROGRESS)
+    return SCORING_NONE;
+  return calculate_and_distribute_pot_for_moves_internal(board_id, board, moves,
+                                                         num_moves);
+}
+
+ScoringStatus calculate_and_distribute_pot(uint64_t board_id) {
+  WambleBoard *board = get_board_by_id(board_id);
+  if (!board) {
+    return SCORING_ERR_INVALID;
+  }
+  if (board->result == GAME_RESULT_IN_PROGRESS) {
+    return SCORING_NONE;
+  }
+
+  DbMovesResult mres = wamble_query_get_moves_for_board(board_id);
+  if (mres.status == DB_NOT_FOUND) {
+    return SCORING_NONE;
+  }
+  if (mres.status != DB_OK) {
+    return SCORING_ERR_DB;
+  }
+  if (mres.count <= 0 || !mres.rows) {
+    return SCORING_NONE;
+  }
+  return calculate_and_distribute_pot_for_moves_internal(board_id, board,
+                                                         mres.rows, mres.count);
 }

@@ -1,10 +1,11 @@
 #include "../include/wamble/wamble.h"
+#include "../include/wamble/wamble_db.h"
 #include <stdlib.h>
 #include <string.h>
 #if defined(_MSC_VER) && !defined(strtoull)
 #define strtoull _strtoui64
 #endif
-#if defined(WAMBLE_PLATFORM_POSIX) && !defined(TEST_PROFILE_RUNTIME)
+#if defined(WAMBLE_PLATFORM_POSIX)
 #include <fcntl.h>
 #include <unistd.h>
 #endif
@@ -38,6 +39,14 @@ static void ensure_mutex_init(void) {
     wamble_mutex_init(&g_mutex);
     g_mutex_initialized = 1;
   }
+}
+
+static PersistenceStatus flush_intents_status(void) {
+  int failures = 0;
+  PersistenceStatus st = wamble_apply_intents_with_db_checked(
+      wamble_get_intent_buffer(), &failures);
+  wamble_persistence_clear_status();
+  return st;
 }
 
 static char *wamble_strndup_local(const char *src, size_t len) {
@@ -344,13 +353,27 @@ static void *profile_thread_main(void *arg) {
   network_init_thread_state();
   ensure_mutex_init();
 
-#ifndef TEST_PROFILE_RUNTIME
+  WambleIntentBuffer intents_buf;
+  wamble_intents_init(&intents_buf);
+  const WambleQueryService *qs = wamble_get_db_query_service();
+  wamble_set_query_service(qs);
+  wamble_set_intent_buffer(&intents_buf);
+
+  if (!wamble_get_query_service()) {
+    wamble_intents_free(&intents_buf);
+    wamble_set_intent_buffer(NULL);
+    return NULL;
+  }
+
   player_manager_init();
   board_manager_init();
-
-#endif
-
-#ifndef TEST_PROFILE_RUNTIME
+  PersistenceStatus init_flush = flush_intents_status();
+  if (init_flush != PERSISTENCE_STATUS_OK &&
+      init_flush != PERSISTENCE_STATUS_EMPTY) {
+    wamble_intents_free(&intents_buf);
+    wamble_set_intent_buffer(NULL);
+    return NULL;
+  }
   if (rp->state_path && rp->state_path[0]) {
     if (state_load_from_file(rp->state_path) == 0) {
 #if defined(WAMBLE_PLATFORM_POSIX) || defined(WAMBLE_PLATFORM_WINDOWS)
@@ -360,8 +383,10 @@ static void *profile_thread_main(void *arg) {
     free(rp->state_path);
     rp->state_path = NULL;
   }
-#endif
   if (rp->sockfd == WAMBLE_INVALID_SOCKET) {
+    (void)flush_intents_status();
+    wamble_intents_free(&intents_buf);
+    wamble_set_intent_buffer(NULL);
     return NULL;
   }
 
@@ -375,13 +400,6 @@ static void *profile_thread_main(void *arg) {
     if (g_prepare_exec && !rp->ready_for_exec)
       should_prepare = 1;
     wamble_mutex_unlock(&g_mutex);
-#if defined(TEST_PROFILE_RUNTIME)
-    if (should_prepare) {
-      wamble_mutex_lock(&g_mutex);
-      rp->ready_for_exec = 1;
-      wamble_mutex_unlock(&g_mutex);
-    }
-#else
     if (should_prepare) {
       char tmpl[] = "/tmp/wamble_state_prof_XXXXXX";
       int tfd = wamble_mkstemp(tmpl);
@@ -399,20 +417,12 @@ static void *profile_thread_main(void *arg) {
         wamble_mutex_unlock(&g_mutex);
       }
     }
-#endif
 #elif defined(WAMBLE_PLATFORM_WINDOWS)
     int should_prepare = 0;
     wamble_mutex_lock(&g_mutex);
     if (g_prepare_exec && !rp->ready_for_exec)
       should_prepare = 1;
     wamble_mutex_unlock(&g_mutex);
-#if defined(TEST_PROFILE_RUNTIME)
-    if (should_prepare) {
-      wamble_mutex_lock(&g_mutex);
-      rp->ready_for_exec = 1;
-      wamble_mutex_unlock(&g_mutex);
-    }
-#else
     if (should_prepare) {
       char tmpl[] = "wamble_state_prof_XXXXXX";
       int tfd = wamble_mkstemp(tmpl);
@@ -429,7 +439,6 @@ static void *profile_thread_main(void *arg) {
         wamble_mutex_unlock(&g_mutex);
       }
     }
-#endif
 #endif
     if (rp->needs_update) {
       rp->needs_update = 0;
@@ -455,7 +464,11 @@ static void *profile_thread_main(void *arg) {
         struct sockaddr_in cliaddr;
         int n = receive_message(rp->sockfd, &msg, &cliaddr);
         if (n > 0) {
-          handle_message(rp->sockfd, &msg, &cliaddr);
+          int trust_tier = 0;
+          if (qs && qs->get_trust_tier_by_token) {
+            qs->get_trust_tier_by_token(msg.token, &trust_tier);
+          }
+          (void)handle_message(rp->sockfd, &msg, &cliaddr, trust_tier);
           continue;
         }
         break;
@@ -468,14 +481,16 @@ static void *profile_thread_main(void *arg) {
       last_cleanup = now;
     }
     if (now - last_tick > 1) {
-#ifndef TEST_PROFILE_RUNTIME
       board_manager_tick();
+      PersistenceStatus loop_flush = flush_intents_status();
+      if (loop_flush != PERSISTENCE_STATUS_OK &&
+          loop_flush != PERSISTENCE_STATUS_EMPTY) {
+        break;
+      }
       spectator_manager_tick();
-#endif
       last_tick = now;
     }
 
-#ifndef TEST_PROFILE_RUNTIME
     int cap = get_config()->max_client_sessions;
     if (cap < 1)
       cap = 1;
@@ -514,11 +529,13 @@ static void *profile_thread_main(void *arg) {
       }
       free(events);
     }
-#endif
   }
 
   wamble_close_socket(rp->sockfd);
   rp->sockfd = WAMBLE_INVALID_SOCKET;
+  (void)flush_intents_status();
+  wamble_intents_free(&intents_buf);
+  wamble_set_intent_buffer(NULL);
   db_cleanup_thread();
   return NULL;
 }
@@ -526,8 +543,7 @@ static void *profile_thread_main(void *arg) {
 ProfileStartStatus start_profile_listeners(int *out_started) {
   ensure_mutex_init();
 
-#if !defined(TEST_PROFILE_RUNTIME) &&                                          \
-    (defined(WAMBLE_PLATFORM_POSIX) || defined(WAMBLE_PLATFORM_WINDOWS))
+#if defined(WAMBLE_PLATFORM_POSIX) || defined(WAMBLE_PLATFORM_WINDOWS)
   const char *inherited = getenv("WAMBLE_PROFILES_INHERITED");
   if (inherited && *inherited) {
     int capacity = 1;

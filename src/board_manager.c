@@ -5,11 +5,16 @@
 static WAMBLE_THREAD_LOCAL WambleBoard *board_cached;
 static WAMBLE_THREAD_LOCAL int num_cached_boards = 0;
 static WAMBLE_THREAD_LOCAL int total_boards = 0;
-static WAMBLE_THREAD_LOCAL uint64_t next_board_id = 1;
+static uint64_t next_board_id = 1;
+static wamble_mutex_t next_board_id_mutex;
+static int next_board_id_initialized = 0;
 static WAMBLE_THREAD_LOCAL wamble_mutex_t board_mutex;
 
 #define BOARD_MAP_SIZE (get_config()->max_boards * 2)
 static WAMBLE_THREAD_LOCAL int *board_index_map;
+#define INITIAL_BOARD_FEN                                                      \
+  "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+#define INITIAL_BOARD_STATUS "DORMANT"
 
 static inline uint64_t mix64_hash(uint64_t x) {
   x ^= x >> 33;
@@ -18,6 +23,27 @@ static inline uint64_t mix64_hash(uint64_t x) {
   x *= 0xc4ceb9fe1a85ec53ULL;
   x ^= x >> 33;
   return x;
+}
+
+static void ensure_board_id_mutex(void) {
+  static int mutex_init = 0;
+  if (!mutex_init) {
+    wamble_mutex_init(&next_board_id_mutex);
+    mutex_init = 1;
+  }
+}
+
+static uint64_t alloc_board_id(void) {
+  ensure_board_id_mutex();
+  wamble_mutex_lock(&next_board_id_mutex);
+  if (!next_board_id_initialized) {
+    if (next_board_id == 0)
+      next_board_id = 1;
+    next_board_id_initialized = 1;
+  }
+  uint64_t id = next_board_id++;
+  wamble_mutex_unlock(&next_board_id_mutex);
+  return id;
 }
 
 static void board_map_put(uint64_t id, int index) {
@@ -62,6 +88,7 @@ static BoardState board_state_from_string(const char *s) {
 
 static void remove_board_from_cache(int cache_index);
 static void transition_reserved_to_dormant(WambleBoard *board);
+static int find_cache_slot_for_board(void);
 
 void board_manager_tick() {
   wamble_mutex_lock(&board_mutex);
@@ -87,24 +114,25 @@ void board_manager_tick() {
       time_t inactive_time = now - board->last_move_time;
       if (inactive_time >= get_config()->inactivity_timeout) {
         board->state = BOARD_STATE_DORMANT;
-        db_async_update_board(board->id, board->fen, "DORMANT");
+        wamble_emit_update_board(board->id, board->fen, "DORMANT");
       }
     }
   }
 
   if (now - last_count_update >= 60) {
-    DbBoardIdList dormant = db_list_boards_by_status("DORMANT");
-    DbBoardIdList active = db_list_boards_by_status("ACTIVE");
-    DbBoardIdList reserved = db_list_boards_by_status("RESERVED");
+    DbBoardIdList dormant = wamble_query_list_boards_by_status("DORMANT");
+    DbBoardIdList active = wamble_query_list_boards_by_status("ACTIVE");
+    DbBoardIdList reserved = wamble_query_list_boards_by_status("RESERVED");
     bool lists_ok = (dormant.status == DB_OK && active.status == DB_OK &&
                      reserved.status == DB_OK);
-
     if (lists_ok) {
       total_boards = dormant.count + active.count + reserved.count;
       last_count_update = now;
 
-      int longest_game = db_get_longest_game_moves();
-      int players = db_get_active_session_count();
+      int longest_game = 0;
+      int players = 0;
+      (void)wamble_query_get_longest_game_moves(&longest_game);
+      (void)wamble_query_get_active_session_count(&players);
       int target_boards = longest_game * players;
       if (target_boards < get_config()->min_boards) {
         target_boards = get_config()->min_boards;
@@ -119,14 +147,10 @@ void board_manager_tick() {
           if (total_boards >= get_config()->max_boards) {
             break;
           }
-          uint64_t new_board_id = db_create_board(
-              "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
-          if (new_board_id > 0) {
-            total_boards++;
-            if (new_board_id >= next_board_id) {
-              next_board_id = new_board_id + 1;
-            }
-          }
+          uint64_t new_board_id = alloc_board_id();
+          wamble_emit_create_board(new_board_id, INITIAL_BOARD_FEN,
+                                   INITIAL_BOARD_STATUS);
+          total_boards++;
         }
       }
     }
@@ -148,15 +172,23 @@ void board_manager_init(void) {
          sizeof(WambleBoard) * (size_t)get_config()->max_boards);
   num_cached_boards = 0;
   total_boards = 0;
-  next_board_id = 1;
   wamble_mutex_init(&board_mutex);
   rng_init();
   for (int i = 0; i < BOARD_MAP_SIZE; i++)
     board_index_map[i] = -1;
 
-  DbBoardIdList dormant = db_list_boards_by_status("DORMANT");
-  DbBoardIdList active = db_list_boards_by_status("ACTIVE");
-  DbBoardIdList reserved = db_list_boards_by_status("RESERVED");
+  DbBoardIdList dormant = wamble_query_list_boards_by_status("DORMANT");
+  DbBoardIdList active = wamble_query_list_boards_by_status("ACTIVE");
+  DbBoardIdList reserved = wamble_query_list_boards_by_status("RESERVED");
+  ensure_board_id_mutex();
+  uint64_t max_id = 0;
+  DbStatus st = wamble_query_get_max_board_id(&max_id);
+  wamble_mutex_lock(&next_board_id_mutex);
+  if (!next_board_id_initialized) {
+    next_board_id = (st == DB_OK && max_id > 0) ? (max_id + 1) : 1;
+    next_board_id_initialized = 1;
+  }
+  wamble_mutex_unlock(&next_board_id_mutex);
   bool lists_ok = (dormant.status == DB_OK && active.status == DB_OK &&
                    reserved.status == DB_OK);
 
@@ -166,11 +198,25 @@ void board_manager_init(void) {
     int boards_to_create = get_config()->min_boards - total_boards;
     if (boards_to_create > 0) {
       for (int i = 0; i < boards_to_create; i++) {
-        uint64_t new_board_id = db_create_board(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
-        if (new_board_id >= next_board_id) {
-          next_board_id = new_board_id + 1;
-        }
+        int slot = find_cache_slot_for_board();
+        if (slot < 0)
+          break;
+        uint64_t new_board_id = alloc_board_id();
+        WambleBoard *b = &board_cached[slot];
+        memset(b, 0, sizeof(*b));
+        b->id = new_board_id;
+        strcpy(b->fen, INITIAL_BOARD_FEN);
+        parse_fen_to_bitboard(b->fen, &b->board);
+        b->state = BOARD_STATE_DORMANT;
+        b->result = GAME_RESULT_IN_PROGRESS;
+        b->creation_time = wamble_now_wall();
+        b->last_move_time = 0;
+        b->last_assignment_time = 0;
+        board_map_put(b->id, slot);
+        if (slot >= num_cached_boards)
+          num_cached_boards = slot + 1;
+        wamble_emit_create_board(new_board_id, INITIAL_BOARD_FEN,
+                                 INITIAL_BOARD_STATUS);
         total_boards++;
       }
     }
@@ -181,7 +227,7 @@ static void transition_to_archived(WambleBoard *board, GameResult result) {
   board->state = BOARD_STATE_ARCHIVED;
   board->result = result;
 
-  db_async_update_board(board->id, board->fen, "ARCHIVED");
+  wamble_emit_update_board(board->id, board->fen, "ARCHIVED");
 
   char winning_side = 'd';
   if (result == GAME_RESULT_WHITE_WINS) {
@@ -189,7 +235,7 @@ static void transition_to_archived(WambleBoard *board, GameResult result) {
   } else if (result == GAME_RESULT_BLACK_WINS) {
     winning_side = 'b';
   }
-  db_async_record_game_result(board->id, winning_side);
+  wamble_emit_record_game_result(board->id, winning_side);
 
   total_boards--;
 }
@@ -257,26 +303,22 @@ static void apply_reservation_to_board(WambleBoard *board,
   memcpy(board->reservation_player_token, player->token, TOKEN_LENGTH);
   board->reserved_for_white = (board->board.turn == 'w');
 
-  db_async_update_board(board->id, board->fen, "RESERVED");
-  db_async_update_board_assignment_time(board->id);
+  wamble_emit_update_board(board->id, board->fen, "RESERVED");
+  wamble_emit_update_board_assignment_time(board->id);
 
   if (player->has_persistent_identity) {
-    uint64_t session_id = db_get_session_by_token(player->token);
-    if (session_id > 0) {
-      db_async_create_reservation(board->id, session_id,
-                                  get_config()->reservation_timeout);
-    }
+    wamble_emit_create_reservation(board->id, player->token,
+                                   get_config()->reservation_timeout);
   }
 }
 
-static int find_cache_slot_for_board(void);
 static WambleBoard *load_board_into_cache(uint64_t board_id) {
   int cache_slot = find_cache_slot_for_board();
   if (cache_slot < 0) {
     return NULL;
   }
 
-  DbBoardResult br = db_get_board(board_id);
+  DbBoardResult br = wamble_query_get_board(board_id);
   if (br.status != DB_OK) {
     return NULL;
   }
@@ -372,8 +414,8 @@ void board_move_played(uint64_t board_id) {
       board->state = BOARD_STATE_ACTIVE;
       board->last_move_time = wamble_now_wall();
 
-      db_async_update_board(board->id, board->fen, "ACTIVE");
-      db_async_remove_reservation(board->id);
+      wamble_emit_update_board(board->id, board->fen, "ACTIVE");
+      wamble_emit_remove_reservation(board->id);
 
       memset(board->reservation_player_token, 0, TOKEN_LENGTH);
       board->reservation_time = 0;
@@ -388,19 +430,22 @@ void board_move_played(uint64_t board_id) {
 
 void board_game_completed(uint64_t board_id, GameResult result) {
   wamble_mutex_lock(&board_mutex);
-
   int idx = board_map_get(board_id);
   if (idx >= 0) {
     WambleBoard *board = &board_cached[idx];
     board->result = result;
-
     update_player_ratings(board);
+  }
+  wamble_mutex_unlock(&board_mutex);
 
-    calculate_and_distribute_pot(board_id);
+  calculate_and_distribute_pot(board_id);
 
+  wamble_mutex_lock(&board_mutex);
+  idx = board_map_get(board_id);
+  if (idx >= 0) {
+    WambleBoard *board = &board_cached[idx];
     transition_to_archived(board, result);
   }
-
   wamble_mutex_unlock(&board_mutex);
 }
 
@@ -429,8 +474,8 @@ static void transition_reserved_to_dormant(WambleBoard *board) {
   board->reservation_time = 0;
   board->reserved_for_white = false;
 
-  db_async_update_board(board->id, board->fen, "DORMANT");
-  db_async_remove_reservation(board->id);
+  wamble_emit_update_board(board->id, board->fen, "DORMANT");
+  wamble_emit_remove_reservation(board->id);
 }
 
 void board_release_reservation(uint64_t board_id) {
@@ -474,8 +519,12 @@ int board_manager_export(WambleBoard *out, int max, int *out_count,
   }
   if (out_count)
     *out_count = n;
-  if (out_next_id)
+  if (out_next_id) {
+    ensure_board_id_mutex();
+    wamble_mutex_lock(&next_board_id_mutex);
     *out_next_id = next_board_id;
+    wamble_mutex_unlock(&next_board_id_mutex);
+  }
   wamble_mutex_unlock(&board_mutex);
   return 0;
 }
@@ -497,7 +546,11 @@ int board_manager_import(const WambleBoard *in, int count, uint64_t next_id) {
     board_map_put(board_cached[i].id, i);
   }
   num_cached_boards = count;
+  ensure_board_id_mutex();
+  wamble_mutex_lock(&next_board_id_mutex);
   next_board_id = (next_id > 0) ? next_id : (uint64_t)(count + 1);
+  next_board_id_initialized = 1;
+  wamble_mutex_unlock(&next_board_id_mutex);
   wamble_mutex_unlock(&board_mutex);
   return 0;
 }
@@ -539,7 +592,7 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
     eligible_count++;
   }
 
-  DbBoardIdList dormant = db_list_boards_by_status("DORMANT");
+  DbBoardIdList dormant = wamble_query_list_boards_by_status("DORMANT");
   if (dormant.status == DB_OK && dormant.ids) {
     for (int i = 0;
          i < dormant.count && eligible_count < get_config()->max_boards * 2;
@@ -550,7 +603,7 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
         continue;
       }
 
-      DbBoardResult br = db_get_board(board_id);
+      DbBoardResult br = wamble_query_get_board(board_id);
       if (br.status != DB_OK) {
         continue;
       }
@@ -617,8 +670,10 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
 static int create_new_board_for_player(WamblePlayer *player) {
   time_t now = wamble_now_wall();
 
-  int longest_game = db_get_longest_game_moves();
-  int players = db_get_active_session_count();
+  int longest_game = 0;
+  int players = 0;
+  (void)wamble_query_get_longest_game_moves(&longest_game);
+  (void)wamble_query_get_active_session_count(&players);
   int target_boards = longest_game * players;
   if (target_boards < get_config()->min_boards) {
     target_boards = get_config()->min_boards;
@@ -635,17 +690,10 @@ static int create_new_board_for_player(WamblePlayer *player) {
   }
 
   WambleBoard *board = &board_cached[cache_slot];
-  strcpy(board->fen,
-         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+  strcpy(board->fen, INITIAL_BOARD_FEN);
 
-  board->id = db_create_board(board->fen);
-  if (board->id == 0) {
-    board->id = next_board_id++;
-  } else {
-    if (board->id >= next_board_id) {
-      next_board_id = board->id + 1;
-    }
-  }
+  board->id = alloc_board_id();
+  wamble_emit_create_board(board->id, board->fen, INITIAL_BOARD_STATUS);
 
   board->result = GAME_RESULT_IN_PROGRESS;
   parse_fen_to_bitboard(board->fen, &board->board);

@@ -571,6 +571,20 @@ typedef enum {
   SCORING_ERR_INVALID = -2,
 } ScoringStatus;
 
+typedef enum {
+  SERVER_OK = 0,
+  SERVER_ERR_UNSUPPORTED_VERSION = -1,
+  SERVER_ERR_UNKNOWN_CTRL = -2,
+  SERVER_ERR_UNKNOWN_PLAYER = -3,
+  SERVER_ERR_UNKNOWN_BOARD = -4,
+  SERVER_ERR_MOVE_REJECTED = -5,
+  SERVER_ERR_LOGIN_FAILED = -6,
+  SERVER_ERR_SPECTATOR = -7,
+  SERVER_ERR_LEGAL_MOVES = -8,
+  SERVER_ERR_SEND_FAILED = -9,
+  SERVER_ERR_INTERNAL = -10,
+} ServerStatus;
+
 ProfileStartStatus start_profile_listeners(int *out_started);
 void stop_profile_listeners(void);
 ProfileStartStatus reconcile_profile_listeners(void);
@@ -628,6 +642,27 @@ static inline void wamble_log(int level, const char *file, int line,
 #define MAX_UCI_LENGTH 6
 #define TOKEN_LENGTH 16
 #define STATUS_MAX_LENGTH 17
+
+struct WambleMove;
+
+typedef struct {
+  DbStatus status;
+  char fen[FEN_MAX_LENGTH];
+  char status_text[STATUS_MAX_LENGTH];
+  time_t last_assignment_time;
+} DbBoardResult;
+
+typedef struct {
+  DbStatus status;
+  const uint64_t *ids;
+  int count;
+} DbBoardIdList;
+
+typedef struct {
+  DbStatus status;
+  const struct WambleMove *rows;
+  int count;
+} DbMovesResult;
 
 #define WAMBLE_CTRL_CLIENT_HELLO 0x01
 #define WAMBLE_CTRL_SERVER_HELLO 0x02
@@ -864,83 +899,57 @@ int decode_token_from_url(const char *url_string, uint8_t *token_buffer);
 void player_manager_tick(void);
 
 WamblePlayer *get_player_by_token(const uint8_t *token);
+void discard_player_by_token(const uint8_t *token);
 void network_init_thread_state(void);
 
 void cleanup_expired_sessions(void);
-
-int db_init(const char *connection_string);
-void db_cleanup(void);
-void db_tick(void);
-
-uint64_t db_create_session(const uint8_t *token, uint64_t player_id);
-uint64_t db_get_session_by_token(const uint8_t *token);
-uint64_t db_get_persistent_session_by_token(const uint8_t *token);
-void db_async_update_session_last_seen(uint64_t session_id);
-
-uint64_t db_create_board(const char *fen);
-int db_async_update_board(uint64_t board_id, const char *fen,
-                          const char *status);
-int db_async_update_board_assignment_time(uint64_t board_id);
-
-typedef struct {
-  DbStatus status;
-  char fen[FEN_MAX_LENGTH];
-  char status_text[STATUS_MAX_LENGTH];
-  time_t last_assignment_time;
-} DbBoardResult;
-
-DbBoardResult db_get_board(uint64_t board_id);
-
-typedef struct {
-  DbStatus status;
-  const uint64_t *ids;
-  int count;
-} DbBoardIdList;
-
-DbBoardIdList db_list_boards_by_status(const char *status);
-
-int db_async_record_move(uint64_t board_id, uint64_t session_id,
-                         const char *move_uci, int move_number);
-
-typedef struct {
-  DbStatus status;
-  const WambleMove *rows;
-  int count;
-} DbMovesResult;
-
-DbMovesResult db_get_moves_for_board(uint64_t board_id);
-
-int db_async_create_reservation(uint64_t board_id, uint64_t session_id,
-                                int timeout_seconds);
-void db_async_remove_reservation(uint64_t board_id);
-
-int db_async_record_game_result(uint64_t board_id, char winning_side);
-int db_async_record_payout(uint64_t board_id, uint64_t session_id,
-                           double points);
-double db_get_player_total_score(uint64_t session_id);
-double db_get_player_rating(uint64_t session_id);
-int db_async_update_player_rating(uint64_t session_id, double rating);
-
-int db_get_active_session_count(void);
-int db_get_longest_game_moves(void);
-int db_get_session_games_played(uint64_t session_id);
-
-uint64_t db_create_player(const uint8_t *public_key);
-uint64_t db_get_player_by_public_key(const uint8_t *public_key);
-int db_async_link_session_to_player(uint64_t session_id, uint64_t player_id);
-
-void db_expire_reservations(void);
-
-void db_cleanup_thread(void);
-
-int db_get_trust_tier_by_token(const uint8_t *token);
 
 void rng_init(void);
 uint64_t rng_u64(void);
 double rng_double(void);
 void rng_bytes(uint8_t *out, size_t len);
 void rng_seed(uint64_t hi, uint64_t lo);
-void db_archive_inactive_boards(int timeout_seconds);
+
+typedef enum {
+  PERSISTENCE_STATUS_OK = 0,
+  PERSISTENCE_STATUS_NO_BUFFER = 1,
+  PERSISTENCE_STATUS_ALLOC_FAIL = 2,
+  PERSISTENCE_STATUS_APPLY_FAIL = 3,
+  PERSISTENCE_STATUS_EMPTY = 4,
+} PersistenceStatus;
+
+void wamble_emit_update_board(uint64_t board_id, const char *fen,
+                              const char *status);
+void wamble_emit_update_board_assignment_time(uint64_t board_id);
+void wamble_emit_create_reservation(uint64_t board_id, const uint8_t *token,
+                                    int timeout_seconds);
+void wamble_emit_remove_reservation(uint64_t board_id);
+void wamble_emit_record_game_result(uint64_t board_id, char winning_side);
+void wamble_emit_update_session_last_seen(const uint8_t *token);
+void wamble_emit_create_session(const uint8_t *token, uint64_t player_id);
+void wamble_emit_link_session_to_pubkey(const uint8_t *token,
+                                        const uint8_t *public_key);
+void wamble_emit_record_payout(uint64_t board_id, const uint8_t *token,
+                               double points);
+void wamble_emit_create_board(uint64_t board_id, const char *fen,
+                              const char *status);
+void wamble_emit_record_move(uint64_t board_id, const uint8_t *token,
+                             const char *move_uci, int move_number);
+
+DbBoardIdList wamble_query_list_boards_by_status(const char *status);
+DbBoardResult wamble_query_get_board(uint64_t board_id);
+DbMovesResult wamble_query_get_moves_for_board(uint64_t board_id);
+DbStatus wamble_query_get_longest_game_moves(int *out_max_moves);
+DbStatus wamble_query_get_active_session_count(int *out_count);
+DbStatus wamble_query_get_max_board_id(uint64_t *out_max_id);
+DbStatus wamble_query_get_persistent_session_by_token(const uint8_t *token,
+                                                      uint64_t *out_session);
+DbStatus wamble_query_get_player_total_score(uint64_t session_id,
+                                             double *out_total);
+DbStatus wamble_query_get_player_rating(uint64_t session_id,
+                                        double *out_rating);
+DbStatus wamble_query_get_session_games_played(uint64_t session_id,
+                                               int *out_games);
 
 wamble_socket_t create_and_bind_socket(int port);
 int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
@@ -952,8 +961,8 @@ int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
                           int max_retries);
 int send_unreliable_packet(wamble_socket_t sockfd, const struct WambleMsg *msg,
                            const struct sockaddr_in *cliaddr);
-void handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
-                    const struct sockaddr_in *cliaddr);
+ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
+                            const struct sockaddr_in *cliaddr, int trust_tier);
 
 typedef enum {
   SPECTATOR_INIT_OK = 0,
@@ -984,7 +993,7 @@ typedef struct SpectatorUpdate {
 
 SpectatorRequestStatus spectator_handle_request(
     const struct WambleMsg *msg, const struct sockaddr_in *cliaddr,
-    SpectatorState *out_state, uint64_t *out_focus_board_id);
+    int trust_tier, SpectatorState *out_state, uint64_t *out_focus_board_id);
 
 int spectator_collect_updates(struct SpectatorUpdate *out, int max);
 int spectator_collect_notifications(struct SpectatorUpdate *out, int max);

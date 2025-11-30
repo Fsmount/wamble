@@ -56,25 +56,10 @@ void wamble_param_register(const char *base_name, const char *tags,
 
 #define WAMBLE_TEST(name) static int name(void)
 
-#define WAMBLE_TESTS_BEGIN() void wamble_register_tests(void) {
 #define WAMBLE_TESTS_BEGIN_NAMED(fnname) void fnname(void) {
-#define WAMBLE_TESTS_ADD(name)                                                 \
-  wamble_test_register_ex(#name, NULL, name, NULL, NULL, 0)
-#define WAMBLE_TESTS_ADD_EX(name, tags, setup, teardown, timeout_ms)           \
-  wamble_test_register_ex(#name, tags, name, setup, teardown, timeout_ms)
 #define WAMBLE_TESTS_END() }
 
-#define WAMBLE_TESTS_BEGIN_DB()                                                \
-  void wamble_register_tests(void) {                                           \
-    if (wamble_should_skip_db_tests())                                         \
-      return;
-
 #define WAMBLE_PARAM_TEST(type, name) static int name(const type *tc)
-#define WAMBLE_PARAM_REGISTER(type, fn, base_name, tags, arr, timeout_ms)      \
-  wamble_param_register(base_name, tags, (wamble_param_test_fn)(fn),           \
-                        (const void *)(arr), sizeof(type),                     \
-                        (int)(sizeof(arr) / sizeof((arr)[0])), timeout_ms,     \
-                        NULL, NULL)
 
 #define WAMBLE_MK_TAGS(suite_lit, module_lit)                                  \
   "suite=" suite_lit " module=" module_lit
@@ -87,6 +72,20 @@ void wamble_param_register(const char *base_name, const char *tags,
                                timeout_ms)                                     \
   wamble_test_register_ex(#name, WAMBLE_MK_TAGS(suite_lit, module_lit), name,  \
                           setup, teardown, timeout_ms)
+
+#define WAMBLE_TESTS_ADD_DB_SM(name, suite_lit, module_lit)                    \
+  wamble_test_register_ex(                                                     \
+      #name, WAMBLE_MK_TAGS(suite_lit, module_lit) " requires_db=1", name,     \
+      NULL, NULL, 0)
+
+#define WAMBLE_TESTS_ADD_DB_FM(name, module_lit)                               \
+  WAMBLE_TESTS_ADD_DB_SM(name, WAMBLE_SUITE_FUNCTIONAL, module_lit)
+
+#define WAMBLE_TESTS_ADD_DB_EX_SM(name, suite_lit, module_lit, setup,          \
+                                  teardown, timeout_ms)                        \
+  wamble_test_register_ex(                                                     \
+      #name, WAMBLE_MK_TAGS(suite_lit, module_lit) " requires_db=1", name,     \
+      setup, teardown, timeout_ms)
 
 #define WAMBLE_PARAM_REGISTER_SM(type, fn, base_name, suite_lit, module_lit,   \
                                  arr, timeout_ms)                              \
@@ -102,10 +101,6 @@ void wamble_param_register(const char *base_name, const char *tags,
 
 #define WAMBLE_TESTS_ADD_FM(name, module_lit)                                  \
   WAMBLE_TESTS_ADD_SM(name, WAMBLE_SUITE_FUNCTIONAL, module_lit)
-
-#define WAMBLE_TESTS_ADD_EX_FM(name, module_lit, setup, teardown, timeout_ms)  \
-  WAMBLE_TESTS_ADD_EX_SM(name, WAMBLE_SUITE_FUNCTIONAL, module_lit, setup,     \
-                         teardown, timeout_ms)
 
 #define T_FAIL_SIMPLE(msg)                                                     \
   do {                                                                         \

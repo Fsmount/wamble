@@ -257,6 +257,8 @@ typedef struct {
   int warn;
   int use_msvc;
   int err;
+  int with_db;
+  int test_mode;
 } compile_ctx;
 
 static int compile_src_cb(const char *name, int is_dir, void *vctx) {
@@ -308,8 +310,14 @@ static int compile_src_cb(const char *name, int is_dir, void *vctx) {
   {
     sv_push(&ccargs, "-O2");
     sv_push(&ccargs, "-std=c99");
+    sv_push(&ccargs, "-ffunction-sections");
+    sv_push(&ccargs, "-fdata-sections");
     append_warn_flags(&ccargs, c->warn);
     sv_push(&ccargs, "-Iinclude");
+    if (c->test_mode) {
+      sv_push(&ccargs, "-DTEST_PROFILE_RUNTIME");
+      sv_push(&ccargs, "-DWAMBLE_TEST_ONLY");
+    }
     sv_push(&ccargs, "-c");
     sv_push(&ccargs, srcpath);
     sv_push(&ccargs, "-o");
@@ -345,6 +353,7 @@ static int collect_with_suffix_cb(const char *name, int is_dir, void *vctx) {
 
 typedef struct {
   strvec *args;
+  int with_db;
 } test_src_ctx;
 
 static int append_tests_cb(const char *name, int is_dir, void *vctx) {
@@ -357,6 +366,7 @@ static int append_tests_cb(const char *name, int is_dir, void *vctx) {
     return 0;
   if (strncmp(name, "harness", 7) == 0 || strncmp(name, "common", 6) == 0)
     return 0;
+  (void)t; // always include tests; DB is always enabled
   char tsrc[512];
   snprintf(tsrc, sizeof tsrc, "tests/%s", name);
   struct stat st;
@@ -366,13 +376,16 @@ static int append_tests_cb(const char *name, int is_dir, void *vctx) {
   return 0;
 }
 
-static int compile_objects_to_lib(const char *cc, int with_db, int warn) {
+static int compile_objects_to_lib(const char *cc, int with_db, int warn,
+                                  int test_mode) {
   (void)with_db;
   compile_ctx ctx;
   ctx.cc = cc;
   ctx.warn = warn;
   ctx.use_msvc = is_msvc_cc(cc);
   ctx.err = 0;
+  ctx.with_db = with_db;
+  ctx.test_mode = test_mode;
 
   if (iterate_dir("src", compile_src_cb, &ctx) != 0 || ctx.err)
     return -1;
@@ -436,7 +449,9 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[i], "--run-tests") == 0) {
       run_tests = 1;
     } else if (strcmp(argv[i], "--with-no-db") == 0) {
-      with_db = 0;
+      fprintf(stderr, "Error: --with-no-db is no longer supported. The project "
+                      "always builds with DB enabled.\n");
+      return 1;
     } else if (strcmp(argv[i], "--clean") == 0) {
       clean = 1;
     } else if (strcmp(argv[i], "--warn") == 0) {
@@ -448,16 +463,15 @@ int main(int argc, char **argv) {
       run_tests = 1;
       list_tests = 1;
     } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-      printf(
-          "Usage: %s [--server] [--tests] [--run-tests] [--with-db] [--clean] "
-          "[--warn] [--list-tests] [--cc=CC] [-- <test args>]\n",
-          argv[0]);
+      printf("Usage: %s [--server] [--tests] [--run-tests] "
+             "[--clean] "
+             "[--warn] [--list-tests] [--cc=CC] [-- <test args>]\n",
+             argv[0]);
       printf("  --server      Build the server binary (requires libpq "
              "installed)\n");
       printf("  --tests       Build unified test binary\n");
       printf("  --run-tests   Execute tests after building\n");
       printf("  --list-tests  Build tests and list them (no run)\n");
-      printf("  --with-no-db  Build tests without a real database backend\n");
       printf("  --warn        Enable extra compiler warnings\n");
       printf("  --cc=CC       Use custom C compiler (default: c99 or $CC)\n");
       printf("  --clean       Remove build artifacts (lib, objs, bins)\n");
@@ -493,8 +507,44 @@ int main(int argc, char **argv) {
       ensure_dir("build/tests"))
     return 1;
 
+  {
+    char prev_mode = '\0';
+    FILE *f = fopen("build/.dbmode", "rb");
+    if (f) {
+      prev_mode = (char)fgetc(f);
+      fclose(f);
+    }
+    char cur_mode = with_db ? '1' : '0';
+    if (prev_mode != '\0' && prev_mode != cur_mode) {
+      iterate_dir("build/obj", clean_obj_cb, NULL);
+    }
+    f = fopen("build/.dbmode", "wb");
+    if (f) {
+      fputc(cur_mode, f);
+      fclose(f);
+    }
+  }
+
   if (build_server || build_tests) {
-    if (compile_objects_to_lib(cc, with_db, warn) != 0)
+    int test_mode = (build_tests && !build_server) ? 1 : 0;
+    {
+      char prev_mode = '\0';
+      FILE *f = fopen("build/.testmode", "rb");
+      if (f) {
+        prev_mode = (char)fgetc(f);
+        fclose(f);
+      }
+      char cur_mode = test_mode ? '1' : '0';
+      if (prev_mode != cur_mode) {
+        iterate_dir("build/obj", clean_obj_cb, NULL);
+      }
+      f = fopen("build/.testmode", "wb");
+      if (f) {
+        fputc(cur_mode, f);
+        fclose(f);
+      }
+    }
+    if (compile_objects_to_lib(cc, with_db, warn, test_mode) != 0)
       return 1;
   }
 
@@ -537,6 +587,7 @@ int main(int argc, char **argv) {
       sv_push(&link_args, "build/libwamble.a");
       sv_push(&link_args, "-lm");
       sv_push(&link_args, "-lpthread");
+      sv_push(&link_args, "-Wl,--gc-sections");
       sv_push(&link_args, "-lpq");
       sv_push(&link_args, "-o");
       sv_push(&link_args, "build/wamble");
@@ -567,19 +618,12 @@ int main(int argc, char **argv) {
         sv_push(&targs, "/W4");
       sv_push(&targs, "/Iinclude");
       sv_push(&targs, "/Itests/common");
-      if (with_db) {
-        sv_push(&targs, "/DWAMBLE_ENABLE_DB");
-      }
 
       sv_push(&targs, "/DWAMBLE_TEST_ONLY");
       sv_push(&targs, "tests/common/wamble_test.c");
       sv_push(&targs, "tests/common/wamble_test_helpers.c");
       sv_push(&targs, "tests/common/wamble_net_helpers.c");
-      if (with_db) {
-        sv_push(&targs, "src/database.c");
-      } else {
-        sv_push(&targs, "src/test/database_stub.c");
-      }
+      sv_push(&targs, "src/database.c");
       collect_ctx tcollect = {&targs, "build/obj/", ".obj"};
       iterate_dir("build/obj", collect_with_suffix_cb, &tcollect);
       sv_push(&targs, "Ws2_32.lib");
@@ -597,21 +641,15 @@ int main(int argc, char **argv) {
       append_warn_flags(&targs, warn);
       sv_push(&targs, "-Iinclude");
       sv_push(&targs, "-Itests/common");
-      if (with_db) {
-        sv_push(&targs, "-DWAMBLE_ENABLE_DB");
-      }
 
       sv_push(&targs, "-DWAMBLE_TEST_ONLY");
       sv_push(&targs, "tests/common/wamble_test.c");
       sv_push(&targs, "tests/common/wamble_test_helpers.c");
       sv_push(&targs, "tests/common/wamble_net_helpers.c");
-      if (with_db) {
-        sv_push(&targs, "src/database.c");
-      } else {
-        sv_push(&targs, "src/test/database_stub.c");
-      }
+      sv_push(&targs, "src/database.c");
+      sv_push(&targs, "-Wl,--gc-sections");
     }
-    test_src_ctx tctx = {&targs};
+    test_src_ctx tctx = {&targs, 1};
     if (iterate_dir("tests", append_tests_cb, &tctx) != 0) {
       perror("iterate_dir tests");
       sv_free(&targs);
@@ -637,6 +675,16 @@ int main(int argc, char **argv) {
         continue;
       char rel[512];
       snprintf(rel, sizeof rel, "tests/%s", e->d_name);
+
+      int included = 0;
+      for (int i = 0; i < targs.count; i++) {
+        if (targs.data[i] && strcmp(targs.data[i], rel) == 0) {
+          included = 1;
+          break;
+        }
+      }
+      if (!included)
+        continue;
       FILE *f = fopen(rel, "rb");
       if (!f)
         continue;
