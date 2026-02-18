@@ -315,22 +315,30 @@ static int apply_one_intent_db(const struct WamblePersistenceIntent *it) {
 
 PersistenceStatus
 wamble_apply_intents_with_db_checked(struct WambleIntentBuffer *buf,
+                                     int max_batch, int *out_attempted,
                                      int *out_failures) {
   if (!buf) {
+    if (out_attempted)
+      *out_attempted = 0;
     if (out_failures)
       *out_failures = 0;
     persistence_set_status(PERSISTENCE_STATUS_NO_BUFFER);
     return g_persist_status;
   }
   if (buf->count <= 0) {
+    if (out_attempted)
+      *out_attempted = 0;
     if (out_failures)
       *out_failures = 0;
     persistence_set_status(PERSISTENCE_STATUS_EMPTY);
     return g_persist_status;
   }
+  int to_apply = buf->count;
+  if (max_batch > 0 && to_apply > max_batch)
+    to_apply = max_batch;
   int failures = 0;
   int write_idx = 0;
-  for (int i = 0; i < buf->count; i++) {
+  for (int i = 0; i < to_apply; i++) {
     struct WamblePersistenceIntent *it = &buf->items[i];
     int rc = apply_one_intent_db(it);
     if (rc < 0) {
@@ -338,13 +346,23 @@ wamble_apply_intents_with_db_checked(struct WambleIntentBuffer *buf,
       buf->items[write_idx++] = *it;
     }
   }
-  if (failures > 0) {
+  if (to_apply < buf->count) {
+    int tail = buf->count - to_apply;
+    memmove(&buf->items[write_idx], &buf->items[to_apply],
+            (size_t)tail * sizeof(*buf->items));
+    buf->count = write_idx + tail;
+  } else if (failures > 0) {
     buf->count = write_idx;
-    persistence_set_status(PERSISTENCE_STATUS_APPLY_FAIL);
   } else {
     wamble_intents_clear(buf);
+  }
+  if (failures > 0) {
+    persistence_set_status(PERSISTENCE_STATUS_APPLY_FAIL);
+  } else {
     persistence_set_status(PERSISTENCE_STATUS_OK);
   }
+  if (out_attempted)
+    *out_attempted = to_apply;
   if (out_failures)
     *out_failures = failures;
   return g_persist_status;

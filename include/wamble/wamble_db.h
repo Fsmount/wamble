@@ -162,6 +162,7 @@ void wamble_persistence_clear_status(void);
 
 PersistenceStatus
 wamble_apply_intents_with_db_checked(struct WambleIntentBuffer *buf,
+                                     int max_batch, int *out_attempted,
                                      int *out_failures);
 
 #endif
