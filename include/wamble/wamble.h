@@ -523,6 +523,7 @@ typedef enum {
   PROFILE_START_BIND_ERROR = 4,
   PROFILE_START_THREAD_ERROR = 5,
   PROFILE_START_NO_SOCKET = 6,
+  PROFILE_START_DEFAULT_RUNTIME = 7,
 } ProfileStartStatus;
 
 typedef enum {
