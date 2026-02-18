@@ -57,6 +57,29 @@ enum {
   PERSIST_FLUSH_MAX_BATCHES_PER_CYCLE = 4,
 };
 
+static int profile_runtime_batch_limit_for_pending(int pending) {
+  if (pending >= PERSIST_FLUSH_BATCH * 8)
+    return PERSIST_FLUSH_BATCH * 4;
+  if (pending >= PERSIST_FLUSH_BATCH * 2)
+    return PERSIST_FLUSH_BATCH * 2;
+  return PERSIST_FLUSH_BATCH;
+}
+
+static int profile_runtime_config_max_intents(const RunningProfile *rp,
+                                              int pending) {
+  int cfg_limit = (rp && rp->cfg.persistence_max_intents > 0)
+                      ? rp->cfg.persistence_max_intents
+                      : PERSIST_FLUSH_BATCH;
+  int adaptive = profile_runtime_batch_limit_for_pending(pending);
+  return (cfg_limit < adaptive) ? cfg_limit : adaptive;
+}
+
+static int profile_runtime_config_max_payload_bytes(const RunningProfile *rp) {
+  if (rp && rp->cfg.persistence_max_payload_bytes > 0)
+    return rp->cfg.persistence_max_payload_bytes;
+  return 64 * 1024;
+}
+
 static char *wamble_strndup_local(const char *src, size_t len) {
   char *out = (char *)malloc(len + 1);
   if (!out)
@@ -702,9 +725,13 @@ static int profile_runtime_init(RunningProfile *rp) {
     for (int i = 0; i < 64; i++) {
       int attempted = 0;
       int failures = 0;
+      int batch_limit =
+          profile_runtime_config_max_intents(rp, rp->intents_buf.count);
+      int payload_limit = profile_runtime_config_max_payload_bytes(rp);
       wamble_persistence_clear_status();
       PersistenceStatus st = wamble_apply_intents_with_db_checked(
-          &rp->intents_buf, PERSIST_FLUSH_BATCH, &attempted, &failures);
+          &rp->intents_buf, batch_limit, payload_limit, NULL, &attempted,
+          &failures);
       int pending = rp->intents_buf.count;
       rp->last_flush_ms = now_ms;
       if (st == PERSISTENCE_STATUS_OK || st == PERSISTENCE_STATUS_EMPTY) {
@@ -731,9 +758,13 @@ static int profile_runtime_init(RunningProfile *rp) {
     for (int i = 0; i < 64; i++) {
       int attempted = 0;
       int failures = 0;
+      int batch_limit =
+          profile_runtime_config_max_intents(rp, rp->intents_buf.count);
+      int payload_limit = profile_runtime_config_max_payload_bytes(rp);
       wamble_persistence_clear_status();
       PersistenceStatus st = wamble_apply_intents_with_db_checked(
-          &rp->intents_buf, PERSIST_FLUSH_BATCH, &attempted, &failures);
+          &rp->intents_buf, batch_limit, payload_limit, NULL, &attempted,
+          &failures);
       int pending = rp->intents_buf.count;
       rp->last_flush_ms = now_ms;
       if (st == PERSISTENCE_STATUS_OK || st == PERSISTENCE_STATUS_EMPTY) {
@@ -762,9 +793,13 @@ static void profile_runtime_shutdown(RunningProfile *rp) {
     for (int i = 0; i < 64; i++) {
       int attempted = 0;
       int failures = 0;
+      int batch_limit =
+          profile_runtime_config_max_intents(rp, rp->intents_buf.count);
+      int payload_limit = profile_runtime_config_max_payload_bytes(rp);
       wamble_persistence_clear_status();
       PersistenceStatus st = wamble_apply_intents_with_db_checked(
-          &rp->intents_buf, PERSIST_FLUSH_BATCH, &attempted, &failures);
+          &rp->intents_buf, batch_limit, payload_limit, NULL, &attempted,
+          &failures);
       int pending = rp->intents_buf.count;
       rp->last_flush_ms = now_ms;
       if (st == PERSISTENCE_STATUS_OK || st == PERSISTENCE_STATUS_EMPTY) {
@@ -817,9 +852,13 @@ static void profile_runtime_step(RunningProfile *rp) {
       for (int i = 0; i < PERSIST_FLUSH_MAX_BATCHES_PER_CYCLE; i++) {
         int attempted = 0;
         int failures = 0;
+        int batch_limit =
+            profile_runtime_config_max_intents(rp, rp->intents_buf.count);
+        int payload_limit = profile_runtime_config_max_payload_bytes(rp);
         wamble_persistence_clear_status();
         PersistenceStatus st = wamble_apply_intents_with_db_checked(
-            &rp->intents_buf, PERSIST_FLUSH_BATCH, &attempted, &failures);
+            &rp->intents_buf, batch_limit, payload_limit, NULL, &attempted,
+            &failures);
         pending = rp->intents_buf.count;
         rp->last_flush_ms = now_ms;
         if (st == PERSISTENCE_STATUS_OK || st == PERSISTENCE_STATUS_EMPTY) {
