@@ -42,6 +42,10 @@ Database Connections
 - `cleanup-interval-sec` (int, 60): Session cleanup cadence.
 - `max-token-attempts` / `max-token-local-attempts` (int, 1000 / 100): Token
   generation limits.
+- `persistence-max-intents` (int, 128): Upper bound per flush cycle for how
+  many queued persistence intents are selected for DB apply.
+- `persistence-max-payload-bytes` (int, 65536): Upper bound per flush cycle for
+  estimated total payload of selected persistence intents.
 Spectator Settings
 - `max-spectators` (int, 1024; -1 for no cap): Capacity limit for focused spectators at the server. Admins (see `admin-trust-level`) may bypass this cap.
 - `spectator-visibility` (int, 0): Minimum trust tier required to spectate (summary or focus). Requests below this threshold are rejected.
@@ -218,4 +222,4 @@ References
 - Spectators (see docs/spectator_management.txt): `max-spectators`, `spectator-visibility`, `spectator-summary-hz`, `spectator-focus-hz`, `spectator-max-focus-per-session`, `spectator-summary-mode`
 - Scoring (see docs/scoring.txt): `max-pot`, `max-contributors`
 - Move engine (see docs/move_engine.txt and docs/board_behaviour.txt): `max-moves-per-board`, board behavior
-- Profiles runtime/state (see docs/profile_runtime_and_state.txt): `state-dir`, per-profile `port`, `buffer-size`, `select-timeout-usec`, `cleanup-interval-sec`, `db-*`, `advertise`, `visibility`
+- Profiles runtime/state (see docs/runtime_and_state.txt): `state-dir`, per-profile `port`, `buffer-size`, `select-timeout-usec`, `cleanup-interval-sec`, `db-*`, `advertise`, `visibility`

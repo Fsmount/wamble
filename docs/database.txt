@@ -12,6 +12,31 @@ Connections
   that profile's `db-host`, `db-user`, `db-pass`, `db-name`.
   This supports running multiple profiles against different databases in a single process.
 
+Read Path Caching
+- Token-indexed reads are cached in thread-local memory to reduce repeated DB lookups
+  during hot loops (session lookup, persistent-session lookup, trust-tier lookup).
+- Cache characteristics:
+  - Capacity: 256 entries per cache type per runtime thread.
+  - TTL: 500ms per entry.
+  - Scope: thread-local; no cross-thread sharing.
+- Cache entries include both successful and failure statuses (`DB_OK`, `DB_NOT_FOUND`,
+  connection/exec/bad-data errors), so repeated failures are also throttled within TTL.
+- Session-linking updates invalidate the persistent-session cache for correctness.
+
+Write Batching and Transactions
+- Intent flushes are applied in bounded batches (intent count and estimated payload bytes;
+  see `persistence-max-intents` and `persistence-max-payload-bytes` in config).
+- The selected batch is attempted inside an explicit DB transaction (`BEGIN`/`COMMIT`).
+- If transactional apply fails, the runtime rolls back and retries selected intents in
+  non-transactional per-intent mode, requeuing only failed intents.
+- Intent selection/coalescing rules reduce redundant writes before execution:
+  - Keep only the newest per key for `UPDATE_BOARD`, `UPDATE_BOARD_ASSIGNMENT_TIME`,
+    `UPDATE_SESSION_LAST_SEEN`, and `REMOVE_RESERVATION`.
+  - `RECORD_MOVE` and `RECORD_PAYOUT` intents are grouped and sorted for append-friendly
+    write locality.
+- Flush cadence is runtime-driven and can perform multiple batches per cycle when backlog
+  is high.
+
 Tables
 - players
   - `id BIGSERIAL PRIMARY KEY`
@@ -85,7 +110,8 @@ Trust and Visibility
 
 Operational Notes
 - Multiple advertised profiles within one process may point to different databases.
-- Persistence intents are applied periodically in the main loop and per-profile threads.
+- Persistence intents are applied from the runtime loop (threaded for multi-profile, inline
+  in main thread for single-runtime mode).
 
 Examples
 - Promote a session to trust level 10 by hex token:
