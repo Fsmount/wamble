@@ -473,6 +473,8 @@ typedef struct WambleConfig {
   int cleanup_interval_sec;
   int max_token_attempts;
   int max_token_local_attempts;
+  int persistence_max_intents;
+  int persistence_max_payload_bytes;
   double new_player_early_phase_mult;
   double new_player_mid_phase_mult;
   double new_player_end_phase_mult;

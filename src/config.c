@@ -818,6 +818,9 @@ static const ConfigVarMap config_map[] = {
     CONF_ITEM("cleanup-interval-sec", CONF_INT, cleanup_interval_sec),
     CONF_ITEM("max-token-attempts", CONF_INT, max_token_attempts),
     CONF_ITEM("max-token-local-attempts", CONF_INT, max_token_local_attempts),
+    CONF_ITEM("persistence-max-intents", CONF_INT, persistence_max_intents),
+    CONF_ITEM("persistence-max-payload-bytes", CONF_INT,
+              persistence_max_payload_bytes),
     CONF_ITEM("new-player-early-phase-mult", CONF_DOUBLE,
               new_player_early_phase_mult),
     CONF_ITEM("new-player-mid-phase-mult", CONF_DOUBLE,
@@ -907,6 +910,8 @@ static void config_set_defaults(void) {
   g_config.cleanup_interval_sec = 60;
   g_config.max_token_attempts = 1000;
   g_config.max_token_local_attempts = 100;
+  g_config.persistence_max_intents = 128;
+  g_config.persistence_max_payload_bytes = 64 * 1024;
   g_config.admin_trust_level = -1;
 
   g_config.new_player_early_phase_mult = 2.0;

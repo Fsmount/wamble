@@ -8,6 +8,9 @@ struct WambleQueryService;
 int db_init(const char *connection_string);
 void db_cleanup(void);
 void db_tick(void);
+int db_write_batch_begin(void);
+int db_write_batch_commit(void);
+void db_write_batch_rollback(void);
 
 uint64_t db_create_session(const uint8_t *token, uint64_t player_id);
 DbStatus db_get_session_by_token(const uint8_t *token, uint64_t *out_session);
@@ -160,9 +163,8 @@ void wamble_intents_clear(struct WambleIntentBuffer *buf);
 
 void wamble_persistence_clear_status(void);
 
-PersistenceStatus
-wamble_apply_intents_with_db_checked(struct WambleIntentBuffer *buf,
-                                     int max_batch, int *out_attempted,
-                                     int *out_failures);
+PersistenceStatus wamble_apply_intents_with_db_checked(
+    struct WambleIntentBuffer *buf, int max_intents, int max_payload_bytes,
+    int *out_selected_bytes, int *out_attempted, int *out_failures);
 
 #endif

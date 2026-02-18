@@ -73,6 +73,36 @@ pq_exec_params_locked(const char *command, int nParams, const Oid *paramTypes,
   return res;
 }
 
+int db_write_batch_begin(void) {
+  PGresult *res = pq_exec_locked("BEGIN");
+  if (!res)
+    return -1;
+  if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+    PQclear(res);
+    return -1;
+  }
+  PQclear(res);
+  return 0;
+}
+
+int db_write_batch_commit(void) {
+  PGresult *res = pq_exec_locked("COMMIT");
+  if (!res)
+    return -1;
+  if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+    PQclear(res);
+    return -1;
+  }
+  PQclear(res);
+  return 0;
+}
+
+void db_write_batch_rollback(void) {
+  PGresult *res = pq_exec_locked("ROLLBACK");
+  if (res)
+    PQclear(res);
+}
+
 typedef enum {
   DB_JOB_UPDATE_BOARD,
   DB_JOB_CREATE_RESERVATION,
