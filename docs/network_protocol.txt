@@ -140,4 +140,4 @@ References
 - Spectators: docs/spectator_management.txt (SPECTATE_GAME, SPECTATE_UPDATE, SPECTATE_STOP)
 - Players: docs/player_management.txt (LOGIN_REQUEST, LOGIN_*, GET_PLAYER_STATS, PLAYER_STATS_DATA)
 - Move engine: docs/move_engine.txt (PLAYER_MOVE, BOARD_UPDATE, GET_LEGAL_MOVES, LEGAL_MOVES)
-- Profiles runtime: docs/profile_runtime_and_state.txt (LIST_PROFILES, PROFILES_LIST, GET_PROFILE_INFO, PROFILE_INFO)
+- Profiles runtime: docs/runtime_and_state.txt (LIST_PROFILES, PROFILES_LIST, GET_PROFILE_INFO, PROFILE_INFO)

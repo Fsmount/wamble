@@ -1,0 +1,69 @@
+Wamble Runtime and State
+========================
+
+Overview
+- Runs listener runtimes inside one process:
+  - Advertised profiles: one UDP socket per profile.
+  - No advertised profiles: a default runtime is created from top-level config.
+- Execution model:
+  - Single runtime: runs inline in the main thread (pumped by `profile_runtime_pump_inline()`).
+  - Multiple runtimes: one worker thread per runtime.
+- Supports config reload and exec handoff without dropping sockets.
+
+Profiles
+- Defined in the config with `defprofile`.
+- Each has a `name`, `config`, `advertise`, `visibility`, `db-isolated`.
+
+Start/Stop
+- `start_profile_listeners()` pre-binds all advertised sockets (checks conflicts) and
+  starts runtimes. If there are no advertised profiles, it starts a default runtime.
+- `stop_profile_listeners()` asks threads to stop, closes sockets, and joins.
+
+Reconcile
+- On config reload, `reconcile_profile_listeners()` compares current vs. desired.
+- If names match, threads keep running and just pick up updated config.
+- If not, sockets are re-bound and threads are restarted.
+- If advertised profiles drop to zero, runtime reconciles to a default runtime
+  instead of leaving the process without a listener.
+
+Thread Loop
+- Per runtime (threaded or inline): set thread-local config, init network state,
+  players, boards, intent/query services.
+- Poll UDP socket with `select()`; on readable, `receive_message()` then `handle_message()`.
+- Every second: `board_manager_tick()`, `spectator_manager_tick()`.
+- Periodically: `cleanup_expired_sessions()`.
+- Sends `SPECTATE_UPDATE`/`SERVER_NOTIFICATION` for its own socket.
+- Persistence flushing:
+  - Flushes queued intents in bounded batches (config + adaptive limits).
+  - Eager flush when queue is large; periodic flush otherwise.
+  - Can process multiple batches per cycle under backlog.
+
+Exec Handoff
+- Export phase:
+  - `profile_mark_sockets_inheritable()` clears close-on-exec.
+  - `profile_prepare_state_save_and_inherit()` asks threads to save a small per-profile state file and reports a `name=path` CSV.
+  - `profile_export_inherited_sockets()` reports `name=socket_handle` CSV.
+- Environment used by the new process:
+  - `WAMBLE_HOT_RELOAD=1`
+  - `WAMBLE_PROFILES_INHERITED=name=fd,...`
+  - `WAMBLE_STATE_FILES=name=/tmp/file,...`
+- Adoption: new process starts threads with the inherited sockets and loads state files once, then unlinks them.
+
+State Files
+- Written by `state_save_to_file()` and read by `state_load_from_file()`.
+- Simple header + an array of `WambleBoard` from the board cache.
+
+DB and Config
+- Each runtime uses its active config to build its own `libpq` connection on demand.
+- Runtime config supports persistence tuning:
+  - `persistence-max-intents`
+  - `persistence-max-payload-bytes`
+
+Errors
+- `ProfileStartStatus` and `ProfileExportStatus` report bind failures, not ready, or buffer limits.
+- `PROFILE_START_DEFAULT_RUNTIME` is used internally to indicate that no advertised
+  profile sockets were prebound and startup should use default-runtime mode.
+
+References
+- Config (see docs/configuration.txt): `advertise`, `visibility`, per-profile `port`, `buffer-size`, `select-timeout-usec`, `cleanup-interval-sec`, `db-*`, `state-dir`.
+- Protocol (see docs/network_protocol.txt): `LIST_PROFILES`, `PROFILES_LIST`, `GET_PROFILE_INFO`, `PROFILE_INFO`, and runtime message handling in the profile runtime loop.
