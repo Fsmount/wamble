@@ -159,6 +159,112 @@ static WAMBLE_THREAD_LOCAL int tls_ids_cap;
 static WAMBLE_THREAD_LOCAL WambleMove *tls_moves;
 static WAMBLE_THREAD_LOCAL int tls_moves_cap;
 
+enum {
+  TOKEN_READ_CACHE_CAP = 256,
+  TOKEN_READ_CACHE_TTL_MS = 500,
+};
+
+typedef struct {
+  uint8_t token[TOKEN_LENGTH];
+  DbStatus status;
+  uint64_t value;
+  uint64_t expires_ms;
+  int used;
+} TokenReadCacheU64Entry;
+
+typedef struct {
+  uint8_t token[TOKEN_LENGTH];
+  DbStatus status;
+  int value;
+  uint64_t expires_ms;
+  int used;
+} TokenReadCacheIntEntry;
+
+static WAMBLE_THREAD_LOCAL TokenReadCacheU64Entry
+    tls_session_cache[TOKEN_READ_CACHE_CAP];
+static WAMBLE_THREAD_LOCAL TokenReadCacheU64Entry
+    tls_persistent_session_cache[TOKEN_READ_CACHE_CAP];
+static WAMBLE_THREAD_LOCAL TokenReadCacheIntEntry
+    tls_trust_cache[TOKEN_READ_CACHE_CAP];
+static WAMBLE_THREAD_LOCAL int tls_session_cache_next = 0;
+static WAMBLE_THREAD_LOCAL int tls_persistent_session_cache_next = 0;
+static WAMBLE_THREAD_LOCAL int tls_trust_cache_next = 0;
+
+static int token_cache_u64_lookup(TokenReadCacheU64Entry *cache, int cap,
+                                  const uint8_t *token, uint64_t now_ms,
+                                  DbStatus *out_status, uint64_t *out_value) {
+  if (!cache || !token || !out_status || !out_value)
+    return 0;
+  for (int i = 0; i < cap; i++) {
+    TokenReadCacheU64Entry *e = &cache[i];
+    if (!e->used)
+      continue;
+    if (e->expires_ms < now_ms)
+      continue;
+    if (memcmp(e->token, token, TOKEN_LENGTH) != 0)
+      continue;
+    *out_status = e->status;
+    *out_value = e->value;
+    return 1;
+  }
+  return 0;
+}
+
+static void token_cache_u64_store(TokenReadCacheU64Entry *cache, int cap,
+                                  int *next_slot, const uint8_t *token,
+                                  DbStatus status, uint64_t value,
+                                  uint64_t now_ms) {
+  if (!cache || !next_slot || !token || cap <= 0)
+    return;
+  int idx = *next_slot;
+  if (idx < 0 || idx >= cap)
+    idx = 0;
+  TokenReadCacheU64Entry *e = &cache[idx];
+  memcpy(e->token, token, TOKEN_LENGTH);
+  e->status = status;
+  e->value = value;
+  e->expires_ms = now_ms + TOKEN_READ_CACHE_TTL_MS;
+  e->used = 1;
+  *next_slot = (idx + 1) % cap;
+}
+
+static int token_cache_int_lookup(TokenReadCacheIntEntry *cache, int cap,
+                                  const uint8_t *token, uint64_t now_ms,
+                                  DbStatus *out_status, int *out_value) {
+  if (!cache || !token || !out_status || !out_value)
+    return 0;
+  for (int i = 0; i < cap; i++) {
+    TokenReadCacheIntEntry *e = &cache[i];
+    if (!e->used)
+      continue;
+    if (e->expires_ms < now_ms)
+      continue;
+    if (memcmp(e->token, token, TOKEN_LENGTH) != 0)
+      continue;
+    *out_status = e->status;
+    *out_value = e->value;
+    return 1;
+  }
+  return 0;
+}
+
+static void token_cache_int_store(TokenReadCacheIntEntry *cache, int cap,
+                                  int *next_slot, const uint8_t *token,
+                                  DbStatus status, int value, uint64_t now_ms) {
+  if (!cache || !next_slot || !token || cap <= 0)
+    return;
+  int idx = *next_slot;
+  if (idx < 0 || idx >= cap)
+    idx = 0;
+  TokenReadCacheIntEntry *e = &cache[idx];
+  memcpy(e->token, token, TOKEN_LENGTH);
+  e->status = status;
+  e->value = value;
+  e->expires_ms = now_ms + TOKEN_READ_CACHE_TTL_MS;
+  e->used = 1;
+  *next_slot = (idx + 1) % cap;
+}
+
 void db_cleanup_thread(void) {
   if (db_conn_tls) {
     PQfinish(db_conn_tls);
@@ -174,11 +280,26 @@ void db_cleanup_thread(void) {
     tls_moves = NULL;
     tls_moves_cap = 0;
   }
+  memset(tls_session_cache, 0, sizeof(tls_session_cache));
+  memset(tls_persistent_session_cache, 0, sizeof(tls_persistent_session_cache));
+  memset(tls_trust_cache, 0, sizeof(tls_trust_cache));
+  tls_session_cache_next = 0;
+  tls_persistent_session_cache_next = 0;
+  tls_trust_cache_next = 0;
 }
 
 DbStatus db_get_trust_tier_by_token(const uint8_t *token, int *out_trust) {
-  if (!out_trust)
+  if (!out_trust || !token)
     return DB_ERR_BAD_DATA;
+  uint64_t now_ms = wamble_now_mono_millis();
+  DbStatus cached_status = DB_ERR_EXEC;
+  int cached_value = 0;
+  if (token_cache_int_lookup(tls_trust_cache, TOKEN_READ_CACHE_CAP, token,
+                             now_ms, &cached_status, &cached_value)) {
+    if (cached_status == DB_OK)
+      *out_trust = cached_value;
+    return cached_status;
+  }
 
   const char *query =
       "SELECT trust_level FROM sessions WHERE token = decode($1, 'hex')";
@@ -190,15 +311,23 @@ DbStatus db_get_trust_tier_by_token(const uint8_t *token, int *out_trust) {
 
   PGresult *res =
       pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
-  if (!res)
+  if (!res) {
+    token_cache_int_store(tls_trust_cache, TOKEN_READ_CACHE_CAP,
+                          &tls_trust_cache_next, token, DB_ERR_CONN, 0, now_ms);
     return DB_ERR_CONN;
+  }
 
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     PQclear(res);
+    token_cache_int_store(tls_trust_cache, TOKEN_READ_CACHE_CAP,
+                          &tls_trust_cache_next, token, DB_ERR_EXEC, 0, now_ms);
     return DB_ERR_EXEC;
   }
   if (PQntuples(res) == 0) {
     PQclear(res);
+    token_cache_int_store(tls_trust_cache, TOKEN_READ_CACHE_CAP,
+                          &tls_trust_cache_next, token, DB_NOT_FOUND, 0,
+                          now_ms);
     return DB_NOT_FOUND;
   }
 
@@ -206,10 +335,16 @@ DbStatus db_get_trust_tier_by_token(const uint8_t *token, int *out_trust) {
   long trust = strtol(PQgetvalue(res, 0, 0), &endptr, 10);
   if (!endptr || *endptr != '\0') {
     PQclear(res);
+    token_cache_int_store(tls_trust_cache, TOKEN_READ_CACHE_CAP,
+                          &tls_trust_cache_next, token, DB_ERR_BAD_DATA, 0,
+                          now_ms);
     return DB_ERR_BAD_DATA;
   }
   *out_trust = (int)trust;
   PQclear(res);
+  token_cache_int_store(tls_trust_cache, TOKEN_READ_CACHE_CAP,
+                        &tls_trust_cache_next, token, DB_OK, *out_trust,
+                        now_ms);
   return DB_OK;
 }
 
@@ -363,12 +498,33 @@ uint64_t db_create_session(const uint8_t *token, uint64_t player_id) {
 
   uint64_t session_id = strtoull(PQgetvalue(res, 0, 0), NULL, 10);
   PQclear(res);
+  if (token) {
+    uint64_t now_ms = wamble_now_mono_millis();
+    token_cache_u64_store(tls_session_cache, TOKEN_READ_CACHE_CAP,
+                          &tls_session_cache_next, token, DB_OK, session_id,
+                          now_ms);
+    token_cache_u64_store(tls_persistent_session_cache, TOKEN_READ_CACHE_CAP,
+                          &tls_persistent_session_cache_next, token,
+                          player_id > 0 ? DB_OK : DB_NOT_FOUND,
+                          player_id > 0 ? session_id : 0, now_ms);
+    token_cache_int_store(tls_trust_cache, TOKEN_READ_CACHE_CAP,
+                          &tls_trust_cache_next, token, DB_OK, 0, now_ms);
+  }
   return session_id;
 }
 
 DbStatus db_get_session_by_token(const uint8_t *token, uint64_t *out_session) {
-  if (!out_session)
+  if (!out_session || !token)
     return DB_ERR_BAD_DATA;
+  uint64_t now_ms = wamble_now_mono_millis();
+  DbStatus cached_status = DB_ERR_EXEC;
+  uint64_t cached_value = 0;
+  if (token_cache_u64_lookup(tls_session_cache, TOKEN_READ_CACHE_CAP, token,
+                             now_ms, &cached_status, &cached_value)) {
+    if (cached_status == DB_OK)
+      *out_session = cached_value;
+    return cached_status;
+  }
   const char *query = "SELECT id FROM sessions WHERE token = decode($1, 'hex')";
 
   char token_hex[33];
@@ -379,14 +535,24 @@ DbStatus db_get_session_by_token(const uint8_t *token, uint64_t *out_session) {
   PGresult *res =
       pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
 
-  if (!res)
+  if (!res) {
+    token_cache_u64_store(tls_session_cache, TOKEN_READ_CACHE_CAP,
+                          &tls_session_cache_next, token, DB_ERR_CONN, 0,
+                          now_ms);
     return DB_ERR_CONN;
+  }
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     PQclear(res);
+    token_cache_u64_store(tls_session_cache, TOKEN_READ_CACHE_CAP,
+                          &tls_session_cache_next, token, DB_ERR_EXEC, 0,
+                          now_ms);
     return DB_ERR_EXEC;
   }
   if (PQntuples(res) == 0) {
     PQclear(res);
+    token_cache_u64_store(tls_session_cache, TOKEN_READ_CACHE_CAP,
+                          &tls_session_cache_next, token, DB_NOT_FOUND, 0,
+                          now_ms);
     return DB_NOT_FOUND;
   }
 
@@ -394,17 +560,32 @@ DbStatus db_get_session_by_token(const uint8_t *token, uint64_t *out_session) {
   uint64_t session_id = strtoull(PQgetvalue(res, 0, 0), &endptr, 10);
   if (!endptr || *endptr != '\0') {
     PQclear(res);
+    token_cache_u64_store(tls_session_cache, TOKEN_READ_CACHE_CAP,
+                          &tls_session_cache_next, token, DB_ERR_BAD_DATA, 0,
+                          now_ms);
     return DB_ERR_BAD_DATA;
   }
   *out_session = session_id;
   PQclear(res);
+  token_cache_u64_store(tls_session_cache, TOKEN_READ_CACHE_CAP,
+                        &tls_session_cache_next, token, DB_OK, session_id,
+                        now_ms);
   return DB_OK;
 }
 
 DbStatus db_get_persistent_session_by_token(const uint8_t *token,
                                             uint64_t *out_session) {
-  if (!out_session)
+  if (!out_session || !token)
     return DB_ERR_BAD_DATA;
+  uint64_t now_ms = wamble_now_mono_millis();
+  DbStatus cached_status = DB_ERR_EXEC;
+  uint64_t cached_value = 0;
+  if (token_cache_u64_lookup(tls_persistent_session_cache, TOKEN_READ_CACHE_CAP,
+                             token, now_ms, &cached_status, &cached_value)) {
+    if (cached_status == DB_OK)
+      *out_session = cached_value;
+    return cached_status;
+  }
   const char *query =
       "SELECT id FROM sessions WHERE token = decode($1, 'hex') AND "
       "player_id IS NOT NULL";
@@ -417,14 +598,24 @@ DbStatus db_get_persistent_session_by_token(const uint8_t *token,
   PGresult *res =
       pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
 
-  if (!res)
+  if (!res) {
+    token_cache_u64_store(tls_persistent_session_cache, TOKEN_READ_CACHE_CAP,
+                          &tls_persistent_session_cache_next, token,
+                          DB_ERR_CONN, 0, now_ms);
     return DB_ERR_CONN;
+  }
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     PQclear(res);
+    token_cache_u64_store(tls_persistent_session_cache, TOKEN_READ_CACHE_CAP,
+                          &tls_persistent_session_cache_next, token,
+                          DB_ERR_EXEC, 0, now_ms);
     return DB_ERR_EXEC;
   }
   if (PQntuples(res) == 0) {
     PQclear(res);
+    token_cache_u64_store(tls_persistent_session_cache, TOKEN_READ_CACHE_CAP,
+                          &tls_persistent_session_cache_next, token,
+                          DB_NOT_FOUND, 0, now_ms);
     return DB_NOT_FOUND;
   }
 
@@ -432,10 +623,16 @@ DbStatus db_get_persistent_session_by_token(const uint8_t *token,
   uint64_t session_id = strtoull(PQgetvalue(res, 0, 0), &endptr, 10);
   if (!endptr || *endptr != '\0') {
     PQclear(res);
+    token_cache_u64_store(tls_persistent_session_cache, TOKEN_READ_CACHE_CAP,
+                          &tls_persistent_session_cache_next, token,
+                          DB_ERR_BAD_DATA, 0, now_ms);
     return DB_ERR_BAD_DATA;
   }
   *out_session = session_id;
   PQclear(res);
+  token_cache_u64_store(tls_persistent_session_cache, TOKEN_READ_CACHE_CAP,
+                        &tls_persistent_session_cache_next, token, DB_OK,
+                        session_id, now_ms);
   return DB_OK;
 }
 
@@ -1146,5 +1343,7 @@ int db_async_link_session_to_player(uint64_t session_id, uint64_t player_id) {
   }
 
   PQclear(res);
+  memset(tls_persistent_session_cache, 0, sizeof(tls_persistent_session_cache));
+  tls_persistent_session_cache_next = 0;
   return 0;
 }
