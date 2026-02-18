@@ -589,6 +589,7 @@ typedef enum {
 ProfileStartStatus start_profile_listeners(int *out_started);
 void stop_profile_listeners(void);
 ProfileStartStatus reconcile_profile_listeners(void);
+int profile_runtime_pump_inline(void);
 
 int state_save_to_file(const char *path);
 int state_load_from_file(const char *path);

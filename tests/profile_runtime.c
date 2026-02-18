@@ -220,11 +220,44 @@ WAMBLE_TEST(profile_config_inheritance_child_uses_base_port) {
   return 0;
 }
 
+WAMBLE_TEST(profile_single_listener_runs_inline) {
+  T_ASSERT_STATUS_OK(wamble_net_init());
+  const char *cfg = "(defprofile solo ((def port 19300) (def advertise 1)))\n";
+  T_ASSERT_EQ_INT(write_conf(cfg), 0);
+  char status[64];
+  T_ASSERT_STATUS_OK(config_load(conf_path, NULL, status, sizeof(status)));
+  int started = 0;
+  T_ASSERT_EQ_INT(start_profile_listeners(&started), PROFILE_START_OK);
+  T_ASSERT_EQ_INT(started, 1);
+  T_ASSERT_EQ_INT(profile_runtime_pump_inline(), 1);
+  stop_profile_listeners();
+  wamble_net_cleanup();
+  return 0;
+}
+
+WAMBLE_TEST(profile_multi_listener_not_inline) {
+  T_ASSERT_STATUS_OK(wamble_net_init());
+  const char *cfg = "(defprofile alpha ((def port 19310) (def advertise 1)))\n"
+                    "(defprofile beta ((def port 19311) (def advertise 1)))\n";
+  T_ASSERT_EQ_INT(write_conf(cfg), 0);
+  char status[64];
+  T_ASSERT_STATUS_OK(config_load(conf_path, NULL, status, sizeof(status)));
+  int started = 0;
+  T_ASSERT_EQ_INT(start_profile_listeners(&started), PROFILE_START_OK);
+  T_ASSERT_EQ_INT(started, 2);
+  T_ASSERT_EQ_INT(profile_runtime_pump_inline(), 0);
+  stop_profile_listeners();
+  wamble_net_cleanup();
+  return 0;
+}
+
 WAMBLE_TESTS_BEGIN_NAMED(profile_runtime_tests) {
   WAMBLE_TESTS_ADD_FM(profile_start_export_and_state_files, "profile_runtime");
   WAMBLE_TESTS_ADD_FM(profile_export_buffer_too_small, "profile_runtime");
   WAMBLE_TESTS_ADD_FM(profile_hot_reload_state_roundtrip, "profile_runtime");
   WAMBLE_TESTS_ADD_FM(profile_config_inheritance_child_uses_base_port,
                       "profile_runtime");
+  WAMBLE_TESTS_ADD_FM(profile_single_listener_runs_inline, "profile_runtime");
+  WAMBLE_TESTS_ADD_FM(profile_multi_listener_not_inline, "profile_runtime");
 }
 WAMBLE_TESTS_END()

@@ -259,14 +259,15 @@ int main(int argc, char *argv[]) {
 #endif
 
   time_t last_cleanup = wamble_now_wall();
-  time_t last_tick = wamble_now_wall();
 
   LOG_INFO("Server main loop starting");
   while (!g_shutdown_requested) {
     LOG_DEBUG("Main loop iteration start");
+    int inline_runtime = profile_runtime_pump_inline();
 
     time_t now = wamble_now_wall();
-    if (now - last_cleanup > get_config()->cleanup_interval_sec) {
+    if (!inline_runtime &&
+        now - last_cleanup > get_config()->cleanup_interval_sec) {
       LOG_INFO("Cleaning up expired client sessions");
       cleanup_expired_sessions();
       last_cleanup = now;
