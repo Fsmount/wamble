@@ -293,6 +293,16 @@ int main(int argc, char *argv[]) {
         g_exec_reload_requested = 0;
     }
 
+    {
+      char profile_name[64];
+      WsGatewayStatus rst = WS_GATEWAY_OK;
+      while (profile_runtime_take_ws_gateway_status(&rst, profile_name,
+                                                    sizeof(profile_name))) {
+        LOG_ERROR("WS gateway issue profile=%s status=%d",
+                  profile_name[0] ? profile_name : "default", (int)rst);
+      }
+    }
+
     LOG_DEBUG("Main loop iteration end");
   }
   LOG_INFO("Server main loop ending");
