@@ -12,7 +12,8 @@ int db_write_batch_begin(void);
 int db_write_batch_commit(void);
 void db_write_batch_rollback(void);
 
-uint64_t db_create_session(const uint8_t *token, uint64_t player_id);
+uint64_t db_create_session(const uint8_t *token, uint64_t player_id,
+                           int experiment_arm);
 DbStatus db_get_session_by_token(const uint8_t *token, uint64_t *out_session);
 DbStatus db_get_persistent_session_by_token(const uint8_t *token,
                                             uint64_t *out_session);
@@ -24,6 +25,10 @@ int db_insert_board(uint64_t board_id, const char *fen, const char *status);
 int db_async_update_board(uint64_t board_id, const char *fen,
                           const char *status);
 int db_async_update_board_assignment_time(uint64_t board_id);
+int db_async_update_board_move_meta(uint64_t board_id, int last_mover_arm);
+int db_async_update_board_reservation_meta(uint64_t board_id,
+                                           time_t reservation_time,
+                                           int reserved_for_white);
 
 DbBoardResult db_get_board(uint64_t board_id);
 DbBoardIdList db_list_boards_by_status(const char *status);
@@ -34,10 +39,12 @@ int db_async_record_move(uint64_t board_id, uint64_t session_id,
 DbMovesResult db_get_moves_for_board(uint64_t board_id);
 
 int db_async_create_reservation(uint64_t board_id, uint64_t session_id,
-                                int timeout_seconds);
+                                int timeout_seconds, int reserved_for_white);
 void db_async_remove_reservation(uint64_t board_id);
 
-int db_async_record_game_result(uint64_t board_id, char winning_side);
+int db_async_record_game_result(uint64_t board_id, char winning_side,
+                                int move_count, int duration_seconds,
+                                const char *termination_reason);
 int db_async_record_payout(uint64_t board_id, uint64_t session_id,
                            double points);
 DbStatus db_get_player_total_score(uint64_t session_id, double *out_total);
@@ -90,6 +97,8 @@ typedef enum {
   WAMBLE_INTENT_RECORD_PAYOUT = 9,
   WAMBLE_INTENT_CREATE_BOARD = 10,
   WAMBLE_INTENT_RECORD_MOVE = 11,
+  WAMBLE_INTENT_UPDATE_BOARD_MOVE_META = 12,
+  WAMBLE_INTENT_UPDATE_BOARD_RESERVATION_META = 13,
 } WambleIntentType;
 
 typedef struct WamblePersistenceIntent {
@@ -112,6 +121,7 @@ typedef struct WamblePersistenceIntent {
       uint64_t board_id;
       uint8_t token[TOKEN_LENGTH];
       int timeout_seconds;
+      int reserved_for_white;
     } create_reservation;
     struct {
       uint64_t board_id;
@@ -119,6 +129,9 @@ typedef struct WamblePersistenceIntent {
     struct {
       uint64_t board_id;
       char winning_side;
+      int move_count;
+      int duration_seconds;
+      char termination_reason[32];
     } record_game_result;
     struct {
       uint8_t token[TOKEN_LENGTH];
@@ -126,6 +139,7 @@ typedef struct WamblePersistenceIntent {
     struct {
       uint8_t token[TOKEN_LENGTH];
       uint64_t player_id;
+      int experiment_arm;
     } create_session;
     struct {
       uint8_t token[TOKEN_LENGTH];
@@ -142,6 +156,15 @@ typedef struct WamblePersistenceIntent {
       char move_uci[MAX_UCI_LENGTH];
       int move_number;
     } record_move;
+    struct {
+      uint64_t board_id;
+      int last_mover_arm;
+    } update_board_move_meta;
+    struct {
+      uint64_t board_id;
+      time_t reservation_time;
+      int reserved_for_white;
+    } update_board_reservation_meta;
   } as;
 } WamblePersistenceIntent;
 

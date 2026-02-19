@@ -135,7 +135,8 @@ void wamble_emit_update_board_assignment_time(uint64_t board_id) {
 }
 
 void wamble_emit_create_reservation(uint64_t board_id, const uint8_t *token,
-                                    int timeout_seconds) {
+                                    int timeout_seconds,
+                                    bool reserved_for_white) {
   if (!token)
     return;
   struct WamblePersistenceIntent it = {0};
@@ -143,6 +144,7 @@ void wamble_emit_create_reservation(uint64_t board_id, const uint8_t *token,
   it.as.create_reservation.board_id = board_id;
   memcpy(it.as.create_reservation.token, token, TOKEN_LENGTH);
   it.as.create_reservation.timeout_seconds = timeout_seconds;
+  it.as.create_reservation.reserved_for_white = reserved_for_white ? 1 : 0;
   intents_push(it);
 }
 
@@ -153,11 +155,21 @@ void wamble_emit_remove_reservation(uint64_t board_id) {
   intents_push(it);
 }
 
-void wamble_emit_record_game_result(uint64_t board_id, char winning_side) {
+void wamble_emit_record_game_result(uint64_t board_id, char winning_side,
+                                    int move_count, int duration_seconds,
+                                    const char *termination_reason) {
   struct WamblePersistenceIntent it = {0};
   it.type = WAMBLE_INTENT_RECORD_GAME_RESULT;
   it.as.record_game_result.board_id = board_id;
   it.as.record_game_result.winning_side = winning_side;
+  it.as.record_game_result.move_count = move_count;
+  it.as.record_game_result.duration_seconds = duration_seconds;
+  if (termination_reason) {
+    size_t n = strnlen(termination_reason,
+                       sizeof(it.as.record_game_result.termination_reason) - 1);
+    memcpy(it.as.record_game_result.termination_reason, termination_reason, n);
+    it.as.record_game_result.termination_reason[n] = '\0';
+  }
   intents_push(it);
 }
 
@@ -192,6 +204,32 @@ void wamble_emit_create_session(const uint8_t *token, uint64_t player_id) {
   it.type = WAMBLE_INTENT_CREATE_SESSION;
   memcpy(it.as.create_session.token, token, TOKEN_LENGTH);
   it.as.create_session.player_id = player_id;
+  it.as.create_session.experiment_arm =
+      (int)network_experiment_arm_for_token(token);
+  intents_push(it);
+}
+
+void wamble_emit_update_board_move_meta(uint64_t board_id, int last_mover_arm) {
+  if (board_id == 0)
+    return;
+  struct WamblePersistenceIntent it = {0};
+  it.type = WAMBLE_INTENT_UPDATE_BOARD_MOVE_META;
+  it.as.update_board_move_meta.board_id = board_id;
+  it.as.update_board_move_meta.last_mover_arm = last_mover_arm;
+  intents_push(it);
+}
+
+void wamble_emit_update_board_reservation_meta(uint64_t board_id,
+                                               time_t reservation_time,
+                                               bool reserved_for_white) {
+  if (board_id == 0)
+    return;
+  struct WamblePersistenceIntent it = {0};
+  it.type = WAMBLE_INTENT_UPDATE_BOARD_RESERVATION_META;
+  it.as.update_board_reservation_meta.board_id = board_id;
+  it.as.update_board_reservation_meta.reservation_time = reservation_time;
+  it.as.update_board_reservation_meta.reserved_for_white =
+      reserved_for_white ? 1 : 0;
   intents_push(it);
 }
 
@@ -309,14 +347,19 @@ static int apply_one_intent_db(const struct WamblePersistenceIntent *it,
       return 0;
     return db_async_create_reservation(
         it->as.create_reservation.board_id, sid,
-        it->as.create_reservation.timeout_seconds);
+        it->as.create_reservation.timeout_seconds,
+        it->as.create_reservation.reserved_for_white);
   }
   case WAMBLE_INTENT_REMOVE_RESERVATION:
     db_async_remove_reservation(it->as.remove_reservation.board_id);
     return 0;
   case WAMBLE_INTENT_RECORD_GAME_RESULT:
-    return db_async_record_game_result(it->as.record_game_result.board_id,
-                                       it->as.record_game_result.winning_side);
+    return db_async_record_game_result(
+        it->as.record_game_result.board_id,
+        it->as.record_game_result.winning_side,
+        it->as.record_game_result.move_count,
+        it->as.record_game_result.duration_seconds,
+        it->as.record_game_result.termination_reason);
   case WAMBLE_INTENT_UPDATE_SESSION_LAST_SEEN: {
     uint64_t sid = 0;
     DbStatus st = resolve_session_id_cached(
@@ -328,7 +371,8 @@ static int apply_one_intent_db(const struct WamblePersistenceIntent *it,
   }
   case WAMBLE_INTENT_CREATE_SESSION: {
     uint64_t sid = db_create_session(it->as.create_session.token,
-                                     it->as.create_session.player_id);
+                                     it->as.create_session.player_id,
+                                     it->as.create_session.experiment_arm);
     cache_put_session(cache, it->as.create_session.token,
                       sid > 0 ? DB_OK : DB_ERR_EXEC, sid);
     return sid > 0 ? 0 : -1;
@@ -371,6 +415,15 @@ static int apply_one_intent_db(const struct WamblePersistenceIntent *it,
                                 it->as.record_move.move_uci,
                                 it->as.record_move.move_number);
   }
+  case WAMBLE_INTENT_UPDATE_BOARD_MOVE_META:
+    return db_async_update_board_move_meta(
+        it->as.update_board_move_meta.board_id,
+        it->as.update_board_move_meta.last_mover_arm);
+  case WAMBLE_INTENT_UPDATE_BOARD_RESERVATION_META:
+    return db_async_update_board_reservation_meta(
+        it->as.update_board_reservation_meta.board_id,
+        it->as.update_board_reservation_meta.reservation_time,
+        it->as.update_board_reservation_meta.reserved_for_white);
   default:
     return 0;
   }
@@ -431,21 +484,25 @@ intent_payload_estimate_bytes(const struct WamblePersistenceIntent *it) {
   case WAMBLE_INTENT_UPDATE_BOARD_ASSIGNMENT_TIME:
     return 8;
   case WAMBLE_INTENT_CREATE_RESERVATION:
-    return 8 + TOKEN_LENGTH + 4;
+    return 8 + TOKEN_LENGTH + 8;
   case WAMBLE_INTENT_REMOVE_RESERVATION:
     return 8;
   case WAMBLE_INTENT_RECORD_GAME_RESULT:
-    return 8 + 1;
+    return 8 + 1 + 4 + 4 + 32;
   case WAMBLE_INTENT_UPDATE_SESSION_LAST_SEEN:
     return TOKEN_LENGTH;
   case WAMBLE_INTENT_CREATE_SESSION:
-    return TOKEN_LENGTH + 8;
+    return TOKEN_LENGTH + 12;
   case WAMBLE_INTENT_LINK_SESSION_TO_PUBKEY:
     return TOKEN_LENGTH + 32;
   case WAMBLE_INTENT_RECORD_PAYOUT:
     return 8 + TOKEN_LENGTH + 8;
   case WAMBLE_INTENT_RECORD_MOVE:
     return 8 + TOKEN_LENGTH + MAX_UCI_LENGTH + 4;
+  case WAMBLE_INTENT_UPDATE_BOARD_MOVE_META:
+    return 8 + 4;
+  case WAMBLE_INTENT_UPDATE_BOARD_RESERVATION_META:
+    return 8 + 8 + 1;
   default:
     return sizeof(*it);
   }
@@ -552,6 +609,33 @@ PersistenceStatus wamble_apply_intents_with_db_checked(
                   WAMBLE_INTENT_UPDATE_BOARD_ASSIGNMENT_TIME &&
               buf->items[j].as.update_board_assignment_time.board_id ==
                   it->as.update_board_assignment_time.board_id) {
+            handled[j] = 1;
+          }
+        }
+        exec_idx[exec_count++] = i;
+        continue;
+      }
+      if (it->type == WAMBLE_INTENT_UPDATE_BOARD_MOVE_META) {
+        handled[i] = 1;
+        for (int j = i - 1; j >= 0; j--) {
+          if (!handled[j] &&
+              buf->items[j].type == WAMBLE_INTENT_UPDATE_BOARD_MOVE_META &&
+              buf->items[j].as.update_board_move_meta.board_id ==
+                  it->as.update_board_move_meta.board_id) {
+            handled[j] = 1;
+          }
+        }
+        exec_idx[exec_count++] = i;
+        continue;
+      }
+      if (it->type == WAMBLE_INTENT_UPDATE_BOARD_RESERVATION_META) {
+        handled[i] = 1;
+        for (int j = i - 1; j >= 0; j--) {
+          if (!handled[j] &&
+              buf->items[j].type ==
+                  WAMBLE_INTENT_UPDATE_BOARD_RESERVATION_META &&
+              buf->items[j].as.update_board_reservation_meta.board_id ==
+                  it->as.update_board_reservation_meta.board_id) {
             handled[j] = 1;
           }
         }

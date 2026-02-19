@@ -90,6 +90,7 @@ int main(int argc, char **argv) {
   }
   if (do_migrate) {
     exec_file(c, "migrations/001_initial_schema.sql");
+    exec_file(c, "migrations/002_runtime_metadata.sql");
   }
   if (do_fixture) {
     exec_file(c, "tests/db/fixture.sql");

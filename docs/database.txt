@@ -102,6 +102,8 @@ Tables
 
 Migrations
 - 001_initial_schema.sql: creates all tables, indexes, triggers.
+- 002_runtime_metadata.sql: adds persisted experiment/session metadata, board
+  move/reservation metadata, and richer game-result fields.
 
 Trust and Visibility
 - Client trust is read from `sessions.trust_level`.

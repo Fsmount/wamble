@@ -387,6 +387,10 @@ static DbBoardResult query_board_error(void) {
   out.fen[0] = '\0';
   out.status_text[0] = '\0';
   out.last_assignment_time = 0;
+  out.last_move_time = 0;
+  out.reservation_time = 0;
+  out.last_mover_arm = -1;
+  out.reserved_for_white = false;
   return out;
 }
 
@@ -472,9 +476,11 @@ DbStatus wamble_query_get_session_games_played(uint64_t session_id,
   return qs->get_session_games_played(session_id, out_games);
 }
 
-uint64_t db_create_session(const uint8_t *token, uint64_t player_id) {
-  const char *query = "INSERT INTO sessions (token, player_id) VALUES "
-                      "(decode($1, 'hex'), $2) RETURNING id";
+uint64_t db_create_session(const uint8_t *token, uint64_t player_id,
+                           int experiment_arm) {
+  const char *query =
+      "INSERT INTO sessions (token, player_id, experiment_arm) VALUES "
+      "(decode($1, 'hex'), $2, $3) RETURNING id";
 
   char token_hex[33];
   bytes_to_hex(token, TOKEN_LENGTH, token_hex);
@@ -483,11 +489,15 @@ uint64_t db_create_session(const uint8_t *token, uint64_t player_id) {
   if (player_id > 0) {
     snprintf(player_id_str, sizeof(player_id_str), "%lu", player_id);
   }
+  char experiment_arm_str[16];
+  snprintf(experiment_arm_str, sizeof(experiment_arm_str), "%d",
+           experiment_arm);
 
-  const char *paramValues[] = {token_hex, player_id > 0 ? player_id_str : NULL};
+  const char *paramValues[] = {token_hex, player_id > 0 ? player_id_str : NULL,
+                               experiment_arm_str};
 
   PGresult *res =
-      pq_exec_params_locked(query, 2, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 3, NULL, paramValues, NULL, NULL, 0);
 
   if (!res)
     return 0;
@@ -776,11 +786,81 @@ int db_async_update_board_assignment_time(uint64_t board_id) {
   return 0;
 }
 
+int db_async_update_board_move_meta(uint64_t board_id, int last_mover_arm) {
+  const char *query = "UPDATE boards SET last_move_time = NOW(), "
+                      "last_mover_arm = $2 WHERE id = $1";
+
+  char board_id_str[32];
+  char arm_str[16];
+  snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
+  snprintf(arm_str, sizeof(arm_str), "%d", last_mover_arm);
+
+  const char *paramValues[] = {board_id_str, arm_str};
+
+  PGresult *res =
+      pq_exec_params_locked(query, 2, NULL, paramValues, NULL, NULL, 0);
+
+  if (!res)
+    return -1;
+  if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+    PQclear(res);
+    return -1;
+  }
+
+  PQclear(res);
+  return 0;
+}
+
+int db_async_update_board_reservation_meta(uint64_t board_id,
+                                           time_t reservation_time,
+                                           int reserved_for_white) {
+  const char *query =
+      "UPDATE boards SET reservation_started_at = CASE WHEN $2::bigint > 0 "
+      "THEN to_timestamp($2::bigint) ELSE NULL END, "
+      "reserved_for_white = $3 WHERE id = $1";
+
+  char board_id_str[32];
+  char reservation_time_str[32];
+  char reserved_str[2];
+  snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
+  snprintf(reservation_time_str, sizeof(reservation_time_str), "%lld",
+           (long long)reservation_time);
+  reserved_str[0] = reserved_for_white ? 't' : 'f';
+  reserved_str[1] = '\0';
+
+  const char *paramValues[] = {board_id_str, reservation_time_str,
+                               reserved_str};
+
+  PGresult *res =
+      pq_exec_params_locked(query, 3, NULL, paramValues, NULL, NULL, 0);
+
+  if (!res)
+    return -1;
+  if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+    PQclear(res);
+    return -1;
+  }
+
+  PQclear(res);
+  return 0;
+}
+
 DbBoardResult db_get_board(uint64_t board_id) {
   DbBoardResult out = {0};
   out.status = DB_NOT_FOUND;
-  const char *query = "SELECT fen, status, EXTRACT(EPOCH FROM "
-                      "last_assignment_time)::bigint FROM boards WHERE id = $1";
+  out.last_mover_arm = -1;
+  out.reserved_for_white = false;
+  const char *query =
+      "SELECT b.fen, b.status, "
+      "COALESCE(EXTRACT(EPOCH FROM b.last_assignment_time)::bigint, 0), "
+      "COALESCE(EXTRACT(EPOCH FROM b.last_move_time)::bigint, 0), "
+      "COALESCE(b.last_mover_arm, -1), "
+      "COALESCE(EXTRACT(EPOCH FROM r.started_at)::bigint, "
+      "COALESCE(EXTRACT(EPOCH FROM b.reservation_started_at)::bigint, 0)), "
+      "COALESCE(r.reserved_for_white, COALESCE(b.reserved_for_white, FALSE)) "
+      "FROM boards b "
+      "LEFT JOIN reservations r ON r.board_id = b.id "
+      "WHERE b.id = $1";
 
   char board_id_str[32];
   snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
@@ -808,6 +888,17 @@ DbBoardResult db_get_board(uint64_t board_id) {
   strncpy(out.status_text, PQgetvalue(res, 0, 1), STATUS_MAX_LENGTH - 1);
   out.status_text[STATUS_MAX_LENGTH - 1] = '\0';
   out.last_assignment_time = (time_t)strtoull(PQgetvalue(res, 0, 2), NULL, 10);
+  out.last_move_time = (time_t)strtoull(PQgetvalue(res, 0, 3), NULL, 10);
+  {
+    char *endptr = NULL;
+    long arm = strtol(PQgetvalue(res, 0, 4), &endptr, 10);
+    if (!endptr || *endptr != '\0')
+      arm = -1;
+    out.last_mover_arm = (int)arm;
+  }
+  out.reservation_time = (time_t)strtoull(PQgetvalue(res, 0, 5), NULL, 10);
+  out.reserved_for_white =
+      (PQgetvalue(res, 0, 6)[0] == 't' || PQgetvalue(res, 0, 6)[0] == '1');
   out.status = DB_OK;
   PQclear(res);
   return out;
@@ -964,25 +1055,31 @@ DbMovesResult db_get_moves_for_board(uint64_t board_id) {
 }
 
 int db_async_create_reservation(uint64_t board_id, uint64_t session_id,
-                                int timeout_seconds) {
+                                int timeout_seconds, int reserved_for_white) {
   const char *query =
-      "INSERT INTO reservations (board_id, session_id, expires_at) "
-      "VALUES ($1, $2, NOW() + $3 * INTERVAL '1 second') "
+      "INSERT INTO reservations (board_id, session_id, expires_at, started_at, "
+      "reserved_for_white) "
+      "VALUES ($1, $2, NOW() + $3 * INTERVAL '1 second', NOW(), $4) "
       "ON CONFLICT (board_id) DO UPDATE SET "
-      "session_id = $2, expires_at = NOW() + $3 * INTERVAL '1 second'";
+      "session_id = $2, expires_at = NOW() + $3 * INTERVAL '1 second', "
+      "started_at = NOW(), reserved_for_white = $4";
 
   char board_id_str[32];
   char session_id_str[32];
   char timeout_str[16];
+  char reserved_str[2];
 
   snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
   snprintf(session_id_str, sizeof(session_id_str), "%lu", session_id);
   snprintf(timeout_str, sizeof(timeout_str), "%d", timeout_seconds);
+  reserved_str[0] = reserved_for_white ? 't' : 'f';
+  reserved_str[1] = '\0';
 
-  const char *paramValues[] = {board_id_str, session_id_str, timeout_str};
+  const char *paramValues[] = {board_id_str, session_id_str, timeout_str,
+                               reserved_str};
 
   PGresult *res =
-      pq_exec_params_locked(query, 3, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 4, NULL, paramValues, NULL, NULL, 0);
 
   if (!res)
     return -1;
@@ -997,7 +1094,8 @@ int db_async_create_reservation(uint64_t board_id, uint64_t session_id,
 
 void db_expire_reservations(void) {
   const char *update_query =
-      "UPDATE boards SET status = 'DORMANT', updated_at = NOW() "
+      "UPDATE boards SET status = 'DORMANT', updated_at = NOW(), "
+      "reservation_started_at = NULL, reserved_for_white = FALSE "
       "WHERE status = 'RESERVED' AND id IN "
       "(SELECT board_id FROM reservations WHERE expires_at <= NOW())";
   PGresult *res_update = pq_exec_locked(update_query);
@@ -1038,23 +1136,45 @@ void db_async_remove_reservation(uint64_t board_id) {
       pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
   if (res)
     PQclear(res);
+
+  const char *clear_query =
+      "UPDATE boards SET reservation_started_at = NULL, reserved_for_white = "
+      "FALSE WHERE id = $1";
+  PGresult *res_clear =
+      pq_exec_params_locked(clear_query, 1, NULL, paramValues, NULL, NULL, 0);
+  if (res_clear)
+    PQclear(res_clear);
 }
 
-int db_async_record_game_result(uint64_t board_id, char winning_side) {
-  const char *query =
-      "INSERT INTO game_results (board_id, winning_side) VALUES ($1, $2)";
+int db_async_record_game_result(uint64_t board_id, char winning_side,
+                                int move_count, int duration_seconds,
+                                const char *termination_reason) {
+  const char *query = "INSERT INTO game_results "
+                      "(board_id, winning_side, move_count, duration_seconds, "
+                      "termination_reason) VALUES ($1, $2, $3, $4, $5) "
+                      "ON CONFLICT (board_id) DO UPDATE SET "
+                      "winning_side = EXCLUDED.winning_side, "
+                      "move_count = EXCLUDED.move_count, "
+                      "duration_seconds = EXCLUDED.duration_seconds, "
+                      "termination_reason = EXCLUDED.termination_reason";
 
   char board_id_str[32];
   char winning_side_str[2];
+  char move_count_str[16];
+  char duration_str[16];
 
   snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
   winning_side_str[0] = winning_side;
   winning_side_str[1] = '\0';
+  snprintf(move_count_str, sizeof(move_count_str), "%d", move_count);
+  snprintf(duration_str, sizeof(duration_str), "%d", duration_seconds);
 
-  const char *paramValues[] = {board_id_str, winning_side_str};
+  const char *paramValues[] = {board_id_str, winning_side_str, move_count_str,
+                               duration_str,
+                               termination_reason ? termination_reason : ""};
 
   PGresult *res =
-      pq_exec_params_locked(query, 2, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 5, NULL, paramValues, NULL, NULL, 0);
 
   if (!res)
     return -1;

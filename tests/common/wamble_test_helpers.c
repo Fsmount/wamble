@@ -307,7 +307,9 @@ int test_db_apply_migrations(const char *schema_name) {
     return -1;
   if (test_db_set_search_path(schema_name) != 0)
     return -1;
-  return test_db_apply_sql_file("migrations/001_initial_schema.sql");
+  if (test_db_apply_sql_file("migrations/001_initial_schema.sql") != 0)
+    return -1;
+  return test_db_apply_sql_file("migrations/002_runtime_metadata.sql");
 #else
   (void)schema_name;
   return -1;
