@@ -3,12 +3,16 @@ Wamble Network Protocol
 
 Overview
 - Transport: UDP, non-blocking sockets.
+- Additional transport adapter: a WebSocket bridge (TCP) tunnels Wamble UDP
+  wire packets as binary websocket frames.
 - Topology: Single server, multiple listeners (one per profile).
 - Reliability: Application-level ACK with retries.
 - Encoding: Base64url for tokens (logs/URLs).
 
 Message Layout
 - Transport: UDP with a custom header and a variable payload.
+- WebSocket transport: each binary websocket frame carries one full Wamble
+  wire packet (header + payload) with identical byte layout.
 - The `WambleMsg` struct in the source code is a container for message
   data, not a direct representation of the on-the-wire format.
 - All packets share a common header, followed by a payload specific to the
@@ -89,7 +93,8 @@ Control Codes
 - `0x16` GET_LEGAL_MOVES (client to server): Request legal moves for a square.
   - Payload: `uint8 square_index` (0-63, 0 = a1).
   - Header: `board_id` must reference the board assignment for the player.
-  - Authorization: server validates the requesting token still owns the reservation; otherwise the response is an empty `LEGAL_MOVES` packet.
+  - Authorization: server validates the requesting token owns the reservation;
+    otherwise the response is an empty `LEGAL_MOVES` packet.
 - `0x17` LEGAL_MOVES (server to client): Response to GET_LEGAL_MOVES.
   - Payload: `uint8 square_index; uint8 move_count; struct { uint8 from; uint8 to; int8 promotion; } moves[move_count]`.
   - `move_count` is capped at 218 and only includes moves originating from `square_index`.
@@ -141,3 +146,31 @@ References
 - Players: docs/player_management.txt (LOGIN_REQUEST, LOGIN_*, GET_PLAYER_STATS, PLAYER_STATS_DATA)
 - Move engine: docs/move_engine.txt (PLAYER_MOVE, BOARD_UPDATE, GET_LEGAL_MOVES, LEGAL_MOVES)
 - Profiles runtime: docs/runtime_and_state.txt (LIST_PROFILES, PROFILES_LIST, GET_PROFILE_INFO, PROFILE_INFO)
+
+WebSocket Bridge
+- Endpoint: `ws://<host>:<websocket-port><websocket-path>`
+  - Controlled by config keys: `websocket-enabled`, `websocket-port`,
+    `websocket-path`.
+  - If `websocket-port` is `0`, the server uses `port` for websocket TCP.
+- Handshake:
+  - HTTP `GET` to `websocket-path`.
+  - Requires standard websocket upgrade headers (`Upgrade`, `Connection`,
+    `Sec-WebSocket-Key`, `Sec-WebSocket-Version: 13`).
+- Framing:
+  - Client -> server: masked binary frames (`opcode=0x2`) containing one
+    Wamble packet each.
+  - Server -> client: unmasked binary frames containing one Wamble packet each.
+  - Data transport is binary-only, text and continuation data frames are not
+    supported.
+  - Ping/Pong and Close control frames are supported.
+  - Fragmentation is not supported (`FIN=1` required on all frames).
+  - Frame payload limit is currently 4096 bytes.
+- Semantics:
+  - Control codes and packet bytes are unchanged.
+  - Reliability/ACK and sequence semantics are enforced by the application
+    protocol, independent of websocket/TCP transport reliability.
+  - The websocket layer is strictly a transport adapter over the existing
+    protocol.
+  - The adapter creates a loopback UDP socket per websocket client; server-side
+    session address/port therefore reflects the local bridge socket (not the
+    browser's remote IP/port).

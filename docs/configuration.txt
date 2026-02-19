@@ -9,6 +9,12 @@ Overview
 
 Core Options (common defaults)
 - `port` (int, 8888): UDP server port.
+- `websocket-enabled` (int, 0): Enable websocket bridge for browser clients
+  on this profile/runtime.
+- `websocket-port` (int, 0): Websocket TCP port. If set to `0`, it uses `port`
+  as the TCP websocket port number.
+- `websocket-path` (string, `/ws`): Websocket HTTP upgrade endpoint path.
+  - Must start with `/`.
 - `timeout-ms` (int, 100): Reliable send ACK timeout (ms).
 - `max-retries` (int, 3): Reliable send retries.
 - `max-message-size` (int, 126): Fixed message body size (informational).
@@ -172,11 +178,16 @@ Running with a Profile
 
 Concurrent Profiles
 - When multiple profiles are defined with `advertise=1`, the server starts
-  one listener per profile on its configured `port`, enforcing unique ports.
+  one listener per profile on its configured `port`, enforcing unique UDP
+  ports.
+- If websocket is enabled for multiple advertised profiles, effective websocket
+  TCP ports must also be unique (effective port = `websocket-port` when set,
+  otherwise `port`).
 - On SIGHUP, config reloads and listeners are reconciled: added/removed/updated
   profiles are started/stopped/restarted accordingly.
-- Validation is strict: if two advertised profiles conflict (duplicate ports),
-  the server terminates with a fatal error.
+- Validation is strict: if two advertised profiles conflict (duplicate UDP
+  ports or duplicate effective websocket TCP ports when enabled), the server
+  terminates with a fatal error.
 - DB model: Profiles may use distinct DB settings; each listener thread manages
   its own connection. If two advertised profiles both set `db-isolated=1` they
   must not point to the same DB.

@@ -449,6 +449,8 @@ static inline int wamble_cond_broadcast(wamble_cond_t *cond) {
 
 typedef struct WambleConfig {
   int port;
+  int websocket_enabled;
+  int websocket_port;
   int timeout_ms;
   int max_retries;
   int max_message_size;
@@ -493,6 +495,7 @@ typedef struct WambleConfig {
   int admin_trust_level;
 
   char *state_dir;
+  char *websocket_path;
 } WambleConfig;
 
 typedef enum {
@@ -552,6 +555,14 @@ typedef enum {
 } NetworkStatus;
 
 typedef enum {
+  WS_GATEWAY_OK = 0,
+  WS_GATEWAY_ERR_CONFIG = -1,
+  WS_GATEWAY_ERR_BIND = -2,
+  WS_GATEWAY_ERR_THREAD = -3,
+  WS_GATEWAY_ERR_ALLOC = -4,
+} WsGatewayStatus;
+
+typedef enum {
   PLAYER_OK = 0,
   PLAYER_ERR_BUSY = -1,
   PLAYER_ERR_DB = -2,
@@ -592,6 +603,9 @@ ProfileStartStatus start_profile_listeners(int *out_started);
 void stop_profile_listeners(void);
 ProfileStartStatus reconcile_profile_listeners(void);
 int profile_runtime_pump_inline(void);
+int profile_runtime_take_ws_gateway_status(WsGatewayStatus *out_status,
+                                           char *out_profile,
+                                           size_t out_profile_size);
 
 int state_save_to_file(const char *path);
 int state_load_from_file(const char *path);
@@ -967,6 +981,14 @@ int send_unreliable_packet(wamble_socket_t sockfd, const struct WambleMsg *msg,
                            const struct sockaddr_in *cliaddr);
 ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
                             const struct sockaddr_in *cliaddr, int trust_tier);
+
+typedef struct WambleWsGateway WambleWsGateway;
+WambleWsGateway *ws_gateway_start(const char *profile_name, int ws_port,
+                                  int udp_port, const char *ws_path,
+                                  int max_clients, WsGatewayStatus *out_status);
+void ws_gateway_stop(WambleWsGateway *gateway);
+int ws_gateway_matches(const WambleWsGateway *gateway, int ws_port,
+                       int udp_port, const char *ws_path);
 
 typedef enum {
   SPECTATOR_INIT_OK = 0,
