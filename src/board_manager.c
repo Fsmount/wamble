@@ -91,6 +91,16 @@ static void remove_board_from_cache(int cache_index);
 static void transition_reserved_to_dormant(WambleBoard *board);
 static int find_cache_slot_for_board(void);
 
+static int token_is_zero(const uint8_t *token) {
+  if (!token)
+    return 1;
+  for (int i = 0; i < TOKEN_LENGTH; i++) {
+    if (token[i] != 0)
+      return 0;
+  }
+  return 1;
+}
+
 void board_manager_tick() {
   wamble_mutex_lock(&board_mutex);
 
@@ -101,6 +111,10 @@ void board_manager_tick() {
     WambleBoard *board = &board_cached[i];
 
     if (board->state == BOARD_STATE_RESERVED) {
+      if (token_is_zero(board->reservation_player_token)) {
+        transition_reserved_to_dormant(board);
+        continue;
+      }
       time_t reservation_age = now - board->reservation_time;
       if (reservation_age >= get_config()->reservation_timeout) {
         WamblePlayer *player =
@@ -237,7 +251,9 @@ static void transition_to_archived(WambleBoard *board, GameResult result) {
   } else if (result == GAME_RESULT_BLACK_WINS) {
     winning_side = 'b';
   }
-  int move_count = board->board.fullmove_number;
+  int move_count = (board->board.fullmove_number - 1) * 2;
+  if (board->board.turn == 'b')
+    move_count += 1;
   if (move_count < 0)
     move_count = 0;
   int duration_seconds = 0;
@@ -460,7 +476,8 @@ static WambleBoard *load_board_into_cache(uint64_t board_id) {
   board->state = board_state_from_string(br.status_text);
   board->result = GAME_RESULT_IN_PROGRESS;
   board->last_move_time = 0;
-  board->creation_time = wamble_now_wall();
+  board->creation_time =
+      (br.created_at > 0) ? br.created_at : wamble_now_wall();
   board->last_assignment_time = br.last_assignment_time;
   board->last_move_time = br.last_move_time;
   board->last_mover_arm = (br.last_mover_arm >= 0) ? (uint16_t)br.last_mover_arm

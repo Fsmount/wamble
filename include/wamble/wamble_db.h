@@ -54,6 +54,8 @@ int db_async_update_player_rating(uint64_t session_id, double rating);
 DbStatus db_get_active_session_count(int *out_count);
 DbStatus db_get_longest_game_moves(int *out_max_moves);
 DbStatus db_get_session_games_played(uint64_t session_id, int *out_games);
+DbLeaderboardResult db_get_leaderboard(uint64_t requester_session_id,
+                                       uint8_t leaderboard_type, int limit);
 
 uint64_t db_create_player(const uint8_t *public_key);
 uint64_t db_get_player_by_public_key(const uint8_t *public_key);
@@ -79,6 +81,8 @@ typedef struct WambleQueryService {
   DbStatus (*get_player_total_score)(uint64_t session_id, double *out_total);
   DbStatus (*get_player_rating)(uint64_t session_id, double *out_rating);
   DbStatus (*get_session_games_played)(uint64_t session_id, int *out_games);
+  DbLeaderboardResult (*get_leaderboard)(uint64_t requester_session_id,
+                                         uint8_t leaderboard_type, int limit);
   DbMovesResult (*get_moves_for_board)(uint64_t board_id);
   DbStatus (*get_trust_tier_by_token)(const uint8_t *token, int *out_trust);
 } WambleQueryService;

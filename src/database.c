@@ -362,6 +362,7 @@ const WambleQueryService *wamble_get_db_query_service(void) {
     svc.get_player_total_score = db_get_player_total_score;
     svc.get_player_rating = db_get_player_rating;
     svc.get_session_games_played = db_get_session_games_played;
+    svc.get_leaderboard = db_get_leaderboard;
     svc.get_moves_for_board = db_get_moves_for_board;
     svc.get_trust_tier_by_token = db_get_trust_tier_by_token;
     initialized = 1;
@@ -386,6 +387,7 @@ static DbBoardResult query_board_error(void) {
   out.status = DB_ERR_EXEC;
   out.fen[0] = '\0';
   out.status_text[0] = '\0';
+  out.created_at = 0;
   out.last_assignment_time = 0;
   out.last_move_time = 0;
   out.reservation_time = 0;
@@ -399,6 +401,15 @@ static DbMovesResult query_moves_error(void) {
   out.status = DB_ERR_EXEC;
   out.rows = NULL;
   out.count = 0;
+  return out;
+}
+
+static DbLeaderboardResult query_leaderboard_error(void) {
+  DbLeaderboardResult out = {0};
+  out.status = DB_ERR_EXEC;
+  out.rows = NULL;
+  out.count = 0;
+  out.self_rank = 0;
   return out;
 }
 
@@ -444,6 +455,14 @@ DbStatus wamble_query_get_max_board_id(uint64_t *out_max_id) {
   return qs->get_max_board_id(out_max_id);
 }
 
+DbStatus wamble_query_get_session_by_token(const uint8_t *token,
+                                           uint64_t *out_session) {
+  const WambleQueryService *qs = get_query_service();
+  if (!qs || !qs->get_session_by_token)
+    return DB_ERR_EXEC;
+  return qs->get_session_by_token(token, out_session);
+}
+
 DbStatus wamble_query_get_persistent_session_by_token(const uint8_t *token,
                                                       uint64_t *out_session) {
   const WambleQueryService *qs = get_query_service();
@@ -474,6 +493,15 @@ DbStatus wamble_query_get_session_games_played(uint64_t session_id,
   if (!qs || !qs->get_session_games_played)
     return DB_ERR_EXEC;
   return qs->get_session_games_played(session_id, out_games);
+}
+
+DbLeaderboardResult wamble_query_get_leaderboard(uint64_t requester_session_id,
+                                                 uint8_t leaderboard_type,
+                                                 int limit) {
+  const WambleQueryService *qs = get_query_service();
+  if (!qs || !qs->get_leaderboard)
+    return query_leaderboard_error();
+  return qs->get_leaderboard(requester_session_id, leaderboard_type, limit);
 }
 
 uint64_t db_create_session(const uint8_t *token, uint64_t player_id,
@@ -852,6 +880,7 @@ DbBoardResult db_get_board(uint64_t board_id) {
   out.reserved_for_white = false;
   const char *query =
       "SELECT b.fen, b.status, "
+      "COALESCE(EXTRACT(EPOCH FROM b.created_at)::bigint, 0), "
       "COALESCE(EXTRACT(EPOCH FROM b.last_assignment_time)::bigint, 0), "
       "COALESCE(EXTRACT(EPOCH FROM b.last_move_time)::bigint, 0), "
       "COALESCE(b.last_mover_arm, -1), "
@@ -887,18 +916,19 @@ DbBoardResult db_get_board(uint64_t board_id) {
   snprintf(out.fen, FEN_MAX_LENGTH, "%s", PQgetvalue(res, 0, 0));
   strncpy(out.status_text, PQgetvalue(res, 0, 1), STATUS_MAX_LENGTH - 1);
   out.status_text[STATUS_MAX_LENGTH - 1] = '\0';
-  out.last_assignment_time = (time_t)strtoull(PQgetvalue(res, 0, 2), NULL, 10);
-  out.last_move_time = (time_t)strtoull(PQgetvalue(res, 0, 3), NULL, 10);
+  out.created_at = (time_t)strtoull(PQgetvalue(res, 0, 2), NULL, 10);
+  out.last_assignment_time = (time_t)strtoull(PQgetvalue(res, 0, 3), NULL, 10);
+  out.last_move_time = (time_t)strtoull(PQgetvalue(res, 0, 4), NULL, 10);
   {
     char *endptr = NULL;
-    long arm = strtol(PQgetvalue(res, 0, 4), &endptr, 10);
+    long arm = strtol(PQgetvalue(res, 0, 5), &endptr, 10);
     if (!endptr || *endptr != '\0')
       arm = -1;
     out.last_mover_arm = (int)arm;
   }
-  out.reservation_time = (time_t)strtoull(PQgetvalue(res, 0, 5), NULL, 10);
+  out.reservation_time = (time_t)strtoull(PQgetvalue(res, 0, 6), NULL, 10);
   out.reserved_for_white =
-      (PQgetvalue(res, 0, 6)[0] == 't' || PQgetvalue(res, 0, 6)[0] == '1');
+      (PQgetvalue(res, 0, 7)[0] == 't' || PQgetvalue(res, 0, 7)[0] == '1');
   out.status = DB_OK;
   PQclear(res);
   return out;
@@ -1219,8 +1249,8 @@ int db_async_record_payout(uint64_t board_id, uint64_t session_id,
 DbStatus db_get_player_total_score(uint64_t session_id, double *out_total) {
   if (!out_total)
     return DB_ERR_BAD_DATA;
-  const char *query = "SELECT COALESCE(SUM(points_awarded), 0) FROM payouts "
-                      "WHERE session_id = $1";
+  const char *query = "SELECT COALESCE(total_score, 0) FROM sessions "
+                      "WHERE id = $1";
 
   char session_id_str[32];
   snprintf(session_id_str, sizeof(session_id_str), "%lu", session_id);
@@ -1235,6 +1265,10 @@ DbStatus db_get_player_total_score(uint64_t session_id, double *out_total) {
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     PQclear(res);
     return DB_ERR_EXEC;
+  }
+  if (PQntuples(res) == 0) {
+    PQclear(res);
+    return DB_NOT_FOUND;
   }
 
   char *endptr;
@@ -1363,8 +1397,8 @@ DbStatus db_get_longest_game_moves(int *out_max_moves) {
 DbStatus db_get_session_games_played(uint64_t session_id, int *out_games) {
   if (!out_games)
     return DB_ERR_BAD_DATA;
-  const char *query =
-      "SELECT COUNT(DISTINCT board_id) FROM moves WHERE session_id = $1";
+  const char *query = "SELECT COALESCE(games_played, 0) FROM sessions "
+                      "WHERE id = $1";
 
   char session_id_str[32];
   snprintf(session_id_str, sizeof(session_id_str), "%lu", session_id);
@@ -1380,6 +1414,10 @@ DbStatus db_get_session_games_played(uint64_t session_id, int *out_games) {
     PQclear(res);
     return DB_ERR_EXEC;
   }
+  if (PQntuples(res) == 0) {
+    PQclear(res);
+    return DB_NOT_FOUND;
+  }
 
   char *endptr;
   long games_played = strtol(PQgetvalue(res, 0, 0), &endptr, 10);
@@ -1390,6 +1428,112 @@ DbStatus db_get_session_games_played(uint64_t session_id, int *out_games) {
   PQclear(res);
   *out_games = (int)games_played;
   return DB_OK;
+}
+
+DbLeaderboardResult db_get_leaderboard(uint64_t requester_session_id,
+                                       uint8_t leaderboard_type, int limit) {
+  static WAMBLE_THREAD_LOCAL DbLeaderboardEntry
+      rows[WAMBLE_MAX_LEADERBOARD_ENTRIES];
+  DbLeaderboardResult out = {0};
+  out.status = DB_ERR_EXEC;
+  out.rows = rows;
+  out.count = 0;
+  out.self_rank = 0;
+
+  int effective_limit = limit;
+  if (effective_limit <= 0)
+    effective_limit = 10;
+  if (effective_limit > WAMBLE_MAX_LEADERBOARD_ENTRIES)
+    effective_limit = WAMBLE_MAX_LEADERBOARD_ENTRIES;
+
+  uint8_t effective_type = leaderboard_type;
+  if (effective_type != WAMBLE_LEADERBOARD_RATING)
+    effective_type = WAMBLE_LEADERBOARD_SCORE;
+
+  char limit_str[16];
+  snprintf(limit_str, sizeof(limit_str), "%d", effective_limit);
+  const char *top_query = NULL;
+  const char *rank_query = NULL;
+  if (effective_type == WAMBLE_LEADERBOARD_RATING) {
+    top_query =
+        "SELECT s.id, s.total_score, COALESCE(p.rating, 0), s.games_played "
+        "FROM sessions s "
+        "LEFT JOIN players p ON p.id = s.player_id "
+        "ORDER BY COALESCE(p.rating, 0) DESC, s.total_score DESC, s.id ASC "
+        "LIMIT $1";
+    rank_query =
+        "SELECT rank_pos FROM ("
+        "  SELECT s.id, ROW_NUMBER() OVER ("
+        "    ORDER BY COALESCE(p.rating, 0) DESC, s.total_score DESC, s.id ASC"
+        "  ) AS rank_pos "
+        "  FROM sessions s "
+        "  LEFT JOIN players p ON p.id = s.player_id"
+        ") ranked WHERE id = $1";
+  } else {
+    top_query =
+        "SELECT s.id, s.total_score, COALESCE(p.rating, 0), s.games_played "
+        "FROM sessions s "
+        "LEFT JOIN players p ON p.id = s.player_id "
+        "ORDER BY s.total_score DESC, COALESCE(p.rating, 0) DESC, s.id ASC "
+        "LIMIT $1";
+    rank_query =
+        "SELECT rank_pos FROM ("
+        "  SELECT s.id, ROW_NUMBER() OVER ("
+        "    ORDER BY s.total_score DESC, COALESCE(p.rating, 0) DESC, s.id ASC"
+        "  ) AS rank_pos "
+        "  FROM sessions s "
+        "  LEFT JOIN players p ON p.id = s.player_id"
+        ") ranked WHERE id = $1";
+  }
+  const char *top_params[] = {limit_str};
+  PGresult *res =
+      pq_exec_params_locked(top_query, 1, NULL, top_params, NULL, NULL, 0);
+  if (!res) {
+    out.status = DB_ERR_CONN;
+    return out;
+  }
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    PQclear(res);
+    out.status = DB_ERR_EXEC;
+    return out;
+  }
+
+  int n = PQntuples(res);
+  if (n > WAMBLE_MAX_LEADERBOARD_ENTRIES)
+    n = WAMBLE_MAX_LEADERBOARD_ENTRIES;
+  for (int i = 0; i < n; i++) {
+    rows[i].rank = (uint32_t)(i + 1);
+    rows[i].session_id = strtoull(PQgetvalue(res, i, 0), NULL, 10);
+    rows[i].score = strtod(PQgetvalue(res, i, 1), NULL);
+    rows[i].rating = strtod(PQgetvalue(res, i, 2), NULL);
+    rows[i].games_played = (uint32_t)strtoul(PQgetvalue(res, i, 3), NULL, 10);
+  }
+  out.count = n;
+  PQclear(res);
+
+  if (requester_session_id > 0) {
+    char sid_str[32];
+    snprintf(sid_str, sizeof(sid_str), "%" PRIu64, requester_session_id);
+    const char *rank_params[] = {sid_str};
+    PGresult *rank_res =
+        pq_exec_params_locked(rank_query, 1, NULL, rank_params, NULL, NULL, 0);
+    if (!rank_res) {
+      out.status = DB_ERR_CONN;
+      return out;
+    }
+    if (PQresultStatus(rank_res) != PGRES_TUPLES_OK) {
+      PQclear(rank_res);
+      out.status = DB_ERR_EXEC;
+      return out;
+    }
+    if (PQntuples(rank_res) > 0) {
+      out.self_rank = (uint32_t)strtoul(PQgetvalue(rank_res, 0, 0), NULL, 10);
+    }
+    PQclear(rank_res);
+  }
+
+  out.status = DB_OK;
+  return out;
 }
 
 void db_tick(void) { db_expire_reservations(); }

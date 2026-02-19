@@ -42,11 +42,10 @@ Wamble is a multiplayer chess variant where after every move you're switched to 
     GRANT ALL PRIVILEGES ON DATABASE wamble TO wamble_user;
     ```
 
-3.  Apply migrations:
+3.  Apply migrations for each file under migrations/:
 
     ```sh
-    psql -U wamble_user -d wamble -f migrations/001_initial_schema.sql
-    psql -U wamble_user -d wamble -f migrations/002_runtime_metadata.sql
+    psql -U wamble_user -d wamble -f migrations/00n_*.sql
     ```
 
 ### Building Wamble

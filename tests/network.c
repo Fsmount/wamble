@@ -131,6 +131,69 @@ WAMBLE_TEST(spectate_update_roundtrip) {
   return 0;
 }
 
+WAMBLE_TEST(leaderboard_data_roundtrip) {
+  config_load(NULL, NULL, NULL, 0);
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  RecvCtx ctx;
+  memset(&ctx, 0, sizeof(ctx));
+  ctx.sock = cli;
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, (wamble_thread_func_t)recv_one, &ctx) ==
+           0);
+
+  struct WambleMsg out = {0};
+  out.ctrl = WAMBLE_CTRL_LEADERBOARD_DATA;
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    out.token[i] = (uint8_t)(0x20 + i);
+  out.leaderboard_type = WAMBLE_LEADERBOARD_RATING;
+  out.leaderboard_self_rank = 9;
+  out.leaderboard_count = 2;
+  out.leaderboard[0].rank = 1;
+  out.leaderboard[0].session_id = 101;
+  out.leaderboard[0].score = 150.5;
+  out.leaderboard[0].rating = 1210.0;
+  out.leaderboard[0].games_played = 12;
+  out.leaderboard[1].rank = 2;
+  out.leaderboard[1].session_id = 102;
+  out.leaderboard[1].score = 120.0;
+  out.leaderboard[1].rating = 1188.25;
+  out.leaderboard[1].games_played = 8;
+
+  T_ASSERT_STATUS_OK(send_unreliable_packet(srv, &out, &cliaddr));
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+
+  T_ASSERT_EQ_INT(ctx.received, 1);
+  T_ASSERT_EQ_INT(ctx.msg.ctrl, WAMBLE_CTRL_LEADERBOARD_DATA);
+  T_ASSERT_EQ_INT((int)ctx.msg.leaderboard_type, WAMBLE_LEADERBOARD_RATING);
+  T_ASSERT_EQ_INT((int)ctx.msg.leaderboard_self_rank, 9);
+  T_ASSERT_EQ_INT((int)ctx.msg.leaderboard_count, 2);
+  T_ASSERT_EQ_INT((int)ctx.msg.leaderboard[0].rank, 1);
+  T_ASSERT_EQ_INT((int)ctx.msg.leaderboard[0].session_id, 101);
+  T_ASSERT_EQ_INT((int)ctx.msg.leaderboard[0].games_played, 12);
+  T_ASSERT(fabs(ctx.msg.leaderboard[0].score - 150.5) < 1e-9);
+  T_ASSERT(fabs(ctx.msg.leaderboard[0].rating - 1210.0) < 1e-9);
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
 typedef struct {
   wamble_socket_t sock;
   struct sockaddr_in from;
@@ -801,6 +864,8 @@ WAMBLE_TESTS_ADD_SM(experiment_arm_defaults_to_zero_when_disabled,
 WAMBLE_TESTS_ADD_SM(experiment_arm_deterministic_and_bounded_when_enabled,
                     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(spectate_update_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
+                    "network");
+WAMBLE_TESTS_ADD_SM(leaderboard_data_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
 WAMBLE_TESTS_ADD_SM(reliable_ack_success, WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(malformed_tiny_packet_rejected, WAMBLE_SUITE_FUNCTIONAL,

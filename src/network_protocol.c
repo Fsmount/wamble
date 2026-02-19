@@ -165,8 +165,18 @@ static NetworkStatus serialize_wamble_msg(const struct WambleMsg *msg,
   case WAMBLE_CTRL_CLIENT_GOODBYE:
   case WAMBLE_CTRL_LOGOUT:
   case WAMBLE_CTRL_GET_PLAYER_STATS:
+  case WAMBLE_CTRL_SPECTATE_STOP:
     payload_len = 0;
     break;
+  case WAMBLE_CTRL_GET_LEADERBOARD: {
+    uint8_t lb_type = msg->leaderboard_type ? msg->leaderboard_type
+                                            : WAMBLE_LEADERBOARD_SCORE;
+    uint8_t limit = msg->leaderboard_limit ? msg->leaderboard_limit : 10;
+    payload[0] = lb_type;
+    payload[1] = limit;
+    payload_len = 2;
+    break;
+  }
   case WAMBLE_CTRL_PLAYER_MOVE: {
     size_t need = 1 + (size_t)msg->uci_len;
     if (need > WAMBLE_MAX_PAYLOAD)
@@ -300,6 +310,45 @@ static NetworkStatus serialize_wamble_msg(const struct WambleMsg *msg,
     payload_len = 3 + reason_len;
     break;
   }
+  case WAMBLE_CTRL_LEADERBOARD_DATA: {
+    uint8_t lb_type = msg->leaderboard_type ? msg->leaderboard_type
+                                            : WAMBLE_LEADERBOARD_SCORE;
+    uint8_t count = msg->leaderboard_count;
+    if (count > WAMBLE_MAX_LEADERBOARD_ENTRIES)
+      return NET_ERR_INVALID;
+    size_t need = 1 + 1 + 4 + (size_t)count * 32;
+    if (need > WAMBLE_MAX_PAYLOAD)
+      return NET_ERR_TRUNCATED;
+    payload[0] = lb_type;
+    payload[1] = count;
+    uint32_t self_rank_be = htonl(msg->leaderboard_self_rank);
+    memcpy(payload + 2, &self_rank_be, 4);
+    size_t offset = 6;
+    for (uint8_t i = 0; i < count; i++) {
+      const WambleLeaderboardEntry *e = &msg->leaderboard[i];
+      uint32_t rank_be = htonl(e->rank);
+      uint64_t sid_be = host_to_net64(e->session_id);
+      uint64_t score_bits = 0;
+      uint64_t rating_bits = 0;
+      memcpy(&score_bits, &e->score, sizeof(double));
+      memcpy(&rating_bits, &e->rating, sizeof(double));
+      score_bits = host_to_net64(score_bits);
+      rating_bits = host_to_net64(rating_bits);
+      uint32_t games_be = htonl(e->games_played);
+      memcpy(payload + offset, &rank_be, 4);
+      offset += 4;
+      memcpy(payload + offset, &sid_be, 8);
+      offset += 8;
+      memcpy(payload + offset, &score_bits, 8);
+      offset += 8;
+      memcpy(payload + offset, &rating_bits, 8);
+      offset += 8;
+      memcpy(payload + offset, &games_be, 4);
+      offset += 4;
+    }
+    payload_len = need;
+    break;
+  }
   default:
 
     payload_len = 0;
@@ -356,6 +405,19 @@ static NetworkStatus deserialize_wamble_msg(const uint8_t *buffer,
   case WAMBLE_CTRL_LOGOUT:
 
     break;
+  case WAMBLE_CTRL_GET_LEADERBOARD: {
+    if (payload_len > 2)
+      return NET_ERR_INVALID;
+    msg->leaderboard_type = WAMBLE_LEADERBOARD_SCORE;
+    msg->leaderboard_limit = 10;
+    if (payload_len == 1) {
+      msg->leaderboard_limit = payload[0];
+    } else if (payload_len == 2) {
+      msg->leaderboard_type = payload[0];
+      msg->leaderboard_limit = payload[1];
+    }
+    break;
+  }
   case WAMBLE_CTRL_PLAYER_MOVE: {
     if (payload_len < 1)
       return NET_ERR_TRUNCATED;
@@ -474,6 +536,47 @@ static NetworkStatus deserialize_wamble_msg(const uint8_t *buffer,
       msg->moves[i].from = payload[offset++];
       msg->moves[i].to = payload[offset++];
       msg->moves[i].promotion = (int8_t)payload[offset++];
+    }
+    break;
+  }
+  case WAMBLE_CTRL_LEADERBOARD_DATA: {
+    if (payload_len < 6)
+      return NET_ERR_TRUNCATED;
+    msg->leaderboard_type = payload[0];
+    msg->leaderboard_count = payload[1];
+    if (msg->leaderboard_count > WAMBLE_MAX_LEADERBOARD_ENTRIES)
+      return NET_ERR_INVALID;
+    size_t need = 1 + 1 + 4 + (size_t)msg->leaderboard_count * 32;
+    if (payload_len < need)
+      return NET_ERR_TRUNCATED;
+    uint32_t self_rank_be = 0;
+    memcpy(&self_rank_be, payload + 2, 4);
+    msg->leaderboard_self_rank = ntohl(self_rank_be);
+    size_t offset = 6;
+    for (uint8_t i = 0; i < msg->leaderboard_count; i++) {
+      WambleLeaderboardEntry *e = &msg->leaderboard[i];
+      uint32_t rank_be = 0;
+      uint64_t sid_be = 0;
+      uint64_t score_be = 0;
+      uint64_t rating_be = 0;
+      uint32_t games_be = 0;
+      memcpy(&rank_be, payload + offset, 4);
+      offset += 4;
+      memcpy(&sid_be, payload + offset, 8);
+      offset += 8;
+      memcpy(&score_be, payload + offset, 8);
+      offset += 8;
+      memcpy(&rating_be, payload + offset, 8);
+      offset += 8;
+      memcpy(&games_be, payload + offset, 4);
+      offset += 4;
+      e->rank = ntohl(rank_be);
+      e->session_id = net_to_host64(sid_be);
+      score_be = net_to_host64(score_be);
+      rating_be = net_to_host64(rating_be);
+      memcpy(&e->score, &score_be, sizeof(double));
+      memcpy(&e->rating, &rating_be, sizeof(double));
+      e->games_played = ntohl(games_be);
     }
     break;
   }
@@ -645,7 +748,9 @@ int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
       msg->ctrl != WAMBLE_CTRL_GET_PLAYER_STATS &&
       msg->ctrl != WAMBLE_CTRL_PLAYER_STATS_DATA &&
       msg->ctrl != WAMBLE_CTRL_GET_LEGAL_MOVES &&
-      msg->ctrl != WAMBLE_CTRL_LEGAL_MOVES) {
+      msg->ctrl != WAMBLE_CTRL_LEGAL_MOVES &&
+      msg->ctrl != WAMBLE_CTRL_GET_LEADERBOARD &&
+      msg->ctrl != WAMBLE_CTRL_LEADERBOARD_DATA) {
     return -1;
   }
   if (msg->uci_len > MAX_UCI_LENGTH) {

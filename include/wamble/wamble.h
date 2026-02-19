@@ -671,6 +671,7 @@ typedef struct {
   DbStatus status;
   char fen[FEN_MAX_LENGTH];
   char status_text[STATUS_MAX_LENGTH];
+  time_t created_at;
   time_t last_assignment_time;
   time_t last_move_time;
   time_t reservation_time;
@@ -689,6 +690,21 @@ typedef struct {
   const struct WambleMove *rows;
   int count;
 } DbMovesResult;
+
+typedef struct {
+  uint32_t rank;
+  uint64_t session_id;
+  double score;
+  double rating;
+  uint32_t games_played;
+} DbLeaderboardEntry;
+
+typedef struct {
+  DbStatus status;
+  const DbLeaderboardEntry *rows;
+  int count;
+  uint32_t self_rank;
+} DbLeaderboardResult;
 
 #define WAMBLE_CTRL_CLIENT_HELLO 0x01
 #define WAMBLE_CTRL_SERVER_HELLO 0x02
@@ -719,6 +735,8 @@ typedef struct {
 
 #define WAMBLE_CTRL_GET_LEGAL_MOVES 0x16
 #define WAMBLE_CTRL_LEGAL_MOVES 0x17
+#define WAMBLE_CTRL_GET_LEADERBOARD 0x18
+#define WAMBLE_CTRL_LEADERBOARD_DATA 0x19
 
 #define get_bit(square) (1ULL << (square))
 
@@ -802,12 +820,23 @@ typedef enum {
 #define WAMBLE_FLAG_UNRELIABLE 0x80
 
 #define WAMBLE_MAX_LEGAL_MOVES 218
+#define WAMBLE_MAX_LEADERBOARD_ENTRIES 16
+#define WAMBLE_LEADERBOARD_SCORE 1
+#define WAMBLE_LEADERBOARD_RATING 2
 
 typedef struct {
   uint8_t from;
   uint8_t to;
   int8_t promotion;
 } WambleNetMove;
+
+typedef struct {
+  uint32_t rank;
+  uint64_t session_id;
+  double score;
+  double rating;
+  uint32_t games_played;
+} WambleLeaderboardEntry;
 
 #pragma pack(push, 1)
 struct WambleMsg {
@@ -826,6 +855,11 @@ struct WambleMsg {
   uint8_t move_square;
   uint8_t move_count;
   WambleNetMove moves[WAMBLE_MAX_LEGAL_MOVES];
+  uint8_t leaderboard_type;
+  uint8_t leaderboard_limit;
+  uint8_t leaderboard_count;
+  uint32_t leaderboard_self_rank;
+  WambleLeaderboardEntry leaderboard[WAMBLE_MAX_LEADERBOARD_ENTRIES];
 };
 #pragma pack(pop)
 
@@ -981,6 +1015,8 @@ DbMovesResult wamble_query_get_moves_for_board(uint64_t board_id);
 DbStatus wamble_query_get_longest_game_moves(int *out_max_moves);
 DbStatus wamble_query_get_active_session_count(int *out_count);
 DbStatus wamble_query_get_max_board_id(uint64_t *out_max_id);
+DbStatus wamble_query_get_session_by_token(const uint8_t *token,
+                                           uint64_t *out_session);
 DbStatus wamble_query_get_persistent_session_by_token(const uint8_t *token,
                                                       uint64_t *out_session);
 DbStatus wamble_query_get_player_total_score(uint64_t session_id,
@@ -989,6 +1025,9 @@ DbStatus wamble_query_get_player_rating(uint64_t session_id,
                                         double *out_rating);
 DbStatus wamble_query_get_session_games_played(uint64_t session_id,
                                                int *out_games);
+DbLeaderboardResult wamble_query_get_leaderboard(uint64_t requester_session_id,
+                                                 uint8_t leaderboard_type,
+                                                 int limit);
 
 wamble_socket_t create_and_bind_socket(int port);
 int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
