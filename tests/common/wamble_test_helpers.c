@@ -309,7 +309,11 @@ int test_db_apply_migrations(const char *schema_name) {
     return -1;
   if (test_db_apply_sql_file("migrations/001_initial_schema.sql") != 0)
     return -1;
-  return test_db_apply_sql_file("migrations/002_runtime_metadata.sql");
+  if (test_db_apply_sql_file("migrations/002_runtime_metadata.sql") != 0)
+    return -1;
+  if (test_db_apply_sql_file("migrations/003_leaderboard_indexes.sql") != 0)
+    return -1;
+  return test_db_apply_sql_file("migrations/004_session_stats_counters.sql");
 #else
   (void)schema_name;
   return -1;

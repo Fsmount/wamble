@@ -256,6 +256,46 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     }
     return SERVER_ERR_UNKNOWN_PLAYER;
   }
+  case WAMBLE_CTRL_GET_LEADERBOARD: {
+    uint8_t lb_type = msg->leaderboard_type;
+    if (lb_type != WAMBLE_LEADERBOARD_RATING)
+      lb_type = WAMBLE_LEADERBOARD_SCORE;
+    uint64_t requester_session_id = 0;
+    if (wamble_query_get_session_by_token(msg->token, &requester_session_id) !=
+        DB_OK) {
+      requester_session_id = 0;
+    }
+    int limit = msg->leaderboard_limit ? (int)msg->leaderboard_limit : 10;
+    DbLeaderboardResult lb =
+        wamble_query_get_leaderboard(requester_session_id, lb_type, limit);
+    if (lb.status != DB_OK) {
+      return SERVER_ERR_INTERNAL;
+    }
+    struct WambleMsg response = {0};
+    response.ctrl = WAMBLE_CTRL_LEADERBOARD_DATA;
+    memcpy(response.token, msg->token, TOKEN_LENGTH);
+    response.leaderboard_type = lb_type;
+    response.leaderboard_self_rank = lb.self_rank;
+    int count = lb.count;
+    if (count < 0)
+      count = 0;
+    if (count > WAMBLE_MAX_LEADERBOARD_ENTRIES)
+      count = WAMBLE_MAX_LEADERBOARD_ENTRIES;
+    response.leaderboard_count = (uint8_t)count;
+    for (int i = 0; i < count; i++) {
+      response.leaderboard[i].rank = lb.rows[i].rank;
+      response.leaderboard[i].session_id = lb.rows[i].session_id;
+      response.leaderboard[i].score = lb.rows[i].score;
+      response.leaderboard[i].rating = lb.rows[i].rating;
+      response.leaderboard[i].games_played = lb.rows[i].games_played;
+    }
+    if (send_reliable_message(sockfd, &response, cliaddr,
+                              get_config()->timeout_ms,
+                              get_config()->max_retries) != 0) {
+      return SERVER_ERR_SEND_FAILED;
+    }
+    return SERVER_OK;
+  }
   case WAMBLE_CTRL_GET_LEGAL_MOVES: {
     WamblePlayer *player = get_player_by_token(msg->token);
     if (!player) {

@@ -100,6 +100,18 @@ Control Codes
   - `move_count` is capped at 218 and only includes moves originating from `square_index`.
   - Promotion is encoded as ASCII lowercase (`'q'`, `'r'`, `'b'`, `'n'`) or 0 for non-promotions.
   - Typically sent reliably so clients can pre-populate hover highlights.
+- `0x18` GET_LEADERBOARD (client to server): Request leaderboard snapshot.
+  - Payload: `uint8 leaderboard_type; uint8 limit`.
+  - `leaderboard_type`: `1=score`, `2=rating`.
+  - `limit`: defaults to 10 if 0.
+- `0x19` LEADERBOARD_DATA (server to client): Leaderboard response.
+  - Payload:
+    - `uint8 leaderboard_type`
+    - `uint8 count`
+    - `uint32 self_rank_be` (0 when requester has no known rank)
+    - `count * struct { uint32 rank_be; uint64 session_id_be; uint64 score_bits_be; uint64 rating_bits_be; uint32 games_played_be; }`
+  - `score_bits_be` and `rating_bits_be` are IEEE-754 double bit patterns in big-endian order.
+  - Maximum entries per packet: 16.
 
 Reliability
 - Reliable messages are sent with a sequence number (`seq_num`).

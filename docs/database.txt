@@ -49,6 +49,8 @@ Tables
   - `token BYTEA UNIQUE NOT NULL` (16 bytes)
   - `player_id BIGINT NULL REFERENCES players(id)`
   - `trust_level INTEGER NOT NULL DEFAULT 0`
+  - `total_score DECIMAL(10,4) NOT NULL DEFAULT 0`
+  - `games_played INTEGER NOT NULL DEFAULT 0`
   - `created_at TIMESTAMPTZ DEFAULT NOW()`
   - `last_seen_at TIMESTAMPTZ DEFAULT NOW()`
   - Indexes: `idx_sessions_token` on `(token)`
@@ -91,6 +93,8 @@ Tables
   - `points_awarded DECIMAL(10,4) NOT NULL`
   - `created_at TIMESTAMPTZ DEFAULT NOW()`
   - Index: `idx_payouts_session_id` on `(session_id)`
+  - Trigger: `trg_payouts_bump_session_total_score` increments
+    `sessions.total_score` on insert.
 
 - predictions
   - `id BIGSERIAL PRIMARY KEY`
@@ -104,6 +108,11 @@ Migrations
 - 001_initial_schema.sql: creates all tables, indexes, triggers.
 - 002_runtime_metadata.sql: adds persisted experiment/session metadata, board
   move/reservation metadata, and richer game-result fields.
+- 003_leaderboard_indexes.sql: adds leaderboard-oriented indexes for payouts,
+  sessions, and player rating ordering.
+- 004_session_stats_counters.sql: adds persisted per-session counters
+  (`total_score`, `games_played`) with backfill and insert triggers on
+  `payouts`/`moves`.
 
 Trust and Visibility
 - Client trust is read from `sessions.trust_level`.
