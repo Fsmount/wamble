@@ -672,6 +672,10 @@ typedef struct {
   char fen[FEN_MAX_LENGTH];
   char status_text[STATUS_MAX_LENGTH];
   time_t last_assignment_time;
+  time_t last_move_time;
+  time_t reservation_time;
+  int last_mover_arm;
+  bool reserved_for_white;
 } DbBoardResult;
 
 typedef struct {
@@ -950,9 +954,16 @@ void wamble_emit_update_board(uint64_t board_id, const char *fen,
                               const char *status);
 void wamble_emit_update_board_assignment_time(uint64_t board_id);
 void wamble_emit_create_reservation(uint64_t board_id, const uint8_t *token,
-                                    int timeout_seconds);
+                                    int timeout_seconds,
+                                    bool reserved_for_white);
 void wamble_emit_remove_reservation(uint64_t board_id);
-void wamble_emit_record_game_result(uint64_t board_id, char winning_side);
+void wamble_emit_record_game_result(uint64_t board_id, char winning_side,
+                                    int move_count, int duration_seconds,
+                                    const char *termination_reason);
+void wamble_emit_update_board_move_meta(uint64_t board_id, int last_mover_arm);
+void wamble_emit_update_board_reservation_meta(uint64_t board_id,
+                                               time_t reservation_time,
+                                               bool reserved_for_white);
 void wamble_emit_update_session_last_seen(const uint8_t *token);
 void wamble_emit_create_session(const uint8_t *token, uint64_t player_id);
 void wamble_emit_link_session_to_pubkey(const uint8_t *token,

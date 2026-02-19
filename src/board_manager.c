@@ -225,6 +225,7 @@ void board_manager_init(void) {
 }
 
 static void transition_to_archived(WambleBoard *board, GameResult result) {
+  time_t now = wamble_now_wall();
   board->state = BOARD_STATE_ARCHIVED;
   board->result = result;
 
@@ -236,7 +237,22 @@ static void transition_to_archived(WambleBoard *board, GameResult result) {
   } else if (result == GAME_RESULT_BLACK_WINS) {
     winning_side = 'b';
   }
-  wamble_emit_record_game_result(board->id, winning_side);
+  int move_count = board->board.fullmove_number;
+  if (move_count < 0)
+    move_count = 0;
+  int duration_seconds = 0;
+  if (board->creation_time > 0 && now > board->creation_time) {
+    duration_seconds = (int)(now - board->creation_time);
+  }
+  const char *termination_reason = "unknown";
+  if (result == GAME_RESULT_DRAW) {
+    termination_reason = "draw";
+  } else if (result == GAME_RESULT_WHITE_WINS ||
+             result == GAME_RESULT_BLACK_WINS) {
+    termination_reason = "win";
+  }
+  wamble_emit_record_game_result(board->id, winning_side, move_count,
+                                 duration_seconds, termination_reason);
 
   total_boards--;
 }
@@ -412,10 +428,13 @@ static void apply_reservation_to_board(WambleBoard *board,
 
   wamble_emit_update_board(board->id, board->fen, "RESERVED");
   wamble_emit_update_board_assignment_time(board->id);
+  wamble_emit_update_board_reservation_meta(board->id, now,
+                                            board->reserved_for_white);
 
   if (player->has_persistent_identity) {
     wamble_emit_create_reservation(board->id, player->token,
-                                   get_config()->reservation_timeout);
+                                   get_config()->reservation_timeout,
+                                   board->reserved_for_white);
   }
 }
 
@@ -443,10 +462,12 @@ static WambleBoard *load_board_into_cache(uint64_t board_id) {
   board->last_move_time = 0;
   board->creation_time = wamble_now_wall();
   board->last_assignment_time = br.last_assignment_time;
-  board->last_mover_arm = WAMBLE_EXPERIMENT_ARM_NULL;
+  board->last_move_time = br.last_move_time;
+  board->last_mover_arm = (br.last_mover_arm >= 0) ? (uint16_t)br.last_mover_arm
+                                                   : WAMBLE_EXPERIMENT_ARM_NULL;
   memset(board->reservation_player_token, 0, TOKEN_LENGTH);
-  board->reservation_time = 0;
-  board->reserved_for_white = false;
+  board->reservation_time = br.reservation_time;
+  board->reserved_for_white = br.reserved_for_white;
 
   board_map_put(board_id, cache_slot);
   if (cache_slot >= num_cached_boards) {
@@ -525,13 +546,16 @@ void board_move_played(uint64_t board_id) {
       board->last_move_time = wamble_now_wall();
 
       wamble_emit_update_board(board->id, board->fen, "ACTIVE");
+      wamble_emit_update_board_move_meta(board->id, (int)board->last_mover_arm);
       wamble_emit_remove_reservation(board->id);
+      wamble_emit_update_board_reservation_meta(board->id, 0, false);
 
       memset(board->reservation_player_token, 0, TOKEN_LENGTH);
       board->reservation_time = 0;
       board->reserved_for_white = false;
     } else if (board->state == BOARD_STATE_ACTIVE) {
       board->last_move_time = wamble_now_wall();
+      wamble_emit_update_board_move_meta(board->id, (int)board->last_mover_arm);
     }
   }
 
@@ -586,6 +610,7 @@ static void transition_reserved_to_dormant(WambleBoard *board) {
 
   wamble_emit_update_board(board->id, board->fen, "DORMANT");
   wamble_emit_remove_reservation(board->id);
+  wamble_emit_update_board_reservation_meta(board->id, 0, false);
 }
 
 void board_release_reservation(uint64_t board_id) {
@@ -732,7 +757,9 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
       temp_board.state = BOARD_STATE_DORMANT;
       temp_board.result = GAME_RESULT_IN_PROGRESS;
       temp_board.last_assignment_time = br.last_assignment_time;
-      temp_board.last_mover_arm = WAMBLE_EXPERIMENT_ARM_NULL;
+      temp_board.last_mover_arm = (br.last_mover_arm >= 0)
+                                      ? (uint16_t)br.last_mover_arm
+                                      : WAMBLE_EXPERIMENT_ARM_NULL;
 
       if (!board_pairing_allowed_for_player(&temp_board, player)) {
         continue;
