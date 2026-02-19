@@ -10,6 +10,14 @@ static int setup_managers(void) {
   return 0;
 }
 
+static int setup_managers_with_config(const char *path) {
+  char msg[128];
+  (void)config_load(path, NULL, msg, sizeof(msg));
+  player_manager_init();
+  board_manager_init();
+  return 0;
+}
+
 WAMBLE_TEST(board_reservation_flow) {
   T_ASSERT_EQ_INT(setup_managers(), 0);
 
@@ -103,6 +111,44 @@ WAMBLE_TEST(board_inactivity_timeout_transitions_to_dormant) {
   return 0;
 }
 
+WAMBLE_TEST(board_assignment_respects_experiment_pairings) {
+  const char *p = "build/test_board_pairings.conf";
+  const char *cfg = "(def experiment-enabled 1)\n"
+                    "(def experiment-seed 9)\n"
+                    "(def experiment-arms 2)\n"
+                    "(def experiment-pairings \"0:0,1:1\")\n";
+  FILE *f = fopen(p, "w");
+  T_ASSERT(f != NULL);
+  fwrite(cfg, 1, strlen(cfg), f);
+  fclose(f);
+
+  T_ASSERT_EQ_INT(setup_managers_with_config(p), 0);
+
+  WamblePlayer *p0 = create_new_player();
+  T_ASSERT(p0 != NULL);
+  WambleBoard *b0 = find_board_for_player(p0);
+  T_ASSERT(b0 != NULL);
+  board_move_played(b0->id);
+
+  uint16_t arm0 = network_experiment_arm_for_token(p0->token);
+  WamblePlayer *p1 = NULL;
+  uint16_t arm1 = arm0;
+  for (int i = 0; i < 32; i++) {
+    p1 = create_new_player();
+    T_ASSERT(p1 != NULL);
+    arm1 = network_experiment_arm_for_token(p1->token);
+    if (arm1 != arm0)
+      break;
+  }
+  T_ASSERT(p1 != NULL);
+  T_ASSERT(arm1 != arm0);
+
+  WambleBoard *b1 = find_board_for_player(p1);
+  T_ASSERT(b1 != NULL);
+  T_ASSERT(b1->id != b0->id);
+  return 0;
+}
+
 WAMBLE_TESTS_BEGIN_NAMED(board_manager_tests) {
   WAMBLE_TESTS_ADD_FM(board_reservation_flow, "board_manager");
   WAMBLE_TESTS_ADD_FM(board_move_transitions_to_active, "board_manager");
@@ -111,6 +157,8 @@ WAMBLE_TESTS_BEGIN_NAMED(board_manager_tests) {
   WAMBLE_TESTS_ADD_FM(board_reservation_timeout_transitions_to_dormant,
                       "board_manager");
   WAMBLE_TESTS_ADD_FM(board_inactivity_timeout_transitions_to_dormant,
+                      "board_manager");
+  WAMBLE_TESTS_ADD_FM(board_assignment_respects_experiment_pairings,
                       "board_manager");
 }
 WAMBLE_TESTS_END()

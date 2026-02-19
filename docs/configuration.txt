@@ -15,6 +15,17 @@ Core Options (common defaults)
   as the TCP websocket port number.
 - `websocket-path` (string, `/ws`): Websocket HTTP upgrade endpoint path.
   - Must start with `/`.
+- `experiment-enabled` (int, 0): Enable hidden server-side experiment arm
+  assignment for sessions on this profile.
+- `experiment-seed` (int, 0): Per-profile deterministic seed used for arm
+  assignment.
+- `experiment-arms` (int, 1): Number of arms (`N`) for this profile's
+  experiment. Sessions are assigned to arm index `0..N-1`.
+- `experiment-pairings` (string, `*`): Allowed `(current_arm:opponent_arm)`
+  tuples for board assignment within a profile. `*` allows all pairs.
+  - Format: comma-separated tuples like `0:0,0:1,1:*` where `*` is wildcard.
+  - `current_arm` is the requesting player's arm.
+  - `opponent_arm` is the arm of the last mover on that board.
 - `timeout-ms` (int, 100): Reliable send ACK timeout (ms).
 - `max-retries` (int, 3): Reliable send retries.
 - `max-message-size` (int, 126): Fixed message body size (informational).

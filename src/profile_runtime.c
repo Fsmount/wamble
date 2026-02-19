@@ -227,11 +227,13 @@ static void runtime_cfg_free_owned(WambleConfig *cfg) {
   free(cfg->db_pass);
   free(cfg->db_name);
   free(cfg->websocket_path);
+  free(cfg->experiment_pairings);
   cfg->db_host = NULL;
   cfg->db_user = NULL;
   cfg->db_pass = NULL;
   cfg->db_name = NULL;
   cfg->websocket_path = NULL;
+  cfg->experiment_pairings = NULL;
 }
 
 static int runtime_cfg_dup_from(WambleConfig *dst, const WambleConfig *src) {
@@ -244,8 +246,10 @@ static int runtime_cfg_dup_from(WambleConfig *dst, const WambleConfig *src) {
   dst->db_pass = wamble_strdup_local(src->db_pass);
   dst->db_name = wamble_strdup_local(src->db_name);
   dst->websocket_path = wamble_strdup_local(src->websocket_path);
+  dst->experiment_pairings = wamble_strdup_local(
+      src->experiment_pairings ? src->experiment_pairings : "*");
   if (!dst->db_host || !dst->db_user || !dst->db_pass || !dst->db_name ||
-      !dst->websocket_path) {
+      !dst->websocket_path || !dst->experiment_pairings) {
     runtime_cfg_free_owned(dst);
     return -1;
   }
@@ -1209,6 +1213,9 @@ static int runtime_cfg_equals(const WambleConfig *a, const WambleConfig *b) {
     return 0;
   return a->port == b->port && a->websocket_enabled == b->websocket_enabled &&
          a->websocket_port == b->websocket_port &&
+         a->experiment_enabled == b->experiment_enabled &&
+         a->experiment_seed == b->experiment_seed &&
+         a->experiment_arms == b->experiment_arms &&
          a->timeout_ms == b->timeout_ms && a->max_retries == b->max_retries &&
          a->buffer_size == b->buffer_size &&
          a->max_client_sessions == b->max_client_sessions &&
@@ -1220,7 +1227,8 @@ static int runtime_cfg_equals(const WambleConfig *a, const WambleConfig *b) {
          strcmp(a->db_user, b->db_user) == 0 &&
          strcmp(a->db_pass, b->db_pass) == 0 &&
          strcmp(a->db_name, b->db_name) == 0 &&
-         strcmp(a->websocket_path, b->websocket_path) == 0;
+         strcmp(a->websocket_path, b->websocket_path) == 0 &&
+         strcmp(a->experiment_pairings, b->experiment_pairings) == 0;
 }
 
 static void refresh_running_profile_configs(void) {

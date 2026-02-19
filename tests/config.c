@@ -53,6 +53,9 @@ WAMBLE_TEST(config_defaults_no_file) {
   T_ASSERT_STATUS(s, CONFIG_LOAD_DEFAULTS);
   T_ASSERT_EQ_INT(get_config()->port, 8888);
   T_ASSERT_EQ_INT(get_config()->timeout_ms, 100);
+  T_ASSERT_EQ_INT(get_config()->experiment_enabled, 0);
+  T_ASSERT_EQ_INT(get_config()->experiment_seed, 0);
+  T_ASSERT_EQ_INT(get_config()->experiment_arms, 1);
   T_ASSERT_EQ_INT(get_config()->log_level, LOG_LEVEL_INFO);
   return 0;
 }
@@ -157,6 +160,10 @@ WAMBLE_TEST(config_parse_doubles_and_strings) {
   const char *cfg = "(def max-pot 33.5)\n"
                     "(def new-player-early-phase-mult 1.75)\n"
                     "(def experienced-player-end-phase-mult 1.5)\n"
+                    "(def experiment-enabled 1)\n"
+                    "(def experiment-seed 42)\n"
+                    "(def experiment-arms 7)\n"
+                    "(def experiment-pairings \"0:0,0:1,1:*\")\n"
                     "(def select-timeout-usec 250000)\n"
                     "(def state-dir \"/var/tmp/wamble\")\n";
   FILE *f = fopen(p, "w");
@@ -168,6 +175,10 @@ WAMBLE_TEST(config_parse_doubles_and_strings) {
   T_ASSERT(fabs(get_config()->max_pot - 33.5) < 1e-9);
   T_ASSERT(fabs(get_config()->new_player_early_phase_mult - 1.75) < 1e-9);
   T_ASSERT(fabs(get_config()->experienced_player_end_phase_mult - 1.5) < 1e-9);
+  T_ASSERT_EQ_INT(get_config()->experiment_enabled, 1);
+  T_ASSERT_EQ_INT(get_config()->experiment_seed, 42);
+  T_ASSERT_EQ_INT(get_config()->experiment_arms, 7);
+  T_ASSERT_STREQ(get_config()->experiment_pairings, "0:0,0:1,1:*");
   T_ASSERT_STREQ(get_config()->state_dir, "/var/tmp/wamble");
   return 0;
 }

@@ -795,6 +795,11 @@ static const ConfigVarMap config_map[] = {
     CONF_ITEM("port", CONF_INT, port),
     CONF_ITEM("websocket-enabled", CONF_INT, websocket_enabled),
     CONF_ITEM("websocket-port", CONF_INT, websocket_port),
+    CONF_ITEM("experiment-enabled", CONF_INT, experiment_enabled),
+    CONF_ITEM("experiment-seed", CONF_INT, experiment_seed),
+    CONF_ITEM("experiment-arms", CONF_INT, experiment_arms),
+    CONF_ITEM("treatment-groups-enabled", CONF_INT, experiment_enabled),
+    CONF_ITEM("treatment-groups-seed", CONF_INT, experiment_seed),
     CONF_ITEM("timeout-ms", CONF_INT, timeout_ms),
     CONF_ITEM("max-retries", CONF_INT, max_retries),
     CONF_ITEM("max-message-size", CONF_INT, max_message_size),
@@ -846,7 +851,8 @@ static const ConfigVarMap config_map[] = {
               spectator_max_focus_per_session),
     CONF_ITEM("spectator-summary-mode", CONF_STRING, spectator_summary_mode),
     CONF_ITEM("state-dir", CONF_STRING, state_dir),
-    CONF_ITEM("websocket-path", CONF_STRING, websocket_path)};
+    CONF_ITEM("websocket-path", CONF_STRING, websocket_path),
+    CONF_ITEM("experiment-pairings", CONF_STRING, experiment_pairings)};
 
 static void populate_config_from_env(LispEnv *env) {
   for (size_t i = 0; i < sizeof(config_map) / sizeof(config_map[0]); i++) {
@@ -891,6 +897,9 @@ static void config_set_defaults(void) {
   g_config.port = 8888;
   g_config.websocket_enabled = 0;
   g_config.websocket_port = 0;
+  g_config.experiment_enabled = 0;
+  g_config.experiment_seed = 0;
+  g_config.experiment_arms = 1;
   g_config.timeout_ms = 100;
   g_config.max_retries = 3;
   g_config.max_message_size = 126;
@@ -935,6 +944,7 @@ static void config_set_defaults(void) {
   g_config.spectator_summary_mode = strdup("changes");
   g_config.state_dir = NULL;
   g_config.websocket_path = strdup("/ws");
+  g_config.experiment_pairings = strdup("*");
 }
 
 static void free_profiles(void) {
@@ -950,6 +960,7 @@ static void free_profiles(void) {
     free(g_profiles[i].config.spectator_summary_mode);
     free(g_profiles[i].config.state_dir);
     free(g_profiles[i].config.websocket_path);
+    free(g_profiles[i].config.experiment_pairings);
   }
   free(g_profiles);
   g_profiles = NULL;
@@ -969,6 +980,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
     g_config.spectator_summary_mode = NULL;
     g_config.state_dir = NULL;
     g_config.websocket_path = NULL;
+    g_config.experiment_pairings = NULL;
   } else {
     free(g_config.db_host);
     free(g_config.db_user);
@@ -977,6 +989,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
     free(g_config.spectator_summary_mode);
     free(g_config.state_dir);
     free(g_config.websocket_path);
+    free(g_config.experiment_pairings);
   }
   config_set_defaults();
 
@@ -1147,6 +1160,8 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
             cfg.state_dir = strdup(base_cfg.state_dir);
           if (base_cfg.websocket_path)
             cfg.websocket_path = strdup(base_cfg.websocket_path);
+          if (base_cfg.experiment_pairings)
+            cfg.experiment_pairings = strdup(base_cfg.experiment_pairings);
 
           WambleConfig saved = g_config;
           g_config = cfg;
@@ -1209,6 +1224,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
             free(g_profiles[i].config.spectator_summary_mode);
             free(g_profiles[i].config.state_dir);
             free(g_profiles[i].config.websocket_path);
+            free(g_profiles[i].config.experiment_pairings);
           }
         }
         free(g_profiles);

@@ -451,6 +451,9 @@ typedef struct WambleConfig {
   int port;
   int websocket_enabled;
   int websocket_port;
+  int experiment_enabled;
+  int experiment_seed;
+  int experiment_arms;
   int timeout_ms;
   int max_retries;
   int max_message_size;
@@ -496,6 +499,7 @@ typedef struct WambleConfig {
 
   char *state_dir;
   char *websocket_path;
+  char *experiment_pairings;
 } WambleConfig;
 
 typedef enum {
@@ -843,10 +847,13 @@ typedef struct WambleBoard {
   time_t last_move_time;
   time_t creation_time;
   time_t last_assignment_time;
+  uint16_t last_mover_arm;
   uint8_t reservation_player_token[TOKEN_LENGTH];
   bool reserved_for_white;
   time_t reservation_time;
 } WambleBoard;
+
+#define WAMBLE_EXPERIMENT_ARM_NULL UINT16_MAX
 
 typedef struct WambleClientSession {
   struct sockaddr_in addr;
@@ -854,6 +861,7 @@ typedef struct WambleClientSession {
   uint32_t last_seq_num;
   time_t last_seen;
   uint32_t next_seq_num;
+  uint16_t experiment_arm;
 } WambleClientSession;
 
 int validate_and_apply_move_status(WambleBoard *wamble_board,
@@ -919,6 +927,8 @@ void player_manager_tick(void);
 WamblePlayer *get_player_by_token(const uint8_t *token);
 void discard_player_by_token(const uint8_t *token);
 void network_init_thread_state(void);
+uint16_t network_experiment_arm_for_token(const uint8_t *token);
+int network_get_session_experiment_arm(const uint8_t *token, uint16_t *out_arm);
 
 void cleanup_expired_sessions(void);
 
