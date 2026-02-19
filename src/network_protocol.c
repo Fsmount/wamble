@@ -53,6 +53,26 @@ static inline uint64_t addr_hash_key(const struct sockaddr_in *addr) {
   return mix64_s((ip << 16) ^ port);
 }
 
+uint16_t network_experiment_arm_for_token(const uint8_t *token) {
+  int arms = get_config()->experiment_arms;
+  if (arms <= 0)
+    arms = 1;
+  if (!token || get_config()->experiment_enabled == 0)
+    return 0;
+
+  uint64_t h = (uint64_t)(uint32_t)get_config()->experiment_seed;
+  h ^= (uint64_t)(uint16_t)get_config()->port << 32;
+
+  uint64_t t0 = 0;
+  uint64_t t1 = 0;
+  memcpy(&t0, token, sizeof(t0));
+  memcpy(&t1, token + sizeof(t0), sizeof(t1));
+
+  h = mix64_s(h ^ t0);
+  h = mix64_s(h ^ t1);
+  return (uint16_t)(h % (uint64_t)arms);
+}
+
 static void session_map_init(void) {
   for (int i = 0; i < SESSION_MAP_SIZE; i++)
     session_index_map[i] = -1;
@@ -492,6 +512,7 @@ create_client_session(const struct sockaddr_in *addr, const uint8_t *token) {
   session->last_seq_num = 0;
   session->last_seen = wamble_now_wall();
   session->next_seq_num = 1;
+  session->experiment_arm = network_experiment_arm_for_token(token);
   session_map_put(addr, (int)(session - client_sessions));
   return session;
 }
@@ -531,6 +552,19 @@ void network_init_thread_state(void) {
   }
   num_sessions = 0;
   session_map_init();
+}
+
+int network_get_session_experiment_arm(const uint8_t *token,
+                                       uint16_t *out_arm) {
+  if (!token || !out_arm)
+    return -1;
+  if (!client_sessions)
+    network_init_thread_state();
+  WambleClientSession *session = find_client_session_by_token(token);
+  if (!session)
+    return -1;
+  *out_arm = session->experiment_arm;
+  return 0;
 }
 
 wamble_socket_t create_and_bind_socket(int port) {

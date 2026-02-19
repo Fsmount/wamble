@@ -28,6 +28,38 @@ WAMBLE_TEST(token_base64url_roundtrip) {
   return 0;
 }
 
+WAMBLE_TEST(experiment_arm_defaults_to_zero_when_disabled) {
+  config_load(NULL, NULL, NULL, 0);
+  uint8_t token[TOKEN_LENGTH];
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    token[i] = (uint8_t)(i + 11);
+  uint16_t arm = network_experiment_arm_for_token(token);
+  T_ASSERT_EQ_INT((int)arm, 0);
+  return 0;
+}
+
+WAMBLE_TEST(experiment_arm_deterministic_and_bounded_when_enabled) {
+  const char *p = "build/test_network_experiment.conf";
+  const char *cfg = "(def experiment-enabled 1)\n"
+                    "(def experiment-seed 12345)\n"
+                    "(def experiment-arms 9)\n";
+  FILE *f = fopen(p, "w");
+  T_ASSERT(f != NULL);
+  fwrite(cfg, 1, strlen(cfg), f);
+  fclose(f);
+  T_ASSERT_STATUS(config_load(p, NULL, NULL, 0), CONFIG_LOAD_OK);
+
+  uint8_t token[TOKEN_LENGTH];
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    token[i] = (uint8_t)(0xA0 + i);
+
+  uint16_t a1 = network_experiment_arm_for_token(token);
+  uint16_t a2 = network_experiment_arm_for_token(token);
+  T_ASSERT_EQ_INT((int)a1, (int)a2);
+  T_ASSERT(a1 < 9);
+  return 0;
+}
+
 typedef struct {
   wamble_socket_t sock;
   struct sockaddr_in from;
@@ -764,6 +796,10 @@ WAMBLE_TEST(player_move_uci_len_guard) {
 WAMBLE_TESTS_BEGIN_NAMED(wamble_register_tests_network)
 WAMBLE_TESTS_ADD_SM(token_base64url_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
+WAMBLE_TESTS_ADD_SM(experiment_arm_defaults_to_zero_when_disabled,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(experiment_arm_deterministic_and_bounded_when_enabled,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(spectate_update_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
 WAMBLE_TESTS_ADD_SM(reliable_ack_success, WAMBLE_SUITE_FUNCTIONAL, "network");

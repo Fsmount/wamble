@@ -1,5 +1,6 @@
 #include "../include/wamble/wamble.h"
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 static WAMBLE_THREAD_LOCAL WambleBoard *board_cached;
@@ -246,6 +247,112 @@ static bool is_board_eligible_for_assignment(const WambleBoard *board) {
          board->result == GAME_RESULT_IN_PROGRESS;
 }
 
+static void board_pairing_allow_all(uint8_t *allow, int arms) {
+  if (!allow || arms <= 0)
+    return;
+  memset(allow, 1, (size_t)arms * (size_t)arms);
+}
+
+static int board_parse_pair_term(const char *p, size_t len, int arms,
+                                 int *out_is_wild, int *out_value) {
+  if (!p || !out_is_wild || !out_value || arms <= 0)
+    return -1;
+  if (len == 1 && p[0] == '*') {
+    *out_is_wild = 1;
+    *out_value = 0;
+    return 0;
+  }
+  if (len == 0 || len > 10)
+    return -1;
+  char tmp[16];
+  memcpy(tmp, p, len);
+  tmp[len] = '\0';
+  char *end = NULL;
+  long v = strtol(tmp, &end, 10);
+  if (!end || *end != '\0' || v < 0 || v >= arms)
+    return -1;
+  *out_is_wild = 0;
+  *out_value = (int)v;
+  return 0;
+}
+
+static int board_build_pairing_matrix(const char *spec, int arms,
+                                      uint8_t *allow) {
+  if (!allow || arms <= 0)
+    return -1;
+  if (!spec || !spec[0] || strcmp(spec, "*") == 0) {
+    board_pairing_allow_all(allow, arms);
+    return 0;
+  }
+
+  memset(allow, 0, (size_t)arms * (size_t)arms);
+  const char *cur = spec;
+  while (*cur) {
+    while (*cur == ' ' || *cur == '\t' || *cur == ',')
+      cur++;
+    if (!*cur)
+      break;
+
+    const char *term = cur;
+    while (*cur && *cur != ',')
+      cur++;
+    const char *end = cur;
+    while (end > term && (end[-1] == ' ' || end[-1] == '\t'))
+      end--;
+    const char *colon = memchr(term, ':', (size_t)(end - term));
+    if (!colon)
+      return -1;
+
+    int lhs_wild = 0, rhs_wild = 0, lhs = 0, rhs = 0;
+    if (board_parse_pair_term(term, (size_t)(colon - term), arms, &lhs_wild,
+                              &lhs) != 0 ||
+        board_parse_pair_term(colon + 1, (size_t)(end - (colon + 1)), arms,
+                              &rhs_wild, &rhs) != 0) {
+      return -1;
+    }
+
+    int i_from = lhs_wild ? 0 : lhs;
+    int i_to = lhs_wild ? (arms - 1) : lhs;
+    int j_from = rhs_wild ? 0 : rhs;
+    int j_to = rhs_wild ? (arms - 1) : rhs;
+    for (int i = i_from; i <= i_to; i++) {
+      for (int j = j_from; j <= j_to; j++) {
+        allow[i * arms + j] = 1;
+      }
+    }
+  }
+
+  return 0;
+}
+
+static int board_pairing_allowed_for_player(const WambleBoard *board,
+                                            const WamblePlayer *player) {
+  if (!board || !player)
+    return 0;
+  if (!get_config()->experiment_enabled || get_config()->experiment_arms <= 1)
+    return 1;
+  if (board->last_mover_arm == WAMBLE_EXPERIMENT_ARM_NULL)
+    return 1;
+
+  int arms = get_config()->experiment_arms;
+  if (arms <= 0)
+    arms = 1;
+  if (arms > 64)
+    arms = 64;
+
+  uint16_t cur_arm = network_experiment_arm_for_token(player->token);
+  uint16_t opp_arm = board->last_mover_arm;
+  if ((int)cur_arm >= arms || (int)opp_arm >= arms)
+    return 1;
+
+  uint8_t allow[64 * 64];
+  if (board_build_pairing_matrix(get_config()->experiment_pairings, arms,
+                                 allow) != 0) {
+    board_pairing_allow_all(allow, arms);
+  }
+  return allow[(size_t)cur_arm * (size_t)arms + (size_t)opp_arm] ? 1 : 0;
+}
+
 static double calculate_board_attractiveness(const WambleBoard *board,
                                              const WamblePlayer *player) {
   time_t now = wamble_now_wall();
@@ -336,6 +443,7 @@ static WambleBoard *load_board_into_cache(uint64_t board_id) {
   board->last_move_time = 0;
   board->creation_time = wamble_now_wall();
   board->last_assignment_time = br.last_assignment_time;
+  board->last_mover_arm = WAMBLE_EXPERIMENT_ARM_NULL;
   memset(board->reservation_player_token, 0, TOKEN_LENGTH);
   board->reservation_time = 0;
   board->reserved_for_white = false;
@@ -411,6 +519,8 @@ void board_move_played(uint64_t board_id) {
     WambleBoard *board = &board_cached[idx];
 
     if (board->state == BOARD_STATE_RESERVED) {
+      board->last_mover_arm =
+          network_experiment_arm_for_token(board->reservation_player_token);
       board->state = BOARD_STATE_ACTIVE;
       board->last_move_time = wamble_now_wall();
 
@@ -581,6 +691,9 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
     if (!is_board_eligible_for_assignment(board)) {
       continue;
     }
+    if (!board_pairing_allowed_for_player(board, player)) {
+      continue;
+    }
 
     double score = calculate_board_attractiveness(board, player);
 
@@ -619,6 +732,11 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
       temp_board.state = BOARD_STATE_DORMANT;
       temp_board.result = GAME_RESULT_IN_PROGRESS;
       temp_board.last_assignment_time = br.last_assignment_time;
+      temp_board.last_mover_arm = WAMBLE_EXPERIMENT_ARM_NULL;
+
+      if (!board_pairing_allowed_for_player(&temp_board, player)) {
+        continue;
+      }
 
       double score = calculate_board_attractiveness(&temp_board, player);
 
@@ -699,6 +817,7 @@ static int create_new_board_for_player(WamblePlayer *player) {
   parse_fen_to_bitboard(board->fen, &board->board);
   board->last_move_time = now;
   board->creation_time = now;
+  board->last_mover_arm = WAMBLE_EXPERIMENT_ARM_NULL;
 
   apply_reservation_to_board(board, player);
 
