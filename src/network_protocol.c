@@ -763,7 +763,7 @@ int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
       break;
     }
   }
-  if (!token_valid) {
+  if (!token_valid && msg->ctrl != WAMBLE_CTRL_CLIENT_HELLO) {
     return -1;
   }
 

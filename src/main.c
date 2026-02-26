@@ -5,9 +5,11 @@
 #include <stdlib.h>
 #include <string.h>
 #ifdef WAMBLE_PLATFORM_POSIX
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 #ifdef WAMBLE_PLATFORM_WINDOWS
+#include <io.h>
 #include <process.h>
 #endif
 
@@ -69,6 +71,151 @@ static int exec_self(char *argv[]) {
   execvp(argv[0], argv);
   return wamble_last_error();
 #endif
+}
+
+static int close_fd_local(int fd) {
+#ifdef WAMBLE_PLATFORM_WINDOWS
+  return _close(fd);
+#else
+  return close(fd);
+#endif
+}
+
+static int read_text_file(const char *path, char **out_text) {
+  if (!path || !out_text)
+    return -1;
+  *out_text = NULL;
+  FILE *f = fopen(path, "rb");
+  if (!f)
+    return -1;
+  if (fseek(f, 0, SEEK_END) != 0) {
+    fclose(f);
+    return -1;
+  }
+  long sz = ftell(f);
+  if (sz < 0) {
+    fclose(f);
+    return -1;
+  }
+  if (fseek(f, 0, SEEK_SET) != 0) {
+    fclose(f);
+    return -1;
+  }
+  char *buf = (char *)malloc((size_t)sz + 1);
+  if (!buf) {
+    fclose(f);
+    return -1;
+  }
+  size_t rd = fread(buf, 1, (size_t)sz, f);
+  fclose(f);
+  if (rd != (size_t)sz) {
+    free(buf);
+    return -1;
+  }
+  buf[rd] = '\0';
+  *out_text = buf;
+  return 0;
+}
+
+static int load_config_from_text_blob(const char *text, const char *profile,
+                                      char *status_msg,
+                                      size_t status_msg_size) {
+  if (!text || !text[0])
+    return -1;
+  char tmpl[] = "wamble_cfg_XXXXXX";
+  int fd = wamble_mkstemp(tmpl);
+  if (fd < 0)
+    return -1;
+  if (close_fd_local(fd) != 0) {
+    wamble_unlink(tmpl);
+    return -1;
+  }
+  FILE *f = fopen(tmpl, "wb");
+  if (!f) {
+    wamble_unlink(tmpl);
+    return -1;
+  }
+  size_t len = strlen(text);
+  size_t wr = fwrite(text, 1, len, f);
+  fclose(f);
+  if (wr != len) {
+    wamble_unlink(tmpl);
+    return -1;
+  }
+  ConfigLoadStatus st = config_load(tmpl, profile, status_msg, status_msg_size);
+  wamble_unlink(tmpl);
+  return (st == CONFIG_LOAD_OK) ? 0 : -1;
+}
+
+static int db_endpoint_equal(const char *host_a, const char *user_a,
+                             const char *db_a, const char *host_b,
+                             const char *user_b, const char *db_b) {
+  const char *ha = host_a ? host_a : "";
+  const char *ua = user_a ? user_a : "";
+  const char *da = db_a ? db_a : "";
+  const char *hb = host_b ? host_b : "";
+  const char *ub = user_b ? user_b : "";
+  const char *db = db_b ? db_b : "";
+  return strcmp(ha, hb) == 0 && strcmp(ua, ub) == 0 && strcmp(da, db) == 0;
+}
+
+static int validate_db_topology(char *err, size_t err_size) {
+  const WambleConfig *cfg = get_config();
+  if (!cfg)
+    return -1;
+
+  const char *global_host = cfg->global_db_host;
+  const char *global_user = cfg->global_db_user;
+  const char *global_name = cfg->global_db_name;
+
+  int count = config_profile_count();
+  if (count > 0) {
+    const WambleProfile *first = config_get_profile(0);
+    if (first) {
+      global_host = first->config.global_db_host;
+      global_user = first->config.global_db_user;
+      global_name = first->config.global_db_name;
+    }
+  }
+
+  if (db_endpoint_equal(cfg->db_host, cfg->db_user, cfg->db_name, global_host,
+                        global_user, global_name)) {
+    if (err && err_size) {
+      snprintf(
+          err, err_size,
+          "profile DB endpoint must differ from shared global DB endpoint");
+    }
+    return -1;
+  }
+
+  for (int i = 0; i < count; i++) {
+    const WambleProfile *p = config_get_profile(i);
+    if (!p)
+      continue;
+    if (!db_endpoint_equal(p->config.global_db_host, p->config.global_db_user,
+                           p->config.global_db_name, global_host, global_user,
+                           global_name)) {
+      if (err && err_size) {
+        snprintf(err, err_size,
+                 "profile '%s' overrides global DB endpoint; all profiles must "
+                 "share one global identity store",
+                 p->name ? p->name : "");
+      }
+      return -1;
+    }
+    if (db_endpoint_equal(p->config.db_host, p->config.db_user,
+                          p->config.db_name, global_host, global_user,
+                          global_name)) {
+      if (err && err_size) {
+        snprintf(err, err_size,
+                 "profile '%s' DB endpoint overlaps shared global DB endpoint",
+                 p->name ? p->name : "");
+      }
+      return -1;
+    }
+  }
+
+  return 0;
 }
 
 static int perform_profile_exec_reload(char *argv[]) {
@@ -201,9 +348,42 @@ int main(int argc, char *argv[]) {
 #endif
 
   char db_conn_str[256];
+  char global_conn_str[256];
+  char topology_err[256];
+  if (validate_db_topology(topology_err, sizeof(topology_err)) != 0) {
+    LOG_FATAL("Invalid DB topology: %s", topology_err);
+    return 1;
+  }
   snprintf(db_conn_str, sizeof(db_conn_str),
            "dbname=%s user=%s password=%s host=%s", get_config()->db_name,
            get_config()->db_user, get_config()->db_pass, get_config()->db_host);
+  snprintf(global_conn_str, sizeof(global_conn_str),
+           "dbname=%s user=%s password=%s host=%s",
+           get_config()->global_db_name, get_config()->global_db_user,
+           get_config()->global_db_pass, get_config()->global_db_host);
+
+  if (db_set_global_store_connection(global_conn_str) != 0) {
+    LOG_FATAL("Failed to configure shared global store connection");
+    return 1;
+  }
+  {
+    char *cfg_text = NULL;
+    if (read_text_file(config_file, &cfg_text) == 0) {
+      const char *profile_key = profile ? profile : "__default__";
+      if (db_store_config_snapshot(profile_key, cfg_text) != 0) {
+        LOG_WARN("Failed to persist initial config snapshot to global store");
+      }
+      free(cfg_text);
+    }
+  }
+  {
+    const char *profile_key = profile ? profile : "__default__";
+    if (db_apply_config_policy_rules(profile_key) != 0 ||
+        db_validate_global_policy() != 0) {
+      LOG_FATAL("Failed to load/validate trust policy");
+      return 1;
+    }
+  }
 
   if (db_init(db_conn_str) != 0) {
     LOG_FATAL("Failed to initialize database");
@@ -275,15 +455,138 @@ int main(int argc, char *argv[]) {
     }
     if (g_reload_requested) {
       LOG_INFO("Reload requested; reloading config and reconciling listeners");
+      char *attempt_cfg_text = NULL;
+      (void)read_text_file(config_file, &attempt_cfg_text);
+      void *cfg_snapshot = config_create_snapshot();
+      if (!cfg_snapshot) {
+        LOG_WARN("Config reload skipped: failed to snapshot current config");
+        free(attempt_cfg_text);
+        g_reload_requested = 0;
+        continue;
+      }
+      const char *profile_key = profile ? profile : "__default__";
+      int loaded_from_db_snapshot = 0;
       ConfigLoadStatus rcfg =
           config_load(config_file, profile, cfg_status, sizeof(cfg_status));
       if (rcfg != CONFIG_LOAD_OK) {
-        LOG_WARN("Config reload status=%d", (int)rcfg);
+        char errbuf[128];
+        snprintf(errbuf, sizeof(errbuf), "config_load_status=%d", (int)rcfg);
+        (void)db_record_config_event(profile_key, attempt_cfg_text, "file",
+                                     "rejected", errbuf);
+        char *db_cfg = NULL;
+        if (db_load_config_snapshot(profile_key, &db_cfg) == 0 && db_cfg) {
+          LOG_WARN("Config reload parse/load failed status=%d; attempting DB "
+                   "snapshot restore",
+                   (int)rcfg);
+          if (load_config_from_text_blob(db_cfg, profile, cfg_status,
+                                         sizeof(cfg_status)) == 0) {
+            LOG_INFO("Recovered config from DB snapshot for profile key %s",
+                     profile_key);
+            loaded_from_db_snapshot = 1;
+          } else {
+            LOG_WARN("DB snapshot restore failed; keeping in-memory previous "
+                     "config");
+            (void)config_restore_snapshot(cfg_snapshot);
+            config_free_snapshot(cfg_snapshot);
+            free(db_cfg);
+            free(attempt_cfg_text);
+            g_reload_requested = 0;
+            continue;
+          }
+          free(db_cfg);
+        } else {
+          LOG_WARN("Config reload rejected status=%d; no DB snapshot "
+                   "available, keeping previous config",
+                   (int)rcfg);
+          (void)config_restore_snapshot(cfg_snapshot);
+          config_free_snapshot(cfg_snapshot);
+          free(attempt_cfg_text);
+          g_reload_requested = 0;
+          continue;
+        }
       }
+
+      if (validate_db_topology(topology_err, sizeof(topology_err)) != 0) {
+        LOG_WARN("Config reload rejected: invalid DB topology (%s); keeping "
+                 "previous config",
+                 topology_err);
+        (void)db_record_config_event(profile_key, attempt_cfg_text, "file",
+                                     "rejected", topology_err);
+        (void)config_restore_snapshot(cfg_snapshot);
+        config_free_snapshot(cfg_snapshot);
+        free(attempt_cfg_text);
+        g_reload_requested = 0;
+        continue;
+      }
+
+      snprintf(global_conn_str, sizeof(global_conn_str),
+               "dbname=%s user=%s password=%s host=%s",
+               get_config()->global_db_name, get_config()->global_db_user,
+               get_config()->global_db_pass, get_config()->global_db_host);
+      if (db_set_global_store_connection(global_conn_str) != 0 ||
+          db_apply_config_policy_rules(profile_key) != 0 ||
+          db_validate_global_policy() != 0) {
+        LOG_WARN("Config reload rejected: invalid global store/policy; keeping "
+                 "previous config");
+        (void)db_record_config_event(
+            profile_key, attempt_cfg_text, "file", "rejected",
+            "global_store_or_policy_validation_failed");
+        (void)config_restore_snapshot(cfg_snapshot);
+        snprintf(global_conn_str, sizeof(global_conn_str),
+                 "dbname=%s user=%s password=%s host=%s",
+                 get_config()->global_db_name, get_config()->global_db_user,
+                 get_config()->global_db_pass, get_config()->global_db_host);
+        (void)db_set_global_store_connection(global_conn_str);
+        (void)db_apply_config_policy_rules(profile_key);
+        (void)db_validate_global_policy();
+        config_free_snapshot(cfg_snapshot);
+        free(attempt_cfg_text);
+        g_reload_requested = 0;
+        continue;
+      }
+
       ProfileStartStatus rst = reconcile_profile_listeners();
       if (rst != PROFILE_START_OK) {
-        LOG_FATAL("Listener reconcile failed (status=%d)", (int)rst);
+        LOG_WARN("Config reload reconcile failed (status=%d); restoring "
+                 "previous config",
+                 (int)rst);
+        char errbuf[128];
+        snprintf(errbuf, sizeof(errbuf), "reconcile_status=%d", (int)rst);
+        (void)db_record_config_event(profile_key, attempt_cfg_text, "file",
+                                     "rejected", errbuf);
+        if (config_restore_snapshot(cfg_snapshot) != 0) {
+          LOG_FATAL("Failed to restore previous config snapshot");
+        }
+        snprintf(global_conn_str, sizeof(global_conn_str),
+                 "dbname=%s user=%s password=%s host=%s",
+                 get_config()->global_db_name, get_config()->global_db_user,
+                 get_config()->global_db_pass, get_config()->global_db_host);
+        if (db_set_global_store_connection(global_conn_str) != 0 ||
+            db_apply_config_policy_rules(profile_key) != 0 ||
+            db_validate_global_policy() != 0) {
+          LOG_FATAL(
+              "Failed to restore global store settings after rejected reload");
+        }
+        if (reconcile_profile_listeners() != PROFILE_START_OK) {
+          LOG_FATAL("Failed to reconcile listeners back to previous config");
+        }
+      } else {
+        if (!loaded_from_db_snapshot) {
+          if (attempt_cfg_text && attempt_cfg_text[0]) {
+            if (db_store_config_snapshot(profile_key, attempt_cfg_text) != 0) {
+              LOG_WARN(
+                  "Failed to persist updated config snapshot to global store");
+            } else {
+              if (db_apply_config_policy_rules(profile_key) != 0 ||
+                  db_validate_global_policy() != 0) {
+                LOG_WARN("Failed to rebind policy to active config snapshot");
+              }
+            }
+          }
+        }
       }
+      config_free_snapshot(cfg_snapshot);
+      free(attempt_cfg_text);
       g_reload_requested = 0;
     }
 
@@ -300,6 +603,15 @@ int main(int argc, char *argv[]) {
                                                     sizeof(profile_name))) {
         LOG_ERROR("WS gateway issue profile=%s status=%d",
                   profile_name[0] ? profile_name : "default", (int)rst);
+      }
+    }
+    {
+      char profile_name[64];
+      ProfileTrustDecisionStatus tdst = PROFILE_TRUST_DECISION_DENIED;
+      while (profile_runtime_take_trust_decision_status(&tdst, profile_name,
+                                                        sizeof(profile_name))) {
+        LOG_DEBUG("trust decision profile=%s status=%d",
+                  profile_name[0] ? profile_name : "default", (int)tdst);
       }
     }
 

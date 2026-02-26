@@ -6,7 +6,12 @@
 #include <string.h>
 
 static WAMBLE_THREAD_LOCAL PGconn *db_conn_tls = NULL;
+static WAMBLE_THREAD_LOCAL PGconn *db_global_conn_tls = NULL;
 static bool db_initialized = false;
+static char g_global_conn_str[512];
+static int g_global_conn_configured = 0;
+static void bytes_to_hex(const uint8_t *bytes, int len, char *hex_out);
+static uint64_t db_global_identity_create_anonymous(void);
 
 static void build_conn_string_from_cfg(const WambleConfig *cfg, char *out,
                                        size_t outlen) {
@@ -49,6 +54,36 @@ static PGconn *ensure_connection(void) {
   return db_conn_tls;
 }
 
+static PGconn *ensure_global_connection(void) {
+  if (db_global_conn_tls) {
+    if (PQstatus(db_global_conn_tls) != CONNECTION_OK) {
+      PQreset(db_global_conn_tls);
+      if (PQstatus(db_global_conn_tls) != CONNECTION_OK) {
+        PQfinish(db_global_conn_tls);
+        db_global_conn_tls = NULL;
+        return NULL;
+      }
+    }
+    return db_global_conn_tls;
+  }
+
+  if (g_global_conn_configured && g_global_conn_str[0]) {
+    db_global_conn_tls = PQconnectdb(g_global_conn_str);
+  } else {
+    char conn[256];
+    snprintf(conn, sizeof(conn), "dbname=%s user=%s password=%s host=%s",
+             get_config()->global_db_name, get_config()->global_db_user,
+             get_config()->global_db_pass, get_config()->global_db_host);
+    db_global_conn_tls = PQconnectdb(conn);
+  }
+  if (PQstatus(db_global_conn_tls) != CONNECTION_OK) {
+    PQfinish(db_global_conn_tls);
+    db_global_conn_tls = NULL;
+    return NULL;
+  }
+  return db_global_conn_tls;
+}
+
 static PGresult *pq_exec_locked(const char *command) {
   PGconn *c = ensure_connection();
   if (!c)
@@ -71,6 +106,416 @@ pq_exec_params_locked(const char *command, int nParams, const Oid *paramTypes,
   if (!res)
     return NULL;
   return res;
+}
+
+static PGresult *pq_exec_params_global_locked(const char *command, int nParams,
+                                              const Oid *paramTypes,
+                                              const char *const *paramValues,
+                                              const int *paramLengths,
+                                              const int *paramFormats,
+                                              int resultFormat) {
+  PGconn *c = ensure_global_connection();
+  if (!c)
+    return NULL;
+  PGresult *res = PQexecParams(c, command, nParams, paramTypes, paramValues,
+                               paramLengths, paramFormats, resultFormat);
+  if (!res)
+    return NULL;
+  return res;
+}
+
+int db_set_global_store_connection(const char *connection_string) {
+  if (!connection_string || !connection_string[0])
+    return -1;
+  size_t n = strlen(connection_string);
+  if (n >= sizeof(g_global_conn_str))
+    return -1;
+  PGconn *probe = PQconnectdb(connection_string);
+  if (!probe)
+    return -1;
+  int ok = (PQstatus(probe) == CONNECTION_OK) ? 0 : -1;
+  PQfinish(probe);
+  if (ok != 0)
+    return -1;
+
+  memcpy(g_global_conn_str, connection_string, n + 1);
+  g_global_conn_configured = 1;
+  if (db_global_conn_tls) {
+    PQfinish(db_global_conn_tls);
+    db_global_conn_tls = NULL;
+  }
+  return ok;
+}
+
+static int db_ensure_global_policy_schema(void) {
+  const char *ddl[] = {
+      "CREATE TABLE IF NOT EXISTS global_policy_rules ("
+      "  id BIGSERIAL PRIMARY KEY,"
+      "  global_identity_id BIGINT NOT NULL,"
+      "  action VARCHAR(128) NOT NULL,"
+      "  resource VARCHAR(256) NOT NULL,"
+      "  effect VARCHAR(8) NOT NULL CHECK (effect IN ('allow', 'deny')),"
+      "  permission_level INTEGER NOT NULL DEFAULT 0,"
+      "  policy_version VARCHAR(64) NOT NULL DEFAULT 'v1',"
+      "  reason TEXT,"
+      "  created_at TIMESTAMPTZ DEFAULT NOW(),"
+      "  updated_at TIMESTAMPTZ DEFAULT NOW()"
+      ")",
+      "ALTER TABLE global_policy_rules "
+      "ADD COLUMN IF NOT EXISTS scope VARCHAR(256) NOT NULL DEFAULT '*'",
+      "ALTER TABLE global_policy_rules "
+      "ADD COLUMN IF NOT EXISTS source VARCHAR(32) NOT NULL DEFAULT 'manual'",
+      "ALTER TABLE global_policy_rules "
+      "ADD COLUMN IF NOT EXISTS snapshot_revision_id BIGINT",
+      "ALTER TABLE global_policy_rules "
+      "ADD COLUMN IF NOT EXISTS not_before_at TIMESTAMPTZ",
+      "ALTER TABLE global_policy_rules "
+      "ADD COLUMN IF NOT EXISTS not_after_at TIMESTAMPTZ",
+      "ALTER TABLE global_policy_rules "
+      "ADD COLUMN IF NOT EXISTS context_key VARCHAR(128)",
+      "ALTER TABLE global_policy_rules "
+      "ADD COLUMN IF NOT EXISTS context_value VARCHAR(256)",
+      "CREATE INDEX IF NOT EXISTS idx_policy_identity_action_scope "
+      "ON global_policy_rules(global_identity_id, action, scope, resource)",
+      "CREATE INDEX IF NOT EXISTS idx_policy_source_snapshot "
+      "ON global_policy_rules(source, snapshot_revision_id)"};
+
+  for (size_t i = 0; i < sizeof(ddl) / sizeof(ddl[0]); i++) {
+    PGresult *res =
+        pq_exec_params_global_locked(ddl[i], 0, NULL, NULL, NULL, NULL, 0);
+    if (!res)
+      return -1;
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+      PQclear(res);
+      return -1;
+    }
+    PQclear(res);
+  }
+
+  return 0;
+}
+
+static int db_ensure_global_identity_schema(void) {
+  const char *ddl = "CREATE TABLE IF NOT EXISTS global_identities ("
+                    "  id BIGSERIAL PRIMARY KEY,"
+                    "  public_key BYTEA UNIQUE CHECK (LENGTH(public_key) = 32),"
+                    "  created_at TIMESTAMPTZ DEFAULT NOW()"
+                    ")";
+  PGresult *res =
+      pq_exec_params_global_locked(ddl, 0, NULL, NULL, NULL, NULL, 0);
+  if (!res)
+    return -1;
+  int ok = (PQresultStatus(res) == PGRES_COMMAND_OK) ? 0 : -1;
+  PQclear(res);
+  return ok;
+}
+
+static int db_ensure_global_identity_tag_schema(void) {
+  const char *ddl[] = {
+      "CREATE TABLE IF NOT EXISTS global_identity_tags ("
+      "  global_identity_id BIGINT NOT NULL,"
+      "  tag VARCHAR(128) NOT NULL,"
+      "  created_at TIMESTAMPTZ DEFAULT NOW(),"
+      "  PRIMARY KEY (global_identity_id, tag)"
+      ")",
+      "CREATE INDEX IF NOT EXISTS idx_global_identity_tags_tag "
+      "ON global_identity_tags(tag, global_identity_id)"};
+  for (size_t i = 0; i < sizeof(ddl) / sizeof(ddl[0]); i++) {
+    PGresult *res =
+        pq_exec_params_global_locked(ddl[i], 0, NULL, NULL, NULL, NULL, 0);
+    if (!res)
+      return -1;
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+      PQclear(res);
+      return -1;
+    }
+    PQclear(res);
+  }
+  return 0;
+}
+
+int db_validate_global_policy(void) {
+  if (db_ensure_global_identity_schema() != 0 ||
+      db_ensure_global_identity_tag_schema() != 0 ||
+      db_ensure_global_policy_schema() != 0)
+    return -1;
+  const char *query = "SELECT id "
+                      "FROM global_policy_rules "
+                      "WHERE action = 'trust.tier' "
+                      "  AND resource = 'tier' "
+                      "  AND (scope = '*' OR scope LIKE 'profile:%' OR "
+                      "scope LIKE 'profile_group:%') "
+                      "LIMIT 1";
+  PGresult *res =
+      pq_exec_params_global_locked(query, 0, NULL, NULL, NULL, NULL, 0);
+  if (!res)
+    return -1;
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    PQclear(res);
+    return -1;
+  }
+  int ok = (PQntuples(res) > 0) ? 0 : -1;
+  PQclear(res);
+  return ok;
+}
+
+static DbStatus db_get_or_create_session_identity(const uint8_t *token,
+                                                  uint64_t *out_identity_id) {
+  if (!token || !out_identity_id)
+    return DB_ERR_BAD_DATA;
+  *out_identity_id = 0;
+  if (db_ensure_global_identity_schema() != 0)
+    return DB_ERR_EXEC;
+  const char *sid_query =
+      "SELECT global_identity_id FROM sessions WHERE token = decode($1, 'hex')";
+  char token_hex[33];
+  bytes_to_hex(token, TOKEN_LENGTH, token_hex);
+  const char *sid_params[] = {token_hex};
+  PGresult *sid_res =
+      pq_exec_params_locked(sid_query, 1, NULL, sid_params, NULL, NULL, 0);
+  if (!sid_res)
+    return DB_ERR_CONN;
+  if (PQresultStatus(sid_res) != PGRES_TUPLES_OK) {
+    PQclear(sid_res);
+    return DB_ERR_EXEC;
+  }
+  if (PQntuples(sid_res) == 0) {
+    PQclear(sid_res);
+    return DB_NOT_FOUND;
+  }
+
+  uint64_t identity_id = 0;
+  if (!PQgetisnull(sid_res, 0, 0)) {
+    char *endptr = NULL;
+    identity_id = strtoull(PQgetvalue(sid_res, 0, 0), &endptr, 10);
+    if (!endptr || *endptr != '\0') {
+      PQclear(sid_res);
+      return DB_ERR_BAD_DATA;
+    }
+  }
+  PQclear(sid_res);
+
+  if (identity_id == 0) {
+    identity_id = db_global_identity_create_anonymous();
+    if (identity_id == 0)
+      return DB_ERR_EXEC;
+    char identity_id_str[32];
+    snprintf(identity_id_str, sizeof(identity_id_str), "%" PRIu64, identity_id);
+    const char *update_query =
+        "UPDATE sessions "
+        "SET global_identity_id = $2 "
+        "WHERE token = decode($1, 'hex') "
+        "  AND (global_identity_id IS NULL OR global_identity_id = 0)";
+    const char *update_params[] = {token_hex, identity_id_str};
+    PGresult *upd = pq_exec_params_locked(update_query, 2, NULL, update_params,
+                                          NULL, NULL, 0);
+    if (!upd)
+      return DB_ERR_CONN;
+    if (PQresultStatus(upd) != PGRES_COMMAND_OK) {
+      PQclear(upd);
+      return DB_ERR_EXEC;
+    }
+    int updated_rows = atoi(PQcmdTuples(upd));
+    PQclear(upd);
+    if (updated_rows == 0) {
+      PGresult *recheck =
+          pq_exec_params_locked(sid_query, 1, NULL, sid_params, NULL, NULL, 0);
+      if (!recheck)
+        return DB_ERR_CONN;
+      if (PQresultStatus(recheck) != PGRES_TUPLES_OK ||
+          PQntuples(recheck) == 0) {
+        PQclear(recheck);
+        return DB_ERR_EXEC;
+      }
+      if (!PQgetisnull(recheck, 0, 0)) {
+        char *endptr = NULL;
+        uint64_t existing = strtoull(PQgetvalue(recheck, 0, 0), &endptr, 10);
+        if (endptr && *endptr == '\0' && existing > 0)
+          identity_id = existing;
+      }
+      PQclear(recheck);
+      if (identity_id == 0)
+        return DB_ERR_EXEC;
+    }
+  }
+
+  *out_identity_id = identity_id;
+  return DB_OK;
+}
+
+static int db_ensure_config_snapshot_table(void) {
+  const char *ddl1 = "CREATE TABLE IF NOT EXISTS global_runtime_config_blobs ("
+                     "  content_hash VARCHAR(32) PRIMARY KEY,"
+                     "  config_text TEXT NOT NULL,"
+                     "  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
+                     ")";
+  const char *ddl2 =
+      "CREATE TABLE IF NOT EXISTS global_runtime_config_revisions ("
+      "  id BIGSERIAL PRIMARY KEY,"
+      "  profile_key VARCHAR(128) NOT NULL,"
+      "  content_hash VARCHAR(32) NULL REFERENCES "
+      "global_runtime_config_blobs(content_hash),"
+      "  source VARCHAR(32) NOT NULL DEFAULT 'file',"
+      "  result VARCHAR(16) NOT NULL,"
+      "  error_text TEXT,"
+      "  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
+      "  activated_at TIMESTAMPTZ"
+      ")";
+  const char *ddl4 =
+      "CREATE INDEX IF NOT EXISTS idx_runtime_config_revisions_profile_created "
+      "ON global_runtime_config_revisions(profile_key, created_at DESC)";
+  const char *ddl5 = "CREATE INDEX IF NOT EXISTS "
+                     "idx_runtime_config_revisions_profile_result_created "
+                     "ON global_runtime_config_revisions(profile_key, result, "
+                     "created_at DESC)";
+  PGresult *res =
+      pq_exec_params_global_locked(ddl1, 0, NULL, NULL, NULL, NULL, 0);
+  if (!res)
+    return -1;
+  int ok = (PQresultStatus(res) == PGRES_COMMAND_OK) ? 0 : -1;
+  PQclear(res);
+  if (ok != 0)
+    return -1;
+  res = pq_exec_params_global_locked(ddl2, 0, NULL, NULL, NULL, NULL, 0);
+  if (!res)
+    return -1;
+  ok = (PQresultStatus(res) == PGRES_COMMAND_OK) ? 0 : -1;
+  PQclear(res);
+  if (ok != 0)
+    return -1;
+  res = pq_exec_params_global_locked(ddl4, 0, NULL, NULL, NULL, NULL, 0);
+  if (!res)
+    return -1;
+  ok = (PQresultStatus(res) == PGRES_COMMAND_OK) ? 0 : -1;
+  PQclear(res);
+  if (ok != 0)
+    return -1;
+  res = pq_exec_params_global_locked(ddl5, 0, NULL, NULL, NULL, NULL, 0);
+  if (!res)
+    return -1;
+  ok = (PQresultStatus(res) == PGRES_COMMAND_OK) ? 0 : -1;
+  PQclear(res);
+  return ok;
+}
+
+int db_record_config_event(const char *profile_key, const char *config_text,
+                           const char *source, const char *result,
+                           const char *error_text) {
+  if (!result || !result[0])
+    return -1;
+  if (db_ensure_config_snapshot_table() != 0)
+    return -1;
+  const char *key =
+      (profile_key && profile_key[0]) ? profile_key : "__default__";
+  const char *src = (source && source[0]) ? source : "runtime";
+  const char *err = (error_text && error_text[0]) ? error_text : NULL;
+  PGresult *res = NULL;
+  if (config_text && config_text[0]) {
+    const char *blob_q =
+        "INSERT INTO global_runtime_config_blobs (content_hash, config_text) "
+        "VALUES (md5($1), $1) "
+        "ON CONFLICT (content_hash) DO NOTHING";
+    const char *blob_params[] = {config_text};
+    res = pq_exec_params_global_locked(blob_q, 1, NULL, blob_params, NULL, NULL,
+                                       0);
+    if (!res)
+      return -1;
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+      PQclear(res);
+      return -1;
+    }
+    PQclear(res);
+  }
+
+  const char *rev_q =
+      "INSERT INTO global_runtime_config_revisions "
+      "(profile_key, content_hash, source, result, error_text, activated_at) "
+      "VALUES ($1, CASE WHEN $2 IS NULL OR $2 = '' THEN NULL ELSE md5($2) END, "
+      "        $3, $4, $5, CASE WHEN $4 = 'active' THEN NOW() ELSE NULL END) "
+      "RETURNING id";
+  const char *rev_params[] = {key, config_text, src, result, err};
+  res = pq_exec_params_global_locked(rev_q, 5, NULL, rev_params, NULL, NULL, 0);
+  if (!res)
+    return -1;
+  if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+    PQclear(res);
+    return -1;
+  }
+  char *endptr = NULL;
+  uint64_t rev_id = strtoull(PQgetvalue(res, 0, 0), &endptr, 10);
+  PQclear(res);
+  if (!endptr || *endptr != '\0' || rev_id == 0)
+    return -1;
+
+  return 0;
+}
+
+int db_store_config_snapshot(const char *profile_key, const char *config_text) {
+  return db_record_config_event(profile_key, config_text, "file", "active",
+                                NULL);
+}
+
+int db_load_config_snapshot(const char *profile_key, char **out_config_text) {
+  if (!out_config_text)
+    return -1;
+  *out_config_text = NULL;
+  if (db_ensure_config_snapshot_table() != 0)
+    return -1;
+  const char *key =
+      (profile_key && profile_key[0]) ? profile_key : "__default__";
+  const char *query =
+      "SELECT b.config_text "
+      "FROM global_runtime_config_revisions r "
+      "JOIN global_runtime_config_blobs b ON b.content_hash = r.content_hash "
+      "WHERE r.profile_key = $1 AND r.result = 'active' "
+      "ORDER BY r.created_at DESC LIMIT 1";
+  const char *params[] = {key};
+  PGresult *res =
+      pq_exec_params_global_locked(query, 1, NULL, params, NULL, NULL, 0);
+  if (!res)
+    return -1;
+  if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+    PQclear(res);
+    return -1;
+  }
+  const char *txt = PQgetvalue(res, 0, 0);
+  if (!txt) {
+    PQclear(res);
+    return -1;
+  }
+  *out_config_text = strdup(txt);
+  PQclear(res);
+  return *out_config_text ? 0 : -1;
+}
+
+static int db_get_active_revision_id(const char *profile_key,
+                                     uint64_t *out_revision_id) {
+  if (!out_revision_id)
+    return -1;
+  *out_revision_id = 0;
+  if (db_ensure_config_snapshot_table() != 0)
+    return -1;
+  const char *key =
+      (profile_key && profile_key[0]) ? profile_key : "__default__";
+  const char *query = "SELECT id FROM global_runtime_config_revisions "
+                      "WHERE profile_key = $1 AND result = 'active' "
+                      "ORDER BY created_at DESC LIMIT 1";
+  const char *params[] = {key};
+  PGresult *res =
+      pq_exec_params_global_locked(query, 1, NULL, params, NULL, NULL, 0);
+  if (!res)
+    return -1;
+  if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+    PQclear(res);
+    return -1;
+  }
+  char *endptr = NULL;
+  uint64_t id = strtoull(PQgetvalue(res, 0, 0), &endptr, 10);
+  PQclear(res);
+  if (!endptr || *endptr != '\0' || id == 0)
+    return -1;
+  *out_revision_id = id;
+  return 0;
 }
 
 int db_write_batch_begin(void) {
@@ -172,23 +617,12 @@ typedef struct {
   int used;
 } TokenReadCacheU64Entry;
 
-typedef struct {
-  uint8_t token[TOKEN_LENGTH];
-  DbStatus status;
-  int value;
-  uint64_t expires_ms;
-  int used;
-} TokenReadCacheIntEntry;
-
 static WAMBLE_THREAD_LOCAL TokenReadCacheU64Entry
     tls_session_cache[TOKEN_READ_CACHE_CAP];
 static WAMBLE_THREAD_LOCAL TokenReadCacheU64Entry
     tls_persistent_session_cache[TOKEN_READ_CACHE_CAP];
-static WAMBLE_THREAD_LOCAL TokenReadCacheIntEntry
-    tls_trust_cache[TOKEN_READ_CACHE_CAP];
 static WAMBLE_THREAD_LOCAL int tls_session_cache_next = 0;
 static WAMBLE_THREAD_LOCAL int tls_persistent_session_cache_next = 0;
-static WAMBLE_THREAD_LOCAL int tls_trust_cache_next = 0;
 
 static int token_cache_u64_lookup(TokenReadCacheU64Entry *cache, int cap,
                                   const uint8_t *token, uint64_t now_ms,
@@ -228,47 +662,14 @@ static void token_cache_u64_store(TokenReadCacheU64Entry *cache, int cap,
   *next_slot = (idx + 1) % cap;
 }
 
-static int token_cache_int_lookup(TokenReadCacheIntEntry *cache, int cap,
-                                  const uint8_t *token, uint64_t now_ms,
-                                  DbStatus *out_status, int *out_value) {
-  if (!cache || !token || !out_status || !out_value)
-    return 0;
-  for (int i = 0; i < cap; i++) {
-    TokenReadCacheIntEntry *e = &cache[i];
-    if (!e->used)
-      continue;
-    if (e->expires_ms < now_ms)
-      continue;
-    if (memcmp(e->token, token, TOKEN_LENGTH) != 0)
-      continue;
-    *out_status = e->status;
-    *out_value = e->value;
-    return 1;
-  }
-  return 0;
-}
-
-static void token_cache_int_store(TokenReadCacheIntEntry *cache, int cap,
-                                  int *next_slot, const uint8_t *token,
-                                  DbStatus status, int value, uint64_t now_ms) {
-  if (!cache || !next_slot || !token || cap <= 0)
-    return;
-  int idx = *next_slot;
-  if (idx < 0 || idx >= cap)
-    idx = 0;
-  TokenReadCacheIntEntry *e = &cache[idx];
-  memcpy(e->token, token, TOKEN_LENGTH);
-  e->status = status;
-  e->value = value;
-  e->expires_ms = now_ms + TOKEN_READ_CACHE_TTL_MS;
-  e->used = 1;
-  *next_slot = (idx + 1) % cap;
-}
-
 void db_cleanup_thread(void) {
   if (db_conn_tls) {
     PQfinish(db_conn_tls);
     db_conn_tls = NULL;
+  }
+  if (db_global_conn_tls) {
+    PQfinish(db_global_conn_tls);
+    db_global_conn_tls = NULL;
   }
   if (tls_ids) {
     free(tls_ids);
@@ -282,69 +683,475 @@ void db_cleanup_thread(void) {
   }
   memset(tls_session_cache, 0, sizeof(tls_session_cache));
   memset(tls_persistent_session_cache, 0, sizeof(tls_persistent_session_cache));
-  memset(tls_trust_cache, 0, sizeof(tls_trust_cache));
   tls_session_cache_next = 0;
   tls_persistent_session_cache_next = 0;
-  tls_trust_cache_next = 0;
 }
 
-DbStatus db_get_trust_tier_by_token(const uint8_t *token, int *out_trust) {
-  if (!out_trust || !token)
-    return DB_ERR_BAD_DATA;
-  uint64_t now_ms = wamble_now_mono_millis();
-  DbStatus cached_status = DB_ERR_EXEC;
-  int cached_value = 0;
-  if (token_cache_int_lookup(tls_trust_cache, TOKEN_READ_CACHE_CAP, token,
-                             now_ms, &cached_status, &cached_value)) {
-    if (cached_status == DB_OK)
-      *out_trust = cached_value;
-    return cached_status;
+static uint64_t db_global_identity_create_anonymous(void) {
+  if (db_ensure_global_identity_schema() != 0)
+    return 0;
+  const char *query =
+      "INSERT INTO global_identities DEFAULT VALUES RETURNING id";
+  PGresult *res =
+      pq_exec_params_global_locked(query, 0, NULL, NULL, NULL, NULL, 0);
+  if (!res)
+    return 0;
+  if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+    PQclear(res);
+    return 0;
+  }
+  uint64_t id = strtoull(PQgetvalue(res, 0, 0), NULL, 10);
+  PQclear(res);
+  return id;
+}
+
+static uint64_t
+db_global_identity_resolve_or_create_pubkey(const uint8_t *public_key) {
+  if (!public_key)
+    return 0;
+  if (db_ensure_global_identity_schema() != 0)
+    return 0;
+  const char *query =
+      "WITH upsert AS ("
+      "  INSERT INTO global_identities (public_key)"
+      "  VALUES (decode($1, 'hex'))"
+      "  ON CONFLICT (public_key) DO NOTHING"
+      ") "
+      "SELECT id FROM global_identities WHERE public_key = decode($1, 'hex')";
+  char public_key_hex[65];
+  bytes_to_hex(public_key, 32, public_key_hex);
+  const char *paramValues[] = {public_key_hex};
+  PGresult *res =
+      pq_exec_params_global_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
+  if (!res)
+    return 0;
+  if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+    PQclear(res);
+    return 0;
+  }
+  uint64_t id = strtoull(PQgetvalue(res, 0, 0), NULL, 10);
+  PQclear(res);
+  return id;
+}
+
+static int parse_identity_numeric_selector(const char *selector,
+                                           uint64_t *out_identity_id) {
+  if (!selector || !out_identity_id)
+    return -1;
+  const char *idtxt = selector;
+  if (strncmp(idtxt, "identity:", 9) == 0)
+    idtxt += 9;
+  else if (strncmp(idtxt, "id:", 3) == 0)
+    idtxt += 3;
+  if (!idtxt[0])
+    return -1;
+  char *endptr = NULL;
+  uint64_t id = strtoull(idtxt, &endptr, 10);
+  if (!endptr || *endptr != '\0' || id == 0)
+    return -1;
+  *out_identity_id = id;
+  return 0;
+}
+
+static uint64_t db_resolve_single_identity_selector(const char *selector) {
+  if (!selector || !selector[0] || strcmp(selector, "*") == 0)
+    return 0;
+  uint64_t numeric_id = 0;
+  if (parse_identity_numeric_selector(selector, &numeric_id) == 0)
+    return numeric_id;
+  const char *hex = selector;
+  if (strncmp(selector, "pubkey:", 7) == 0)
+    hex = selector + 7;
+  if (strlen(hex) != 64)
+    return UINT64_MAX;
+  uint8_t key[32] = {0};
+  for (int i = 0; i < 64; i++) {
+    int c = hex[i];
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+          (c >= 'A' && c <= 'F')))
+      return UINT64_MAX;
+  }
+  hex_to_bytes(hex, key, 32);
+  return db_global_identity_resolve_or_create_pubkey(key);
+}
+
+static int db_collect_identity_ids_for_selector(const char *selector,
+                                                uint64_t **out_ids,
+                                                int *out_count) {
+  if (!out_ids || !out_count)
+    return -1;
+  *out_ids = NULL;
+  *out_count = 0;
+  if (!selector || !selector[0] || strcmp(selector, "*") == 0) {
+    uint64_t *ids = (uint64_t *)malloc(sizeof(uint64_t));
+    if (!ids)
+      return -1;
+    ids[0] = 0;
+    *out_ids = ids;
+    *out_count = 1;
+    return 0;
+  }
+  if (strncmp(selector, "tag:", 4) == 0) {
+    const char *tag = selector + 4;
+    if (!tag[0])
+      return -1;
+    if (db_ensure_global_identity_tag_schema() != 0)
+      return -1;
+    const char *query = "SELECT global_identity_id "
+                        "FROM global_identity_tags "
+                        "WHERE tag = $1 "
+                        "ORDER BY global_identity_id";
+    const char *params[] = {tag};
+    PGresult *res =
+        pq_exec_params_global_locked(query, 1, NULL, params, NULL, NULL, 0);
+    if (!res)
+      return -1;
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+      PQclear(res);
+      return -1;
+    }
+    int n = PQntuples(res);
+    if (n == 0) {
+      PQclear(res);
+      return 0;
+    }
+    uint64_t *ids = (uint64_t *)calloc((size_t)n, sizeof(uint64_t));
+    if (!ids) {
+      PQclear(res);
+      return -1;
+    }
+    for (int i = 0; i < n; i++) {
+      char *endptr = NULL;
+      uint64_t id = strtoull(PQgetvalue(res, i, 0), &endptr, 10);
+      if (!endptr || *endptr != '\0' || id == 0) {
+        free(ids);
+        PQclear(res);
+        return -1;
+      }
+      ids[i] = id;
+    }
+    PQclear(res);
+    *out_ids = ids;
+    *out_count = n;
+    return 0;
   }
 
-  const char *query =
-      "SELECT trust_level FROM sessions WHERE token = decode($1, 'hex')";
+  uint64_t identity_id = db_resolve_single_identity_selector(selector);
+  if (identity_id == UINT64_MAX)
+    return -1;
+  uint64_t *ids = (uint64_t *)malloc(sizeof(uint64_t));
+  if (!ids)
+    return -1;
+  ids[0] = identity_id;
+  *out_ids = ids;
+  *out_count = 1;
+  return 0;
+}
 
-  char token_hex[33];
-  bytes_to_hex(token, TOKEN_LENGTH, token_hex);
+static void
+normalize_policy_scope_resource(const char *action, const char *raw_resource,
+                                char *out_scope, size_t out_scope_len,
+                                char *out_resource, size_t out_resource_len) {
+  if (!out_scope || !out_resource || out_scope_len == 0 ||
+      out_resource_len == 0)
+    return;
+  out_scope[0] = '\0';
+  out_resource[0] = '\0';
+  const char *res = (raw_resource && raw_resource[0]) ? raw_resource : "*";
+  const char *sep = strstr(res, "::");
+  if (sep) {
+    size_t scope_len = (size_t)(sep - res);
+    if (scope_len >= out_scope_len)
+      scope_len = out_scope_len - 1;
+    memcpy(out_scope, res, scope_len);
+    out_scope[scope_len] = '\0';
+    snprintf(out_resource, out_resource_len, "%s", sep + 2);
+    if (out_resource[0] == '\0')
+      snprintf(out_resource, out_resource_len, "*");
+    return;
+  }
+  if (strcmp(action ? action : "", "trust.tier") == 0 &&
+      (strcmp(res, "*") == 0 || strncmp(res, "profile:", 8) == 0 ||
+       strncmp(res, "profile_group:", 14) == 0)) {
+    snprintf(out_scope, out_scope_len, "%s", res);
+    snprintf(out_resource, out_resource_len, "tier");
+    return;
+  }
+  snprintf(out_scope, out_scope_len, "*");
+  snprintf(out_resource, out_resource_len, "%s", res);
+}
 
-  const char *paramValues[] = {token_hex};
+int db_apply_config_policy_rules(const char *profile_key) {
+  if (db_ensure_global_identity_schema() != 0 ||
+      db_ensure_global_identity_tag_schema() != 0 ||
+      db_ensure_global_policy_schema() != 0)
+    return -1;
+  const char *profile_scope_key =
+      (profile_key && profile_key[0]) ? profile_key : "__default__";
+  uint64_t snapshot_id = 0;
+  (void)db_get_active_revision_id(profile_scope_key, &snapshot_id);
 
   PGresult *res =
-      pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_global_locked("BEGIN", 0, NULL, NULL, NULL, NULL, 0);
+  if (!res)
+    return -1;
+  if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+    PQclear(res);
+    return -1;
+  }
+  PQclear(res);
+
+  const char *delete_q =
+      "DELETE FROM global_policy_rules "
+      "WHERE source = md5($1) "
+      "   OR (source = 'config' AND snapshot_revision_id IN ("
+      "       SELECT id FROM global_runtime_config_revisions WHERE "
+      "profile_key = $1))";
+  const char *delete_params[] = {profile_scope_key};
+  res = pq_exec_params_global_locked(delete_q, 1, NULL, delete_params, NULL,
+                                     NULL, 0);
   if (!res) {
-    token_cache_int_store(tls_trust_cache, TOKEN_READ_CACHE_CAP,
-                          &tls_trust_cache_next, token, DB_ERR_CONN, 0, now_ms);
-    return DB_ERR_CONN;
+    (void)pq_exec_params_global_locked("ROLLBACK", 0, NULL, NULL, NULL, NULL,
+                                       0);
+    return -1;
+  }
+  if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+    PQclear(res);
+    (void)pq_exec_params_global_locked("ROLLBACK", 0, NULL, NULL, NULL, NULL,
+                                       0);
+    return -1;
+  }
+  PQclear(res);
+
+  int count = config_policy_rule_count();
+  for (int i = 0; i < count; i++) {
+    const WamblePolicyRuleSpec *r = config_policy_rule_get(i);
+    if (!r || !r->action || !r->resource || !r->effect)
+      continue;
+    uint64_t *identity_ids = NULL;
+    int identity_count = 0;
+    if (db_collect_identity_ids_for_selector(
+            r->identity_selector, &identity_ids, &identity_count) != 0) {
+      (void)pq_exec_params_global_locked("ROLLBACK", 0, NULL, NULL, NULL, NULL,
+                                         0);
+      return -1;
+    }
+    if (identity_count == 0) {
+      free(identity_ids);
+      continue;
+    }
+    char snapshot_id_str[32];
+    if (snapshot_id > 0) {
+      snprintf(snapshot_id_str, sizeof(snapshot_id_str), "%" PRIu64,
+               snapshot_id);
+    }
+    char level_str[16];
+    snprintf(level_str, sizeof(level_str), "%d", r->permission_level);
+    char not_before_str[32];
+    char not_after_str[32];
+    const char *not_before = NULL;
+    const char *not_after = NULL;
+    if (r->not_before_at > 0) {
+      snprintf(not_before_str, sizeof(not_before_str), "%" PRId64,
+               r->not_before_at);
+      not_before = not_before_str;
+    }
+    if (r->not_after_at > 0) {
+      snprintf(not_after_str, sizeof(not_after_str), "%" PRId64,
+               r->not_after_at);
+      not_after = not_after_str;
+    }
+    char scope[256];
+    char resource[256];
+    normalize_policy_scope_resource(r->action, r->resource, scope,
+                                    sizeof(scope), resource, sizeof(resource));
+    for (int j = 0; j < identity_count; j++) {
+      char identity_id_str[32];
+      snprintf(identity_id_str, sizeof(identity_id_str), "%" PRIu64,
+               identity_ids[j]);
+      const char *insert_q =
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, "
+          " policy_version, reason, source, snapshot_revision_id, "
+          "not_before_at, "
+          " not_after_at, context_key, context_value) "
+          "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, md5($14), $9, "
+          "        CASE WHEN $10::text IS NULL THEN NULL ELSE "
+          "to_timestamp($10::double precision) END, "
+          "        CASE WHEN $11::text IS NULL THEN NULL ELSE "
+          "to_timestamp($11::double precision) END, "
+          "        $12, $13)";
+      const char *params[] = {
+          identity_id_str,
+          r->action,
+          resource,
+          scope,
+          r->effect,
+          level_str,
+          r->policy_version ? r->policy_version : "v1",
+          r->reason ? r->reason : "",
+          snapshot_id > 0 ? snapshot_id_str : NULL,
+          not_before,
+          not_after,
+          r->context_key,
+          r->context_value,
+          profile_scope_key,
+      };
+      res = pq_exec_params_global_locked(insert_q, 14, NULL, params, NULL, NULL,
+                                         0);
+      if (!res || PQresultStatus(res) != PGRES_COMMAND_OK) {
+        if (res)
+          PQclear(res);
+        free(identity_ids);
+        (void)pq_exec_params_global_locked("ROLLBACK", 0, NULL, NULL, NULL,
+                                           NULL, 0);
+        return -1;
+      }
+      PQclear(res);
+    }
+    free(identity_ids);
   }
 
+  res = pq_exec_params_global_locked("COMMIT", 0, NULL, NULL, NULL, NULL, 0);
+  if (!res)
+    return -1;
+  int ok = (PQresultStatus(res) == PGRES_COMMAND_OK) ? 0 : -1;
+  PQclear(res);
+  return ok;
+}
+
+static int db_get_player_public_key_by_id(uint64_t player_id,
+                                          uint8_t out_public_key[32]) {
+  const char *query =
+      "SELECT ENCODE(public_key, 'hex') FROM players WHERE id = $1";
+  char player_id_str[32];
+  snprintf(player_id_str, sizeof(player_id_str), "%" PRIu64, player_id);
+  const char *paramValues[] = {player_id_str};
+  PGresult *res =
+      pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
+  if (!res)
+    return -1;
+  if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+    PQclear(res);
+    return -1;
+  }
+  const char *hex = PQgetvalue(res, 0, 0);
+  if (!hex || strlen(hex) != 64) {
+    PQclear(res);
+    return -1;
+  }
+  hex_to_bytes(hex, out_public_key, 32);
+  PQclear(res);
+  return 0;
+}
+
+DbStatus db_resolve_policy_decision(const uint8_t *token, const char *profile,
+                                    const char *action, const char *resource,
+                                    const char *context_key,
+                                    const char *context_value,
+                                    WamblePolicyDecision *out) {
+  if (!token || !action || !action[0] || !resource || !resource[0] || !out)
+    return DB_ERR_BAD_DATA;
+  memset(out, 0, sizeof(*out));
+  snprintf(out->action, sizeof(out->action), "%s", action);
+  snprintf(out->resource, sizeof(out->resource), "%s", resource);
+  snprintf(out->effect, sizeof(out->effect), "deny");
+  snprintf(out->policy_version, sizeof(out->policy_version), "v1");
+  snprintf(out->reason, sizeof(out->reason), "default_deny_no_rule");
+  snprintf(out->scope, sizeof(out->scope), "*");
+
+  if (db_ensure_global_identity_schema() != 0 ||
+      db_ensure_global_policy_schema() != 0)
+    return DB_ERR_EXEC;
+
+  uint64_t identity_id = 0;
+  DbStatus sid_status = db_get_or_create_session_identity(token, &identity_id);
+  if (sid_status != DB_OK)
+    return sid_status;
+  out->global_identity_id = identity_id;
+
+  const char *profile_name = (profile && profile[0]) ? profile : "";
+  const char *group = config_profile_group(profile_name);
+  if (!group)
+    group = "";
+
+  char scope_exact[256];
+  char scope_group[256];
+  snprintf(scope_exact, sizeof(scope_exact), "profile:%s", profile_name);
+  snprintf(scope_group, sizeof(scope_group), "profile_group:%s", group);
+  char identity_id_str[32];
+  snprintf(identity_id_str, sizeof(identity_id_str), "%" PRIu64, identity_id);
+
+  const char *query =
+      "SELECT id, effect, permission_level, policy_version, "
+      "       COALESCE(reason, ''), scope, "
+      "       COALESCE(snapshot_revision_id, 0) "
+      "FROM global_policy_rules "
+      "WHERE action = $1 "
+      "  AND (resource = $2 OR resource = '*') "
+      "  AND (global_identity_id = $3 OR global_identity_id = 0) "
+      "  AND (scope = $4 OR scope = $5 OR scope = '*') "
+      "  AND (context_key IS NULL OR "
+      "       ($6::text IS NOT NULL AND context_key = $6 AND "
+      "        COALESCE(context_value, '') = COALESCE($7, ''))) "
+      "  AND (not_before_at IS NULL OR not_before_at <= NOW()) "
+      "  AND (not_after_at IS NULL OR not_after_at >= NOW()) "
+      "ORDER BY "
+      "  CASE WHEN global_identity_id = $3 THEN 0 ELSE 1 END, "
+      "  CASE WHEN scope = $4 THEN 0 WHEN scope = $5 THEN 1 ELSE 2 END, "
+      "  CASE WHEN resource = $2 THEN 0 ELSE 1 END, "
+      "  CASE effect WHEN 'deny' THEN 0 ELSE 1 END, "
+      "  id DESC "
+      "LIMIT 1";
+  const char *params[] = {action,       resource,    identity_id_str,
+                          scope_exact,  scope_group, context_key,
+                          context_value};
+  PGresult *res =
+      pq_exec_params_global_locked(query, 7, NULL, params, NULL, NULL, 0);
+  if (!res)
+    return DB_ERR_CONN;
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     PQclear(res);
-    token_cache_int_store(tls_trust_cache, TOKEN_READ_CACHE_CAP,
-                          &tls_trust_cache_next, token, DB_ERR_EXEC, 0, now_ms);
     return DB_ERR_EXEC;
   }
   if (PQntuples(res) == 0) {
     PQclear(res);
-    token_cache_int_store(tls_trust_cache, TOKEN_READ_CACHE_CAP,
-                          &tls_trust_cache_next, token, DB_NOT_FOUND, 0,
-                          now_ms);
-    return DB_NOT_FOUND;
+    out->allowed = 0;
+    return DB_OK;
   }
 
-  char *endptr = NULL;
-  long trust = strtol(PQgetvalue(res, 0, 0), &endptr, 10);
-  if (!endptr || *endptr != '\0') {
+  char *e = NULL;
+  uint64_t rule_id = strtoull(PQgetvalue(res, 0, 0), &e, 10);
+  if (!e || *e != '\0') {
     PQclear(res);
-    token_cache_int_store(tls_trust_cache, TOKEN_READ_CACHE_CAP,
-                          &tls_trust_cache_next, token, DB_ERR_BAD_DATA, 0,
-                          now_ms);
     return DB_ERR_BAD_DATA;
   }
-  *out_trust = (int)trust;
+  const char *effect = PQgetvalue(res, 0, 1);
+  char *lp = NULL;
+  long level = strtol(PQgetvalue(res, 0, 2), &lp, 10);
+  if (!lp || *lp != '\0') {
+    PQclear(res);
+    return DB_ERR_BAD_DATA;
+  }
+  char *sp = NULL;
+  uint64_t snapshot_revision_id = strtoull(PQgetvalue(res, 0, 6), &sp, 10);
+  if (!sp || *sp != '\0')
+    snapshot_revision_id = 0;
+
+  out->rule_id = rule_id;
+  out->snapshot_revision_id = snapshot_revision_id;
+  out->permission_level = (int)level;
+  snprintf(out->effect, sizeof(out->effect), "%s",
+           effect && effect[0] ? effect : "deny");
+  snprintf(out->policy_version, sizeof(out->policy_version), "%s",
+           PQgetvalue(res, 0, 3));
+  snprintf(out->reason, sizeof(out->reason), "%s", PQgetvalue(res, 0, 4));
+  snprintf(out->scope, sizeof(out->scope), "%s", PQgetvalue(res, 0, 5));
+  out->allowed = (strcmp(out->effect, "allow") == 0) ? 1 : 0;
+  if (!out->allowed)
+    out->permission_level = 0;
   PQclear(res);
-  token_cache_int_store(tls_trust_cache, TOKEN_READ_CACHE_CAP,
-                        &tls_trust_cache_next, token, DB_OK, *out_trust,
-                        now_ms);
   return DB_OK;
 }
 
@@ -364,7 +1171,7 @@ const WambleQueryService *wamble_get_db_query_service(void) {
     svc.get_session_games_played = db_get_session_games_played;
     svc.get_leaderboard = db_get_leaderboard;
     svc.get_moves_for_board = db_get_moves_for_board;
-    svc.get_trust_tier_by_token = db_get_trust_tier_by_token;
+    svc.resolve_policy_decision = db_resolve_policy_decision;
     initialized = 1;
   }
   return &svc;
@@ -506,26 +1313,53 @@ DbLeaderboardResult wamble_query_get_leaderboard(uint64_t requester_session_id,
 
 uint64_t db_create_session(const uint8_t *token, uint64_t player_id,
                            int experiment_arm) {
-  const char *query =
-      "INSERT INTO sessions (token, player_id, experiment_arm) VALUES "
-      "(decode($1, 'hex'), $2, $3) RETURNING id";
+  const char *query = "INSERT INTO sessions (token, player_id, "
+                      "global_identity_id, config_revision_id, "
+                      "policy_snapshot_revision_id, experiment_arm) "
+                      "VALUES (decode($1, 'hex'), $2, $3, $4, $5, $6) "
+                      "RETURNING id";
 
   char token_hex[33];
   bytes_to_hex(token, TOKEN_LENGTH, token_hex);
-
-  char player_id_str[32];
+  uint64_t global_identity_id = 0;
   if (player_id > 0) {
-    snprintf(player_id_str, sizeof(player_id_str), "%lu", player_id);
+    uint8_t public_key[32];
+    if (db_get_player_public_key_by_id(player_id, public_key) != 0)
+      return 0;
+    global_identity_id =
+        db_global_identity_resolve_or_create_pubkey(public_key);
+  } else {
+    global_identity_id = db_global_identity_create_anonymous();
+  }
+  if (global_identity_id == 0)
+    return 0;
+  const char *profile_key = wamble_runtime_profile_key();
+  uint64_t active_revision_id = 0;
+  if (db_get_active_revision_id(profile_key, &active_revision_id) != 0)
+    active_revision_id = 0;
+  char player_id_str[32];
+  if (player_id > 0)
+    snprintf(player_id_str, sizeof(player_id_str), "%" PRIu64, player_id);
+  char identity_id_str[32];
+  snprintf(identity_id_str, sizeof(identity_id_str), "%" PRIu64,
+           global_identity_id);
+  char revision_id_str[32];
+  const char *revision_param = NULL;
+  if (active_revision_id > 0) {
+    snprintf(revision_id_str, sizeof(revision_id_str), "%" PRIu64,
+             active_revision_id);
+    revision_param = revision_id_str;
   }
   char experiment_arm_str[16];
   snprintf(experiment_arm_str, sizeof(experiment_arm_str), "%d",
            experiment_arm);
-
-  const char *paramValues[] = {token_hex, player_id > 0 ? player_id_str : NULL,
-                               experiment_arm_str};
+  const char *paramValues[] = {
+      token_hex,       player_id > 0 ? player_id_str : NULL,
+      identity_id_str, revision_param,
+      revision_param,  experiment_arm_str};
 
   PGresult *res =
-      pq_exec_params_locked(query, 3, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 6, NULL, paramValues, NULL, NULL, 0);
 
   if (!res)
     return 0;
@@ -545,8 +1379,6 @@ uint64_t db_create_session(const uint8_t *token, uint64_t player_id,
                           &tls_persistent_session_cache_next, token,
                           player_id > 0 ? DB_OK : DB_NOT_FOUND,
                           player_id > 0 ? session_id : 0, now_ms);
-    token_cache_int_store(tls_trust_cache, TOKEN_READ_CACHE_CAP,
-                          &tls_trust_cache_next, token, DB_OK, 0, now_ms);
   }
   return session_id;
 }
@@ -1587,17 +2419,29 @@ uint64_t db_get_player_by_public_key(const uint8_t *public_key) {
 }
 
 int db_async_link_session_to_player(uint64_t session_id, uint64_t player_id) {
-  const char *query = "UPDATE sessions SET player_id = $2 WHERE id = $1";
+  const char *query = "UPDATE sessions SET player_id = $2, global_identity_id "
+                      "= $3 WHERE id = $1";
+
+  uint8_t public_key[32];
+  if (db_get_player_public_key_by_id(player_id, public_key) != 0)
+    return -1;
+  uint64_t global_identity_id =
+      db_global_identity_resolve_or_create_pubkey(public_key);
+  if (global_identity_id == 0)
+    return -1;
 
   char session_id_str[32];
   char player_id_str[32];
-  snprintf(session_id_str, sizeof(session_id_str), "%lu", session_id);
-  snprintf(player_id_str, sizeof(player_id_str), "%lu", player_id);
+  char identity_id_str[32];
+  snprintf(session_id_str, sizeof(session_id_str), "%" PRIu64, session_id);
+  snprintf(player_id_str, sizeof(player_id_str), "%" PRIu64, player_id);
+  snprintf(identity_id_str, sizeof(identity_id_str), "%" PRIu64,
+           global_identity_id);
 
-  const char *paramValues[] = {session_id_str, player_id_str};
+  const char *paramValues[] = {session_id_str, player_id_str, identity_id_str};
 
   PGresult *res =
-      pq_exec_params_locked(query, 2, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 3, NULL, paramValues, NULL, NULL, 0);
 
   if (!res)
     return -1;

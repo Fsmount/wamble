@@ -14,6 +14,7 @@ typedef struct SpectatorEntry {
   int has_pending_notice;
   uint64_t pending_notice_board_id;
   char pending_notice[FEN_MAX_LENGTH];
+  int capacity_bypass;
   int owner_port;
 } SpectatorEntry;
 
@@ -119,6 +120,7 @@ static SpectatorEntry *ensure_spectator(const struct sockaddr_in *addr,
   e->has_pending_notice = 0;
   e->pending_notice_board_id = 0;
   e->pending_notice[0] = '\0';
+  e->capacity_bypass = 0;
   e->owner_port = get_config() ? get_config()->port : 0;
   return e;
 }
@@ -244,6 +246,7 @@ void spectator_manager_tick(void) {
         e->state = SPECTATOR_STATE_SUMMARY;
         e->focus_board_id = 0;
         e->last_focus_sent = 0.0;
+        e->capacity_bypass = 0;
         e->last_summary_wall = 0;
       } else {
         WambleBoard *b = get_board_by_id(e->focus_board_id);
@@ -258,6 +261,7 @@ void spectator_manager_tick(void) {
           e->state = SPECTATOR_STATE_SUMMARY;
           e->focus_board_id = 0;
           e->last_focus_sent = 0.0;
+          e->capacity_bypass = 0;
           e->last_summary_wall = 0;
         }
       }
@@ -277,6 +281,7 @@ void spectator_manager_tick(void) {
       e->state = SPECTATOR_STATE_SUMMARY;
       e->focus_board_id = 0;
       e->last_focus_sent = 0.0;
+      e->capacity_bypass = 0;
       e->last_summary_wall = 0;
     }
 
@@ -316,9 +321,11 @@ int spectator_collect_notifications(struct SpectatorUpdate *out, int max) {
   return out_count;
 }
 
-SpectatorRequestStatus spectator_handle_request(
-    const struct WambleMsg *msg, const struct sockaddr_in *cliaddr,
-    int trust_tier, SpectatorState *out_state, uint64_t *out_focus_board_id) {
+SpectatorRequestStatus
+spectator_handle_request(const struct WambleMsg *msg,
+                         const struct sockaddr_in *cliaddr, int trust_tier,
+                         int capacity_bypass, SpectatorState *out_state,
+                         uint64_t *out_focus_board_id) {
   wamble_mutex_lock(&spectators_mutex);
   if (trust_tier < get_config()->spectator_visibility) {
     wamble_mutex_unlock(&spectators_mutex);
@@ -334,6 +341,7 @@ SpectatorRequestStatus spectator_handle_request(
 
   if (msg->ctrl == WAMBLE_CTRL_SPECTATE_STOP) {
     e->state = SPECTATOR_STATE_IDLE;
+    e->capacity_bypass = 0;
     if (out_state)
       *out_state = e->state;
     if (out_focus_board_id)
@@ -345,16 +353,20 @@ SpectatorRequestStatus spectator_handle_request(
   if (msg->ctrl == WAMBLE_CTRL_SPECTATE_GAME) {
     if (msg->board_id != 0) {
       int cap = get_config()->max_spectators;
-      int active_focus = 0;
+      int active_focus_non_bypass = 0;
       if (cap >= 0) {
         for (int i = 0; i < spectators_count; i++) {
-          if (spectators[i].state == SPECTATOR_STATE_FOCUS)
-            active_focus++;
+          if (spectators[i].state == SPECTATOR_STATE_FOCUS &&
+              !spectators[i].capacity_bypass)
+            active_focus_non_bypass++;
         }
       }
-      int thr = get_config()->admin_trust_level;
-      int is_admin = (thr >= 0) && (trust_tier >= thr);
-      if (cap >= 0 && active_focus >= cap && !is_admin) {
+      int current_contrib =
+          (e->state == SPECTATOR_STATE_FOCUS && !e->capacity_bypass) ? 1 : 0;
+      int desired_contrib = capacity_bypass ? 0 : 1;
+      int projected_non_bypass =
+          active_focus_non_bypass - current_contrib + desired_contrib;
+      if (cap >= 0 && projected_non_bypass > cap) {
         wamble_mutex_unlock(&spectators_mutex);
         return SPECTATOR_ERR_FULL;
       }
@@ -364,6 +376,7 @@ SpectatorRequestStatus spectator_handle_request(
       e->state = SPECTATOR_STATE_SUMMARY;
       e->focus_board_id = 0;
       e->last_summary_sent = 0.0;
+      e->capacity_bypass = 0;
       e->last_summary_wall = 0;
       if (out_state)
         *out_state = e->state;
@@ -385,6 +398,7 @@ SpectatorRequestStatus spectator_handle_request(
       e->state = SPECTATOR_STATE_FOCUS;
       e->focus_board_id = msg->board_id;
       e->last_focus_sent = 0.0;
+      e->capacity_bypass = capacity_bypass ? 1 : 0;
       if (out_state)
         *out_state = e->state;
       if (out_focus_board_id)

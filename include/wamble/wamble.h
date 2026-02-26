@@ -213,6 +213,7 @@ void set_thread_config(const struct WambleConfig *cfg);
 void wamble_config_push(const struct WambleConfig *cfg);
 void wamble_config_pop(void);
 typedef struct WambleProfile WambleProfile;
+typedef struct WamblePolicyDecision WamblePolicyDecision;
 
 static inline void wamble_log(int level, const char *file, int line,
                               const char *func, const char *level_str,
@@ -459,6 +460,7 @@ typedef struct WambleConfig {
   int max_message_size;
   int buffer_size;
   int max_client_sessions;
+  int rate_limit_requests_per_sec;
   int session_timeout;
   int max_boards;
   int min_boards;
@@ -474,6 +476,10 @@ typedef struct WambleConfig {
   char *db_user;
   char *db_pass;
   char *db_name;
+  char *global_db_host;
+  char *global_db_user;
+  char *global_db_pass;
+  char *global_db_name;
   int select_timeout_usec;
   int cleanup_interval_sec;
   int max_token_attempts;
@@ -495,7 +501,6 @@ typedef struct WambleConfig {
   int spectator_max_focus_per_session;
 
   char *spectator_summary_mode;
-  int admin_trust_level;
 
   char *state_dir;
   char *websocket_path;
@@ -511,9 +516,13 @@ typedef enum {
 
 ConfigLoadStatus config_load(const char *filename, const char *profile,
                              char *status_msg, size_t status_msg_size);
+void *config_create_snapshot(void);
+int config_restore_snapshot(const void *snapshot);
+void config_free_snapshot(void *snapshot);
 
 struct WambleProfile {
   char *name;
+  char *group;
   WambleConfig config;
   int advertise;
   int visibility;
@@ -523,6 +532,30 @@ struct WambleProfile {
 int config_profile_count(void);
 const WambleProfile *config_get_profile(int index);
 const WambleProfile *config_find_profile(const char *name);
+const char *config_profile_group(const char *name);
+
+typedef struct WamblePolicyRuleSpec {
+  char *identity_selector;
+  char *action;
+  char *resource;
+  char *effect;
+  int permission_level;
+  char *reason;
+  char *policy_version;
+  int64_t not_before_at;
+  int64_t not_after_at;
+  char *context_key;
+  char *context_value;
+} WamblePolicyRuleSpec;
+
+int config_policy_rule_count(void);
+const WamblePolicyRuleSpec *config_policy_rule_get(int index);
+int config_has_policy_eval(void);
+int config_policy_eval(const char *identity_selector, const char *action,
+                       const char *resource, const char *profile_name,
+                       const char *profile_group, const char *context_key,
+                       const char *context_value, int64_t now_epoch_seconds,
+                       WamblePolicyDecision *out);
 
 typedef enum {
   PROFILE_START_OK = 0,
@@ -549,6 +582,20 @@ typedef enum {
   DB_ERR_EXEC = -2,
   DB_ERR_BAD_DATA = -3,
 } DbStatus;
+
+struct WamblePolicyDecision {
+  int allowed;
+  int permission_level;
+  uint64_t global_identity_id;
+  uint64_t rule_id;
+  uint64_t snapshot_revision_id;
+  char effect[8];
+  char action[128];
+  char resource[256];
+  char scope[256];
+  char reason[256];
+  char policy_version[64];
+};
 
 typedef enum {
   NET_OK = 0,
@@ -601,6 +648,7 @@ typedef enum {
   SERVER_ERR_LEGAL_MOVES = -8,
   SERVER_ERR_SEND_FAILED = -9,
   SERVER_ERR_INTERNAL = -10,
+  SERVER_ERR_FORBIDDEN = -11,
 } ServerStatus;
 
 ProfileStartStatus start_profile_listeners(int *out_started);
@@ -610,6 +658,14 @@ int profile_runtime_pump_inline(void);
 int profile_runtime_take_ws_gateway_status(WsGatewayStatus *out_status,
                                            char *out_profile,
                                            size_t out_profile_size);
+const char *wamble_runtime_profile_key(void);
+typedef enum {
+  PROFILE_TRUST_DECISION_DENIED = 0,
+  PROFILE_TRUST_DECISION_ALLOWED = 1,
+} ProfileTrustDecisionStatus;
+int profile_runtime_take_trust_decision_status(
+    ProfileTrustDecisionStatus *out_status, char *out_profile,
+    size_t out_profile_size);
 
 int state_save_to_file(const char *path);
 int state_load_from_file(const char *path);
@@ -816,6 +872,7 @@ typedef enum {
 #define WAMBLE_CAP_HOT_RELOAD 0x01
 #define WAMBLE_CAP_PROFILE_STATE 0x02
 #define WAMBLE_ERR_UNSUPPORTED_VERSION 1000
+#define WAMBLE_ERR_ACCESS_DENIED 1001
 
 #define WAMBLE_FLAG_UNRELIABLE 0x80
 
@@ -957,7 +1014,8 @@ ScoringStatus calculate_and_distribute_pot(uint64_t board_id);
 
 void player_manager_init(void);
 WamblePlayer *create_new_player(void);
-WamblePlayer *login_player(const uint8_t *public_key);
+WamblePlayer *attach_persistent_identity(const uint8_t *token,
+                                         const uint8_t *public_key);
 void format_token_for_url(const uint8_t *token, char *url_buffer);
 int decode_token_from_url(const char *url_string, uint8_t *token_buffer);
 void player_manager_tick(void);
@@ -1040,7 +1098,8 @@ int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
 int send_unreliable_packet(wamble_socket_t sockfd, const struct WambleMsg *msg,
                            const struct sockaddr_in *cliaddr);
 ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
-                            const struct sockaddr_in *cliaddr, int trust_tier);
+                            const struct sockaddr_in *cliaddr, int trust_tier,
+                            const char *profile_name);
 
 typedef struct WambleWsGateway WambleWsGateway;
 WambleWsGateway *ws_gateway_start(const char *profile_name, int ws_port,
@@ -1077,9 +1136,11 @@ typedef struct SpectatorUpdate {
   struct sockaddr_in addr;
 } SpectatorUpdate;
 
-SpectatorRequestStatus spectator_handle_request(
-    const struct WambleMsg *msg, const struct sockaddr_in *cliaddr,
-    int trust_tier, SpectatorState *out_state, uint64_t *out_focus_board_id);
+SpectatorRequestStatus
+spectator_handle_request(const struct WambleMsg *msg,
+                         const struct sockaddr_in *cliaddr, int trust_tier,
+                         int capacity_bypass, SpectatorState *out_state,
+                         uint64_t *out_focus_board_id);
 
 int spectator_collect_updates(struct SpectatorUpdate *out, int max);
 int spectator_collect_notifications(struct SpectatorUpdate *out, int max);

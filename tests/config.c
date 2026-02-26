@@ -1,5 +1,6 @@
 #include "common/wamble_test.h"
 #include "wamble/wamble.h"
+#include "wamble/wamble_db.h"
 
 #if defined(WAMBLE_PLATFORM_POSIX)
 int setenv(const char *name, const char *value, int overwrite);
@@ -53,6 +54,7 @@ WAMBLE_TEST(config_defaults_no_file) {
   T_ASSERT_STATUS(s, CONFIG_LOAD_DEFAULTS);
   T_ASSERT_EQ_INT(get_config()->port, 8888);
   T_ASSERT_EQ_INT(get_config()->timeout_ms, 100);
+  T_ASSERT_EQ_INT(get_config()->rate_limit_requests_per_sec, 120);
   T_ASSERT_EQ_INT(get_config()->experiment_enabled, 0);
   T_ASSERT_EQ_INT(get_config()->experiment_seed, 0);
   T_ASSERT_EQ_INT(get_config()->experiment_arms, 1);
@@ -163,6 +165,7 @@ WAMBLE_TEST(config_parse_doubles_and_strings) {
                     "(def experiment-enabled 1)\n"
                     "(def experiment-seed 42)\n"
                     "(def experiment-arms 7)\n"
+                    "(def rate-limit-requests-per-sec 33)\n"
                     "(def experiment-pairings \"0:0,0:1,1:*\")\n"
                     "(def select-timeout-usec 250000)\n"
                     "(def state-dir \"/var/tmp/wamble\")\n";
@@ -178,6 +181,7 @@ WAMBLE_TEST(config_parse_doubles_and_strings) {
   T_ASSERT_EQ_INT(get_config()->experiment_enabled, 1);
   T_ASSERT_EQ_INT(get_config()->experiment_seed, 42);
   T_ASSERT_EQ_INT(get_config()->experiment_arms, 7);
+  T_ASSERT_EQ_INT(get_config()->rate_limit_requests_per_sec, 33);
   T_ASSERT_STREQ(get_config()->experiment_pairings, "0:0,0:1,1:*");
   T_ASSERT_STREQ(get_config()->state_dir, "/var/tmp/wamble");
   return 0;
@@ -257,6 +261,234 @@ WAMBLE_TEST(config_env_getenv_unset) {
   return 0;
 }
 
+WAMBLE_TEST(config_snapshot_restore_rebuilds_policy_eval) {
+  const char *p = "build/test_config_policy_eval.conf";
+  const char *cfg =
+      "(defn policy-eval (identity action resource profile group context-key "
+      "context-value now)\n"
+      "  (if (= action \"protocol.ctrl\") (quote (allow 7 \"restored\" "
+      "\"t1\")) "
+      "(quote deny)))\n";
+  FILE *f = fopen(p, "w");
+  T_ASSERT(f != NULL);
+  fwrite(cfg, 1, strlen(cfg), f);
+  fclose(f);
+
+  T_ASSERT_STATUS(config_load(p, NULL, NULL, 0), CONFIG_LOAD_OK);
+  T_ASSERT_EQ_INT(config_has_policy_eval(), 1);
+  void *snap = config_create_snapshot();
+  T_ASSERT(snap != NULL);
+
+  T_ASSERT_STATUS(config_load("build/does_not_exist.conf", NULL, NULL, 0),
+                  CONFIG_LOAD_DEFAULTS);
+  T_ASSERT_EQ_INT(config_has_policy_eval(), 0);
+
+  T_ASSERT_STATUS_OK(config_restore_snapshot(snap));
+  T_ASSERT_EQ_INT(config_has_policy_eval(), 1);
+
+  WamblePolicyDecision out;
+  memset(&out, 0, sizeof(out));
+  int rc = config_policy_eval("pubkey:00", "protocol.ctrl", "list_profiles", "",
+                              "", "", "", 0, &out);
+  T_ASSERT_EQ_INT(rc, 1);
+  T_ASSERT_EQ_INT(out.allowed, 1);
+  T_ASSERT_EQ_INT(out.permission_level, 7);
+  T_ASSERT_STREQ(out.reason, "restored");
+  T_ASSERT_STREQ(out.policy_version, "t1");
+
+  config_free_snapshot(snap);
+  return 0;
+}
+
+static int config_db_exec_sql(const char *sql) {
+  char path[128];
+  static unsigned long seq = 0;
+  snprintf(path, sizeof(path), "build/test_config_db_sql_%lu.sql", ++seq);
+  FILE *f = fopen(path, "wb");
+  if (!f)
+    return -1;
+  fwrite(sql, 1, strlen(sql), f);
+  fclose(f);
+  return test_db_apply_sql_file(path);
+}
+
+static int config_db_prepare(void) {
+  if (!wamble_db_available())
+    return -1;
+  if (test_db_apply_migrations(NULL) != 0)
+    return -1;
+  if (config_db_exec_sql(
+          "TRUNCATE TABLE predictions, payouts, game_results, reservations, "
+          "moves, boards, sessions, players, global_policy_rules, "
+          "global_runtime_config_revisions, global_runtime_config_blobs, "
+          "global_identities, global_identity_tags RESTART IDENTITY "
+          "CASCADE;") != 0)
+    return -1;
+  if (config_load(NULL, NULL, NULL, 0) < 0)
+    return -1;
+  if (db_set_global_store_connection(wamble_test_dsn()) != 0)
+    return -1;
+  if (db_init(wamble_test_dsn()) != 0)
+    return -1;
+  return 0;
+}
+
+WAMBLE_TEST(config_db_policy_validation_requires_trust_tier_rule) {
+  if (config_db_prepare() != 0)
+    T_FAIL_SIMPLE("config_db_prepare failed");
+  T_ASSERT(db_validate_global_policy() != 0);
+  T_ASSERT_STATUS_OK(config_db_exec_sql(
+      "INSERT INTO global_policy_rules "
+      "(global_identity_id, action, resource, scope, effect, permission_level, "
+      " reason, source) "
+      "VALUES (0, 'trust.tier', 'tier', '*', 'allow', 1, 'seed', 'manual');"));
+  T_ASSERT_STATUS_OK(db_validate_global_policy());
+  return 0;
+}
+
+WAMBLE_TEST(config_db_policy_precedence_exact_deny_over_group_and_global) {
+  uint8_t token[TOKEN_LENGTH] = {0x10, 0x32, 0x54, 0x76, 0x98, 0xba,
+                                 0xdc, 0xfe, 0x12, 0x34, 0x56, 0x78,
+                                 0x9a, 0xbc, 0xde, 0xf0};
+  if (config_db_prepare() != 0)
+    T_FAIL_SIMPLE("config_db_prepare failed");
+  const char *cfg_path = "build/test_policy_precedence.conf";
+  const char *cfg = "(defprofile alpha ((def advertise 1) (def profile-group "
+                    "\"trusted\")))\n";
+  FILE *f = fopen(cfg_path, "wb");
+  T_ASSERT(f != NULL);
+  fwrite(cfg, 1, strlen(cfg), f);
+  fclose(f);
+  T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
+
+  uint64_t sid = db_create_session(token, 0, 0);
+  T_ASSERT(sid > 0);
+
+  WamblePolicyDecision out = {0};
+  T_ASSERT_STATUS(db_resolve_policy_decision(token, "alpha", "trust.tier",
+                                             "tier", NULL, NULL, &out),
+                  DB_OK);
+  T_ASSERT(out.global_identity_id > 0);
+
+  char sql[1024];
+  snprintf(sql, sizeof(sql),
+           "INSERT INTO global_policy_rules "
+           "(global_identity_id, action, resource, scope, effect, "
+           " permission_level, reason, source) VALUES "
+           "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'global_allow', "
+           "'manual'), "
+           "(0, 'trust.tier', 'tier', 'profile_group:trusted', 'allow', 5, "
+           "'group_allow', 'manual'), "
+           "(%llu, 'trust.tier', 'tier', 'profile:alpha', 'deny', 0, "
+           "'exact_deny', 'manual');",
+           (unsigned long long)out.global_identity_id);
+  T_ASSERT_STATUS_OK(config_db_exec_sql(sql));
+
+  memset(&out, 0, sizeof(out));
+  T_ASSERT_STATUS(db_resolve_policy_decision(token, "alpha", "trust.tier",
+                                             "tier", NULL, NULL, &out),
+                  DB_OK);
+  T_ASSERT_EQ_INT(out.allowed, 0);
+  T_ASSERT_STREQ(out.scope, "profile:alpha");
+  T_ASSERT_STREQ(out.effect, "deny");
+  return 0;
+}
+
+WAMBLE_TEST(config_db_resolve_assigns_identity_when_session_identity_missing) {
+  uint8_t token[TOKEN_LENGTH] = {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+                                 0x10, 0x20, 0x30, 0x40, 0x50, 0x60,
+                                 0x70, 0x80, 0x90, 0xa0};
+  if (config_db_prepare() != 0)
+    T_FAIL_SIMPLE("config_db_prepare failed");
+  T_ASSERT_STATUS_OK(config_db_exec_sql(
+      "INSERT INTO global_policy_rules "
+      "(global_identity_id, action, resource, scope, effect, permission_level, "
+      " reason, source) "
+      "VALUES (0, 'trust.tier', 'tier', '*', 'allow', 1, 'seed', 'manual');"));
+  T_ASSERT_STATUS_OK(config_db_exec_sql(
+      "INSERT INTO sessions (token, player_id, global_identity_id, "
+      "experiment_arm) "
+      "VALUES (decode('aabbccddeeff102030405060708090a0', 'hex'), NULL, NULL, "
+      "0);"));
+  WamblePolicyDecision out = {0};
+  T_ASSERT_STATUS(db_resolve_policy_decision(token, "", "trust.tier", "tier",
+                                             NULL, NULL, &out),
+                  DB_OK);
+  T_ASSERT(out.global_identity_id > 0);
+  T_ASSERT_EQ_INT(out.allowed, 1);
+  return 0;
+}
+
+WAMBLE_TEST(config_db_apply_policy_rule_with_identity_selector) {
+  if (config_db_prepare() != 0)
+    T_FAIL_SIMPLE("config_db_prepare failed");
+  T_ASSERT_STATUS_OK(config_db_exec_sql(
+      "INSERT INTO global_identities (public_key) "
+      "VALUES (decode('00112233445566778899aabbccddeeff00112233445566778899"
+      "aabbccddeeff', 'hex'));"));
+
+  const char *cfg_path = "build/test_policy_identity_selector.conf";
+  const char *cfg =
+      "(policy-allow \"identity:1\" \"trust.tier\" \"profile:alpha\" 7 "
+      "\"seed\")\n";
+  FILE *f = fopen(cfg_path, "wb");
+  T_ASSERT(f != NULL);
+  fwrite(cfg, 1, strlen(cfg), f);
+  fclose(f);
+  T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
+  T_ASSERT_STATUS_OK(db_apply_config_policy_rules("__default__"));
+
+  T_ASSERT_STATUS_OK(config_db_exec_sql(
+      "DO $$ BEGIN "
+      "IF NOT EXISTS ("
+      "  SELECT 1 FROM global_policy_rules "
+      "  WHERE global_identity_id = 1 "
+      "    AND action = 'trust.tier' "
+      "    AND resource = 'tier' "
+      "    AND scope = 'profile:alpha' "
+      "    AND effect = 'allow' "
+      "    AND permission_level = 7"
+      ") THEN RAISE EXCEPTION 'missing identity selector rule'; "
+      "END IF; END $$;"));
+  return 0;
+}
+
+WAMBLE_TEST(config_db_apply_policy_rule_with_tag_selector) {
+  if (config_db_prepare() != 0)
+    T_FAIL_SIMPLE("config_db_prepare failed");
+  T_ASSERT_STATUS_OK(config_db_exec_sql(
+      "INSERT INTO global_identities (public_key) VALUES "
+      "(decode('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      "aaaa', 'hex')), "
+      "(decode('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      "bbbb', 'hex'));"
+      "INSERT INTO global_identity_tags (global_identity_id, tag) "
+      "VALUES (1, 'ops'), (2, 'ops');"));
+
+  const char *cfg_path = "build/test_policy_tag_selector.conf";
+  const char *cfg =
+      "(policy-deny \"tag:ops\" \"profile.discover\" \"profile_selector:"
+      "internal\" \"seed\")\n";
+  FILE *f = fopen(cfg_path, "wb");
+  T_ASSERT(f != NULL);
+  fwrite(cfg, 1, strlen(cfg), f);
+  fclose(f);
+  T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
+  T_ASSERT_STATUS_OK(db_apply_config_policy_rules("__default__"));
+
+  T_ASSERT_STATUS_OK(config_db_exec_sql(
+      "DO $$ DECLARE c INT; BEGIN "
+      "SELECT COUNT(*) INTO c FROM global_policy_rules "
+      "WHERE action = 'profile.discover' "
+      "  AND resource = 'profile_selector:internal' "
+      "  AND scope = '*' "
+      "  AND effect = 'deny' "
+      "  AND global_identity_id IN (1,2); "
+      "IF c <> 2 THEN RAISE EXCEPTION 'expected two tag-expanded rules'; "
+      "END IF; END $$;"));
+  return 0;
+}
+
 WAMBLE_TESTS_BEGIN_NAMED(wamble_register_tests_config)
 WAMBLE_TESTS_ADD_FM(config_basic_eval, "config");
 WAMBLE_TESTS_ADD_FM(config_defaults_no_file, "config");
@@ -274,4 +506,14 @@ WAMBLE_TESTS_ADD_FM(config_profile_select_and_not_found, "config");
 WAMBLE_TESTS_ADD_FM(config_profile_inheritance_variants, "config");
 WAMBLE_TESTS_ADD_FM(config_profile_missing_base_skipped, "config");
 WAMBLE_TESTS_ADD_FM(config_env_getenv_unset, "config");
+WAMBLE_TESTS_ADD_FM(config_snapshot_restore_rebuilds_policy_eval, "config");
+WAMBLE_TESTS_ADD_DB_FM(config_db_policy_validation_requires_trust_tier_rule,
+                       "config");
+WAMBLE_TESTS_ADD_DB_FM(
+    config_db_policy_precedence_exact_deny_over_group_and_global, "config");
+WAMBLE_TESTS_ADD_DB_FM(
+    config_db_resolve_assigns_identity_when_session_identity_missing, "config");
+WAMBLE_TESTS_ADD_DB_FM(config_db_apply_policy_rule_with_identity_selector,
+                       "config");
+WAMBLE_TESTS_ADD_DB_FM(config_db_apply_policy_rule_with_tag_selector, "config");
 WAMBLE_TESTS_END()

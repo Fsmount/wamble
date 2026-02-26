@@ -307,13 +307,28 @@ int test_db_apply_migrations(const char *schema_name) {
     return -1;
   if (test_db_set_search_path(schema_name) != 0)
     return -1;
-  if (test_db_apply_sql_file("migrations/001_initial_schema.sql") != 0)
+  if (test_db_apply_sql_file("migrations/001_profile_initial_schema.sql") != 0)
     return -1;
-  if (test_db_apply_sql_file("migrations/002_runtime_metadata.sql") != 0)
+  if (test_db_apply_sql_file("migrations/002_profile_runtime_metadata.sql") !=
+      0)
     return -1;
-  if (test_db_apply_sql_file("migrations/003_leaderboard_indexes.sql") != 0)
+  if (test_db_apply_sql_file(
+          "migrations/003_profile_leaderboard_indexes.sql") != 0)
     return -1;
-  return test_db_apply_sql_file("migrations/004_session_stats_counters.sql");
+  if (test_db_apply_sql_file(
+          "migrations/004_profile_session_stats_counters.sql") != 0)
+    return -1;
+  if (test_db_apply_sql_file("migrations/005_global_identity_trust.sql") != 0)
+    return -1;
+  if (test_db_apply_sql_file("migrations/006_global_config_snapshots.sql") != 0)
+    return -1;
+  if (test_db_apply_sql_file(
+          "migrations/007_global_policy_runtime_expansion.sql") != 0)
+    return -1;
+  if (test_db_apply_sql_file("migrations/008_profile_identity_sessions.sql") !=
+      0)
+    return -1;
+  return test_db_apply_sql_file("migrations/009_global_identity_tags.sql");
 #else
   (void)schema_name;
   return -1;

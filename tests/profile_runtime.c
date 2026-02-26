@@ -251,6 +251,23 @@ WAMBLE_TEST(profile_multi_listener_not_inline) {
   return 0;
 }
 
+WAMBLE_TEST(profile_hidden_listener_enabled_by_discover_override_rule) {
+  T_ASSERT_STATUS_OK(wamble_net_init());
+  const char *cfg =
+      "(defprofile hidden ((def port 19320) (def advertise 0)))\n"
+      "(policy-allow \"*\" \"profile.discover.override\" \"profile:hidden\" 1 "
+      "\"enable hidden listener\")\n";
+  T_ASSERT_EQ_INT(write_conf(cfg), 0);
+  char status[128];
+  T_ASSERT_STATUS_OK(config_load(conf_path, NULL, status, sizeof(status)));
+  int started = 0;
+  T_ASSERT_EQ_INT(start_profile_listeners(&started), PROFILE_START_OK);
+  T_ASSERT_EQ_INT(started, 1);
+  stop_profile_listeners();
+  wamble_net_cleanup();
+  return 0;
+}
+
 WAMBLE_TESTS_BEGIN_NAMED(profile_runtime_tests) {
   WAMBLE_TESTS_ADD_FM(profile_start_export_and_state_files, "profile_runtime");
   WAMBLE_TESTS_ADD_FM(profile_export_buffer_too_small, "profile_runtime");
@@ -259,5 +276,7 @@ WAMBLE_TESTS_BEGIN_NAMED(profile_runtime_tests) {
                       "profile_runtime");
   WAMBLE_TESTS_ADD_FM(profile_single_listener_runs_inline, "profile_runtime");
   WAMBLE_TESTS_ADD_FM(profile_multi_listener_not_inline, "profile_runtime");
+  WAMBLE_TESTS_ADD_FM(profile_hidden_listener_enabled_by_discover_override_rule,
+                      "profile_runtime");
 }
 WAMBLE_TESTS_END()

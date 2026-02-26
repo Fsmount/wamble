@@ -1,4 +1,236 @@
 #include "../include/wamble/wamble.h"
+#include "../include/wamble/wamble_db.h"
+
+typedef struct {
+  int used;
+  uint8_t token[TOKEN_LENGTH];
+  uint64_t window_start_ms;
+  int count;
+} RequestRateLimitEntry;
+
+static WAMBLE_THREAD_LOCAL RequestRateLimitEntry g_rate_limit_entries[1024];
+
+static int policy_check(const uint8_t *token, const char *profile_name,
+                        const char *action, const char *resource,
+                        const char *context_key, const char *context_value,
+                        WamblePolicyDecision *out_decision) {
+  const WambleQueryService *qs = wamble_get_query_service();
+  if (!qs || !qs->resolve_policy_decision)
+    return 0;
+  WamblePolicyDecision decision;
+  DbStatus st =
+      qs->resolve_policy_decision(token, profile_name, action, resource,
+                                  context_key, context_value, &decision);
+  if (st != DB_OK)
+    return 0;
+  if (out_decision)
+    *out_decision = decision;
+  return decision.allowed ? 1 : 0;
+}
+
+static int resolve_profile_trust_tier(const uint8_t *token,
+                                      const char *profile_name) {
+  const WambleQueryService *qs = wamble_get_query_service();
+  if (!qs || !qs->resolve_policy_decision)
+    return 0;
+  WamblePolicyDecision trust_decision;
+  DbStatus st = qs->resolve_policy_decision(
+      token, profile_name, "trust.tier", "tier", NULL, NULL, &trust_decision);
+  return (st == DB_OK && trust_decision.allowed)
+             ? trust_decision.permission_level
+             : 0;
+}
+
+typedef enum {
+  DISCOVER_POLICY_NO_RULE = 0,
+  DISCOVER_POLICY_ALLOW = 1,
+  DISCOVER_POLICY_DENY = -1,
+} DiscoverPolicyDecision;
+
+static DiscoverPolicyDecision resolve_discovery_policy_for_action(
+    const uint8_t *token, const WambleProfile *p, const char *action) {
+  if (!token || !p || !p->name)
+    return DISCOVER_POLICY_NO_RULE;
+  const WambleQueryService *qs = wamble_get_query_service();
+  if (!qs || !qs->resolve_policy_decision)
+    return DISCOVER_POLICY_NO_RULE;
+
+  WamblePolicyDecision decision;
+  char resource[256];
+  DbStatus st;
+
+  snprintf(resource, sizeof(resource), "profile:%s", p->name);
+  st = qs->resolve_policy_decision(token, p->name, action, resource, NULL, NULL,
+                                   &decision);
+  if (st == DB_OK && decision.rule_id > 0)
+    return decision.allowed ? DISCOVER_POLICY_ALLOW : DISCOVER_POLICY_DENY;
+
+  if (p->group && p->group[0]) {
+    snprintf(resource, sizeof(resource), "profile_selector:%s", p->group);
+    st = qs->resolve_policy_decision(token, p->name, action, resource, NULL,
+                                     NULL, &decision);
+    if (st == DB_OK && decision.rule_id > 0)
+      return decision.allowed ? DISCOVER_POLICY_ALLOW : DISCOVER_POLICY_DENY;
+  }
+
+  st = qs->resolve_policy_decision(token, p->name, action, "*", NULL, NULL,
+                                   &decision);
+  if (st == DB_OK && decision.rule_id > 0)
+    return decision.allowed ? DISCOVER_POLICY_ALLOW : DISCOVER_POLICY_DENY;
+  return DISCOVER_POLICY_NO_RULE;
+}
+
+static int rate_limit_allowed(const uint8_t *token, int max_per_sec) {
+  if (!token || max_per_sec <= 0)
+    return 1;
+  uint64_t now = wamble_now_mono_millis();
+  int match_idx = -1;
+  int free_idx = -1;
+  int oldest_idx = 0;
+  uint64_t oldest_ms = UINT64_MAX;
+  for (int i = 0; i < (int)(sizeof(g_rate_limit_entries) /
+                            sizeof(g_rate_limit_entries[0]));
+       i++) {
+    RequestRateLimitEntry *e = &g_rate_limit_entries[i];
+    if (!e->used) {
+      if (free_idx < 0)
+        free_idx = i;
+      continue;
+    }
+    if (tokens_equal(e->token, token)) {
+      match_idx = i;
+      break;
+    }
+    if (e->window_start_ms < oldest_ms) {
+      oldest_ms = e->window_start_ms;
+      oldest_idx = i;
+    }
+  }
+
+  RequestRateLimitEntry *entry = NULL;
+  if (match_idx >= 0) {
+    entry = &g_rate_limit_entries[match_idx];
+    if (now >= entry->window_start_ms + 1000) {
+      entry->window_start_ms = now;
+      entry->count = 0;
+    }
+  } else {
+    int idx = (free_idx >= 0) ? free_idx : oldest_idx;
+    entry = &g_rate_limit_entries[idx];
+    entry->used = 1;
+    memcpy(entry->token, token, TOKEN_LENGTH);
+    entry->window_start_ms = now;
+    entry->count = 0;
+  }
+  if (entry->count >= max_per_sec)
+    return 0;
+  entry->count++;
+  return 1;
+}
+
+static int profile_discovery_allowed(const uint8_t *token,
+                                     const WambleProfile *p, int trust_tier) {
+  if (!token || !p)
+    return 0;
+  (void)trust_tier;
+  DiscoverPolicyDecision override = resolve_discovery_policy_for_action(
+      token, p, "profile.discover.override");
+  if (override == DISCOVER_POLICY_DENY)
+    return 0;
+  if (override == DISCOVER_POLICY_ALLOW)
+    return 1;
+  int effective_trust = resolve_profile_trust_tier(token, p->name);
+  int default_visible =
+      (p->advertise && effective_trust >= p->visibility) ? 1 : 0;
+  DiscoverPolicyDecision policy =
+      resolve_discovery_policy_for_action(token, p, "profile.discover");
+  if (policy == DISCOVER_POLICY_DENY)
+    return 0;
+  if (policy == DISCOVER_POLICY_ALLOW)
+    return 1;
+  return default_visible;
+}
+
+static ServerStatus send_policy_denied(wamble_socket_t sockfd,
+                                       const struct sockaddr_in *cliaddr,
+                                       const uint8_t *token, const char *action,
+                                       const char *resource,
+                                       const WamblePolicyDecision *decision) {
+  struct WambleMsg err = {0};
+  err.ctrl = WAMBLE_CTRL_ERROR;
+  memcpy(err.token, token, TOKEN_LENGTH);
+  err.error_code = WAMBLE_ERR_ACCESS_DENIED;
+  if (decision && decision->reason[0]) {
+    snprintf(err.error_reason, sizeof(err.error_reason),
+             "denied %.24s/%.24s: %.30s", action ? action : "",
+             resource ? resource : "", decision->reason);
+  } else {
+    snprintf(err.error_reason, sizeof(err.error_reason), "denied %.24s/%.24s",
+             action ? action : "", resource ? resource : "");
+  }
+  if (send_reliable_message(sockfd, &err, cliaddr, get_config()->timeout_ms,
+                            get_config()->max_retries) != 0) {
+    return SERVER_ERR_SEND_FAILED;
+  }
+  return SERVER_ERR_FORBIDDEN;
+}
+
+static const char *ctrl_policy_resource(uint8_t ctrl) {
+  switch (ctrl) {
+  case WAMBLE_CTRL_CLIENT_HELLO:
+    return "client_hello";
+  case WAMBLE_CTRL_SERVER_HELLO:
+    return "server_hello";
+  case WAMBLE_CTRL_PLAYER_MOVE:
+    return "player_move";
+  case WAMBLE_CTRL_BOARD_UPDATE:
+    return "board_update";
+  case WAMBLE_CTRL_ACK:
+    return "ack";
+  case WAMBLE_CTRL_LIST_PROFILES:
+    return "list_profiles";
+  case WAMBLE_CTRL_PROFILE_INFO:
+    return "profile_info";
+  case WAMBLE_CTRL_ERROR:
+    return "error";
+  case WAMBLE_CTRL_SERVER_NOTIFICATION:
+    return "server_notification";
+  case WAMBLE_CTRL_CLIENT_GOODBYE:
+    return "client_goodbye";
+  case WAMBLE_CTRL_SPECTATE_GAME:
+    return "spectate_game";
+  case WAMBLE_CTRL_SPECTATE_UPDATE:
+    return "spectate_update";
+  case WAMBLE_CTRL_LOGIN_REQUEST:
+    return "login_request";
+  case WAMBLE_CTRL_LOGOUT:
+    return "logout";
+  case WAMBLE_CTRL_LOGIN_SUCCESS:
+    return "login_success";
+  case WAMBLE_CTRL_LOGIN_FAILED:
+    return "login_failed";
+  case WAMBLE_CTRL_GET_PLAYER_STATS:
+    return "get_player_stats";
+  case WAMBLE_CTRL_PLAYER_STATS_DATA:
+    return "player_stats_data";
+  case WAMBLE_CTRL_GET_PROFILE_INFO:
+    return "get_profile_info";
+  case WAMBLE_CTRL_PROFILES_LIST:
+    return "profiles_list";
+  case WAMBLE_CTRL_SPECTATE_STOP:
+    return "spectate_stop";
+  case WAMBLE_CTRL_GET_LEGAL_MOVES:
+    return "get_legal_moves";
+  case WAMBLE_CTRL_LEGAL_MOVES:
+    return "legal_moves";
+  case WAMBLE_CTRL_GET_LEADERBOARD:
+    return "get_leaderboard";
+  case WAMBLE_CTRL_LEADERBOARD_DATA:
+    return "leaderboard_data";
+  default:
+    return "unknown";
+  }
+}
 
 static ServerStatus handle_client_hello(wamble_socket_t sockfd,
                                         const struct WambleMsg *msg,
@@ -64,7 +296,15 @@ static ServerStatus handle_client_hello(wamble_socket_t sockfd,
 
 static ServerStatus handle_player_move(wamble_socket_t sockfd,
                                        const struct WambleMsg *msg,
-                                       const struct sockaddr_in *cliaddr) {
+                                       const struct sockaddr_in *cliaddr,
+                                       const char *profile_name) {
+  WamblePolicyDecision decision;
+  memset(&decision, 0, sizeof(decision));
+  if (!policy_check(msg->token, profile_name, "game.move", "play", NULL, NULL,
+                    &decision)) {
+    return send_policy_denied(sockfd, cliaddr, msg->token, "game.move", "play",
+                              &decision);
+  }
   WamblePlayer *player = get_player_by_token(msg->token);
   if (!player) {
     return SERVER_ERR_UNKNOWN_PLAYER;
@@ -126,14 +366,46 @@ static ServerStatus handle_player_move(wamble_socket_t sockfd,
 }
 
 ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
-                            const struct sockaddr_in *cliaddr, int trust_tier) {
+                            const struct sockaddr_in *cliaddr, int trust_tier,
+                            const char *profile_name) {
+  if (msg->ctrl != WAMBLE_CTRL_CLIENT_HELLO && msg->ctrl != WAMBLE_CTRL_ACK) {
+    WamblePolicyDecision bypass = {0};
+    const char *ctrl_res = ctrl_policy_resource(msg->ctrl);
+    int bypass_rate_limit =
+        policy_check(msg->token, profile_name, "rate_limit.bypass", "request",
+                     "ctrl", ctrl_res, &bypass);
+    int max_per_sec = get_config()->rate_limit_requests_per_sec;
+    if (!bypass_rate_limit && !rate_limit_allowed(msg->token, max_per_sec)) {
+      struct WambleMsg out = {0};
+      out.ctrl = WAMBLE_CTRL_ERROR;
+      memcpy(out.token, msg->token, TOKEN_LENGTH);
+      out.error_code = WAMBLE_ERR_ACCESS_DENIED;
+      snprintf(out.error_reason, sizeof(out.error_reason), "rate_limited");
+      if (send_reliable_message(sockfd, &out, cliaddr, get_config()->timeout_ms,
+                                get_config()->max_retries) != 0) {
+        return SERVER_ERR_SEND_FAILED;
+      }
+      return SERVER_ERR_FORBIDDEN;
+    }
+  }
+  if (msg->ctrl != WAMBLE_CTRL_CLIENT_HELLO && msg->ctrl != WAMBLE_CTRL_ACK &&
+      msg->ctrl != WAMBLE_CTRL_LOGIN_REQUEST) {
+    WamblePolicyDecision decision;
+    memset(&decision, 0, sizeof(decision));
+    const char *ctrl_res = ctrl_policy_resource(msg->ctrl);
+    if (!policy_check(msg->token, profile_name, "protocol.ctrl", ctrl_res, NULL,
+                      NULL, &decision)) {
+      return send_policy_denied(sockfd, cliaddr, msg->token, "protocol.ctrl",
+                                ctrl_res, &decision);
+    }
+  }
   switch (msg->ctrl) {
   case WAMBLE_CTRL_CLIENT_HELLO:
     return handle_client_hello(sockfd, msg, cliaddr);
   case WAMBLE_CTRL_PLAYER_MOVE:
     if ((msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0)
       send_ack(sockfd, msg, cliaddr);
-    return handle_player_move(sockfd, msg, cliaddr);
+    return handle_player_move(sockfd, msg, cliaddr, profile_name);
   case WAMBLE_CTRL_LIST_PROFILES: {
     struct WambleMsg resp = {0};
     resp.ctrl = WAMBLE_CTRL_PROFILES_LIST;
@@ -143,10 +415,9 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     int written = 0;
     for (int i = 0; i < count; i++) {
       const WambleProfile *p = config_get_profile(i);
-      if (!p || !p->advertise)
+      if (!p)
         continue;
-
-      if (trust_tier < p->visibility)
+      if (!profile_discovery_allowed(msg->token, p, trust_tier))
         continue;
       const char *name = p->name ? p->name : "";
       int need = (int)strlen(name);
@@ -175,7 +446,7 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     struct WambleMsg resp = {0};
     resp.ctrl = WAMBLE_CTRL_PROFILE_INFO;
     memcpy(resp.token, msg->token, TOKEN_LENGTH);
-    if (p) {
+    if (p && profile_discovery_allowed(msg->token, p, trust_tier)) {
       snprintf(resp.fen, FEN_MAX_LENGTH, "%s;%d;%d;%d", p->name, p->config.port,
                p->advertise, p->visibility);
     } else {
@@ -189,8 +460,15 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
   }
   case WAMBLE_CTRL_LOGIN_REQUEST: {
     WamblePlayer *player = NULL;
-    if (msg->login_pubkey[0] || msg->login_pubkey[31]) {
-      player = login_player(msg->login_pubkey);
+    int has_key = 0;
+    for (int i = 0; i < 32; i++) {
+      if (msg->login_pubkey[i] != 0) {
+        has_key = 1;
+        break;
+      }
+    }
+    if (has_key) {
+      player = attach_persistent_identity(msg->token, msg->login_pubkey);
     }
     struct WambleMsg response = {0};
     if (player) {
@@ -199,8 +477,13 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     } else {
       response.ctrl = WAMBLE_CTRL_LOGIN_FAILED;
       response.error_code = 1;
-      snprintf(response.error_reason, sizeof(response.error_reason),
-               "invalid or missing public key");
+      if (!has_key) {
+        snprintf(response.error_reason, sizeof(response.error_reason),
+                 "missing public key");
+      } else {
+        snprintf(response.error_reason, sizeof(response.error_reason),
+                 "unknown session token; call CLIENT_HELLO first");
+      }
     }
     if (send_reliable_message(sockfd, &response, cliaddr,
                               get_config()->timeout_ms,
@@ -212,10 +495,31 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
   case WAMBLE_CTRL_SPECTATE_GAME: {
     if ((msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0)
       send_ack(sockfd, msg, cliaddr);
+    const char *spectate_mode = (msg->board_id == 0) ? "summary" : "focus";
+    WamblePolicyDecision decision;
+    memset(&decision, 0, sizeof(decision));
+    if (!policy_check(msg->token, profile_name, "spectate.access", "view",
+                      "mode", spectate_mode, &decision)) {
+      struct WambleMsg out = {0};
+      out.ctrl = WAMBLE_CTRL_ERROR;
+      memcpy(out.token, msg->token, TOKEN_LENGTH);
+      out.error_code = WAMBLE_ERR_ACCESS_DENIED;
+      snprintf(out.error_reason, sizeof(out.error_reason),
+               "denied spectate: %.48s",
+               decision.reason[0] ? decision.reason : "policy");
+      if (send_reliable_message(sockfd, &out, cliaddr, get_config()->timeout_ms,
+                                get_config()->max_retries) != 0) {
+        return SERVER_ERR_SEND_FAILED;
+      }
+      return SERVER_ERR_FORBIDDEN;
+    }
     SpectatorState new_state = SPECTATOR_STATE_IDLE;
     uint64_t focus_id = 0;
+    int capacity_bypass =
+        policy_check(msg->token, profile_name, "spectate.capacity_bypass",
+                     "focus", NULL, NULL, NULL);
     SpectatorRequestStatus res = spectator_handle_request(
-        msg, cliaddr, trust_tier, &new_state, &focus_id);
+        msg, cliaddr, trust_tier, capacity_bypass, &new_state, &focus_id);
     if (!(res == SPECTATOR_OK_FOCUS || res == SPECTATOR_OK_SUMMARY ||
           res == SPECTATOR_OK_STOP)) {
       struct WambleMsg out = {0};
@@ -236,11 +540,18 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
       send_ack(sockfd, msg, cliaddr);
     SpectatorState new_state = SPECTATOR_STATE_IDLE;
     uint64_t focus_id = 0;
-    (void)spectator_handle_request(msg, cliaddr, trust_tier, &new_state,
+    (void)spectator_handle_request(msg, cliaddr, trust_tier, 0, &new_state,
                                    &focus_id);
     return SERVER_OK;
   }
   case WAMBLE_CTRL_GET_PLAYER_STATS: {
+    WamblePolicyDecision decision;
+    memset(&decision, 0, sizeof(decision));
+    if (!policy_check(msg->token, profile_name, "stats.read", "player", NULL,
+                      NULL, &decision)) {
+      return send_policy_denied(sockfd, cliaddr, msg->token, "stats.read",
+                                "player", &decision);
+    }
     WamblePlayer *player = get_player_by_token(msg->token);
     if (player) {
       struct WambleMsg response;
@@ -257,6 +568,13 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     return SERVER_ERR_UNKNOWN_PLAYER;
   }
   case WAMBLE_CTRL_GET_LEADERBOARD: {
+    WamblePolicyDecision decision;
+    memset(&decision, 0, sizeof(decision));
+    if (!policy_check(msg->token, profile_name, "leaderboard.read", "global",
+                      NULL, NULL, &decision)) {
+      return send_policy_denied(sockfd, cliaddr, msg->token, "leaderboard.read",
+                                "global", &decision);
+    }
     uint8_t lb_type = msg->leaderboard_type;
     if (lb_type != WAMBLE_LEADERBOARD_RATING)
       lb_type = WAMBLE_LEADERBOARD_SCORE;
@@ -297,6 +615,13 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     return SERVER_OK;
   }
   case WAMBLE_CTRL_GET_LEGAL_MOVES: {
+    WamblePolicyDecision decision;
+    memset(&decision, 0, sizeof(decision));
+    if (!policy_check(msg->token, profile_name, "game.move", "legal", NULL,
+                      NULL, &decision)) {
+      return send_policy_denied(sockfd, cliaddr, msg->token, "game.move",
+                                "legal", &decision);
+    }
     WamblePlayer *player = get_player_by_token(msg->token);
     if (!player) {
       return SERVER_ERR_UNKNOWN_PLAYER;
