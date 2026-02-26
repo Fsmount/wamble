@@ -56,20 +56,26 @@ static void exec_file(PGconn *c, const char *path) {
 
 int main(int argc, char **argv) {
   const char *schema = NULL;
-  int do_migrate = 0;
+  int do_migrate_profile = 0;
+  int do_migrate_global = 0;
   int do_fixture = 0;
   int do_reset = 0;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--schema") == 0 && i + 1 < argc) {
       schema = argv[++i];
     } else if (strcmp(argv[i], "--migrate") == 0) {
-      do_migrate = 1;
+      do_migrate_profile = 1;
+    } else if (strcmp(argv[i], "--migrate-profile") == 0) {
+      do_migrate_profile = 1;
+    } else if (strcmp(argv[i], "--migrate-global") == 0) {
+      do_migrate_global = 1;
     } else if (strcmp(argv[i], "--fixture") == 0) {
       do_fixture = 1;
     } else if (strcmp(argv[i], "--reset") == 0) {
       do_reset = 1;
     } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-      printf("Usage: %s [--schema NAME] [--migrate] [--fixture] [--reset]\n",
+      printf("Usage: %s [--schema NAME] [--migrate|--migrate-profile] "
+             "[--migrate-global] [--fixture] [--reset]\n",
              argv[0]);
       return 0;
     }
@@ -85,14 +91,40 @@ int main(int argc, char **argv) {
   }
   if (do_reset) {
     exec_sql(c,
-             "TRUNCATE TABLE predictions, payouts, game_results, reservations, "
-             "moves, boards, sessions, players RESTART IDENTITY CASCADE");
+             "DO $$ "
+             "BEGIN "
+             "  IF to_regclass('predictions') IS NOT NULL THEN "
+             "    EXECUTE 'TRUNCATE TABLE predictions, payouts, game_results, "
+             "reservations, moves, boards, sessions, players RESTART IDENTITY "
+             "CASCADE'; "
+             "  END IF; "
+             "  IF to_regclass('global_policy_rules') IS NOT NULL THEN "
+             "    EXECUTE 'TRUNCATE TABLE global_policy_rules RESTART IDENTITY "
+             "CASCADE'; "
+             "  END IF; "
+             "  IF to_regclass('global_runtime_config_revisions') IS NOT NULL "
+             "THEN "
+             "    EXECUTE 'TRUNCATE TABLE global_runtime_config_revisions, "
+             "global_runtime_config_blobs RESTART IDENTITY CASCADE'; "
+             "  END IF; "
+             "  IF to_regclass('global_identities') IS NOT NULL THEN "
+             "    EXECUTE 'TRUNCATE TABLE global_identities RESTART IDENTITY "
+             "CASCADE'; "
+             "  END IF; "
+             "END $$");
   }
-  if (do_migrate) {
-    exec_file(c, "migrations/001_initial_schema.sql");
-    exec_file(c, "migrations/002_runtime_metadata.sql");
-    exec_file(c, "migrations/003_leaderboard_indexes.sql");
-    exec_file(c, "migrations/004_session_stats_counters.sql");
+  if (do_migrate_profile) {
+    exec_file(c, "migrations/001_profile_initial_schema.sql");
+    exec_file(c, "migrations/002_profile_runtime_metadata.sql");
+    exec_file(c, "migrations/003_profile_leaderboard_indexes.sql");
+    exec_file(c, "migrations/004_profile_session_stats_counters.sql");
+    exec_file(c, "migrations/008_profile_identity_sessions.sql");
+  }
+  if (do_migrate_global) {
+    exec_file(c, "migrations/005_global_identity_trust.sql");
+    exec_file(c, "migrations/006_global_config_snapshots.sql");
+    exec_file(c, "migrations/007_global_policy_runtime_expansion.sql");
+    exec_file(c, "migrations/009_global_identity_tags.sql");
   }
   if (do_fixture) {
     exec_file(c, "tests/db/fixture.sql");

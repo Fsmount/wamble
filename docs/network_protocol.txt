@@ -73,8 +73,10 @@ Control Codes
   - Richer payloads may be introduced later (e.g., player info, predictions),
     but `board_id` will always be present in the header and must be used by
     clients to associate updates with boards.
-- `0x0D` LOGIN_REQUEST (client to server): Authenticate persistent identity.
+- `0x0D` LOGIN_REQUEST (client to server): Attach persistent identity to an
+  existing anonymous session.
   - Payload: `uint8 public_key[32]`.
+  - Requires a valid session token from a prior `CLIENT_HELLO`.
 - `0x0E` LOGOUT (client to server): Disassociate persistent identity.
   - Payload: empty.
 - `0x0F` LOGIN_SUCCESS (server to client): Successful login.
@@ -129,11 +131,12 @@ Unreliable Messages
 - Used for non-critical, high-frequency updates (e.g., `SPECTATE_UPDATE`).
 
 Spectator Policy
-- Visibility: spectating requires `sessions.trust_level >= spectate-visibility`.
+- Visibility: spectating requires resolved trust >= `spectate-visibility`
+  from global policy rules.
 - Capacity: the server may cap the number of focused spectators via
-  `max-spectators`. Admin sessions -if configured via `admin-trust-level`-
-  bypass this cap. Summary mode is designed as a scrollable feed and is not
-  restricted to a fixed top-N.
+  `max-spectators`. Bypass-focused sessions are counted outside 
+  the `max-spectators` pool. Summary mode is designed as a scrollable
+  feed and is not restricted to a fixed top-N.
 - Summary modes:
   - `full`: send all ACTIVE+RESERVED boards.
   - `changes`: send only boards changed since the last summary tick.
@@ -143,15 +146,19 @@ Spectator Policy
 Sessions
 - A session is identified by a `token` and the client's address:port.
 - Session table size is `max-client-sessions` per listener.
+- Request throughput can be limited per token using
+  `rate-limit-requests-per-sec`; bypass is policy-controlled via
+  `rate_limit.bypass` with resource `request`.
 - NAT rebinding: The address:port for a session can be updated if a valid
   packet arrives with the same token and a valid `seq_num`.
 - Idle sessions are removed after `session-timeout` seconds.
 
 Profiles
 - The server runs one UDP listener thread per advertised profile.
-- `LIST_PROFILES` returns profiles where `profile.visibility <= sessions.trust_level`.
-- `GET_PROFILE_INFO` requests details for a named profile.
-- On SIGHUP, config is reloaded and listeners are restarted.
+- `LIST_PROFILES` returns:
+  - advertised profiles where `profile.visibility <= resolved_trust`;
+  - unadvertised profiles explicitly allowed by `profile.discover` policy.
+- `GET_PROFILE_INFO` requests details for a named profile and uses the same discovery authorization as `LIST_PROFILES`.
 
 References
 - Spectators: docs/spectator_management.txt (SPECTATE_GAME, SPECTATE_UPDATE, SPECTATE_STOP)

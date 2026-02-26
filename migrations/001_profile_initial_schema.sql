@@ -9,7 +9,9 @@ CREATE TABLE sessions (
     id BIGSERIAL PRIMARY KEY,
     token BYTEA UNIQUE NOT NULL CHECK (LENGTH(token) = 16),
     player_id BIGINT NULL REFERENCES players(id),
-    trust_level INTEGER NOT NULL DEFAULT 0,
+    global_identity_id BIGINT NOT NULL,
+    config_revision_id BIGINT,
+    policy_snapshot_revision_id BIGINT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     last_seen_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -62,6 +64,7 @@ CREATE TABLE predictions (
 );
 
 CREATE INDEX idx_sessions_token ON sessions(token);
+CREATE INDEX idx_sessions_identity_id ON sessions(global_identity_id);
 CREATE INDEX idx_boards_status ON boards(status);
 CREATE INDEX idx_moves_board_id ON moves(board_id);
 CREATE INDEX idx_moves_session_id ON moves(session_id);

@@ -6,6 +6,13 @@
 struct WambleQueryService;
 
 int db_init(const char *connection_string);
+int db_set_global_store_connection(const char *connection_string);
+int db_validate_global_policy(void);
+int db_store_config_snapshot(const char *profile_key, const char *config_text);
+int db_load_config_snapshot(const char *profile_key, char **out_config_text);
+int db_record_config_event(const char *profile_key, const char *config_text,
+                           const char *source, const char *result,
+                           const char *error_text);
 void db_cleanup(void);
 void db_tick(void);
 int db_write_batch_begin(void);
@@ -65,7 +72,12 @@ void db_expire_reservations(void);
 
 void db_cleanup_thread(void);
 
-DbStatus db_get_trust_tier_by_token(const uint8_t *token, int *out_trust);
+DbStatus db_resolve_policy_decision(const uint8_t *token, const char *profile,
+                                    const char *action, const char *resource,
+                                    const char *context_key,
+                                    const char *context_value,
+                                    WamblePolicyDecision *out);
+int db_apply_config_policy_rules(const char *profile_key);
 
 void db_archive_inactive_boards(int timeout_seconds);
 
@@ -84,7 +96,11 @@ typedef struct WambleQueryService {
   DbLeaderboardResult (*get_leaderboard)(uint64_t requester_session_id,
                                          uint8_t leaderboard_type, int limit);
   DbMovesResult (*get_moves_for_board)(uint64_t board_id);
-  DbStatus (*get_trust_tier_by_token)(const uint8_t *token, int *out_trust);
+  DbStatus (*resolve_policy_decision)(const uint8_t *token, const char *profile,
+                                      const char *action, const char *resource,
+                                      const char *context_key,
+                                      const char *context_value,
+                                      WamblePolicyDecision *out);
 } WambleQueryService;
 
 const WambleQueryService *wamble_get_db_query_service(void);

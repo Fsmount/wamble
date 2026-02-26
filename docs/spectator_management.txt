@@ -11,7 +11,12 @@ States
 - `FOCUS`: periodic updates about one board.
 
 Config
-- `max-spectators`, `spectator-visibility`, `spectator-summary-hz`, `spectator-focus-hz`, `spectator-max-focus-per-session`, `spectator-summary-mode`.
+- `max-spectators`, `spectator-visibility`, `spectator-summary-hz`,
+  `spectator-focus-hz`, `spectator-max-focus-per-session`,
+  `spectator-summary-mode`.
+- Capacity bypass for focused mode is policy-controlled via
+  `spectate.capacity_bypass` / `focus`, and bypass-focused sessions are counted
+  outside the non-bypass capacity pool.
 
 Requests
 - Summary: send `SPECTATE_GAME` with `board_id=0` -> `SPECTATOR_OK_SUMMARY`.

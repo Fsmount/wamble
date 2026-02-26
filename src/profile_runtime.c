@@ -43,19 +43,31 @@ static int g_running_count = 0;
 static wamble_mutex_t g_mutex;
 static int g_mutex_initialized = 0;
 static int g_prepare_exec = 0;
+static WAMBLE_THREAD_LOCAL char g_runtime_profile_key[128];
 typedef struct WsGatewayStatusEvent {
   WsGatewayStatus status;
   char profile[64];
 } WsGatewayStatusEvent;
+typedef struct TrustDecisionStatusEvent {
+  ProfileTrustDecisionStatus status;
+  char profile[64];
+} TrustDecisionStatusEvent;
 enum { WS_STATUS_QUEUE_CAP = 64 };
 static WsGatewayStatusEvent g_ws_status_queue[WS_STATUS_QUEUE_CAP];
 static int g_ws_status_head = 0;
 static int g_ws_status_tail = 0;
 static int g_ws_status_count = 0;
+enum { TRUST_STATUS_QUEUE_CAP = 256 };
+static TrustDecisionStatusEvent g_trust_status_queue[TRUST_STATUS_QUEUE_CAP];
+static int g_trust_status_head = 0;
+static int g_trust_status_tail = 0;
+static int g_trust_status_count = 0;
 
 static void free_running(RunningProfile *rp);
 static void profile_runtime_shutdown(RunningProfile *rp);
 static int profile_has_inline_runtime_locked(void);
+static void profile_runtime_set_profile_key(const char *profile_name);
+static int profile_runtime_enabled(const WambleProfile *p);
 
 static void ensure_mutex_init(void) {
   if (!g_mutex_initialized) {
@@ -64,7 +76,19 @@ static void ensure_mutex_init(void) {
     g_ws_status_head = 0;
     g_ws_status_tail = 0;
     g_ws_status_count = 0;
+    g_trust_status_head = 0;
+    g_trust_status_tail = 0;
+    g_trust_status_count = 0;
   }
+}
+
+const char *wamble_runtime_profile_key(void) {
+  return g_runtime_profile_key[0] ? g_runtime_profile_key : "__default__";
+}
+
+static void profile_runtime_set_profile_key(const char *profile_name) {
+  snprintf(g_runtime_profile_key, sizeof(g_runtime_profile_key), "%s",
+           (profile_name && profile_name[0]) ? profile_name : "__default__");
 }
 
 static void publish_ws_gateway_status(WsGatewayStatus status,
@@ -98,6 +122,49 @@ int profile_runtime_take_ws_gateway_status(WsGatewayStatus *out_status,
     WsGatewayStatusEvent ev = g_ws_status_queue[g_ws_status_head];
     g_ws_status_head = (g_ws_status_head + 1) % WS_STATUS_QUEUE_CAP;
     g_ws_status_count--;
+    if (out_profile && out_profile_size > 0) {
+      snprintf(out_profile, out_profile_size, "%s", ev.profile);
+    }
+    if (out_status)
+      *out_status = ev.status;
+    wamble_mutex_unlock(&g_mutex);
+    return 1;
+  }
+  wamble_mutex_unlock(&g_mutex);
+  return 0;
+}
+
+static void publish_trust_decision_status(ProfileTrustDecisionStatus status,
+                                          const char *profile_name) {
+  ensure_mutex_init();
+  wamble_mutex_lock(&g_mutex);
+  if (g_trust_status_count >= TRUST_STATUS_QUEUE_CAP) {
+    g_trust_status_head = (g_trust_status_head + 1) % TRUST_STATUS_QUEUE_CAP;
+    g_trust_status_count--;
+  }
+  TrustDecisionStatusEvent *ev = &g_trust_status_queue[g_trust_status_tail];
+  ev->status = status;
+  snprintf(ev->profile, sizeof(ev->profile), "%s",
+           (profile_name && profile_name[0]) ? profile_name : "default");
+  g_trust_status_tail = (g_trust_status_tail + 1) % TRUST_STATUS_QUEUE_CAP;
+  g_trust_status_count++;
+  wamble_mutex_unlock(&g_mutex);
+}
+
+int profile_runtime_take_trust_decision_status(
+    ProfileTrustDecisionStatus *out_status, char *out_profile,
+    size_t out_profile_size) {
+  ensure_mutex_init();
+  if (out_status)
+    *out_status = PROFILE_TRUST_DECISION_DENIED;
+  if (out_profile && out_profile_size > 0)
+    out_profile[0] = '\0';
+
+  wamble_mutex_lock(&g_mutex);
+  if (g_trust_status_count > 0) {
+    TrustDecisionStatusEvent ev = g_trust_status_queue[g_trust_status_head];
+    g_trust_status_head = (g_trust_status_head + 1) % TRUST_STATUS_QUEUE_CAP;
+    g_trust_status_count--;
     if (out_profile && out_profile_size > 0) {
       snprintf(out_profile, out_profile_size, "%s", ev.profile);
     }
@@ -226,12 +293,20 @@ static void runtime_cfg_free_owned(WambleConfig *cfg) {
   free(cfg->db_user);
   free(cfg->db_pass);
   free(cfg->db_name);
+  free(cfg->global_db_host);
+  free(cfg->global_db_user);
+  free(cfg->global_db_pass);
+  free(cfg->global_db_name);
   free(cfg->websocket_path);
   free(cfg->experiment_pairings);
   cfg->db_host = NULL;
   cfg->db_user = NULL;
   cfg->db_pass = NULL;
   cfg->db_name = NULL;
+  cfg->global_db_host = NULL;
+  cfg->global_db_user = NULL;
+  cfg->global_db_pass = NULL;
+  cfg->global_db_name = NULL;
   cfg->websocket_path = NULL;
   cfg->experiment_pairings = NULL;
 }
@@ -245,11 +320,17 @@ static int runtime_cfg_dup_from(WambleConfig *dst, const WambleConfig *src) {
   dst->db_user = wamble_strdup_local(src->db_user);
   dst->db_pass = wamble_strdup_local(src->db_pass);
   dst->db_name = wamble_strdup_local(src->db_name);
+  dst->global_db_host = wamble_strdup_local(src->global_db_host);
+  dst->global_db_user = wamble_strdup_local(src->global_db_user);
+  dst->global_db_pass = wamble_strdup_local(src->global_db_pass);
+  dst->global_db_name = wamble_strdup_local(src->global_db_name);
   dst->websocket_path = wamble_strdup_local(src->websocket_path);
   dst->experiment_pairings = wamble_strdup_local(
       src->experiment_pairings ? src->experiment_pairings : "*");
   if (!dst->db_host || !dst->db_user || !dst->db_pass || !dst->db_name ||
-      !dst->websocket_path || !dst->experiment_pairings) {
+      !dst->global_db_host || !dst->global_db_user || !dst->global_db_pass ||
+      !dst->global_db_name || !dst->websocket_path ||
+      !dst->experiment_pairings) {
     runtime_cfg_free_owned(dst);
     return -1;
   }
@@ -265,7 +346,7 @@ static int adopt_profile_from_env(const char *name, const char *value,
     return 0;
 
   const WambleProfile *p = config_find_profile(name);
-  if (!p || !p->advertise)
+  if (!p || !profile_runtime_enabled(p))
     return 0;
 
   char *endptr = NULL;
@@ -533,11 +614,11 @@ static Prebound *preflight_and_bind_all(int *out_count,
     return NULL;
   }
 
-  const WambleProfile **adv = calloc((size_t)total, sizeof(*adv));
-  int *adv_idx = calloc((size_t)total, sizeof(*adv_idx));
-  if (!adv || !adv_idx) {
-    free(adv);
-    free(adv_idx);
+  const WambleProfile **profiles = calloc((size_t)total, sizeof(*profiles));
+  int *profile_idx = calloc((size_t)total, sizeof(*profile_idx));
+  if (!profiles || !profile_idx) {
+    free(profiles);
+    free(profile_idx);
     if (out_status)
       *out_status = PROFILE_START_THREAD_ERROR;
     if (out_count)
@@ -547,24 +628,24 @@ static Prebound *preflight_and_bind_all(int *out_count,
   int count = 0;
   for (int i = 0; i < total; i++) {
     const WambleProfile *p = config_get_profile(i);
-    if (!p || !p->advertise)
+    if (!p || !profile_runtime_enabled(p))
       continue;
-    adv[count] = p;
-    adv_idx[count] = i;
+    profiles[count] = p;
+    profile_idx[count] = i;
     count++;
   }
 
   for (int i = 0; i < count; i++) {
-    const WambleProfile *pi = adv[i];
+    const WambleProfile *pi = profiles[i];
     for (int j = i + 1; j < count; j++) {
-      const WambleProfile *pj = adv[j];
+      const WambleProfile *pj = profiles[j];
       if (pi->config.port == pj->config.port) {
         if (out_status)
           *out_status = PROFILE_START_CONFLICT;
         if (out_count)
           *out_count = 0;
-        free(adv);
-        free(adv_idx);
+        free(profiles);
+        free(profile_idx);
         return NULL;
       }
       if (pi->config.websocket_enabled && pj->config.websocket_enabled) {
@@ -577,8 +658,8 @@ static Prebound *preflight_and_bind_all(int *out_count,
             *out_status = PROFILE_START_CONFLICT;
           if (out_count)
             *out_count = 0;
-          free(adv);
-          free(adv_idx);
+          free(profiles);
+          free(profile_idx);
           return NULL;
         }
       }
@@ -588,8 +669,8 @@ static Prebound *preflight_and_bind_all(int *out_count,
           *out_status = PROFILE_START_CONFLICT;
         if (out_count)
           *out_count = 0;
-        free(adv);
-        free(adv_idx);
+        free(profiles);
+        free(profile_idx);
         return NULL;
       }
     }
@@ -597,8 +678,8 @@ static Prebound *preflight_and_bind_all(int *out_count,
 
   Prebound *pb = calloc((size_t)count, sizeof(Prebound));
   if (!pb) {
-    free(adv);
-    free(adv_idx);
+    free(profiles);
+    free(profile_idx);
     if (out_status)
       *out_status = PROFILE_START_THREAD_ERROR;
     if (out_count)
@@ -607,7 +688,7 @@ static Prebound *preflight_and_bind_all(int *out_count,
   }
   int pb_count = 0;
   for (int i = 0; i < count; i++) {
-    const WambleProfile *p = adv[i];
+    const WambleProfile *p = profiles[i];
     wamble_socket_t sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd == WAMBLE_INVALID_SOCKET) {
       if (out_status)
@@ -615,8 +696,8 @@ static Prebound *preflight_and_bind_all(int *out_count,
       for (int k = 0; k < pb_count; k++)
         wamble_close_socket(pb[k].sockfd);
       free(pb);
-      free(adv);
-      free(adv_idx);
+      free(profiles);
+      free(profile_idx);
       if (out_count)
         *out_count = 0;
       return NULL;
@@ -642,26 +723,58 @@ static Prebound *preflight_and_bind_all(int *out_count,
       if (out_status)
         *out_status = PROFILE_START_BIND_ERROR;
       free(pb);
-      free(adv);
-      free(adv_idx);
+      free(profiles);
+      free(profile_idx);
       if (out_count)
         *out_count = 0;
       return NULL;
     }
 
     (void)wamble_set_nonblocking(sockfd);
-    pb[pb_count].profile_index = adv_idx[i];
+    pb[pb_count].profile_index = profile_idx[i];
     pb[pb_count].sockfd = sockfd;
     pb_count++;
   }
-  free(adv);
-  free(adv_idx);
+  free(profiles);
+  free(profile_idx);
   if (out_count)
     *out_count = pb_count;
   if (out_status)
     *out_status =
         (pb_count > 0) ? PROFILE_START_OK : PROFILE_START_DEFAULT_RUNTIME;
   return pb;
+}
+
+static int profile_runtime_enabled(const WambleProfile *p) {
+  if (!p || !p->name)
+    return 0;
+  if (p->advertise)
+    return 1;
+
+  int rc = config_policy_rule_count();
+  char exact[256];
+  char selector[256];
+  snprintf(exact, sizeof(exact), "profile:%s", p->name);
+  selector[0] = '\0';
+  if (p->group && p->group[0]) {
+    snprintf(selector, sizeof(selector), "profile_selector:%s", p->group);
+  }
+
+  for (int i = 0; i < rc; i++) {
+    const WamblePolicyRuleSpec *r = config_policy_rule_get(i);
+    if (!r || !r->action || !r->resource || !r->effect)
+      continue;
+    if (strcmp(r->action, "profile.discover") != 0 &&
+        strcmp(r->action, "profile.discover.override") != 0)
+      continue;
+    if (strcmp(r->effect, "allow") != 0)
+      continue;
+    if (strcmp(r->resource, "*") == 0 || strcmp(r->resource, exact) == 0)
+      return 1;
+    if (selector[0] && strcmp(r->resource, selector) == 0)
+      return 1;
+  }
+  return 0;
 }
 
 static void profile_runtime_prepare_exec_snapshot(RunningProfile *rp) {
@@ -742,10 +855,20 @@ static void profile_runtime_poll_messages(RunningProfile *rp,
     if (n <= 0)
       break;
     int trust_tier = 0;
-    if (qs && qs->get_trust_tier_by_token) {
-      qs->get_trust_tier_by_token(msg.token, &trust_tier);
+    if (qs && qs->resolve_policy_decision) {
+      WamblePolicyDecision decision;
+      DbStatus st = qs->resolve_policy_decision(
+          msg.token, rp->name, "trust.tier", "tier", NULL, NULL, &decision);
+      if (st == DB_OK && decision.allowed)
+        trust_tier = decision.permission_level;
+      if (st == DB_OK) {
+        publish_trust_decision_status(decision.allowed
+                                          ? PROFILE_TRUST_DECISION_ALLOWED
+                                          : PROFILE_TRUST_DECISION_DENIED,
+                                      rp->name);
+      }
     }
-    (void)handle_message(rp->sockfd, &msg, &cliaddr, trust_tier);
+    (void)handle_message(rp->sockfd, &msg, &cliaddr, trust_tier, rp->name);
   }
 }
 
@@ -843,6 +966,7 @@ static WsGatewayStatus profile_ws_reconcile(RunningProfile *rp) {
 static int profile_runtime_init(RunningProfile *rp) {
   if (!rp || rp->runtime_ready)
     return 0;
+  profile_runtime_set_profile_key(rp->name);
   set_thread_config(&rp->cfg);
   network_init_thread_state();
   ensure_mutex_init();
@@ -986,6 +1110,7 @@ static void profile_runtime_step(RunningProfile *rp) {
       rp->has_pending_cfg = 0;
     }
     set_thread_config(&rp->cfg);
+    profile_runtime_set_profile_key(rp->name);
     rp->ws_retry_enabled = 1;
     (void)profile_ws_reconcile(rp);
   }
@@ -1171,24 +1296,24 @@ int profile_runtime_pump_inline(void) {
   return 1;
 }
 
-static int count_advertised_profiles(void) {
+static int count_configured_profiles(void) {
   int total = config_profile_count();
-  int advertised = 0;
+  int configured = 0;
   for (int i = 0; i < total; i++) {
     const WambleProfile *p = config_get_profile(i);
-    if (p && p->advertise)
-      advertised++;
+    if (profile_runtime_enabled(p))
+      configured++;
   }
-  return advertised;
+  return configured;
 }
 
-static const WambleProfile *find_advertised_profile_by_name(const char *name) {
+static const WambleProfile *find_profile_by_name(const char *name) {
   if (!name || !*name)
     return NULL;
   int total = config_profile_count();
   for (int i = 0; i < total; i++) {
     const WambleProfile *p = config_get_profile(i);
-    if (!p || !p->advertise || !p->name)
+    if (!profile_runtime_enabled(p))
       continue;
     if (strcmp(p->name, name) == 0)
       return p;
@@ -1196,13 +1321,13 @@ static const WambleProfile *find_advertised_profile_by_name(const char *name) {
   return NULL;
 }
 
-static int running_profiles_match_advertised(int desired_adv) {
-  if (g_running_count != desired_adv)
+static int running_profiles_match_configured(int desired_profiles) {
+  if (g_running_count != desired_profiles)
     return 0;
   for (int i = 0; i < g_running_count; i++) {
     if (!g_running[i].name)
       return 0;
-    if (!find_advertised_profile_by_name(g_running[i].name))
+    if (!find_profile_by_name(g_running[i].name))
       return 0;
   }
   return 1;
@@ -1227,14 +1352,17 @@ static int runtime_cfg_equals(const WambleConfig *a, const WambleConfig *b) {
          strcmp(a->db_user, b->db_user) == 0 &&
          strcmp(a->db_pass, b->db_pass) == 0 &&
          strcmp(a->db_name, b->db_name) == 0 &&
+         strcmp(a->global_db_host, b->global_db_host) == 0 &&
+         strcmp(a->global_db_user, b->global_db_user) == 0 &&
+         strcmp(a->global_db_pass, b->global_db_pass) == 0 &&
+         strcmp(a->global_db_name, b->global_db_name) == 0 &&
          strcmp(a->websocket_path, b->websocket_path) == 0 &&
          strcmp(a->experiment_pairings, b->experiment_pairings) == 0;
 }
 
 static void refresh_running_profile_configs(void) {
   for (int i = 0; i < g_running_count; i++) {
-    const WambleProfile *p_match =
-        find_advertised_profile_by_name(g_running[i].name);
+    const WambleProfile *p_match = find_profile_by_name(g_running[i].name);
     if (!p_match)
       continue;
 
@@ -1264,9 +1392,9 @@ ProfileStartStatus reconcile_profile_listeners(void) {
   ensure_mutex_init();
   wamble_mutex_lock(&g_mutex);
 
-  int desired_adv = count_advertised_profiles();
+  int desired_profiles = count_configured_profiles();
 
-  if (desired_adv == 0) {
+  if (desired_profiles == 0) {
     RunningProfile *old = g_running;
     int old_count = g_running_count;
     mark_profiles_stop(old, old_count);
@@ -1287,7 +1415,7 @@ ProfileStartStatus reconcile_profile_listeners(void) {
     return PROFILE_START_OK;
   }
 
-  if (running_profiles_match_advertised(desired_adv)) {
+  if (running_profiles_match_configured(desired_profiles)) {
     refresh_running_profile_configs();
     wamble_mutex_unlock(&g_mutex);
     return PROFILE_START_OK;

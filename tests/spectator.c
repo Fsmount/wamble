@@ -54,7 +54,7 @@ WAMBLE_TEST(spectator_summary_and_focus_flow) {
   SpectatorState st = SPECTATOR_STATE_IDLE;
   uint64_t focus = 0;
   SpectatorRequestStatus rs =
-      spectator_handle_request(&msum, &addr, 0, &st, &focus);
+      spectator_handle_request(&msum, &addr, 0, 0, &st, &focus);
   T_ASSERT_EQ_INT(rs, SPECTATOR_OK_SUMMARY);
   T_ASSERT_EQ_INT(st, SPECTATOR_STATE_SUMMARY);
 
@@ -64,7 +64,7 @@ WAMBLE_TEST(spectator_summary_and_focus_flow) {
   mfoc.board_id = active_id;
   st = SPECTATOR_STATE_IDLE;
   focus = 0;
-  rs = spectator_handle_request(&mfoc, &addr, 0, &st, &focus);
+  rs = spectator_handle_request(&mfoc, &addr, 0, 0, &st, &focus);
   T_ASSERT_EQ_INT(rs, SPECTATOR_OK_FOCUS);
   T_ASSERT_EQ_INT(st, SPECTATOR_STATE_FOCUS);
   T_ASSERT_EQ_INT((int)focus, (int)active_id);
@@ -106,7 +106,7 @@ WAMBLE_TEST(spectator_visibility_and_capacity) {
   SpectatorState st = SPECTATOR_STATE_IDLE;
   uint64_t focus = 0;
   SpectatorRequestStatus rs =
-      spectator_handle_request(&m, &addr, 0, &st, &focus);
+      spectator_handle_request(&m, &addr, 0, 0, &st, &focus);
   T_ASSERT_EQ_INT(rs, SPECTATOR_ERR_VISIBILITY);
 
   cfg = *get_config();
@@ -122,7 +122,7 @@ WAMBLE_TEST(spectator_visibility_and_capacity) {
   memcpy(mf1.token, t1, TOKEN_LENGTH);
   st = SPECTATOR_STATE_IDLE;
   focus = 0;
-  rs = spectator_handle_request(&mf1, &addr, 0, &st, &focus);
+  rs = spectator_handle_request(&mf1, &addr, 0, 0, &st, &focus);
   T_ASSERT_EQ_INT(rs, SPECTATOR_OK_FOCUS);
 
   mf2.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
@@ -130,8 +130,23 @@ WAMBLE_TEST(spectator_visibility_and_capacity) {
   memcpy(mf2.token, t2, TOKEN_LENGTH);
   st = SPECTATOR_STATE_IDLE;
   focus = 0;
-  rs = spectator_handle_request(&mf2, &addr, 0, &st, &focus);
+  rs = spectator_handle_request(&mf2, &addr, 0, 0, &st, &focus);
   T_ASSERT_EQ_INT(rs, SPECTATOR_ERR_FULL);
+  rs = spectator_handle_request(&mf2, &addr, 0, 1, &st, &focus);
+  T_ASSERT_EQ_INT(rs, SPECTATOR_OK_FOCUS);
+
+  struct WambleMsg mstop = {0};
+  mstop.ctrl = WAMBLE_CTRL_SPECTATE_STOP;
+  memcpy(mstop.token, t1, TOKEN_LENGTH);
+  st = SPECTATOR_STATE_FOCUS;
+  focus = active_id;
+  rs = spectator_handle_request(&mstop, &addr, 0, 0, &st, &focus);
+  T_ASSERT_EQ_INT(rs, SPECTATOR_OK_STOP);
+
+  st = SPECTATOR_STATE_IDLE;
+  focus = 0;
+  rs = spectator_handle_request(&mf1, &addr, 0, 0, &st, &focus);
+  T_ASSERT_EQ_INT(rs, SPECTATOR_OK_FOCUS);
 
   teardown_default();
   return 0;

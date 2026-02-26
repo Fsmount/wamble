@@ -8,13 +8,15 @@ Overview
 - Access: Runtime code reads via a small `WambleQueryService` interface and writes by enqueueing persistence intents which are flushed to the database in batches.
 
 Connections
-- Per-thread per-listener: Each listener thread opens its own DB connection using
-  that profile's `db-host`, `db-user`, `db-pass`, `db-name`.
-  This supports running multiple profiles against different databases in a single process.
+- Per-thread per-listener game DB: Each listener thread opens its own profile DB
+  connection using `db-host`, `db-user`, `db-pass`, `db-name`.
+- Shared global DB: Identity and policy resolution uses a separate shared store
+  connection configured by `global-db-host`, `global-db-user`,
+  `global-db-pass`, `global-db-name`.
 
 Read Path Caching
 - Token-indexed reads are cached in thread-local memory to reduce repeated DB lookups
-  during hot loops (session lookup, persistent-session lookup, trust-tier lookup).
+  during hot loops (session lookup, persistent-session lookup).
 - Cache characteristics:
   - Capacity: 256 entries per cache type per runtime thread.
   - TTL: 500ms per entry.
@@ -44,18 +46,61 @@ Tables
   - `rating DECIMAL(10,4) NOT NULL`
   - `created_at TIMESTAMPTZ DEFAULT NOW()`
 
-- sessions
+- sessions (profile DB)
   - `id BIGSERIAL PRIMARY KEY`
   - `token BYTEA UNIQUE NOT NULL` (16 bytes)
   - `player_id BIGINT NULL REFERENCES players(id)`
-  - `trust_level INTEGER NOT NULL DEFAULT 0`
+  - `global_identity_id BIGINT NOT NULL` (identity id allocated in shared identity DB)
   - `total_score DECIMAL(10,4) NOT NULL DEFAULT 0`
   - `games_played INTEGER NOT NULL DEFAULT 0`
   - `created_at TIMESTAMPTZ DEFAULT NOW()`
   - `last_seen_at TIMESTAMPTZ DEFAULT NOW()`
-  - Indexes: `idx_sessions_token` on `(token)`
-  - Usage:
-    - `trust_level` is used to filter profiles in LIST_PROFILES: only profiles with `visibility <= trust_level` are listed to the client.
+  - Indexes: `idx_sessions_token` on `(token)`, `idx_sessions_identity_id` on `(global_identity_id)`
+
+- global_identities (shared global DB)
+  - `id BIGSERIAL PRIMARY KEY`
+  - `public_key BYTEA UNIQUE NULL` (32 bytes for persistent anonymous IDs)
+  - `created_at TIMESTAMPTZ DEFAULT NOW()`
+
+- global_policy_rules (shared global DB)
+  - `id BIGSERIAL PRIMARY KEY`
+  - `global_identity_id BIGINT NOT NULL`
+  - `action VARCHAR(128) NOT NULL`
+  - `resource VARCHAR(256) NOT NULL`
+  - `effect VARCHAR(8) NOT NULL` in {'allow','deny'}
+  - `permission_level INTEGER NOT NULL DEFAULT 0`
+  - `policy_version VARCHAR(64) NOT NULL DEFAULT 'v1'`
+  - `reason TEXT`
+  - `created_at TIMESTAMPTZ DEFAULT NOW()`
+  - `updated_at TIMESTAMPTZ DEFAULT NOW()`
+  - Indexes: `(global_identity_id)`, `(action, resource)`
+
+- global_identity_tags (shared global DB)
+  - `global_identity_id BIGINT NOT NULL`
+  - `tag VARCHAR(128) NOT NULL`
+  - `created_at TIMESTAMPTZ DEFAULT NOW()`
+  - Primary key: `(global_identity_id, tag)`
+  - Indexes: `(tag, global_identity_id)`
+
+- global_runtime_config_blobs (shared global DB)
+  - `content_hash VARCHAR(32) PRIMARY KEY` (md5 of config text)
+  - `config_text TEXT NOT NULL`
+  - `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`
+  - Purpose: deduplicated config payload storage.
+
+- global_runtime_config_revisions (shared global DB)
+  - `id BIGSERIAL PRIMARY KEY`
+  - `profile_key VARCHAR(128) NOT NULL`
+  - `content_hash VARCHAR(32) NULL REFERENCES global_runtime_config_blobs(content_hash)`
+  - `source VARCHAR(32) NOT NULL` (e.g. `file`, `runtime`)
+  - `result VARCHAR(16) NOT NULL` (`active` or `rejected`)
+  - `error_text TEXT`
+  - `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`
+  - `activated_at TIMESTAMPTZ`
+  - Indexes:
+    - `(profile_key, created_at DESC)` for attempt-order lookup
+    - `(profile_key, result, created_at DESC)` for active-entry lookup
+  - Purpose: full history of attempts, including invalid/unloadable configs.
 
 - boards
   - `id BIGSERIAL PRIMARY KEY`
@@ -105,28 +150,68 @@ Tables
   - `created_at TIMESTAMPTZ DEFAULT NOW()`
 
 Migrations
-- 001_initial_schema.sql: creates all tables, indexes, triggers.
-- 002_runtime_metadata.sql: adds persisted experiment/session metadata, board
+- 001_profile_initial_schema.sql: creates profile DB tables, indexes, triggers.
+- 002_profile_runtime_metadata.sql: adds persisted experiment/session metadata, board
   move/reservation metadata, and richer game-result fields.
-- 003_leaderboard_indexes.sql: adds leaderboard-oriented indexes for payouts,
+- 003_profile_leaderboard_indexes.sql: adds leaderboard-oriented indexes for payouts,
   sessions, and player rating ordering.
-- 004_session_stats_counters.sql: adds persisted per-session counters
+- 004_profile_session_stats_counters.sql: adds persisted per-session counters
   (`total_score`, `games_played`) with backfill and insert triggers on
   `payouts`/`moves`.
+- 005_global_identity_trust.sql: introduces shared `global_identities` and
+  `global_policy_rules` in the global DB.
+- 006_global_config_snapshots.sql: adds DB-backed last-known-good config
+  snapshots used for reload restore.
+- 007_global_policy_runtime_expansion.sql: expands global policy rule shape
+  (`scope`, `source`, snapshot binding, time/context predicates).
+- 008_profile_identity_sessions.sql: profile DB migration for session identity
+  linkage (`sessions.global_identity_id`).
+- 009_global_identity_tags.sql: adds identity tags for bulk policy targeting.
 
 Trust and Visibility
-- Client trust is read from `sessions.trust_level`.
-- On LIST_PROFILES, the server filters advertised profiles where `profile.visibility <= sessions.trust_level` for the requesting token.
-- PROFILE_INFO still returns `name;port;advertise;visibility`; no server-side gating there yet.
+- Client trust resolves from identity-scoped policy only, in deterministic
+  precedence:
+  1) resource `profile:<profile_name>`
+  2) resource `profile_group:<profile_group>`
+  3) resource `*`
+- Action used by current trust-tier bridge is `trust.tier`.
+- Deny precedence is explicit at each scope level (`effect='deny'` beats allow
+  for equal scope precedence).
+- Session trust is always policy-derived.
+- LIST_PROFILES filtering compares profile visibility against the resolved
+  trust tier.
+- GET_PROFILE_INFO applies the same discovery authorization as LIST_PROFILES.
 
 Operational Notes
 - Multiple advertised profiles within one process may point to different databases.
 - Persistence intents are applied from the runtime loop (threaded for multi-profile, inline
   in main thread for single-runtime mode).
+- On startup/reload, the server records config attempts into
+  `global_runtime_config_revisions`.
+- Config restore queries the newest row where `result='active'`, while
+  operators can query attempt history independently.
 
 Examples
-- Promote a session to trust level 10 by hex token:
-  UPDATE sessions SET trust_level = 10 WHERE token = decode('<hex>', 'hex');
+- Set trust level 10 globally for a known identity id:
+  INSERT INTO global_policy_rules (global_identity_id, action, resource, scope, effect, permission_level, reason)
+  VALUES (42, 'trust.tier', 'tier', '*', 'allow', 10, 'manual grant');
+
+- Tag identities for bulk policy updates:
+  INSERT INTO global_identity_tags (global_identity_id, tag)
+  VALUES (42, 'ops'), (43, 'ops');
+
+- Set trust level 6 for all identities with tag `ops` on profile group `staff`:
+  INSERT INTO global_policy_rules (global_identity_id, action, resource, scope, effect, permission_level, reason)
+  SELECT t.global_identity_id, 'trust.tier', 'tier', 'profile_group:staff', 'allow', 6, 'ops group grant'
+  FROM global_identity_tags t
+  WHERE t.tag = 'ops';
+
+- Set trust level 10 globally for a persistent identity by public key:
+  INSERT INTO global_policy_rules (global_identity_id, action, resource, effect, permission_level, reason)
+  SELECT i.id, 'trust.tier', '*', 'allow', 10, 'manual grant'
+  FROM global_identities i
+  WHERE i.public_key = decode('<pubkey_hex>', 'hex')
+  ;
 
 References
 - Config (see docs/configuration.txt): `db-host`, `db-user`, `db-pass`, `db-name`.
@@ -134,4 +219,5 @@ References
 - Board behavior (see docs/board_behaviour.txt): board statuses and lifecycle.
 - Move engine (see docs/move_engine.txt): move storage and flow.
 - Scoring (see docs/scoring.txt): payouts written to `payouts`.
-- Spectators (see docs/spectator_management.txt): trust gating via `sessions.trust_level`.
+- Spectators (see docs/spectator_management.txt): trust gating via resolved
+  identity trust.

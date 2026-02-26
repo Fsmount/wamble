@@ -329,13 +329,23 @@ WamblePlayer *create_new_player(void) {
   return NULL;
 }
 
-WamblePlayer *login_player(const uint8_t *public_key) {
-  WamblePlayer *player = create_new_player();
-  if (player) {
-    memcpy(player->public_key, public_key, 32);
-    player->has_persistent_identity = true;
-    wamble_emit_link_session_to_pubkey(player->token, public_key);
+WamblePlayer *attach_persistent_identity(const uint8_t *token,
+                                         const uint8_t *public_key) {
+  if (!token || !public_key)
+    return NULL;
+  if (!get_player_by_token(token))
+    return NULL;
+  wamble_mutex_lock(&player_mutex);
+  int idx = player_map_get(token);
+  if (idx < 0) {
+    wamble_mutex_unlock(&player_mutex);
+    return NULL;
   }
+  WamblePlayer *player = &player_pool[idx];
+  memcpy(player->public_key, public_key, 32);
+  player->has_persistent_identity = true;
+  wamble_emit_link_session_to_pubkey(player->token, public_key);
+  wamble_mutex_unlock(&player_mutex);
   return player;
 }
 

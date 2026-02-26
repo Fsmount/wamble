@@ -13,7 +13,9 @@ Tokens
 
 Creating Players
 - Ephemeral: `create_new_player()` mints a token, creates a DB session, sets defaults (rating, score, timers).
-- Persistent: `login_player(pubkey)` ensures a row in `players`, creates a session, and links them.
+- Persistent attach: `attach_persistent_identity(token, pubkey)` links an existing
+  anonymous session (created by `CLIENT_HELLO`) to a pubkey-backed identity
+  without changing the session token.
 
 Lookups
 - `get_player_by_token(token)` returns a known player. If only the DB knows about the token, we rehydrate a minimal player (score, rating, games) and update last-seen.
@@ -25,7 +27,8 @@ Config
 - `max-players`, `token-expiration`, `default-rating`, `max-token-attempts`, `max-token-local-attempts`.
 
 API
-- `player_manager_init()`, `get_player_by_token()`, `create_new_player()`, `login_player()`, `player_manager_tick()`.
+- `player_manager_init()`, `get_player_by_token()`, `create_new_player()`,
+  `attach_persistent_identity()`, `player_manager_tick()`.
 
 References
 - Config (see docs/configuration.txt): `max-players`, `token-expiration`, `default-rating`, `max-token-attempts`, `max-token-local-attempts`.

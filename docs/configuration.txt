@@ -29,8 +29,10 @@ Core Options (common defaults)
 - `timeout-ms` (int, 100): Reliable send ACK timeout (ms).
 - `max-retries` (int, 3): Reliable send retries.
 - `max-message-size` (int, 126): Fixed message body size (informational).
-- `buffer-size` (int, 65536): Socket send/recv buffer bytes.
+- `buffer-size` (int, 32768): Socket send/recv buffer bytes.
 - `max-client-sessions` (int, 1024): Client session capacity.
+- `rate-limit-requests-per-sec` (int, 120; `0` disables): Per-token request
+  budget applied at runtime.
 - `session-timeout` (int, 300): Idle session timeout (sec).
 - `max-boards` / `min-boards` (int, 1024 / 4): Board pool sizing.
 - `inactivity-timeout` (int, 300): Archive inactive boards (sec).
@@ -51,7 +53,11 @@ Core Options (common defaults)
 - `experienced-player-end-phase-mult` (double, 2.0): Payout multiplier for experienced players in the late game.
 - `db-host`, `db-user`, `db-pass`, `db-name` (string, defaults
   localhost/wamble/wamble/wamble): Database connection.
-- `admin-trust-level` (int, -1): Optional admin threshold. If set to a non-negative trust tier, sessions with `trust >= admin-trust-level` can do admin things. 
+- `global-db-host`, `global-db-user`, `global-db-pass`, `global-db-name`
+  (string, defaults localhost/wamble/wamble/wamble_global): Process-wide
+  global store used for identities, policy rules, and config snapshots/events.
+  All profiles in the process must use the same `global-db-*` endpoint, and it
+  must be different from every profile's game DB endpoint (`db-host/user/name`).
 Database Connections
 - Each profile listener runs in its own thread and opens its own DB connection
   using that profile's `db-host`, `db-user`, `db-pass`, `db-name`.
@@ -64,7 +70,8 @@ Database Connections
 - `persistence-max-payload-bytes` (int, 65536): Upper bound per flush cycle for
   estimated total payload of selected persistence intents.
 Spectator Settings
-- `max-spectators` (int, 1024; -1 for no cap): Capacity limit for focused spectators at the server. Admins (see `admin-trust-level`) may bypass this cap.
+- `max-spectators` (int, 1024; -1 for no cap): Capacity limit for focused spectators at the server.
+   Bypass is policy-controlled via `spectate.capacity_bypass` / `focus`. Bypass-focused sessions are counted outside the `max-spectators` pool.
 - `spectator-visibility` (int, 0): Minimum trust tier required to spectate (summary or focus). Requests below this threshold are rejected.
 - `spectator-summary-hz` (int, 2): Target max update rate (per second) for summary mode. Best-effort; updates are sent over UDP and may be batched by the main loop cadence.
 - `spectator-focus-hz` (int, 20): Target max update rate (per second) for focused board updates. Best-effort over UDP.
@@ -143,6 +150,75 @@ Examples: Functions and Macros
   `(def quoted (quote (def some-setting 1))) ; not evaluated`
   `quoted` evaluates to the AST of `(def some-setting 1)`.
 
+Policy Rule Builtins
+- `policy-allow` appends an allow rule to the config policy rule set.
+- `policy-deny` appends a deny rule to the config policy rule set.
+- Rules are validated/applied against the shared global policy store during
+  startup/reload (see docs/database.txt).
+- Argument order:
+  - `policy-allow`: `(policy-allow identity action resource permission-level reason? policy-version? not-before? not-after? context-key? context-value?)`
+  - `policy-deny`: `(policy-deny identity action resource reason? policy-version? not-before? not-after? context-key? context-value?)`
+- Defaults:
+  - `identity="*"`, `reason=""`, `policy-version="v1"`,
+    `permission-level=0`, `not-before=0`, `not-after=0`.
+- Identity selectors:
+  - `*` for all identities.
+  - `identity:<id>` or `id:<id>` for a specific global identity id.
+  - `pubkey:<64-hex>` or raw `<64-hex>` to resolve/create identity by public key.
+  - `tag:<name>` to target all identities in `global_identity_tags` for that tag.
+- Rule fields:
+  - `action`: policy action key.
+  - `resource`: policy resource key.
+  - `permission-level`: numeric allow level used by allow decisions.
+  - `not-before` / `not-after`: unix epoch seconds mapped to
+    `not_before_at` / `not_after_at`.
+  - `context-key` / `context-value`: optional context predicate values.
+  - `reason` / `policy-version`: metadata persisted with the rule.
+- Resource mapping:
+  - Generic resources are stored with `scope='*'`.
+  - For `action="trust.tier"`, resources `*`, `profile:<name>`,
+    `profile_group:<group>` map to `resource='tier'` and matching `scope`.
+  - Scoped form `<scope>::<resource>` maps directly to DB `scope` and
+    `resource`.
+- Runtime action/resource registry:
+  - `trust.tier`: query resource `tier`; rules should use resource
+    `*`, `profile:<name>`, or `profile_group:<group>`.
+  - `profile.discover`: query resources `profile:<name>`,
+    `profile_selector:<group>`, `*`.
+  - `profile.discover.override`: query resources `profile:<name>`,
+    `profile_selector:<group>`, `*`.
+  - `protocol.ctrl`: query resources
+    `player_move`, `board_update`, `list_profiles`, `profile_info`, `error`,
+    `server_notification`, `client_goodbye`, `spectate_game`,
+    `spectate_update`, `logout`, `login_success`, `login_failed`,
+    `get_player_stats`, `player_stats_data`, `get_profile_info`,
+    `profiles_list`, `spectate_stop`, `get_legal_moves`, `legal_moves`,
+    `get_leaderboard`, `leaderboard_data`, `unknown`.
+  - `game.move`: query resources `play`, `legal`.
+  - `spectate.access`: query resource `view`; context `mode=summary|focus`.
+  - `spectate.capacity_bypass`: query resource `focus`.
+  - `rate_limit.bypass`: query resource `request`; context
+    `ctrl=<control-resource>`.
+  - `stats.read`: query resource `player`.
+  - `leaderboard.read`: query resource `global`.
+- Example:
+  `(policy-allow "identity:42" "trust.tier" "profile:private" 5 "manual grant")`
+  `(policy-deny "tag:contractors" "profile.discover" "profile_selector:internal" "hide internal profiles")`
+
+Custom Policy Evaluator (optional)
+- You may define `(defn policy-eval ...)` for dynamic policy decisions.
+- Evaluator call signature used by `config_policy_eval(...)`:
+  `(policy-eval identity action resource profile-name profile-group context-key context-value now-epoch-seconds)`
+- Accepted return values:
+  - integer `N` (`N >= 0`) -> allow with permission level `N`
+  - string `"allow"` or `"deny"`
+  - list form `(allow [permission-level] [reason] [policy-version])`
+  - list form `(deny [reason] [policy-version])`
+- If missing or malformed, `config_policy_eval(...)` reports no decision/error;
+  final allow/deny behavior then follows the caller's own default path.
+- Current runtime authorization paths use DB policy resolution
+  (`resolve_policy_decision`) as the source of truth.
+
 Examples
 - Computed value:
   `(def session-timeout (* 3 timeout-ms))`
@@ -161,11 +237,13 @@ Profiles
   - `advertise` (int 0/1, default 0): Whether to advertise/offer this profile
     to clients.
   - `visibility` (int, default 0): Minimum trust tier required to see this profile in
-    LIST_PROFILES. The server compares this to `sessions.trust_level` for the
-    requesting token.
+    LIST_PROFILES. The server compares this to identity-scoped trust resolved
+    for the requesting token/profile.
   - `db-isolated` (int 0/1): If 1, this profile must not share the same
     database (host/user/name) with any other advertised profile that also
     sets `db-isolated=1`. Conflicts cause startup to fail with a fatal error.
+  - `profile-group` (string, optional): Logical selector used by permission
+    policy rules (resource form `profile_group:<name>`).
   
 - Explicit inheritance:
   `(defprofile canary :inherits base ((def port 8891) (def log-level 4)))`
@@ -207,6 +285,12 @@ Hot Reload and Exec Handoff
 - `SIGHUP`: rereads the configuration file and reconciles running profile
   threads without restarting the process. Listener threads receive updated
   settings or are shut down/spawned as needed.
+  - Reload safety: if config or global policy validation fails, the running
+    config remains active.
+  - Restore source: runtime loads the newest `result='active'` entry from
+    `global_runtime_config_revisions` joined to
+    `global_runtime_config_blobs`; if DB restore is unavailable, runtime uses
+    the in-memory snapshot.
 - `SIGUSR2` (POSIX only): triggers an exec-based hot reload. The server exports
   active listener sockets (`WAMBLE_PROFILES_INHERITED`) and optional state file
   paths (`WAMBLE_STATE_FILE`/`WAMBLE_STATE_FILES`) before re-execing itself.
@@ -230,9 +314,11 @@ Profile Runtime Notes
 
 Visibility and Discovery
 - LIST_PROFILES returns only advertised profiles whose `visibility` is less
-  than or equal to the requesting client's trust tier,
-  `sessions.trust_level` (see database docs). PROFILE_INFO remains available
-  and returns `name;port;advertise;visibility`.
+  than or equal to the requesting client's resolved trust tier (see
+  docs/database.txt), plus unadvertised profiles explicitly allowed by
+  `profile.discover` policy.
+- GET_PROFILE_INFO applies the same discovery authorization and returns
+  `NOTFOUND;<name>` when not discoverable.
 
 Notes
 - Strings must be quoted. Numbers parse as integers unless they contain a dot.
@@ -240,8 +326,13 @@ Notes
   they remain available for user logic inside the config.
 
 References
-- Players (see docs/player_management.txt): `max-players`, `token-expiration`, `default-rating`, `max-token-attempts`, `max-token-local-attempts`
+- Players (see docs/player_management.txt): `max-players`,
+  `token-expiration`, `default-rating`, `max-token-attempts`,
+  `max-token-local-attempts`
 - Spectators (see docs/spectator_management.txt): `max-spectators`, `spectator-visibility`, `spectator-summary-hz`, `spectator-focus-hz`, `spectator-max-focus-per-session`, `spectator-summary-mode`
 - Scoring (see docs/scoring.txt): `max-pot`, `max-contributors`
 - Move engine (see docs/move_engine.txt and docs/board_behaviour.txt): `max-moves-per-board`, board behavior
-- Profiles runtime/state (see docs/runtime_and_state.txt): `state-dir`, per-profile `port`, `buffer-size`, `select-timeout-usec`, `cleanup-interval-sec`, `db-*`, `advertise`, `visibility`
+- Profiles runtime/state (see docs/runtime_and_state.txt): `state-dir`,
+  per-profile `port`, `buffer-size`, `select-timeout-usec`,
+  `cleanup-interval-sec`, `db-*`, `global-db-*`, `advertise`,
+  `visibility`, `profile-group`
