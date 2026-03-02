@@ -452,6 +452,12 @@ static int db_same(const WambleConfig *a, const WambleConfig *b) {
          strcmp(a->db_name, b->db_name) == 0;
 }
 
+static int cfg_str_eq(const char *a, const char *b) {
+  const char *lhs = a ? a : "";
+  const char *rhs = b ? b : "";
+  return strcmp(lhs, rhs) == 0;
+}
+
 typedef struct Prebound {
   int profile_index;
   wamble_socket_t sockfd;
@@ -1333,6 +1339,13 @@ static int running_profiles_match_configured(int desired_profiles) {
   return 1;
 }
 
+static int runtime_cfg_socket_identity_equals(const WambleConfig *a,
+                                              const WambleConfig *b) {
+  if (!a || !b)
+    return 0;
+  return a->port == b->port;
+}
+
 static int runtime_cfg_equals(const WambleConfig *a, const WambleConfig *b) {
   if (!a || !b)
     return 0;
@@ -1342,22 +1355,75 @@ static int runtime_cfg_equals(const WambleConfig *a, const WambleConfig *b) {
          a->experiment_seed == b->experiment_seed &&
          a->experiment_arms == b->experiment_arms &&
          a->timeout_ms == b->timeout_ms && a->max_retries == b->max_retries &&
+         a->max_message_size == b->max_message_size &&
          a->buffer_size == b->buffer_size &&
          a->max_client_sessions == b->max_client_sessions &&
+         a->rate_limit_requests_per_sec == b->rate_limit_requests_per_sec &&
+         a->session_timeout == b->session_timeout &&
+         a->max_boards == b->max_boards && a->min_boards == b->min_boards &&
          a->cleanup_interval_sec == b->cleanup_interval_sec &&
          a->inactivity_timeout == b->inactivity_timeout &&
          a->reservation_timeout == b->reservation_timeout &&
+         a->default_rating == b->default_rating &&
+         a->max_players == b->max_players &&
+         a->token_expiration == b->token_expiration &&
+         a->max_pot == b->max_pot &&
+         a->max_moves_per_board == b->max_moves_per_board &&
+         a->max_contributors == b->max_contributors &&
          a->select_timeout_usec == b->select_timeout_usec &&
-         a->log_level == b->log_level && strcmp(a->db_host, b->db_host) == 0 &&
-         strcmp(a->db_user, b->db_user) == 0 &&
-         strcmp(a->db_pass, b->db_pass) == 0 &&
-         strcmp(a->db_name, b->db_name) == 0 &&
-         strcmp(a->global_db_host, b->global_db_host) == 0 &&
-         strcmp(a->global_db_user, b->global_db_user) == 0 &&
-         strcmp(a->global_db_pass, b->global_db_pass) == 0 &&
-         strcmp(a->global_db_name, b->global_db_name) == 0 &&
-         strcmp(a->websocket_path, b->websocket_path) == 0 &&
-         strcmp(a->experiment_pairings, b->experiment_pairings) == 0;
+         a->max_token_attempts == b->max_token_attempts &&
+         a->max_token_local_attempts == b->max_token_local_attempts &&
+         a->persistence_max_intents == b->persistence_max_intents &&
+         a->persistence_max_payload_bytes == b->persistence_max_payload_bytes &&
+         a->new_player_early_phase_mult == b->new_player_early_phase_mult &&
+         a->new_player_mid_phase_mult == b->new_player_mid_phase_mult &&
+         a->new_player_end_phase_mult == b->new_player_end_phase_mult &&
+         a->experienced_player_early_phase_mult ==
+             b->experienced_player_early_phase_mult &&
+         a->experienced_player_mid_phase_mult ==
+             b->experienced_player_mid_phase_mult &&
+         a->experienced_player_end_phase_mult ==
+             b->experienced_player_end_phase_mult &&
+         a->log_level == b->log_level && cfg_str_eq(a->db_host, b->db_host) &&
+         cfg_str_eq(a->db_user, b->db_user) &&
+         cfg_str_eq(a->db_pass, b->db_pass) &&
+         cfg_str_eq(a->db_name, b->db_name) &&
+         cfg_str_eq(a->global_db_host, b->global_db_host) &&
+         cfg_str_eq(a->global_db_user, b->global_db_user) &&
+         cfg_str_eq(a->global_db_pass, b->global_db_pass) &&
+         cfg_str_eq(a->global_db_name, b->global_db_name) &&
+         a->max_spectators == b->max_spectators &&
+         a->spectator_visibility == b->spectator_visibility &&
+         a->spectator_summary_hz == b->spectator_summary_hz &&
+         a->spectator_focus_hz == b->spectator_focus_hz &&
+         a->spectator_max_focus_per_session ==
+             b->spectator_max_focus_per_session &&
+         cfg_str_eq(a->spectator_summary_mode, b->spectator_summary_mode) &&
+         cfg_str_eq(a->state_dir, b->state_dir) &&
+         cfg_str_eq(a->websocket_path, b->websocket_path) &&
+         cfg_str_eq(a->experiment_pairings, b->experiment_pairings);
+}
+
+static int running_profiles_can_refresh_in_place(int desired_profiles) {
+  if (!running_profiles_match_configured(desired_profiles))
+    return 0;
+  for (int i = 0; i < g_running_count; i++) {
+    const WambleProfile *p_match = find_profile_by_name(g_running[i].name);
+    if (!p_match)
+      return 0;
+    if (!runtime_cfg_socket_identity_equals(&g_running[i].cfg,
+                                            &p_match->config))
+      return 0;
+  }
+  return 1;
+}
+
+static int default_runtime_can_refresh_in_place(void) {
+  if (g_running_count != 1 || !g_running)
+    return 0;
+  if (g_running[0].name != NULL)
+    return 0;
+  return runtime_cfg_socket_identity_equals(&g_running[0].cfg, get_config());
 }
 
 static void refresh_running_profile_configs(void) {
@@ -1381,6 +1447,22 @@ static void refresh_running_profile_configs(void) {
   }
 }
 
+static void refresh_default_runtime_config(void) {
+  if (g_running_count != 1 || !g_running || g_running[0].name != NULL)
+    return;
+  if (runtime_cfg_equals(&g_running[0].cfg, get_config()))
+    return;
+
+  WambleConfig next_cfg = {0};
+  if (runtime_cfg_dup_from(&next_cfg, get_config()) != 0)
+    return;
+  if (g_running[0].has_pending_cfg)
+    runtime_cfg_free_owned(&g_running[0].pending_cfg);
+  g_running[0].pending_cfg = next_cfg;
+  g_running[0].has_pending_cfg = 1;
+  g_running[0].needs_update = 1;
+}
+
 void stop_profile_listeners(void) {
   RunningProfile *profiles = NULL;
   int count = 0;
@@ -1395,6 +1477,11 @@ ProfileStartStatus reconcile_profile_listeners(void) {
   int desired_profiles = count_configured_profiles();
 
   if (desired_profiles == 0) {
+    if (default_runtime_can_refresh_in_place()) {
+      refresh_default_runtime_config();
+      wamble_mutex_unlock(&g_mutex);
+      return PROFILE_START_OK;
+    }
     RunningProfile *old = g_running;
     int old_count = g_running_count;
     mark_profiles_stop(old, old_count);
@@ -1415,7 +1502,7 @@ ProfileStartStatus reconcile_profile_listeners(void) {
     return PROFILE_START_OK;
   }
 
-  if (running_profiles_match_configured(desired_profiles)) {
+  if (running_profiles_can_refresh_in_place(desired_profiles)) {
     refresh_running_profile_configs();
     wamble_mutex_unlock(&g_mutex);
     return PROFILE_START_OK;

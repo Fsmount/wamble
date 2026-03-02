@@ -268,6 +268,48 @@ WAMBLE_TEST(profile_hidden_listener_enabled_by_discover_override_rule) {
   return 0;
 }
 
+WAMBLE_TEST(profile_non_socket_reload_keeps_listener_socket) {
+  T_ASSERT_STATUS_OK(wamble_net_init());
+
+  const char *cfg_a = "(defprofile alpha ((def port 19330) (def advertise 1) "
+                      "(def spectator-visibility 0)))\n";
+  T_ASSERT_EQ_INT(write_conf(cfg_a), 0);
+
+  char status[128];
+  T_ASSERT_STATUS_OK(config_load(conf_path, NULL, status, sizeof(status)));
+
+  int started = 0;
+  T_ASSERT_EQ_INT(start_profile_listeners(&started), PROFILE_START_OK);
+  T_ASSERT_EQ_INT(started, 1);
+
+  char socket_map_before[256];
+  int exported_before = 0;
+  T_ASSERT_EQ_INT(profile_export_inherited_sockets(socket_map_before,
+                                                   sizeof(socket_map_before),
+                                                   &exported_before),
+                  PROFILE_EXPORT_OK);
+  T_ASSERT_EQ_INT(exported_before, 1);
+
+  const char *cfg_b = "(defprofile alpha ((def port 19330) (def advertise 1) "
+                      "(def spectator-visibility 5)))\n";
+  T_ASSERT_EQ_INT(write_conf(cfg_b), 0);
+  T_ASSERT_STATUS_OK(config_load(conf_path, NULL, status, sizeof(status)));
+  T_ASSERT_EQ_INT(reconcile_profile_listeners(), PROFILE_START_OK);
+
+  char socket_map_after[256];
+  int exported_after = 0;
+  T_ASSERT_EQ_INT(profile_export_inherited_sockets(socket_map_after,
+                                                   sizeof(socket_map_after),
+                                                   &exported_after),
+                  PROFILE_EXPORT_OK);
+  T_ASSERT_EQ_INT(exported_after, 1);
+  T_ASSERT_STREQ(socket_map_before, socket_map_after);
+
+  stop_profile_listeners();
+  wamble_net_cleanup();
+  return 0;
+}
+
 WAMBLE_TESTS_BEGIN_NAMED(profile_runtime_tests) {
   WAMBLE_TESTS_ADD_FM(profile_start_export_and_state_files, "profile_runtime");
   WAMBLE_TESTS_ADD_FM(profile_export_buffer_too_small, "profile_runtime");
@@ -277,6 +319,8 @@ WAMBLE_TESTS_BEGIN_NAMED(profile_runtime_tests) {
   WAMBLE_TESTS_ADD_FM(profile_single_listener_runs_inline, "profile_runtime");
   WAMBLE_TESTS_ADD_FM(profile_multi_listener_not_inline, "profile_runtime");
   WAMBLE_TESTS_ADD_FM(profile_hidden_listener_enabled_by_discover_override_rule,
+                      "profile_runtime");
+  WAMBLE_TESTS_ADD_FM(profile_non_socket_reload_keeps_listener_socket,
                       "profile_runtime");
 }
 WAMBLE_TESTS_END()
