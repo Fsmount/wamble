@@ -489,6 +489,55 @@ WAMBLE_TEST(config_db_apply_policy_rule_with_tag_selector) {
   return 0;
 }
 
+WAMBLE_TEST(config_db_reapply_policy_rules_reexpands_tag_selectors) {
+  if (config_db_prepare() != 0)
+    T_FAIL_SIMPLE("config_db_prepare failed");
+  T_ASSERT_STATUS_OK(config_db_exec_sql(
+      "INSERT INTO global_identities (public_key) VALUES "
+      "(decode('111111111111111111111111111111111111111111111111111111111111"
+      "1111', 'hex')), "
+      "(decode('222222222222222222222222222222222222222222222222222222222222"
+      "2222', 'hex'));"
+      "INSERT INTO global_identity_tags (global_identity_id, tag) "
+      "VALUES (1, 'ops');"));
+
+  const char *cfg_path = "build/test_policy_tag_reapply.conf";
+  const char *cfg =
+      "(policy-deny \"tag:ops\" \"profile.discover\" \"profile_selector:"
+      "internal\" \"seed\")\n";
+  FILE *f = fopen(cfg_path, "wb");
+  T_ASSERT(f != NULL);
+  fwrite(cfg, 1, strlen(cfg), f);
+  fclose(f);
+  T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
+
+  T_ASSERT_STATUS_OK(db_apply_config_policy_rules("__default__"));
+  T_ASSERT_STATUS_OK(config_db_exec_sql(
+      "DO $$ DECLARE c INT; BEGIN "
+      "SELECT COUNT(*) INTO c FROM global_policy_rules "
+      "WHERE action = 'profile.discover' "
+      "  AND resource = 'profile_selector:internal' "
+      "  AND effect = 'deny'; "
+      "IF c <> 1 THEN RAISE EXCEPTION 'expected one expanded rule'; "
+      "END IF; END $$;"));
+
+  T_ASSERT_STATUS_OK(config_db_exec_sql(
+      "INSERT INTO global_identity_tags (global_identity_id, tag) "
+      "VALUES (2, 'ops');"));
+  T_ASSERT_STATUS_OK(db_apply_config_policy_rules("__default__"));
+
+  T_ASSERT_STATUS_OK(config_db_exec_sql(
+      "DO $$ DECLARE c INT; BEGIN "
+      "SELECT COUNT(*) INTO c FROM global_policy_rules "
+      "WHERE action = 'profile.discover' "
+      "  AND resource = 'profile_selector:internal' "
+      "  AND effect = 'deny' "
+      "  AND global_identity_id IN (1, 2); "
+      "IF c <> 2 THEN RAISE EXCEPTION 'expected refreshed expanded rules'; "
+      "END IF; END $$;"));
+  return 0;
+}
+
 WAMBLE_TESTS_BEGIN_NAMED(wamble_register_tests_config)
 WAMBLE_TESTS_ADD_FM(config_basic_eval, "config");
 WAMBLE_TESTS_ADD_FM(config_defaults_no_file, "config");
@@ -516,4 +565,6 @@ WAMBLE_TESTS_ADD_DB_FM(
 WAMBLE_TESTS_ADD_DB_FM(config_db_apply_policy_rule_with_identity_selector,
                        "config");
 WAMBLE_TESTS_ADD_DB_FM(config_db_apply_policy_rule_with_tag_selector, "config");
+WAMBLE_TESTS_ADD_DB_FM(config_db_reapply_policy_rules_reexpands_tag_selectors,
+                       "config");
 WAMBLE_TESTS_END()

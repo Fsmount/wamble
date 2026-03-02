@@ -272,8 +272,9 @@ Concurrent Profiles
 - If websocket is enabled for multiple advertised profiles, effective websocket
   TCP ports must also be unique (effective port = `websocket-port` when set,
   otherwise `port`).
-- On SIGHUP, config reloads and listeners are reconciled: added/removed/updated
-  profiles are started/stopped/restarted accordingly.
+- On `SIGHUP`, config always reloads. Listener reconciliation only happens when
+  profile topology changes, such as added/removed listeners or UDP port
+  changes.
 - Validation is strict: if two advertised profiles conflict (duplicate UDP
   ports or duplicate effective websocket TCP ports when enabled), the server
   terminates with a fatal error.
@@ -281,10 +282,13 @@ Concurrent Profiles
   its own connection. If two advertised profiles both set `db-isolated=1` they
   must not point to the same DB.
 
-Hot Reload and Exec Handoff
-- `SIGHUP`: rereads the configuration file and reconciles running profile
-  threads without restarting the process. Listener threads receive updated
-  settings or are shut down/spawned as needed.
+Config Reload and Exec Handoff
+- `SIGHUP`: rereads the configuration file without restarting the process.
+  - Config is always reparsed and validated.
+  - Non-socket runtime config updates are applied in place when listener
+    topology is unchanged.
+  - Listener reconciliation only happens when profile topology changes, such as
+    added/removed listeners or UDP port changes.
   - Reload safety: if config or global policy validation fails, the running
     config remains active.
   - Restore source: runtime loads the newest `result='active'` entry from
@@ -309,6 +313,8 @@ Profile Runtime Notes
 - `start_profile_listeners` is invoked if at least one profile is defined;
   otherwise the main thread hosts the default listener using process-wide
   defaults.
+- `SIGHUP` therefore acts as config reload first, with listener reconciliation
+  as a conditional sub-step rather than the default meaning of reload.
 - During `SIGUSR2` exec reloads, profile threads mark themselves ready so only
   sockets that acknowledged export participate in the restart.
 

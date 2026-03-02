@@ -7,7 +7,8 @@ Wamble is a multiplayer chess variant where after every move you're switched to 
 ### Host facing
 
 - Single config file with a small Lisp inspired syntax.
-- Hot reloading on POSIX without dropping sockets or cached boards is achieved by sending `SIGHUP` to reload.
+- Config reload on POSIX is triggered with `SIGHUP`
+- Exec-based hot reload without dropping sockets or cached boards is triggered with `SIGUSR2`.
 - Run multiple profiles in one process. Each profile has its own port, DB creds/connection, and visibility tier; advertised profiles get their own UDP listener thread.
 - PostgreSQL stores everything?
 - Compact UDP based protocol with ACKs, retries, and NAT session binding.
