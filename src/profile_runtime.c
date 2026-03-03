@@ -360,7 +360,6 @@ static void runtime_cfg_free_owned(WambleConfig *cfg) {
   free(cfg->global_db_pass);
   free(cfg->global_db_name);
   free(cfg->websocket_path);
-  free(cfg->experiment_pairings);
   cfg->db_host = NULL;
   cfg->db_user = NULL;
   cfg->db_pass = NULL;
@@ -370,7 +369,6 @@ static void runtime_cfg_free_owned(WambleConfig *cfg) {
   cfg->global_db_pass = NULL;
   cfg->global_db_name = NULL;
   cfg->websocket_path = NULL;
-  cfg->experiment_pairings = NULL;
 }
 
 static int runtime_cfg_dup_from(WambleConfig *dst, const WambleConfig *src) {
@@ -387,12 +385,9 @@ static int runtime_cfg_dup_from(WambleConfig *dst, const WambleConfig *src) {
   dst->global_db_pass = wamble_strdup_local(src->global_db_pass);
   dst->global_db_name = wamble_strdup_local(src->global_db_name);
   dst->websocket_path = wamble_strdup_local(src->websocket_path);
-  dst->experiment_pairings = wamble_strdup_local(
-      src->experiment_pairings ? src->experiment_pairings : "*");
   if (!dst->db_host || !dst->db_user || !dst->db_pass || !dst->db_name ||
       !dst->global_db_host || !dst->global_db_user || !dst->global_db_pass ||
-      !dst->global_db_name || !dst->websocket_path ||
-      !dst->experiment_pairings) {
+      !dst->global_db_name || !dst->websocket_path) {
     runtime_cfg_free_owned(dst);
     return -1;
   }
@@ -1420,7 +1415,6 @@ static int runtime_cfg_equals(const WambleConfig *a, const WambleConfig *b) {
          a->websocket_port == b->websocket_port &&
          a->experiment_enabled == b->experiment_enabled &&
          a->experiment_seed == b->experiment_seed &&
-         a->experiment_arms == b->experiment_arms &&
          a->timeout_ms == b->timeout_ms && a->max_retries == b->max_retries &&
          a->max_message_size == b->max_message_size &&
          a->buffer_size == b->buffer_size &&
@@ -1467,8 +1461,7 @@ static int runtime_cfg_equals(const WambleConfig *a, const WambleConfig *b) {
              b->spectator_max_focus_per_session &&
          cfg_str_eq(a->spectator_summary_mode, b->spectator_summary_mode) &&
          cfg_str_eq(a->state_dir, b->state_dir) &&
-         cfg_str_eq(a->websocket_path, b->websocket_path) &&
-         cfg_str_eq(a->experiment_pairings, b->experiment_pairings);
+         cfg_str_eq(a->websocket_path, b->websocket_path);
 }
 
 static int running_profiles_can_refresh_in_place(int desired_profiles) {

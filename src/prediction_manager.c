@@ -115,11 +115,7 @@ static int prediction_resolve_session_id(const uint8_t *player_token,
     return 0;
   }
 
-  uint16_t experiment_arm = 0;
-  if (network_get_session_experiment_arm(player_token, &experiment_arm) != 0) {
-    experiment_arm = network_experiment_arm_for_token(player_token);
-  }
-  session_id = db_create_session(player_token, 0, (int)experiment_arm);
+  session_id = db_create_session(player_token, 0);
   if (session_id > 0) {
     if (out_session_id)
       *out_session_id = session_id;
@@ -239,7 +235,135 @@ static uint64_t prediction_hash_token(const uint8_t *token) {
   return h;
 }
 
-static int prediction_gated_allowed(const uint8_t *token) {
+static int prediction_treatment_feature_bool(const uint8_t *token,
+                                             const WambleBoard *board,
+                                             const char *key, int *out_value) {
+  if (!token || !key || !out_value)
+    return 0;
+  WambleFact facts[2];
+  int fact_count = 0;
+  memset(facts, 0, sizeof(facts));
+  if (board && board->id > 0) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "board.id");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+    facts[fact_count].int_value = (int64_t)board->id;
+    fact_count++;
+  }
+  WambleTreatmentAction actions[8];
+  int action_count = 0;
+  if (db_resolve_treatment_actions(
+          token, "", "prediction.submit",
+          board ? board->last_mover_treatment_group : NULL, facts, fact_count,
+          actions, 8, &action_count) != DB_OK) {
+    return 0;
+  }
+  for (int i = 0; i < action_count; i++) {
+    if (strcmp(actions[i].output_kind, "feature") != 0 ||
+        strcmp(actions[i].output_key, key) != 0) {
+      continue;
+    }
+    if (actions[i].value_type == WAMBLE_TREATMENT_VALUE_BOOL) {
+      *out_value = actions[i].bool_value;
+      return 1;
+    }
+    if (actions[i].value_type == WAMBLE_TREATMENT_VALUE_INT) {
+      *out_value = actions[i].int_value ? 1 : 0;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int prediction_pending_count_locked(uint64_t board_id);
+
+static double prediction_action_number(const WambleTreatmentAction *action,
+                                       int *ok) {
+  if (ok)
+    *ok = 0;
+  if (!action)
+    return 0.0;
+  if (action->value_type == WAMBLE_TREATMENT_VALUE_INT) {
+    if (ok)
+      *ok = 1;
+    return (double)action->int_value;
+  }
+  if (action->value_type == WAMBLE_TREATMENT_VALUE_DOUBLE) {
+    if (ok)
+      *ok = 1;
+    return action->double_value;
+  }
+  return 0.0;
+}
+
+static int prediction_failed_count_for_locked(uint64_t board_id,
+                                              const uint8_t *token) {
+  int count = 0;
+  for (int i = 0; i < g_prediction_count; i++) {
+    if (g_predictions[i].board_id == board_id &&
+        tokens_equal(g_predictions[i].player_token, token) &&
+        strcmp(g_predictions[i].status, "INCORRECT") == 0) {
+      count++;
+    }
+  }
+  return count;
+}
+
+static int prediction_collect_actions(const uint8_t *token,
+                                      const WambleBoard *board,
+                                      const char *hook_name,
+                                      WambleTreatmentAction *actions,
+                                      int max_actions, int *out_count) {
+  if (out_count)
+    *out_count = 0;
+  if (!token || !hook_name || !actions || max_actions <= 0)
+    return -1;
+  WambleFact facts[4];
+  int fact_count = 0;
+  memset(facts, 0, sizeof(facts));
+  if (board && board->id > 0) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "board.id");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+    facts[fact_count].int_value = (int64_t)board->id;
+    fact_count++;
+
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "board.last_move");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+    snprintf(facts[fact_count].string_value,
+             sizeof(facts[fact_count].string_value), "%s", board->fen);
+    fact_count++;
+  }
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "prediction.failed_count");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+  facts[fact_count].int_value =
+      board ? prediction_failed_count_for_locked(board->id, token) : 0;
+  fact_count++;
+
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "prediction.pending_count");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+  facts[fact_count].int_value =
+      board ? prediction_pending_count_locked(board->id) : 0;
+  fact_count++;
+
+  return (db_resolve_treatment_actions(
+              token, "", hook_name,
+              board ? board->last_mover_treatment_group : NULL, facts,
+              fact_count, actions, max_actions, out_count) == DB_OK)
+             ? 0
+             : -1;
+}
+
+static int prediction_gated_allowed(const uint8_t *token,
+                                    const WambleBoard *board) {
+  int override = 0;
+  if (prediction_treatment_feature_bool(token, board, "prediction.gated",
+                                        &override)) {
+    return override;
+  }
   int percent = get_config()->prediction_gated_percent;
   if (percent <= 0)
     return 0;
@@ -363,7 +487,7 @@ static PredictionStatus prediction_submit_allowed(const WambleBoard *board,
       return PREDICTION_ERR_NOT_ALLOWED;
   } else if (get_config()->prediction_mode == PREDICTION_MODE_GATED) {
     resource = "gated";
-    if (!prediction_gated_allowed(player_token))
+    if (!prediction_gated_allowed(player_token, board))
       return PREDICTION_ERR_NOT_ALLOWED;
   }
 
@@ -374,6 +498,79 @@ static PredictionStatus prediction_submit_allowed(const WambleBoard *board,
     return PREDICTION_ERR_NOT_ALLOWED;
   }
   return PREDICTION_OK;
+}
+
+static int prediction_treatment_max_pending_locked(const uint8_t *token,
+                                                   const WambleBoard *board,
+                                                   int fallback) {
+  WambleTreatmentAction actions[16];
+  int action_count = 0;
+  if (prediction_collect_actions(token, board, "prediction.submit", actions, 16,
+                                 &action_count) != 0) {
+    return fallback;
+  }
+  for (int i = 0; i < action_count; i++) {
+    if (strcmp(actions[i].output_kind, "behavior") != 0 ||
+        strcmp(actions[i].output_key, "prediction.max_pending") != 0) {
+      continue;
+    }
+    if (actions[i].value_type == WAMBLE_TREATMENT_VALUE_INT &&
+        actions[i].int_value > 0) {
+      return (int)actions[i].int_value;
+    }
+  }
+  return fallback;
+}
+
+static double
+prediction_apply_resolution_adjustments_locked(const uint8_t *token,
+                                               const WambleBoard *board,
+                                               int is_correct, double points) {
+  WambleTreatmentAction actions[16];
+  int action_count = 0;
+  const char *hook = is_correct ? "prediction.submit" : "prediction.submit";
+  if (prediction_collect_actions(token, board, hook, actions, 16,
+                                 &action_count) != 0) {
+    return points;
+  }
+  for (int i = 0; i < action_count; i++) {
+    if (strcmp(actions[i].output_kind, "behavior") != 0)
+      continue;
+    int ok = 0;
+    double value = prediction_action_number(&actions[i], &ok);
+    if (!ok)
+      continue;
+    if (strcmp(actions[i].output_key, "prediction.points.multiplier") == 0) {
+      points *= value;
+    } else if (strcmp(actions[i].output_key, "prediction.points.bonus") == 0) {
+      points += value;
+    } else if (!is_correct && strcmp(actions[i].output_key,
+                                     "prediction.penalty.multiplier") == 0) {
+      points *= value;
+    }
+  }
+  return points;
+}
+
+static int prediction_treatment_view_depth_cap(const uint8_t *token,
+                                               int fallback) {
+  WambleTreatmentAction actions[16];
+  int action_count = 0;
+  if (prediction_collect_actions(token, NULL, "prediction.read", actions, 16,
+                                 &action_count) != 0) {
+    return fallback;
+  }
+  for (int i = 0; i < action_count; i++) {
+    if (strcmp(actions[i].output_kind, "behavior") != 0 ||
+        strcmp(actions[i].output_key, "prediction.view_depth_cap") != 0) {
+      continue;
+    }
+    if (actions[i].value_type == WAMBLE_TREATMENT_VALUE_INT &&
+        actions[i].int_value >= 0) {
+      return (int)actions[i].int_value;
+    }
+  }
+  return fallback;
 }
 
 static double prediction_points_for_streak(int streak_before) {
@@ -418,6 +615,8 @@ PredictionStatus prediction_submit_with_parent(WambleBoard *board,
   int max_pending = get_config()->prediction_max_pending;
   if (max_pending < 1)
     max_pending = 1;
+  max_pending =
+      prediction_treatment_max_pending_locked(player_token, board, max_pending);
   if (prediction_pending_count_locked(board->id) >= max_pending) {
     wamble_mutex_unlock(&g_prediction_mutex);
     return PREDICTION_ERR_LIMIT;
@@ -508,6 +707,8 @@ PredictionStatus prediction_resolve_move(WambleBoard *board,
           (get_config()->prediction_mode == PREDICTION_MODE_NEXT_SELF_MOVE)
               ? get_config()->prediction_base_points
               : prediction_points_for_streak(pred->correct_streak);
+      points = prediction_apply_resolution_adjustments_locked(
+          pred->player_token, board, 1, points);
       pred->points_awarded = points;
       snprintf(pred->status, sizeof(pred->status), "CORRECT");
       if (points != 0.0)
@@ -518,6 +719,8 @@ PredictionStatus prediction_resolve_move(WambleBoard *board,
                                      pred->target_ply, pred->status, points);
     } else {
       double penalty = -fabs(get_config()->prediction_penalty_incorrect);
+      penalty = prediction_apply_resolution_adjustments_locked(
+          pred->player_token, board, 0, penalty);
       pred->points_awarded = penalty;
       snprintf(pred->status, sizeof(pred->status), "INCORRECT");
       if (penalty != 0.0)
@@ -571,6 +774,8 @@ PredictionStatus prediction_collect_tree(uint64_t board_id,
   int allowed_depth = get_config()->prediction_view_depth_limit;
   if (allowed_depth < 0)
     allowed_depth = 0;
+  allowed_depth =
+      prediction_treatment_view_depth_cap(requester_token, allowed_depth);
   if (decision.permission_level >= 0 &&
       decision.permission_level < allowed_depth)
     allowed_depth = decision.permission_level;

@@ -1,4 +1,5 @@
 #include "../include/wamble/wamble.h"
+#include "../include/wamble/wamble_db.h"
 #include <string.h>
 
 typedef struct {
@@ -6,6 +7,108 @@ typedef struct {
   int white_moves;
   int black_moves;
 } PlayerContribution;
+
+static double scoring_action_number(const WambleTreatmentAction *action,
+                                    int *ok) {
+  if (ok)
+    *ok = 0;
+  if (!action)
+    return 0.0;
+  if (action->value_type == WAMBLE_TREATMENT_VALUE_INT) {
+    if (ok)
+      *ok = 1;
+    return (double)action->int_value;
+  }
+  if (action->value_type == WAMBLE_TREATMENT_VALUE_DOUBLE) {
+    if (ok)
+      *ok = 1;
+    return action->double_value;
+  }
+  return 0.0;
+}
+
+static void scoring_apply_treatment_adjustments(const WambleBoard *board,
+                                                WamblePlayer *player,
+                                                int white_moves,
+                                                int black_moves,
+                                                double *score) {
+  if (!board || !player || !score)
+    return;
+  WambleFact facts[5];
+  int fact_count = 0;
+  memset(facts, 0, sizeof(facts));
+
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "board.id");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+  facts[fact_count].int_value = (int64_t)board->id;
+  fact_count++;
+
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "board.result");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+  if (board->result == GAME_RESULT_WHITE_WINS) {
+    snprintf(facts[fact_count].string_value,
+             sizeof(facts[fact_count].string_value), "%s", "white");
+  } else if (board->result == GAME_RESULT_BLACK_WINS) {
+    snprintf(facts[fact_count].string_value,
+             sizeof(facts[fact_count].string_value), "%s", "black");
+  } else {
+    snprintf(facts[fact_count].string_value,
+             sizeof(facts[fact_count].string_value), "%s", "draw");
+  }
+  fact_count++;
+
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "player.white_moves");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+  facts[fact_count].int_value = white_moves;
+  fact_count++;
+
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "player.black_moves");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+  facts[fact_count].int_value = black_moves;
+  fact_count++;
+
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "player.rating");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+  facts[fact_count].double_value = player->rating;
+  fact_count++;
+
+  WambleTreatmentAction actions[16];
+  int action_count = 0;
+  if (db_resolve_treatment_actions(
+          player->token, "", "scoring.apply", board->last_mover_treatment_group,
+          facts, fact_count, actions, 16, &action_count) != DB_OK) {
+    return;
+  }
+
+  for (int i = 0; i < action_count; i++) {
+    const WambleTreatmentAction *action = &actions[i];
+    if (strcmp(action->output_kind, "feature") == 0 &&
+        strcmp(action->output_key, "scoring.disable") == 0 &&
+        action->value_type == WAMBLE_TREATMENT_VALUE_BOOL &&
+        action->bool_value) {
+      *score = 0.0;
+      continue;
+    }
+    if (strcmp(action->output_kind, "behavior") != 0)
+      continue;
+    int ok = 0;
+    double value = scoring_action_number(action, &ok);
+    if (!ok)
+      continue;
+    if (strcmp(action->output_key, "payout.multiplier") == 0) {
+      *score *= value;
+    } else if (strcmp(action->output_key, "payout.bonus") == 0) {
+      *score += value;
+    }
+  }
+  if (*score < 0.0)
+    *score = 0.0;
+}
 
 static ScoringStatus calculate_and_distribute_pot_for_moves_internal(
     uint64_t board_id, WambleBoard *board, const WambleMove *moves,
@@ -81,11 +184,16 @@ static ScoringStatus calculate_and_distribute_pot_for_moves_internal(
       score /= 2.0;
     }
 
+    WamblePlayer *player = get_player_by_token(contrib->player_token);
+    if (player) {
+      scoring_apply_treatment_adjustments(board, player, contrib->white_moves,
+                                          contrib->black_moves, &score);
+    }
+
     if (score > 0.0) {
       wamble_emit_record_payout(board_id, contrib->player_token, score);
     }
 
-    WamblePlayer *player = get_player_by_token(contrib->player_token);
     if (player) {
       player->score += score;
     }

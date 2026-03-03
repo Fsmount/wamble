@@ -1,4 +1,5 @@
 #include "../include/wamble/wamble.h"
+#include "../include/wamble/wamble_db.h"
 
 #if !defined(__STDC_VERSION__) || (__STDC_VERSION__ < 201112L)
 #ifndef HAVE_STRNLEN_DECL
@@ -53,26 +54,6 @@ static inline uint64_t addr_hash_key(const struct sockaddr_in *addr) {
   uint64_t ip = (uint64_t)addr->sin_addr.s_addr;
   uint64_t port = (uint64_t)addr->sin_port;
   return mix64_s((ip << 16) ^ port);
-}
-
-uint16_t network_experiment_arm_for_token(const uint8_t *token) {
-  int arms = get_config()->experiment_arms;
-  if (arms <= 0)
-    arms = 1;
-  if (!token || get_config()->experiment_enabled == 0)
-    return 0;
-
-  uint64_t h = (uint64_t)(uint32_t)get_config()->experiment_seed;
-  h ^= (uint64_t)(uint16_t)get_config()->port << 32;
-
-  uint64_t t0 = 0;
-  uint64_t t1 = 0;
-  memcpy(&t0, token, sizeof(t0));
-  memcpy(&t1, token + sizeof(t0), sizeof(t1));
-
-  h = mix64_s(h ^ t0);
-  h = mix64_s(h ^ t1);
-  return (uint16_t)(h % (uint64_t)arms);
 }
 
 static void session_map_init(void) {
@@ -732,9 +713,24 @@ create_client_session(const struct sockaddr_in *addr, const uint8_t *token) {
   session->last_seq_num = 0;
   session->last_seen = wamble_now_wall();
   session->next_seq_num = 1;
-  session->experiment_arm = network_experiment_arm_for_token(token);
+  session->treatment_group_key[0] = '\0';
   session_map_put(addr, (int)(session - client_sessions));
   return session;
+}
+
+static void sync_client_session_treatment_group(WambleClientSession *session,
+                                                const uint8_t *token) {
+  if (!session || !token)
+    return;
+  WambleTreatmentAssignment assignment = {0};
+  DbStatus status = db_get_session_treatment_assignment(token, &assignment);
+  if (status == DB_OK) {
+    snprintf(session->treatment_group_key, sizeof(session->treatment_group_key),
+             "%s", assignment.group_key);
+    return;
+  }
+  if (status == DB_NOT_FOUND)
+    session->treatment_group_key[0] = '\0';
 }
 
 static void update_client_session(const struct sockaddr_in *addr,
@@ -759,6 +755,7 @@ static void update_client_session(const struct sockaddr_in *addr,
   session->last_seq_num = seq_num;
   session->last_seen = wamble_now_wall();
   memcpy(session->token, token, TOKEN_LENGTH);
+  sync_client_session_treatment_group(session, token);
 }
 
 void network_init_thread_state(void) {
@@ -774,16 +771,19 @@ void network_init_thread_state(void) {
   session_map_init();
 }
 
-int network_get_session_experiment_arm(const uint8_t *token,
-                                       uint16_t *out_arm) {
-  if (!token || !out_arm)
+int network_get_session_treatment_group(const uint8_t *token, char *out_group,
+                                        size_t out_group_size) {
+  if (!token || !out_group || out_group_size == 0)
     return -1;
   if (!client_sessions)
     network_init_thread_state();
   WambleClientSession *session = find_client_session_by_token(token);
   if (!session)
     return -1;
-  *out_arm = session->experiment_arm;
+  sync_client_session_treatment_group(session, token);
+  if (!session->treatment_group_key[0])
+    return -1;
+  snprintf(out_group, out_group_size, "%s", session->treatment_group_key);
   return 0;
 }
 

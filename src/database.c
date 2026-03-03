@@ -12,6 +12,14 @@ static char g_global_conn_str[512];
 static int g_global_conn_configured = 0;
 static void bytes_to_hex(const uint8_t *bytes, int len, char *hex_out);
 static uint64_t db_global_identity_create_anonymous(void);
+static int db_ensure_global_treatment_schema(void);
+static int db_ensure_profile_treatment_schema(void);
+
+static const char *db_treatment_profile_key(const char *profile) {
+  const char *profile_key =
+      (profile && profile[0]) ? profile : wamble_runtime_profile_key();
+  return (profile_key && profile_key[0]) ? profile_key : "__default__";
+}
 
 static void build_conn_string_from_cfg(const WambleConfig *cfg, char *out,
                                        size_t outlen) {
@@ -223,6 +231,111 @@ static int db_ensure_global_identity_tag_schema(void) {
   for (size_t i = 0; i < sizeof(ddl) / sizeof(ddl[0]); i++) {
     PGresult *res =
         pq_exec_params_global_locked(ddl[i], 0, NULL, NULL, NULL, NULL, 0);
+    if (!res)
+      return -1;
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+      PQclear(res);
+      return -1;
+    }
+    PQclear(res);
+  }
+  return 0;
+}
+
+static int db_ensure_global_treatment_schema(void) {
+  const char *ddl[] = {
+      "CREATE TABLE IF NOT EXISTS global_treatment_groups ("
+      "  id BIGSERIAL PRIMARY KEY,"
+      "  group_key VARCHAR(128) NOT NULL,"
+      "  priority INTEGER NOT NULL,"
+      "  is_default BOOLEAN NOT NULL DEFAULT FALSE,"
+      "  source VARCHAR(32) NOT NULL DEFAULT 'config',"
+      "  snapshot_revision_id BIGINT,"
+      "  created_at TIMESTAMPTZ DEFAULT NOW()"
+      ")",
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_treatment_group_key_source "
+      "ON global_treatment_groups(group_key, source, "
+      "COALESCE(snapshot_revision_id, 0))",
+      "CREATE TABLE IF NOT EXISTS global_treatment_assignment_rules ("
+      "  id BIGSERIAL PRIMARY KEY,"
+      "  global_identity_id BIGINT NOT NULL,"
+      "  profile_scope VARCHAR(256) NOT NULL DEFAULT '*',"
+      "  group_key VARCHAR(128) NOT NULL,"
+      "  priority INTEGER NOT NULL,"
+      "  source VARCHAR(32) NOT NULL DEFAULT 'config',"
+      "  snapshot_revision_id BIGINT,"
+      "  created_at TIMESTAMPTZ DEFAULT NOW()"
+      ")",
+      "CREATE INDEX IF NOT EXISTS idx_treatment_assignment_lookup "
+      "ON global_treatment_assignment_rules(global_identity_id, profile_scope, "
+      "priority, group_key)",
+      "CREATE TABLE IF NOT EXISTS global_treatment_assignment_predicates ("
+      "  rule_id BIGINT NOT NULL REFERENCES "
+      "global_treatment_assignment_rules(id) ON DELETE CASCADE,"
+      "  fact_key VARCHAR(128) NOT NULL,"
+      "  op VARCHAR(16) NOT NULL,"
+      "  value_type INTEGER NOT NULL,"
+      "  value_text VARCHAR(256),"
+      "  value_num DOUBLE PRECISION,"
+      "  value_bool BOOLEAN,"
+      "  value_fact_ref VARCHAR(128)"
+      ")",
+      "CREATE TABLE IF NOT EXISTS global_treatment_group_edges ("
+      "  source_group_key VARCHAR(128) NOT NULL,"
+      "  target_group_key VARCHAR(128) NOT NULL,"
+      "  source VARCHAR(32) NOT NULL DEFAULT 'config',"
+      "  snapshot_revision_id BIGINT,"
+      "  PRIMARY KEY (source_group_key, target_group_key, source, "
+      "snapshot_revision_id)"
+      ")",
+      "CREATE TABLE IF NOT EXISTS global_treatment_group_outputs ("
+      "  id BIGSERIAL PRIMARY KEY,"
+      "  group_key VARCHAR(128) NOT NULL,"
+      "  hook_name VARCHAR(64) NOT NULL DEFAULT '*',"
+      "  output_kind VARCHAR(32) NOT NULL,"
+      "  output_key VARCHAR(128) NOT NULL,"
+      "  value_type INTEGER NOT NULL,"
+      "  value_text VARCHAR(256),"
+      "  value_num DOUBLE PRECISION,"
+      "  value_bool BOOLEAN,"
+      "  value_fact_ref VARCHAR(128),"
+      "  source VARCHAR(32) NOT NULL DEFAULT 'config',"
+      "  snapshot_revision_id BIGINT,"
+      "  created_at TIMESTAMPTZ DEFAULT NOW()"
+      ")",
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_treatment_outputs_unique "
+      "ON global_treatment_group_outputs(group_key, hook_name, output_kind, "
+      "output_key, source, COALESCE(snapshot_revision_id, 0))"};
+  for (size_t i = 0; i < sizeof(ddl) / sizeof(ddl[0]); i++) {
+    PGresult *res =
+        pq_exec_params_global_locked(ddl[i], 0, NULL, NULL, NULL, NULL, 0);
+    if (!res)
+      return -1;
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+      PQclear(res);
+      return -1;
+    }
+    PQclear(res);
+  }
+  return 0;
+}
+
+static int db_ensure_profile_treatment_schema(void) {
+  const char *ddl[] = {
+      "ALTER TABLE sessions "
+      "ADD COLUMN IF NOT EXISTS treatment_group_key VARCHAR(128)",
+      "ALTER TABLE sessions "
+      "ADD COLUMN IF NOT EXISTS treatment_rule_id BIGINT",
+      "ALTER TABLE sessions "
+      "ADD COLUMN IF NOT EXISTS treatment_snapshot_revision_id BIGINT",
+      "ALTER TABLE sessions "
+      "ADD COLUMN IF NOT EXISTS treatment_assigned_at TIMESTAMPTZ",
+      "ALTER TABLE boards "
+      "ADD COLUMN IF NOT EXISTS last_mover_treatment_group VARCHAR(128)",
+      "CREATE INDEX IF NOT EXISTS idx_sessions_treatment_group "
+      "ON sessions(treatment_group_key)"};
+  for (size_t i = 0; i < sizeof(ddl) / sizeof(ddl[0]); i++) {
+    PGresult *res = pq_exec_params_locked(ddl[i], 0, NULL, NULL, NULL, NULL, 0);
     if (!res)
       return -1;
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
@@ -850,6 +963,69 @@ static int db_collect_identity_ids_for_selector(const char *selector,
   return 0;
 }
 
+static const WambleFact *find_fact(const WambleFact *facts, int fact_count,
+                                   const char *key) {
+  if (!facts || fact_count <= 0 || !key)
+    return NULL;
+  for (int i = 0; i < fact_count; i++) {
+    if (strcmp(facts[i].key, key) == 0)
+      return &facts[i];
+  }
+  return NULL;
+}
+
+static int fact_compare_numeric(double lhs, double rhs, const char *op) {
+  if (strcmp(op, "eq") == 0)
+    return lhs == rhs;
+  if (strcmp(op, "ne") == 0)
+    return lhs != rhs;
+  if (strcmp(op, "gt") == 0)
+    return lhs > rhs;
+  if (strcmp(op, "gte") == 0)
+    return lhs >= rhs;
+  if (strcmp(op, "lt") == 0)
+    return lhs < rhs;
+  if (strcmp(op, "lte") == 0)
+    return lhs <= rhs;
+  return 0;
+}
+
+static int fact_matches_predicate(const WambleFact *fact, const char *op,
+                                  int value_type, const char *value_text,
+                                  double value_num, int value_bool) {
+  if (strcmp(op, "exists") == 0)
+    return fact != NULL;
+  if (strcmp(op, "absent") == 0)
+    return fact == NULL;
+  if (!fact)
+    return 0;
+  if (fact->value_type == WAMBLE_TREATMENT_VALUE_STRING &&
+      value_type == WAMBLE_TREATMENT_VALUE_STRING) {
+    if (strcmp(op, "eq") == 0)
+      return strcmp(fact->string_value, value_text ? value_text : "") == 0;
+    if (strcmp(op, "ne") == 0)
+      return strcmp(fact->string_value, value_text ? value_text : "") != 0;
+    return 0;
+  }
+  if ((fact->value_type == WAMBLE_TREATMENT_VALUE_INT ||
+       fact->value_type == WAMBLE_TREATMENT_VALUE_DOUBLE) &&
+      (value_type == WAMBLE_TREATMENT_VALUE_INT ||
+       value_type == WAMBLE_TREATMENT_VALUE_DOUBLE)) {
+    double lhs = (fact->value_type == WAMBLE_TREATMENT_VALUE_INT)
+                     ? (double)fact->int_value
+                     : fact->double_value;
+    return fact_compare_numeric(lhs, value_num, op);
+  }
+  if (fact->value_type == WAMBLE_TREATMENT_VALUE_BOOL &&
+      value_type == WAMBLE_TREATMENT_VALUE_BOOL) {
+    if (strcmp(op, "eq") == 0)
+      return fact->bool_value == value_bool;
+    if (strcmp(op, "ne") == 0)
+      return fact->bool_value != value_bool;
+  }
+  return 0;
+}
+
 static void
 normalize_policy_scope_resource(const char *action, const char *raw_resource,
                                 char *out_scope, size_t out_scope_len,
@@ -1023,6 +1199,768 @@ int db_apply_config_policy_rules(const char *profile_key) {
   return ok;
 }
 
+static int config_find_treatment_group_index(const char *group_key) {
+  int count = config_treatment_group_count();
+  for (int i = 0; i < count; i++) {
+    const WambleTreatmentGroupSpec *g = config_treatment_group_get(i);
+    if (g && g->group_key && strcmp(g->group_key, group_key) == 0)
+      return i;
+  }
+  return -1;
+}
+
+int db_validate_global_treatments(void) {
+  if (db_ensure_global_treatment_schema() != 0)
+    return -1;
+  int group_count = config_treatment_group_count();
+  int default_count = 0;
+  for (int i = 0; i < group_count; i++) {
+    const WambleTreatmentGroupSpec *g = config_treatment_group_get(i);
+    if (!g || !g->group_key || !g->group_key[0])
+      return -1;
+    if (g->is_default)
+      default_count++;
+    for (int j = i + 1; j < group_count; j++) {
+      const WambleTreatmentGroupSpec *other = config_treatment_group_get(j);
+      if (other && other->group_key &&
+          strcmp(other->group_key, g->group_key) == 0)
+        return -1;
+    }
+  }
+  if (group_count > 0 && default_count != 1)
+    return -1;
+  int edge_count = config_treatment_edge_count();
+  for (int i = 0; i < edge_count; i++) {
+    const WambleTreatmentEdgeSpec *e = config_treatment_edge_get(i);
+    if (!e || !e->source_group_key || !e->target_group_key)
+      return -1;
+    if (config_find_treatment_group_index(e->source_group_key) < 0)
+      return -1;
+    if (!e->target_group_key[0])
+      return -1;
+  }
+  int rule_count = config_treatment_rule_count();
+  for (int i = 0; i < rule_count; i++) {
+    const WambleTreatmentRuleSpec *r = config_treatment_rule_get(i);
+    if (!r || !r->group_key ||
+        config_find_treatment_group_index(r->group_key) < 0)
+      return -1;
+  }
+  int output_count = config_treatment_output_count();
+  for (int i = 0; i < output_count; i++) {
+    const WambleTreatmentOutputSpec *o = config_treatment_output_get(i);
+    if (!o || !o->group_key || !o->output_kind || !o->output_key ||
+        config_find_treatment_group_index(o->group_key) < 0)
+      return -1;
+    for (int j = i + 1; j < output_count; j++) {
+      const WambleTreatmentOutputSpec *other = config_treatment_output_get(j);
+      if (!other)
+        continue;
+      if (strcmp(other->group_key ? other->group_key : "", o->group_key) == 0 &&
+          strcmp(other->hook_name ? other->hook_name : "*",
+                 o->hook_name ? o->hook_name : "*") == 0 &&
+          strcmp(other->output_kind ? other->output_kind : "",
+                 o->output_kind) == 0 &&
+          strcmp(other->output_key ? other->output_key : "", o->output_key) ==
+              0)
+        return -1;
+    }
+  }
+  return 0;
+}
+
+int db_apply_config_treatment_rules(const char *profile_key) {
+  if (db_validate_global_treatments() != 0 ||
+      db_ensure_global_identity_schema() != 0 ||
+      db_ensure_global_identity_tag_schema() != 0)
+    return -1;
+  const char *profile_scope_key =
+      (profile_key && profile_key[0]) ? profile_key : "__default__";
+  uint64_t snapshot_id = 0;
+  (void)db_get_active_revision_id(profile_scope_key, &snapshot_id);
+
+  PGresult *res =
+      pq_exec_params_global_locked("BEGIN", 0, NULL, NULL, NULL, NULL, 0);
+  if (!res)
+    return -1;
+  if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+    PQclear(res);
+    return -1;
+  }
+  PQclear(res);
+
+  const char *delete_groups =
+      "DELETE FROM global_treatment_groups WHERE source = md5($1)";
+  const char *delete_rules =
+      "DELETE FROM global_treatment_assignment_rules WHERE source = md5($1)";
+  const char *delete_edges =
+      "DELETE FROM global_treatment_group_edges WHERE source = md5($1)";
+  const char *delete_outputs =
+      "DELETE FROM global_treatment_group_outputs WHERE source = md5($1)";
+  const char *delete_params[] = {profile_scope_key};
+  const char *delete_sql[] = {delete_outputs, delete_edges, delete_rules,
+                              delete_groups};
+  for (size_t i = 0; i < sizeof(delete_sql) / sizeof(delete_sql[0]); i++) {
+    res = pq_exec_params_global_locked(delete_sql[i], 1, NULL, delete_params,
+                                       NULL, NULL, 0);
+    if (!res || PQresultStatus(res) != PGRES_COMMAND_OK) {
+      if (res)
+        PQclear(res);
+      (void)pq_exec_params_global_locked("ROLLBACK", 0, NULL, NULL, NULL, NULL,
+                                         0);
+      return -1;
+    }
+    PQclear(res);
+  }
+
+  char snapshot_id_str[32];
+  snprintf(snapshot_id_str, sizeof(snapshot_id_str), "%" PRIu64, snapshot_id);
+  const char *snapshot_param = snapshot_id_str;
+
+  for (int i = 0; i < config_treatment_group_count(); i++) {
+    const WambleTreatmentGroupSpec *g = config_treatment_group_get(i);
+    if (!g)
+      continue;
+    char priority_str[16];
+    snprintf(priority_str, sizeof(priority_str), "%d", g->priority);
+    const char *params[] = {g->group_key, priority_str,
+                            g->is_default ? "true" : "false", snapshot_param,
+                            profile_scope_key};
+    res = pq_exec_params_global_locked(
+        "INSERT INTO global_treatment_groups "
+        "(group_key, priority, is_default, snapshot_revision_id, source) "
+        "VALUES ($1, $2, $3::boolean, $4, md5($5))",
+        5, NULL, params, NULL, NULL, 0);
+    if (!res || PQresultStatus(res) != PGRES_COMMAND_OK) {
+      if (res)
+        PQclear(res);
+      (void)pq_exec_params_global_locked("ROLLBACK", 0, NULL, NULL, NULL, NULL,
+                                         0);
+      return -1;
+    }
+    PQclear(res);
+  }
+
+  for (int i = 0; i < config_treatment_rule_count(); i++) {
+    const WambleTreatmentRuleSpec *r = config_treatment_rule_get(i);
+    if (!r)
+      continue;
+    uint64_t *identity_ids = NULL;
+    int identity_count = 0;
+    if (db_collect_identity_ids_for_selector(
+            r->identity_selector, &identity_ids, &identity_count) != 0) {
+      (void)pq_exec_params_global_locked("ROLLBACK", 0, NULL, NULL, NULL, NULL,
+                                         0);
+      return -1;
+    }
+    char priority_str[16];
+    snprintf(priority_str, sizeof(priority_str), "%d", r->priority);
+    for (int j = 0; j < identity_count; j++) {
+      char identity_id_str[32];
+      snprintf(identity_id_str, sizeof(identity_id_str), "%" PRIu64,
+               identity_ids[j]);
+      const char *rule_params[] = {identity_id_str, r->profile_scope,
+                                   r->group_key,    priority_str,
+                                   snapshot_param,  profile_scope_key};
+      res = pq_exec_params_global_locked(
+          "INSERT INTO global_treatment_assignment_rules "
+          "(global_identity_id, profile_scope, group_key, priority, "
+          " snapshot_revision_id, source) "
+          "VALUES ($1, $2, $3, $4, $5, md5($6)) RETURNING id",
+          6, NULL, rule_params, NULL, NULL, 0);
+      if (!res || PQresultStatus(res) != PGRES_TUPLES_OK ||
+          PQntuples(res) == 0) {
+        if (res)
+          PQclear(res);
+        free(identity_ids);
+        (void)pq_exec_params_global_locked("ROLLBACK", 0, NULL, NULL, NULL,
+                                           NULL, 0);
+        return -1;
+      }
+      uint64_t rule_id = strtoull(PQgetvalue(res, 0, 0), NULL, 10);
+      PQclear(res);
+      for (int k = 0; k < r->predicate_count; k++) {
+        char rule_id_str[32];
+        char type_str[16];
+        char num_str[64];
+        snprintf(rule_id_str, sizeof(rule_id_str), "%" PRIu64, rule_id);
+        snprintf(type_str, sizeof(type_str), "%d",
+                 (int)r->predicates[k].value.type);
+        const char *num_param = NULL;
+        const char *bool_param = NULL;
+        if (r->predicates[k].value.type == WAMBLE_TREATMENT_VALUE_INT) {
+          snprintf(num_str, sizeof(num_str), "%" PRId64,
+                   r->predicates[k].value.int_value);
+          num_param = num_str;
+        } else if (r->predicates[k].value.type ==
+                   WAMBLE_TREATMENT_VALUE_DOUBLE) {
+          snprintf(num_str, sizeof(num_str), "%.17g",
+                   r->predicates[k].value.double_value);
+          num_param = num_str;
+        } else if (r->predicates[k].value.type == WAMBLE_TREATMENT_VALUE_BOOL) {
+          bool_param = r->predicates[k].value.bool_value ? "true" : "false";
+        }
+        const char *pred_params[] = {
+            rule_id_str,
+            r->predicates[k].fact_key,
+            r->predicates[k].op,
+            type_str,
+            r->predicates[k].value.string_value,
+            num_param,
+            bool_param,
+            r->predicates[k].value.fact_key,
+        };
+        res = pq_exec_params_global_locked(
+            "INSERT INTO global_treatment_assignment_predicates "
+            "(rule_id, fact_key, op, value_type, value_text, value_num, "
+            " value_bool, value_fact_ref) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7::boolean, $8)",
+            8, NULL, pred_params, NULL, NULL, 0);
+        if (!res || PQresultStatus(res) != PGRES_COMMAND_OK) {
+          if (res)
+            PQclear(res);
+          free(identity_ids);
+          (void)pq_exec_params_global_locked("ROLLBACK", 0, NULL, NULL, NULL,
+                                             NULL, 0);
+          return -1;
+        }
+        PQclear(res);
+      }
+    }
+    free(identity_ids);
+  }
+
+  for (int i = 0; i < config_treatment_edge_count(); i++) {
+    const WambleTreatmentEdgeSpec *e = config_treatment_edge_get(i);
+    if (!e)
+      continue;
+    const char *params[] = {e->source_group_key, e->target_group_key,
+                            snapshot_param, profile_scope_key};
+    res = pq_exec_params_global_locked(
+        "INSERT INTO global_treatment_group_edges "
+        "(source_group_key, target_group_key, snapshot_revision_id, source) "
+        "VALUES ($1, $2, $3, md5($4))",
+        4, NULL, params, NULL, NULL, 0);
+    if (!res || PQresultStatus(res) != PGRES_COMMAND_OK) {
+      if (res)
+        PQclear(res);
+      (void)pq_exec_params_global_locked("ROLLBACK", 0, NULL, NULL, NULL, NULL,
+                                         0);
+      return -1;
+    }
+    PQclear(res);
+  }
+
+  for (int i = 0; i < config_treatment_output_count(); i++) {
+    const WambleTreatmentOutputSpec *o = config_treatment_output_get(i);
+    if (!o)
+      continue;
+    char type_str[16];
+    char num_str[64];
+    snprintf(type_str, sizeof(type_str), "%d", (int)o->value.type);
+    const char *num_param = NULL;
+    const char *bool_param = NULL;
+    if (o->value.type == WAMBLE_TREATMENT_VALUE_INT) {
+      snprintf(num_str, sizeof(num_str), "%" PRId64, o->value.int_value);
+      num_param = num_str;
+    } else if (o->value.type == WAMBLE_TREATMENT_VALUE_DOUBLE) {
+      snprintf(num_str, sizeof(num_str), "%.17g", o->value.double_value);
+      num_param = num_str;
+    } else if (o->value.type == WAMBLE_TREATMENT_VALUE_BOOL) {
+      bool_param = o->value.bool_value ? "true" : "false";
+    }
+    const char *params[] = {
+        o->group_key,      o->hook_name ? o->hook_name : "*",
+        o->output_kind,    o->output_key,
+        type_str,          o->value.string_value,
+        num_param,         bool_param,
+        o->value.fact_key, snapshot_param,
+        profile_scope_key};
+    res = pq_exec_params_global_locked(
+        "INSERT INTO global_treatment_group_outputs "
+        "(group_key, hook_name, output_kind, output_key, value_type, "
+        " value_text, value_num, value_bool, value_fact_ref, "
+        " snapshot_revision_id, source) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8::boolean, $9, $10, md5($11))",
+        11, NULL, params, NULL, NULL, 0);
+    if (!res || PQresultStatus(res) != PGRES_COMMAND_OK) {
+      if (res)
+        PQclear(res);
+      (void)pq_exec_params_global_locked("ROLLBACK", 0, NULL, NULL, NULL, NULL,
+                                         0);
+      return -1;
+    }
+    PQclear(res);
+  }
+
+  res = pq_exec_params_global_locked("COMMIT", 0, NULL, NULL, NULL, NULL, 0);
+  if (!res)
+    return -1;
+  int ok = (PQresultStatus(res) == PGRES_COMMAND_OK) ? 0 : -1;
+  PQclear(res);
+  return ok;
+}
+
+static int db_materialize_treatment_value_from_row(PGresult *res, int row,
+                                                   const WambleFact *facts,
+                                                   int fact_count,
+                                                   WambleTreatmentAction *out) {
+  if (!res || !out)
+    return -1;
+  long value_type = strtol(PQgetvalue(res, row, 3), NULL, 10);
+  out->value_type = (WambleTreatmentValueType)value_type;
+  switch (out->value_type) {
+  case WAMBLE_TREATMENT_VALUE_STRING:
+    snprintf(out->string_value, sizeof(out->string_value), "%s",
+             PQgetvalue(res, row, 4));
+    break;
+  case WAMBLE_TREATMENT_VALUE_INT:
+    out->int_value = strtoll(PQgetvalue(res, row, 5), NULL, 10);
+    break;
+  case WAMBLE_TREATMENT_VALUE_DOUBLE:
+    out->double_value = strtod(PQgetvalue(res, row, 5), NULL);
+    break;
+  case WAMBLE_TREATMENT_VALUE_BOOL:
+    out->bool_value = (PQgetvalue(res, row, 6)[0] == 't' ||
+                       PQgetvalue(res, row, 6)[0] == '1');
+    break;
+  case WAMBLE_TREATMENT_VALUE_FACT_REF: {
+    const WambleFact *fact =
+        find_fact(facts, fact_count, PQgetvalue(res, row, 7));
+    if (!fact)
+      return -1;
+    out->value_type = fact->value_type;
+    if (fact->value_type == WAMBLE_TREATMENT_VALUE_STRING) {
+      snprintf(out->string_value, sizeof(out->string_value), "%s",
+               fact->string_value);
+    } else if (fact->value_type == WAMBLE_TREATMENT_VALUE_INT) {
+      out->int_value = fact->int_value;
+    } else if (fact->value_type == WAMBLE_TREATMENT_VALUE_DOUBLE) {
+      out->double_value = fact->double_value;
+    } else if (fact->value_type == WAMBLE_TREATMENT_VALUE_BOOL) {
+      out->bool_value = fact->bool_value;
+    }
+    break;
+  }
+  default:
+    break;
+  }
+  return 0;
+}
+
+static void db_apply_policy_treatment_overrides(const uint8_t *token,
+                                                const char *profile_name,
+                                                WamblePolicyDecision *out,
+                                                const char *context_key,
+                                                const char *context_value) {
+  if (!token || !out)
+    return;
+
+  WambleFact facts[8];
+  int fact_count = 0;
+  memset(facts, 0, sizeof(facts));
+
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "policy.action");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+  snprintf(facts[fact_count].string_value,
+           sizeof(facts[fact_count].string_value), "%s", out->action);
+  fact_count++;
+
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "policy.resource");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+  snprintf(facts[fact_count].string_value,
+           sizeof(facts[fact_count].string_value), "%s", out->resource);
+  fact_count++;
+
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "policy.allowed");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_BOOL;
+  facts[fact_count].bool_value = out->allowed ? 1 : 0;
+  fact_count++;
+
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "policy.permission_level");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+  facts[fact_count].int_value = out->permission_level;
+  fact_count++;
+
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "policy.effect");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+  snprintf(facts[fact_count].string_value,
+           sizeof(facts[fact_count].string_value), "%s", out->effect);
+  fact_count++;
+
+  if (profile_name && profile_name[0] && fact_count < 8) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "profile.name");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+    snprintf(facts[fact_count].string_value,
+             sizeof(facts[fact_count].string_value), "%s", profile_name);
+    fact_count++;
+  }
+
+  if (context_key && context_key[0] && fact_count < 8) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "policy.context_key");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+    snprintf(facts[fact_count].string_value,
+             sizeof(facts[fact_count].string_value), "%s", context_key);
+    fact_count++;
+  }
+
+  if (context_value && context_value[0] && fact_count < 8) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "policy.context_value");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+    snprintf(facts[fact_count].string_value,
+             sizeof(facts[fact_count].string_value), "%s", context_value);
+    fact_count++;
+  }
+
+  WambleTreatmentAction actions[8];
+  int action_count = 0;
+  if (db_resolve_treatment_actions(token, profile_name ? profile_name : "",
+                                   "policy.resolve", NULL, facts, fact_count,
+                                   actions, 8, &action_count) != DB_OK) {
+    return;
+  }
+
+  for (int i = 0; i < action_count; i++) {
+    const WambleTreatmentAction *action = &actions[i];
+    if (strcmp(action->output_kind, "behavior") != 0)
+      continue;
+
+    if ((strcmp(action->output_key, "policy.allow") == 0 ||
+         strcmp(action->output_key, "policy.deny") == 0) &&
+        (action->value_type == WAMBLE_TREATMENT_VALUE_BOOL ||
+         action->value_type == WAMBLE_TREATMENT_VALUE_INT)) {
+      int enabled = (action->value_type == WAMBLE_TREATMENT_VALUE_BOOL)
+                        ? action->bool_value
+                        : (action->int_value != 0);
+      if (!enabled)
+        continue;
+      out->allowed = (strcmp(action->output_key, "policy.allow") == 0) ? 1 : 0;
+      snprintf(out->effect, sizeof(out->effect), "%s",
+               out->allowed ? "allow" : "deny");
+      snprintf(out->reason, sizeof(out->reason), "%s",
+               out->allowed ? "experiment_override_allow"
+                            : "experiment_override_deny");
+      snprintf(out->policy_version, sizeof(out->policy_version), "%s",
+               "treatment");
+      continue;
+    }
+
+    if (strcmp(action->output_key, "policy.permission_level.set") == 0 &&
+        action->value_type == WAMBLE_TREATMENT_VALUE_INT) {
+      out->permission_level = (int)action->int_value;
+    } else if (strcmp(action->output_key, "policy.permission_level.delta") ==
+                   0 &&
+               action->value_type == WAMBLE_TREATMENT_VALUE_INT) {
+      out->permission_level += (int)action->int_value;
+    } else if (strcmp(action->output_key, "policy.permission_level.min") == 0 &&
+               action->value_type == WAMBLE_TREATMENT_VALUE_INT &&
+               out->permission_level < (int)action->int_value) {
+      out->permission_level = (int)action->int_value;
+    } else if (strcmp(action->output_key, "policy.reason") == 0 &&
+               action->value_type == WAMBLE_TREATMENT_VALUE_STRING &&
+               action->string_value[0]) {
+      snprintf(out->reason, sizeof(out->reason), "%s", action->string_value);
+      snprintf(out->policy_version, sizeof(out->policy_version), "%s",
+               "treatment");
+    }
+  }
+
+  if (!out->allowed)
+    out->permission_level = 0;
+}
+
+DbStatus db_get_session_treatment_assignment(const uint8_t *token,
+                                             WambleTreatmentAssignment *out) {
+  if (!token || !out)
+    return DB_ERR_BAD_DATA;
+  if (db_ensure_profile_treatment_schema() != 0)
+    return DB_ERR_EXEC;
+  char token_hex[33];
+  bytes_to_hex(token, TOKEN_LENGTH, token_hex);
+  const char *params[] = {token_hex};
+  PGresult *res = pq_exec_params_locked(
+      "SELECT COALESCE(treatment_group_key, ''), COALESCE(treatment_rule_id, "
+      "0), "
+      "       COALESCE(treatment_snapshot_revision_id, 0), "
+      "       COALESCE(EXTRACT(EPOCH FROM treatment_assigned_at)::bigint, 0) "
+      "FROM sessions WHERE token = decode($1, 'hex')",
+      1, NULL, params, NULL, NULL, 0);
+  if (!res)
+    return DB_ERR_CONN;
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    PQclear(res);
+    return DB_ERR_EXEC;
+  }
+  if (PQntuples(res) == 0) {
+    PQclear(res);
+    return DB_NOT_FOUND;
+  }
+  memset(out, 0, sizeof(*out));
+  snprintf(out->group_key, sizeof(out->group_key), "%s", PQgetvalue(res, 0, 0));
+  out->rule_id = strtoull(PQgetvalue(res, 0, 1), NULL, 10);
+  out->snapshot_revision_id = strtoull(PQgetvalue(res, 0, 2), NULL, 10);
+  out->assigned_at = (time_t)strtoull(PQgetvalue(res, 0, 3), NULL, 10);
+  PQclear(res);
+  return out->group_key[0] ? DB_OK : DB_NOT_FOUND;
+}
+
+DbStatus db_assign_session_treatment(const uint8_t *token, const char *profile,
+                                     const WambleFact *facts, int fact_count,
+                                     WambleTreatmentAssignment *out) {
+  if (!token)
+    return DB_ERR_BAD_DATA;
+  if (db_ensure_profile_treatment_schema() != 0 ||
+      db_ensure_global_treatment_schema() != 0)
+    return DB_ERR_EXEC;
+
+  uint64_t identity_id = 0;
+  DbStatus sid_status = db_get_or_create_session_identity(token, &identity_id);
+  if (sid_status != DB_OK)
+    return sid_status;
+
+  const char *profile_name = db_treatment_profile_key(profile);
+  const char *group = config_profile_group(profile_name);
+  if (!group)
+    group = "";
+  char scope_exact[256];
+  char scope_group[256];
+  snprintf(scope_exact, sizeof(scope_exact), "profile:%s", profile_name);
+  snprintf(scope_group, sizeof(scope_group), "profile_group:%s", group);
+  char identity_id_str[32];
+  snprintf(identity_id_str, sizeof(identity_id_str), "%" PRIu64, identity_id);
+
+  PGresult *res = pq_exec_params_global_locked(
+      "SELECT id, group_key, priority, COALESCE(snapshot_revision_id, 0), "
+      "       profile_scope "
+      "FROM global_treatment_assignment_rules "
+      "WHERE (global_identity_id = $1 OR global_identity_id = 0) "
+      "  AND (profile_scope = $2 OR profile_scope = $3 OR profile_scope = '*') "
+      "  AND source = md5($4) "
+      "ORDER BY "
+      "  CASE WHEN global_identity_id = $1 THEN 0 ELSE 1 END, "
+      "  CASE WHEN profile_scope = $2 THEN 0 WHEN profile_scope = $3 THEN 1 "
+      "ELSE 2 END, "
+      "  priority DESC, id DESC",
+      4, NULL,
+      (const char *[]){identity_id_str, scope_exact, scope_group, profile_name},
+      NULL, NULL, 0);
+  if (!res)
+    return DB_ERR_CONN;
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    PQclear(res);
+    return DB_ERR_EXEC;
+  }
+
+  uint64_t matched_rule_id = 0;
+  uint64_t matched_snapshot_id = 0;
+  char matched_group[128] = {0};
+  for (int i = 0; i < PQntuples(res); i++) {
+    uint64_t rule_id = strtoull(PQgetvalue(res, i, 0), NULL, 10);
+    PGresult *pred_res = pq_exec_params_global_locked(
+        "SELECT fact_key, op, value_type, COALESCE(value_text, ''), "
+        "       COALESCE(value_num, 0), COALESCE(value_bool, FALSE) "
+        "FROM global_treatment_assignment_predicates WHERE rule_id = $1",
+        1, NULL, (const char *[]){PQgetvalue(res, i, 0)}, NULL, NULL, 0);
+    if (!pred_res) {
+      PQclear(res);
+      return DB_ERR_CONN;
+    }
+    if (PQresultStatus(pred_res) != PGRES_TUPLES_OK) {
+      PQclear(pred_res);
+      PQclear(res);
+      return DB_ERR_EXEC;
+    }
+    int matches = 1;
+    for (int j = 0; j < PQntuples(pred_res); j++) {
+      const WambleFact *fact =
+          find_fact(facts, fact_count, PQgetvalue(pred_res, j, 0));
+      int value_type = (int)strtol(PQgetvalue(pred_res, j, 2), NULL, 10);
+      double value_num = strtod(PQgetvalue(pred_res, j, 4), NULL);
+      int value_bool = (PQgetvalue(pred_res, j, 5)[0] == 't' ||
+                        PQgetvalue(pred_res, j, 5)[0] == '1');
+      if (!fact_matches_predicate(fact, PQgetvalue(pred_res, j, 1), value_type,
+                                  PQgetvalue(pred_res, j, 3), value_num,
+                                  value_bool)) {
+        matches = 0;
+        break;
+      }
+    }
+    PQclear(pred_res);
+    if (!matches)
+      continue;
+    if (matched_group[0] != '\0' &&
+        strcmp(matched_group, PQgetvalue(res, i, 1)) != 0) {
+      PQclear(res);
+      return DB_ERR_BAD_DATA;
+    }
+    matched_rule_id = rule_id;
+    matched_snapshot_id = strtoull(PQgetvalue(res, i, 3), NULL, 10);
+    snprintf(matched_group, sizeof(matched_group), "%s", PQgetvalue(res, i, 1));
+    break;
+  }
+  PQclear(res);
+
+  if (!matched_group[0]) {
+    res = pq_exec_params_global_locked(
+        "SELECT group_key, COALESCE(snapshot_revision_id, 0) "
+        "FROM global_treatment_groups "
+        "WHERE is_default = TRUE AND source = md5($1) "
+        "ORDER BY priority DESC, id DESC LIMIT 1",
+        1, NULL, (const char *[]){profile_name}, NULL, NULL, 0);
+    if (!res)
+      return DB_ERR_CONN;
+    if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+      if (res)
+        PQclear(res);
+      return DB_ERR_EXEC;
+    }
+    snprintf(matched_group, sizeof(matched_group), "%s", PQgetvalue(res, 0, 0));
+    matched_snapshot_id = strtoull(PQgetvalue(res, 0, 1), NULL, 10);
+    PQclear(res);
+  }
+
+  char token_hex[33];
+  bytes_to_hex(token, TOKEN_LENGTH, token_hex);
+  char rule_id_str[32];
+  char snapshot_str[32];
+  const char *rule_param = NULL;
+  const char *snapshot_param = NULL;
+  if (matched_rule_id > 0) {
+    snprintf(rule_id_str, sizeof(rule_id_str), "%" PRIu64, matched_rule_id);
+    rule_param = rule_id_str;
+  }
+  if (matched_snapshot_id > 0) {
+    snprintf(snapshot_str, sizeof(snapshot_str), "%" PRIu64,
+             matched_snapshot_id);
+    snapshot_param = snapshot_str;
+  }
+  res = pq_exec_params_locked(
+      "UPDATE sessions SET treatment_group_key = $2, treatment_rule_id = $3, "
+      "treatment_snapshot_revision_id = $4, treatment_assigned_at = NOW() "
+      "WHERE token = decode($1, 'hex')",
+      4, NULL,
+      (const char *[]){token_hex, matched_group, rule_param, snapshot_param},
+      NULL, NULL, 0);
+  if (!res)
+    return DB_ERR_CONN;
+  if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+    PQclear(res);
+    return DB_ERR_EXEC;
+  }
+  PQclear(res);
+
+  res = pq_exec_params_global_locked(
+      "INSERT INTO global_identity_tags(global_identity_id, tag) "
+      "SELECT $1, output_key FROM global_treatment_group_outputs "
+      "WHERE group_key = $2 AND output_kind = 'tag' "
+      "  AND source = md5($3) "
+      "ON CONFLICT DO NOTHING",
+      3, NULL, (const char *[]){identity_id_str, matched_group, profile_name},
+      NULL, NULL, 0);
+  if (res)
+    PQclear(res);
+
+  if (out) {
+    memset(out, 0, sizeof(*out));
+    snprintf(out->group_key, sizeof(out->group_key), "%s", matched_group);
+    out->rule_id = matched_rule_id;
+    out->snapshot_revision_id = matched_snapshot_id;
+    out->assigned_at = wamble_now_wall();
+  }
+  return DB_OK;
+}
+
+DbStatus db_resolve_treatment_actions(const uint8_t *token, const char *profile,
+                                      const char *hook_name,
+                                      const char *opponent_group_key,
+                                      const WambleFact *facts, int fact_count,
+                                      WambleTreatmentAction *out, int max_out,
+                                      int *out_count) {
+  if (out_count)
+    *out_count = 0;
+  if (!token || !hook_name || !out || max_out <= 0)
+    return DB_ERR_BAD_DATA;
+  const char *profile_key = db_treatment_profile_key(profile);
+  WambleTreatmentAssignment assignment = {0};
+  DbStatus st = db_assign_session_treatment(token, profile_key, facts,
+                                            fact_count, &assignment);
+  if (st != DB_OK)
+    return st;
+  if (opponent_group_key && opponent_group_key[0] &&
+      !db_treatment_edge_allows(profile_key, assignment.group_key,
+                                opponent_group_key))
+    return DB_NOT_FOUND;
+  PGresult *res = pq_exec_params_global_locked(
+      "SELECT hook_name, output_kind, output_key, value_type, "
+      "       COALESCE(value_text, ''), COALESCE(value_num, 0), "
+      "       COALESCE(value_bool, FALSE), COALESCE(value_fact_ref, '') "
+      "FROM global_treatment_group_outputs "
+      "WHERE group_key = $1 AND (hook_name = $2 OR hook_name = '*') "
+      "  AND source = md5($3) "
+      "ORDER BY CASE WHEN hook_name = $2 THEN 0 ELSE 1 END, id",
+      3, NULL, (const char *[]){assignment.group_key, hook_name, profile_key},
+      NULL, NULL, 0);
+  if (!res)
+    return DB_ERR_CONN;
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    PQclear(res);
+    return DB_ERR_EXEC;
+  }
+  int n = PQntuples(res);
+  if (n > max_out)
+    n = max_out;
+  for (int i = 0; i < n; i++) {
+    memset(&out[i], 0, sizeof(out[i]));
+    snprintf(out[i].hook_name, sizeof(out[i].hook_name), "%s",
+             PQgetvalue(res, i, 0));
+    snprintf(out[i].output_kind, sizeof(out[i].output_kind), "%s",
+             PQgetvalue(res, i, 1));
+    snprintf(out[i].output_key, sizeof(out[i].output_key), "%s",
+             PQgetvalue(res, i, 2));
+    if (db_materialize_treatment_value_from_row(res, i, facts, fact_count,
+                                                &out[i]) != 0) {
+      memset(&out[i], 0, sizeof(out[i]));
+    }
+  }
+  PQclear(res);
+  if (out_count)
+    *out_count = n;
+  return DB_OK;
+}
+
+int db_treatment_edge_allows(const char *profile, const char *source_group_key,
+                             const char *target_group_key) {
+  if (!source_group_key || !source_group_key[0] || !target_group_key ||
+      !target_group_key[0])
+    return 1;
+  if (db_ensure_global_treatment_schema() != 0)
+    return 1;
+  const char *profile_key = db_treatment_profile_key(profile);
+  PGresult *res = pq_exec_params_global_locked(
+      "SELECT 1 FROM global_treatment_group_edges "
+      "WHERE source_group_key = $1 "
+      "  AND (target_group_key = $2 OR target_group_key = '*') "
+      "  AND source = md5($3) "
+      "LIMIT 1",
+      3, NULL,
+      (const char *[]){source_group_key, target_group_key, profile_key}, NULL,
+      NULL, 0);
+  if (!res)
+    return 1;
+  int allowed =
+      (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) ? 1 : 0;
+  PQclear(res);
+  return allowed;
+}
+
 static int db_get_player_public_key_by_id(uint64_t player_id,
                                           uint8_t out_public_key[32]) {
   const char *query =
@@ -1120,6 +2058,10 @@ DbStatus db_resolve_policy_decision(const uint8_t *token, const char *profile,
   if (PQntuples(res) == 0) {
     PQclear(res);
     out->allowed = 0;
+    db_apply_policy_treatment_overrides(token, profile_name, out, context_key,
+                                        context_value);
+    if (!out->allowed)
+      out->permission_level = 0;
     return DB_OK;
   }
 
@@ -1151,9 +2093,11 @@ DbStatus db_resolve_policy_decision(const uint8_t *token, const char *profile,
   snprintf(out->reason, sizeof(out->reason), "%s", PQgetvalue(res, 0, 4));
   snprintf(out->scope, sizeof(out->scope), "%s", PQgetvalue(res, 0, 5));
   out->allowed = (strcmp(out->effect, "allow") == 0) ? 1 : 0;
+  PQclear(res);
+  db_apply_policy_treatment_overrides(token, profile_name, out, context_key,
+                                      context_value);
   if (!out->allowed)
     out->permission_level = 0;
-  PQclear(res);
   return DB_OK;
 }
 
@@ -1201,7 +2145,6 @@ static DbBoardResult query_board_error(void) {
   out.last_assignment_time = 0;
   out.last_move_time = 0;
   out.reservation_time = 0;
-  out.last_mover_arm = -1;
   out.reserved_for_white = false;
   return out;
 }
@@ -1330,9 +2273,10 @@ DbLeaderboardResult wamble_query_get_leaderboard(uint64_t requester_session_id,
   return qs->get_leaderboard(requester_session_id, leaderboard_type, limit);
 }
 
-uint64_t db_create_session(const uint8_t *token, uint64_t player_id,
-                           int experiment_arm) {
+uint64_t db_create_session(const uint8_t *token, uint64_t player_id) {
   if (!token)
+    return 0;
+  if (db_ensure_profile_treatment_schema() != 0)
     return 0;
 
   uint64_t existing_session_id = 0;
@@ -1343,8 +2287,11 @@ uint64_t db_create_session(const uint8_t *token, uint64_t player_id,
 
   const char *query = "INSERT INTO sessions (token, player_id, "
                       "global_identity_id, config_revision_id, "
-                      "policy_snapshot_revision_id, experiment_arm) "
-                      "VALUES (decode($1, 'hex'), $2, $3, $4, $5, $6) "
+                      "policy_snapshot_revision_id, "
+                      "treatment_group_key, treatment_rule_id, "
+                      "treatment_snapshot_revision_id, treatment_assigned_at) "
+                      "VALUES (decode($1, 'hex'), $2, $3, $4, $5, "
+                      "        NULL, NULL, NULL, NULL) "
                       "RETURNING id";
 
   char token_hex[33];
@@ -1378,16 +2325,11 @@ uint64_t db_create_session(const uint8_t *token, uint64_t player_id,
              active_revision_id);
     revision_param = revision_id_str;
   }
-  char experiment_arm_str[16];
-  snprintf(experiment_arm_str, sizeof(experiment_arm_str), "%d",
-           experiment_arm);
-  const char *paramValues[] = {
-      token_hex,       player_id > 0 ? player_id_str : NULL,
-      identity_id_str, revision_param,
-      revision_param,  experiment_arm_str};
+  const char *paramValues[] = {token_hex, player_id > 0 ? player_id_str : NULL,
+                               identity_id_str, revision_param, revision_param};
 
   PGresult *res =
-      pq_exec_params_locked(query, 6, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 5, NULL, paramValues, NULL, NULL, 0);
 
   if (!res)
     return 0;
@@ -1678,16 +2620,16 @@ int db_async_update_board_assignment_time(uint64_t board_id) {
   return 0;
 }
 
-int db_async_update_board_move_meta(uint64_t board_id, int last_mover_arm) {
+int db_async_update_board_move_meta(uint64_t board_id,
+                                    const char *last_mover_treatment_group) {
   const char *query = "UPDATE boards SET last_move_time = NOW(), "
-                      "last_mover_arm = $2 WHERE id = $1";
+                      "last_mover_treatment_group = $2 "
+                      "WHERE id = $1";
 
   char board_id_str[32];
-  char arm_str[16];
   snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
-  snprintf(arm_str, sizeof(arm_str), "%d", last_mover_arm);
 
-  const char *paramValues[] = {board_id_str, arm_str};
+  const char *paramValues[] = {board_id_str, last_mover_treatment_group};
 
   PGresult *res =
       pq_exec_params_locked(query, 2, NULL, paramValues, NULL, NULL, 0);
@@ -1740,14 +2682,13 @@ int db_async_update_board_reservation_meta(uint64_t board_id,
 DbBoardResult db_get_board(uint64_t board_id) {
   DbBoardResult out = {0};
   out.status = DB_NOT_FOUND;
-  out.last_mover_arm = -1;
   out.reserved_for_white = false;
   const char *query =
       "SELECT b.fen, b.status, "
       "COALESCE(EXTRACT(EPOCH FROM b.created_at)::bigint, 0), "
       "COALESCE(EXTRACT(EPOCH FROM b.last_assignment_time)::bigint, 0), "
       "COALESCE(EXTRACT(EPOCH FROM b.last_move_time)::bigint, 0), "
-      "COALESCE(b.last_mover_arm, -1), "
+      "COALESCE(b.last_mover_treatment_group, ''), "
       "COALESCE(EXTRACT(EPOCH FROM r.started_at)::bigint, "
       "COALESCE(EXTRACT(EPOCH FROM b.reservation_started_at)::bigint, 0)), "
       "COALESCE(r.reserved_for_white, COALESCE(b.reserved_for_white, FALSE)) "
@@ -1783,13 +2724,8 @@ DbBoardResult db_get_board(uint64_t board_id) {
   out.created_at = (time_t)strtoull(PQgetvalue(res, 0, 2), NULL, 10);
   out.last_assignment_time = (time_t)strtoull(PQgetvalue(res, 0, 3), NULL, 10);
   out.last_move_time = (time_t)strtoull(PQgetvalue(res, 0, 4), NULL, 10);
-  {
-    char *endptr = NULL;
-    long arm = strtol(PQgetvalue(res, 0, 5), &endptr, 10);
-    if (!endptr || *endptr != '\0')
-      arm = -1;
-    out.last_mover_arm = (int)arm;
-  }
+  snprintf(out.last_mover_treatment_group,
+           sizeof(out.last_mover_treatment_group), "%s", PQgetvalue(res, 0, 5));
   out.reservation_time = (time_t)strtoull(PQgetvalue(res, 0, 6), NULL, 10);
   out.reserved_for_white =
       (PQgetvalue(res, 0, 7)[0] == 't' || PQgetvalue(res, 0, 7)[0] == '1');

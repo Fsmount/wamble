@@ -1,4 +1,5 @@
 #include "../include/wamble/wamble.h"
+#include "../include/wamble/wamble_db.h"
 #include <string.h>
 
 typedef struct SpectatorEntry {
@@ -40,6 +41,69 @@ static int is_board_eligible(const WambleBoard *b) {
   if (!b)
     return 0;
   return (b->state == BOARD_STATE_ACTIVE || b->state == BOARD_STATE_RESERVED);
+}
+
+static int collect_board_treatment_facts(const WambleBoard *board,
+                                         WambleFact *facts, int max_facts) {
+  int fact_count = 0;
+  if (!board || !facts || max_facts <= 0)
+    return 0;
+  if (fact_count < max_facts) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "board.id");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+    facts[fact_count].int_value = (int64_t)board->id;
+    fact_count++;
+  }
+  if (fact_count < max_facts) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "board.fen");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+    snprintf(facts[fact_count].string_value,
+             sizeof(facts[fact_count].string_value), "%s", board->fen);
+    fact_count++;
+  }
+  if (fact_count < max_facts) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "board.move_count");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+    facts[fact_count].int_value = board->board.fullmove_number;
+    fact_count++;
+  }
+  return fact_count;
+}
+
+static void spectator_write_visible_fen(const uint8_t *token,
+                                        const WambleBoard *board, char *out_fen,
+                                        size_t out_fen_size) {
+  if (!out_fen || out_fen_size == 0)
+    return;
+  out_fen[0] = '\0';
+  if (!board)
+    return;
+  snprintf(out_fen, out_fen_size, "%s", board->fen);
+  if (!token)
+    return;
+  WambleFact facts[3];
+  memset(facts, 0, sizeof(facts));
+  int fact_count = collect_board_treatment_facts(board, facts, 3);
+  WambleTreatmentAction actions[8];
+  int action_count = 0;
+  if (db_resolve_treatment_actions(
+          token, wamble_runtime_profile_key(), "board.read",
+          board->last_mover_treatment_group, facts, fact_count, actions, 8,
+          &action_count) != DB_OK) {
+    return;
+  }
+  for (int i = 0; i < action_count; i++) {
+    if (strcmp(actions[i].output_kind, "view") != 0 ||
+        strcmp(actions[i].output_key, "board.fen") != 0 ||
+        actions[i].value_type != WAMBLE_TREATMENT_VALUE_STRING ||
+        !actions[i].string_value[0]) {
+      continue;
+    }
+    snprintf(out_fen, out_fen_size, "%s", actions[i].string_value);
+  }
 }
 
 static double board_attractiveness(const WambleBoard *b) {
@@ -443,8 +507,7 @@ static void fill_summary_now(SpectatorEntry *e, SpectatorUpdate *out,
         continue;
     }
     u->board_id = b->id;
-    strncpy(u->fen, b->fen, FEN_MAX_LENGTH);
-    u->fen[FEN_MAX_LENGTH - 1] = '\0';
+    spectator_write_visible_fen(e->token, b, u->fen, sizeof(u->fen));
     u->addr = e->addr;
     (*out_count)++;
   }
@@ -546,8 +609,7 @@ int spectator_collect_updates(struct SpectatorUpdate *out, int max) {
             SpectatorUpdate *u = &out[out_count];
             memcpy(u->token, e->token, TOKEN_LENGTH);
             u->board_id = b->id;
-            strncpy(u->fen, b->fen, FEN_MAX_LENGTH);
-            u->fen[FEN_MAX_LENGTH - 1] = '\0';
+            spectator_write_visible_fen(e->token, b, u->fen, sizeof(u->fen));
             u->addr = e->addr;
             out_count++;
           }

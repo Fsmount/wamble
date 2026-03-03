@@ -264,6 +264,35 @@ static int apply_sql_stream(PGconn *c, const char *sql) {
 }
 #endif
 
+#ifdef WAMBLE_ENABLE_DB
+static int relation_exists(PGconn *c, const char *name) {
+  if (!c || !name || !*name)
+    return 0;
+  PGresult *r =
+      PQexecParams(c,
+                   "SELECT 1 FROM information_schema.tables "
+                   "WHERE table_schema = current_schema() AND table_name = $1",
+                   1, NULL, (const char *const[]){name}, NULL, NULL, 0);
+  if (!r)
+    return 0;
+  int exists =
+      (PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) > 0) ? 1 : 0;
+  PQclear(r);
+  return exists;
+}
+
+static int migrations_already_applied(void) {
+  PGconn *c = db_connect();
+  if (!c)
+    return 0;
+  int ready = relation_exists(c, "players") && relation_exists(c, "sessions") &&
+              relation_exists(c, "global_policy_rules") &&
+              relation_exists(c, "global_treatment_group_outputs");
+  PQfinish(c);
+  return ready;
+}
+#endif
+
 int test_db_apply_sql_file(const char *sql_path) {
 #ifdef WAMBLE_ENABLE_DB
   PGconn *c = db_connect();
@@ -303,6 +332,8 @@ int test_db_apply_sql_file(const char *sql_path) {
 
 int test_db_apply_migrations(const char *schema_name) {
 #ifdef WAMBLE_ENABLE_DB
+  if ((!schema_name || !*schema_name) && migrations_already_applied())
+    return 0;
   if (test_db_create_schema_if_needed(schema_name) != 0)
     return -1;
   if (test_db_set_search_path(schema_name) != 0)
@@ -330,8 +361,13 @@ int test_db_apply_migrations(const char *schema_name) {
     return -1;
   if (test_db_apply_sql_file("migrations/009_global_identity_tags.sql") != 0)
     return -1;
-  return test_db_apply_sql_file(
-      "migrations/010_profile_prediction_resolution.sql");
+  if (test_db_apply_sql_file(
+          "migrations/010_profile_prediction_resolution.sql") != 0)
+    return -1;
+  if (test_db_apply_sql_file("migrations/011_profile_treatment_groups.sql") !=
+      0)
+    return -1;
+  return test_db_apply_sql_file("migrations/011_global_treatment_groups.sql");
 #else
   (void)schema_name;
   return -1;
