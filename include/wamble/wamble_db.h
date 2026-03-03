@@ -19,8 +19,12 @@ int db_write_batch_begin(void);
 int db_write_batch_commit(void);
 void db_write_batch_rollback(void);
 
-uint64_t db_create_session(const uint8_t *token, uint64_t player_id,
-                           int experiment_arm);
+uint64_t db_create_session(const uint8_t *token, uint64_t player_id);
+DbStatus db_assign_session_treatment(const uint8_t *token, const char *profile,
+                                     const WambleFact *facts, int fact_count,
+                                     WambleTreatmentAssignment *out);
+DbStatus db_get_session_treatment_assignment(const uint8_t *token,
+                                             WambleTreatmentAssignment *out);
 DbStatus db_get_session_by_token(const uint8_t *token, uint64_t *out_session);
 DbStatus db_get_persistent_session_by_token(const uint8_t *token,
                                             uint64_t *out_session);
@@ -32,7 +36,8 @@ int db_insert_board(uint64_t board_id, const char *fen, const char *status);
 int db_async_update_board(uint64_t board_id, const char *fen,
                           const char *status);
 int db_async_update_board_assignment_time(uint64_t board_id);
-int db_async_update_board_move_meta(uint64_t board_id, int last_mover_arm);
+int db_async_update_board_move_meta(uint64_t board_id,
+                                    const char *last_mover_treatment_group);
 int db_async_update_board_reservation_meta(uint64_t board_id,
                                            time_t reservation_time,
                                            int reserved_for_white);
@@ -91,6 +96,16 @@ DbStatus db_resolve_policy_decision(const uint8_t *token, const char *profile,
                                     const char *context_value,
                                     WamblePolicyDecision *out);
 int db_apply_config_policy_rules(const char *profile_key);
+int db_validate_global_treatments(void);
+int db_apply_config_treatment_rules(const char *profile_key);
+DbStatus db_resolve_treatment_actions(const uint8_t *token, const char *profile,
+                                      const char *hook_name,
+                                      const char *opponent_group_key,
+                                      const WambleFact *facts, int fact_count,
+                                      WambleTreatmentAction *out, int max_out,
+                                      int *out_count);
+int db_treatment_edge_allows(const char *profile, const char *source_group_key,
+                             const char *target_group_key);
 
 void db_archive_inactive_boards(int timeout_seconds);
 
@@ -176,7 +191,7 @@ typedef struct WamblePersistenceIntent {
     struct {
       uint8_t token[TOKEN_LENGTH];
       uint64_t player_id;
-      int experiment_arm;
+      char treatment_group_key[128];
     } create_session;
     struct {
       uint8_t token[TOKEN_LENGTH];
@@ -195,7 +210,7 @@ typedef struct WamblePersistenceIntent {
     } record_move;
     struct {
       uint64_t board_id;
-      int last_mover_arm;
+      char last_mover_treatment_group[128];
     } update_board_move_meta;
     struct {
       uint64_t board_id;

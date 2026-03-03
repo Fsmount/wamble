@@ -204,18 +204,25 @@ void wamble_emit_create_session(const uint8_t *token, uint64_t player_id) {
   it.type = WAMBLE_INTENT_CREATE_SESSION;
   memcpy(it.as.create_session.token, token, TOKEN_LENGTH);
   it.as.create_session.player_id = player_id;
-  it.as.create_session.experiment_arm =
-      (int)network_experiment_arm_for_token(token);
+  it.as.create_session.treatment_group_key[0] = '\0';
   intents_push(it);
 }
 
-void wamble_emit_update_board_move_meta(uint64_t board_id, int last_mover_arm) {
+void wamble_emit_update_board_move_meta(uint64_t board_id,
+                                        const char *group_key) {
   if (board_id == 0)
     return;
   struct WamblePersistenceIntent it = {0};
   it.type = WAMBLE_INTENT_UPDATE_BOARD_MOVE_META;
   it.as.update_board_move_meta.board_id = board_id;
-  it.as.update_board_move_meta.last_mover_arm = last_mover_arm;
+  if (group_key) {
+    size_t n = strnlen(
+        group_key,
+        sizeof(it.as.update_board_move_meta.last_mover_treatment_group) - 1);
+    memcpy(it.as.update_board_move_meta.last_mover_treatment_group, group_key,
+           n);
+    it.as.update_board_move_meta.last_mover_treatment_group[n] = '\0';
+  }
   intents_push(it);
 }
 
@@ -406,8 +413,7 @@ static int apply_one_intent_db(const struct WamblePersistenceIntent *it,
   }
   case WAMBLE_INTENT_CREATE_SESSION: {
     uint64_t sid = db_create_session(it->as.create_session.token,
-                                     it->as.create_session.player_id,
-                                     it->as.create_session.experiment_arm);
+                                     it->as.create_session.player_id);
     cache_put_session(cache, it->as.create_session.token,
                       sid > 0 ? DB_OK : DB_ERR_EXEC, sid);
     return sid > 0 ? 0 : -1;
@@ -453,7 +459,7 @@ static int apply_one_intent_db(const struct WamblePersistenceIntent *it,
   case WAMBLE_INTENT_UPDATE_BOARD_MOVE_META:
     return db_async_update_board_move_meta(
         it->as.update_board_move_meta.board_id,
-        it->as.update_board_move_meta.last_mover_arm);
+        it->as.update_board_move_meta.last_mover_treatment_group);
   case WAMBLE_INTENT_UPDATE_BOARD_RESERVATION_META:
     return db_async_update_board_reservation_meta(
         it->as.update_board_reservation_meta.board_id,

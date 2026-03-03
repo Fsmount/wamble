@@ -454,7 +454,6 @@ typedef struct WambleConfig {
   int websocket_port;
   int experiment_enabled;
   int experiment_seed;
-  int experiment_arms;
   int timeout_ms;
   int max_retries;
   int max_message_size;
@@ -513,7 +512,6 @@ typedef struct WambleConfig {
 
   char *state_dir;
   char *websocket_path;
-  char *experiment_pairings;
 } WambleConfig;
 
 typedef enum {
@@ -557,6 +555,86 @@ typedef struct WamblePolicyRuleSpec {
   char *context_value;
 } WamblePolicyRuleSpec;
 
+typedef enum {
+  WAMBLE_TREATMENT_VALUE_NONE = 0,
+  WAMBLE_TREATMENT_VALUE_STRING = 1,
+  WAMBLE_TREATMENT_VALUE_INT = 2,
+  WAMBLE_TREATMENT_VALUE_DOUBLE = 3,
+  WAMBLE_TREATMENT_VALUE_BOOL = 4,
+  WAMBLE_TREATMENT_VALUE_FACT_REF = 5,
+} WambleTreatmentValueType;
+
+typedef struct WambleTreatmentValueSpec {
+  WambleTreatmentValueType type;
+  char *string_value;
+  int64_t int_value;
+  double double_value;
+  int bool_value;
+  char *fact_key;
+} WambleTreatmentValueSpec;
+
+typedef struct WambleTreatmentGroupSpec {
+  char *group_key;
+  int priority;
+  int is_default;
+} WambleTreatmentGroupSpec;
+
+typedef struct WambleTreatmentRulePredicateSpec {
+  char *fact_key;
+  char *op;
+  WambleTreatmentValueSpec value;
+} WambleTreatmentRulePredicateSpec;
+
+typedef struct WambleTreatmentRuleSpec {
+  char *identity_selector;
+  char *profile_scope;
+  char *group_key;
+  int priority;
+  int predicate_count;
+  WambleTreatmentRulePredicateSpec *predicates;
+} WambleTreatmentRuleSpec;
+
+typedef struct WambleTreatmentEdgeSpec {
+  char *source_group_key;
+  char *target_group_key;
+} WambleTreatmentEdgeSpec;
+
+typedef struct WambleTreatmentOutputSpec {
+  char *group_key;
+  char *hook_name;
+  char *output_kind;
+  char *output_key;
+  WambleTreatmentValueSpec value;
+} WambleTreatmentOutputSpec;
+
+typedef struct WambleFact {
+  char key[128];
+  WambleTreatmentValueType value_type;
+  char string_value[256];
+  int64_t int_value;
+  double double_value;
+  int bool_value;
+} WambleFact;
+
+typedef struct WambleTreatmentAssignment {
+  uint64_t group_id;
+  uint64_t rule_id;
+  uint64_t snapshot_revision_id;
+  time_t assigned_at;
+  char group_key[128];
+} WambleTreatmentAssignment;
+
+typedef struct WambleTreatmentAction {
+  char hook_name[64];
+  char output_kind[32];
+  char output_key[128];
+  WambleTreatmentValueType value_type;
+  char string_value[256];
+  int64_t int_value;
+  double double_value;
+  int bool_value;
+} WambleTreatmentAction;
+
 int config_policy_rule_count(void);
 const WamblePolicyRuleSpec *config_policy_rule_get(int index);
 int config_has_policy_eval(void);
@@ -565,6 +643,14 @@ int config_policy_eval(const char *identity_selector, const char *action,
                        const char *profile_group, const char *context_key,
                        const char *context_value, int64_t now_epoch_seconds,
                        WamblePolicyDecision *out);
+int config_treatment_group_count(void);
+const WambleTreatmentGroupSpec *config_treatment_group_get(int index);
+int config_treatment_rule_count(void);
+const WambleTreatmentRuleSpec *config_treatment_rule_get(int index);
+int config_treatment_edge_count(void);
+const WambleTreatmentEdgeSpec *config_treatment_edge_get(int index);
+int config_treatment_output_count(void);
+const WambleTreatmentOutputSpec *config_treatment_output_get(int index);
 
 typedef enum {
   PROFILE_START_OK = 0,
@@ -767,7 +853,7 @@ typedef struct {
   time_t last_assignment_time;
   time_t last_move_time;
   time_t reservation_time;
-  int last_mover_arm;
+  char last_mover_treatment_group[128];
   bool reserved_for_white;
 } DbBoardResult;
 
@@ -1024,13 +1110,11 @@ typedef struct WambleBoard {
   time_t last_move_time;
   time_t creation_time;
   time_t last_assignment_time;
-  uint16_t last_mover_arm;
+  char last_mover_treatment_group[128];
   uint8_t reservation_player_token[TOKEN_LENGTH];
   bool reserved_for_white;
   time_t reservation_time;
 } WambleBoard;
-
-#define WAMBLE_EXPERIMENT_ARM_NULL UINT16_MAX
 
 typedef struct WambleClientSession {
   struct sockaddr_in addr;
@@ -1038,7 +1122,7 @@ typedef struct WambleClientSession {
   uint32_t last_seq_num;
   time_t last_seen;
   uint32_t next_seq_num;
-  uint16_t experiment_arm;
+  char treatment_group_key[128];
 } WambleClientSession;
 
 int validate_and_apply_move_status(WambleBoard *wamble_board,
@@ -1133,8 +1217,8 @@ void player_manager_tick(void);
 WamblePlayer *get_player_by_token(const uint8_t *token);
 void discard_player_by_token(const uint8_t *token);
 void network_init_thread_state(void);
-uint16_t network_experiment_arm_for_token(const uint8_t *token);
-int network_get_session_experiment_arm(const uint8_t *token, uint16_t *out_arm);
+int network_get_session_treatment_group(const uint8_t *token, char *out_group,
+                                        size_t out_group_size);
 
 void cleanup_expired_sessions(void);
 
@@ -1184,7 +1268,8 @@ void wamble_emit_remove_reservation(uint64_t board_id);
 void wamble_emit_record_game_result(uint64_t board_id, char winning_side,
                                     int move_count, int duration_seconds,
                                     const char *termination_reason);
-void wamble_emit_update_board_move_meta(uint64_t board_id, int last_mover_arm);
+void wamble_emit_update_board_move_meta(uint64_t board_id,
+                                        const char *group_key);
 void wamble_emit_update_board_reservation_meta(uint64_t board_id,
                                                time_t reservation_time,
                                                bool reserved_for_white);

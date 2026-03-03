@@ -7,10 +7,12 @@ Wamble is a multiplayer chess variant where after every move you're switched to 
 ### Host facing
 
 - Single config file with a small Lisp inspired syntax.
-- Config reload on POSIX is triggered with `SIGHUP`
+- Config reload on POSIX is triggered with `SIGHUP`.
 - Exec-based hot reload without dropping sockets or cached boards is triggered with `SIGUSR2`.
-- Run multiple profiles in one process. Each profile has its own port, DB creds/connection, and visibility tier; advertised profiles get their own UDP listener thread.
-- PostgreSQL stores everything?
+- Run multiple profiles in one process. Each profile has its own port, game DB connection, visibility tier, and optional profile-group selector; advertised profiles get their own UDP listener thread.
+- Split PostgreSQL topology: profile DBs hold game/session state, while one shared global DB holds identities, tags, policy rules, config snapshots, and treatment configuration.
+- Lisp-configured policy rules for trust tiers, profile discovery, and protocol/resource authorization.
+- Profile-scoped treatment groups with defaults, predicate-based assignment, directed group edges, persistent tags, and hook-specific outputs.
 - Compact UDP based protocol with ACKs, retries, and NAT session binding.
 - Board pool manager sizes itself, keeps some games in memory, and archives idle/finished boards.
 
@@ -19,9 +21,11 @@ Wamble is a multiplayer chess variant where after every move you're switched to 
 - After every move you're switched to a new board from the shared pool.
 - Matching weights game phase and experience so new players get new-ish games and veterans get middle/end game positions.
 - Spectate a summary feed or lock onto one board.
-- Play anonymously or for persistentcy attach a key.
+- Play anonymously or attach a key for persistent identity.
 - Legal move hints, UCI is validated by a bitboard engine.
-- Scored by pot rewarding contributors of each board.
+- Prediction mode with per-hook treatment control for gating, pending limits, scoring bonuses, and read depth.
+- Scored by pot rewarding contributors of each board, with treatment-aware scoring and rating adjustments.
+- Trust-aware profile discovery and visibility.
 - [planned] skill level rating
 
 ## Getting Started
@@ -33,22 +37,33 @@ Wamble is a multiplayer chess variant where after every move you're switched to 
 
 ### Database Setup
 
-1.  Install PostgreSQL
+1.  Install PostgreSQL.
 
-2.  Create a database and user for Wamble. ig you can do this by running:
+2.  Create one profile database and one global database, plus a user or multiple, ig you can do this by running:
 
     ```sql
-    CREATE DATABASE wamble;
+    CREATE DATABASE wamble_profile;
+    CREATE DATABASE wamble_global;
     CREATE USER wamble_user WITH PASSWORD 'your_password_here';
-    GRANT ALL PRIVILEGES ON DATABASE wamble TO wamble_user;
+    GRANT ALL PRIVILEGES ON DATABASE wamble_profile TO wamble_user;
+    GRANT ALL PRIVILEGES ON DATABASE wamble_global TO wamble_user;
     ```
 
-3.  Apply profile and global migrations separately:
+3.  Build the DB helper:
+
+    ```sh
+    c99 -O2 -std=c99 tools/wamble_db_tool.c -lpq -o build/wamble_db_tool
+    ```
+
+4.  Apply profile and global migrations separately:
 
     ```sh
     WAMBLE_TEST_DSN=postgres://user:pass@localhost:5432/wamble_profile build/wamble_db_tool --migrate-profile
     WAMBLE_TEST_DSN=postgres://user:pass@localhost:5432/wamble_global build/wamble_db_tool --migrate-global
     ```
+
+5.  Point your config at both stores:
+    `db-*` settings for the profile DB and `global-db-*` settings for the shared global DB.
 
 ### Building Wamble
 
@@ -97,7 +112,8 @@ Artifacts are placed under `build/`
 - Set `WAMBLE_TEST_DSN` to point tests/tools at a Postgres instance, e.g. `export WAMBLE_TEST_DSN=postgres://user:pass@localhost:5432/wamble_test`.
 - To temporarily skip DB-backed tests without rebuilding, set `WAMBLE_SKIP_DB_TESTS=1`.
 - The helper tool `build/wamble_db_tool` is built when DB support is enabled (default). Examples:
-  - Migrate schema: `WAMBLE_TEST_DSN=... build/wamble_db_tool --schema test_schema --migrate`
+  - Migrate a profile schema: `WAMBLE_TEST_DSN=... build/wamble_db_tool --schema test_schema --migrate-profile`
+  - Migrate a global schema: `WAMBLE_TEST_DSN=... build/wamble_db_tool --schema test_schema --migrate-global`
   - Load fixtures: `WAMBLE_TEST_DSN=... build/wamble_db_tool --schema test_schema --fixture`
   - Reset tables: `WAMBLE_TEST_DSN=... build/wamble_db_tool --schema test_schema --reset`
 

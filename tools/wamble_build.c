@@ -620,6 +620,8 @@ int main(int argc, char **argv) {
       sv_push(&targs, "/Itests/common");
 
       sv_push(&targs, "/DWAMBLE_TEST_ONLY");
+      if (with_db)
+        sv_push(&targs, "/DWAMBLE_ENABLE_DB");
       sv_push(&targs, "tests/common/wamble_test.c");
       sv_push(&targs, "tests/common/wamble_test_helpers.c");
       sv_push(&targs, "tests/common/wamble_net_helpers.c");
@@ -643,6 +645,8 @@ int main(int argc, char **argv) {
       sv_push(&targs, "-Itests/common");
 
       sv_push(&targs, "-DWAMBLE_TEST_ONLY");
+      if (with_db)
+        sv_push(&targs, "-DWAMBLE_ENABLE_DB");
       sv_push(&targs, "tests/common/wamble_test.c");
       sv_push(&targs, "tests/common/wamble_test_helpers.c");
       sv_push(&targs, "tests/common/wamble_net_helpers.c");

@@ -36,9 +36,177 @@ static int resolve_profile_trust_tier(const uint8_t *token,
   WamblePolicyDecision trust_decision;
   DbStatus st = qs->resolve_policy_decision(
       token, profile_name, "trust.tier", "tier", NULL, NULL, &trust_decision);
-  return (st == DB_OK && trust_decision.allowed)
-             ? trust_decision.permission_level
-             : 0;
+  int trust_tier = (st == DB_OK && trust_decision.allowed)
+                       ? trust_decision.permission_level
+                       : 0;
+
+  WambleFact facts[2];
+  int fact_count = 0;
+  memset(facts, 0, sizeof(facts));
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "trust.tier");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+  facts[fact_count].int_value = trust_tier;
+  fact_count++;
+  if (profile_name && profile_name[0]) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "profile.name");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+    snprintf(facts[fact_count].string_value,
+             sizeof(facts[fact_count].string_value), "%s", profile_name);
+    fact_count++;
+  }
+
+  WambleTreatmentAction actions[8];
+  int action_count = 0;
+  if (db_resolve_treatment_actions(token, profile_name ? profile_name : "",
+                                   "trust.resolve", NULL, facts, fact_count,
+                                   actions, 8, &action_count) == DB_OK) {
+    for (int i = 0; i < action_count; i++) {
+      if (strcmp(actions[i].output_kind, "behavior") != 0)
+        continue;
+      if (strcmp(actions[i].output_key, "trust.tier.set") == 0 &&
+          actions[i].value_type == WAMBLE_TREATMENT_VALUE_INT) {
+        trust_tier = (int)actions[i].int_value;
+      } else if (strcmp(actions[i].output_key, "trust.tier.delta") == 0 &&
+                 actions[i].value_type == WAMBLE_TREATMENT_VALUE_INT) {
+        trust_tier += (int)actions[i].int_value;
+      } else if (strcmp(actions[i].output_key, "trust.tier.min") == 0 &&
+                 actions[i].value_type == WAMBLE_TREATMENT_VALUE_INT &&
+                 trust_tier < (int)actions[i].int_value) {
+        trust_tier = (int)actions[i].int_value;
+      }
+    }
+  }
+  if (trust_tier < 0)
+    trust_tier = 0;
+  return trust_tier;
+}
+
+static int collect_board_treatment_facts(const WambleBoard *board,
+                                         WambleFact *facts, int max_facts) {
+  int fact_count = 0;
+  if (!board || !facts || max_facts <= 0)
+    return 0;
+  if (fact_count < max_facts) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "board.id");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+    facts[fact_count].int_value = (int64_t)board->id;
+    fact_count++;
+  }
+  if (fact_count < max_facts) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "board.fen");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+    snprintf(facts[fact_count].string_value,
+             sizeof(facts[fact_count].string_value), "%s", board->fen);
+    fact_count++;
+  }
+  if (fact_count < max_facts) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "board.move_count");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+    facts[fact_count].int_value = board->board.fullmove_number;
+    fact_count++;
+  }
+  return fact_count;
+}
+
+static void write_visible_board_fen(const uint8_t *token,
+                                    const char *profile_name,
+                                    const WambleBoard *board, char *out_fen,
+                                    size_t out_fen_size) {
+  if (!out_fen || out_fen_size == 0)
+    return;
+  out_fen[0] = '\0';
+  if (!board)
+    return;
+  snprintf(out_fen, out_fen_size, "%s", board->fen);
+  if (!token)
+    return;
+
+  WambleFact facts[3];
+  memset(facts, 0, sizeof(facts));
+  int fact_count = collect_board_treatment_facts(board, facts, 3);
+  WambleTreatmentAction actions[8];
+  int action_count = 0;
+  if (db_resolve_treatment_actions(
+          token, profile_name ? profile_name : "", "board.read",
+          board->last_mover_treatment_group, facts, fact_count, actions, 8,
+          &action_count) != DB_OK) {
+    return;
+  }
+  for (int i = 0; i < action_count; i++) {
+    if (strcmp(actions[i].output_kind, "view") != 0 ||
+        strcmp(actions[i].output_key, "board.fen") != 0 ||
+        actions[i].value_type != WAMBLE_TREATMENT_VALUE_STRING ||
+        !actions[i].string_value[0]) {
+      continue;
+    }
+    snprintf(out_fen, out_fen_size, "%s", actions[i].string_value);
+  }
+}
+
+static int prediction_read_uses_move_projection(const uint8_t *token,
+                                                const char *profile_name,
+                                                const WambleBoard *board) {
+  if (!token || !board)
+    return 0;
+  WambleFact facts[3];
+  memset(facts, 0, sizeof(facts));
+  int fact_count = collect_board_treatment_facts(board, facts, 3);
+  WambleTreatmentAction actions[8];
+  int action_count = 0;
+  if (db_resolve_treatment_actions(
+          token, profile_name ? profile_name : "", "prediction.read",
+          board->last_mover_treatment_group, facts, fact_count, actions, 8,
+          &action_count) != DB_OK) {
+    return 0;
+  }
+  for (int i = 0; i < action_count; i++) {
+    if (strcmp(actions[i].output_kind, "view") == 0 &&
+        strcmp(actions[i].output_key, "prediction.source") == 0 &&
+        actions[i].value_type == WAMBLE_TREATMENT_VALUE_STRING &&
+        strcmp(actions[i].string_value, "moves") == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static PredictionStatus
+prediction_collect_move_projection(uint64_t board_id, WamblePredictionView *out,
+                                   int max_out, int *out_count) {
+  if (out_count)
+    *out_count = 0;
+  if (!out || max_out <= 0)
+    return PREDICTION_ERR_INVALID;
+  DbMovesResult mres = wamble_query_get_moves_for_board(board_id);
+  if (mres.status != DB_OK)
+    return PREDICTION_ERR_NOT_FOUND;
+  int count = mres.count;
+  if (count < 0)
+    count = 0;
+  if (count > max_out)
+    count = max_out;
+  for (int i = 0; i < count; i++) {
+    memset(&out[i], 0, sizeof(out[i]));
+    out[i].id = mres.rows[i].id;
+    out[i].parent_id = (i > 0) ? mres.rows[i - 1].id : 0;
+    out[i].board_id = mres.rows[i].board_id;
+    memcpy(out[i].player_token, mres.rows[i].player_token, TOKEN_LENGTH);
+    snprintf(out[i].predicted_move_uci, sizeof(out[i].predicted_move_uci), "%s",
+             mres.rows[i].uci_move);
+    snprintf(out[i].status, sizeof(out[i].status), "%s", "CORRECT");
+    out[i].target_ply = i + 1;
+    out[i].depth = 0;
+    out[i].points_awarded = 0.0;
+    out[i].created_at = mres.rows[i].timestamp;
+  }
+  if (out_count)
+    *out_count = count;
+  return PREDICTION_OK;
 }
 
 typedef enum {
@@ -294,7 +462,8 @@ send_prediction_rows(wamble_socket_t sockfd, const struct sockaddr_in *cliaddr,
 
 static ServerStatus handle_client_hello(wamble_socket_t sockfd,
                                         const struct WambleMsg *msg,
-                                        const struct sockaddr_in *cliaddr) {
+                                        const struct sockaddr_in *cliaddr,
+                                        const char *profile_name) {
   uint32_t client_version = msg->seq_num;
   if (client_version < WAMBLE_MIN_CLIENT_VERSION)
     client_version = WAMBLE_MIN_CLIENT_VERSION;
@@ -339,11 +508,8 @@ static ServerStatus handle_client_hello(wamble_socket_t sockfd,
   memcpy(response.token, player->token, TOKEN_LENGTH);
   response.board_id = board->id;
   response.seq_num = WAMBLE_PROTO_VERSION;
-  {
-    size_t __len = strnlen(board->fen, FEN_MAX_LENGTH - 1);
-    memcpy(response.fen, board->fen, __len);
-    response.fen[__len] = '\0';
-  }
+  write_visible_board_fen(msg->token, profile_name, board, response.fen,
+                          sizeof(response.fen));
 
   if (send_reliable_message(sockfd, &response, cliaddr,
                             get_config()->timeout_ms,
@@ -411,11 +577,8 @@ static ServerStatus handle_player_move(wamble_socket_t sockfd,
   response.board_id = next_board->id;
   response.seq_num = 0;
   response.uci_len = 0;
-  {
-    size_t __len = strnlen(next_board->fen, FEN_MAX_LENGTH - 1);
-    memcpy(response.fen, next_board->fen, __len);
-    response.fen[__len] = '\0';
-  }
+  write_visible_board_fen(msg->token, profile_name, next_board, response.fen,
+                          sizeof(response.fen));
 
   if (send_reliable_message(sockfd, &response, cliaddr,
                             get_config()->timeout_ms,
@@ -474,7 +637,8 @@ handle_submit_prediction(wamble_socket_t sockfd, const struct WambleMsg *msg,
 
 static ServerStatus handle_get_predictions(wamble_socket_t sockfd,
                                            const struct sockaddr_in *cliaddr,
-                                           const struct WambleMsg *msg) {
+                                           const struct WambleMsg *msg,
+                                           const char *profile_name) {
   WamblePredictionView rows[WAMBLE_MAX_PREDICTION_ENTRIES];
   int count = 0;
   int depth = msg->prediction_depth;
@@ -484,8 +648,13 @@ static ServerStatus handle_get_predictions(wamble_socket_t sockfd,
   if (limit <= 0 || limit > WAMBLE_MAX_PREDICTION_ENTRIES)
     limit = WAMBLE_MAX_PREDICTION_ENTRIES;
 
-  PredictionStatus st = prediction_collect_tree(msg->board_id, msg->token, 0,
-                                                depth, rows, limit, &count);
+  WambleBoard *board = get_board_by_id(msg->board_id);
+  PredictionStatus st =
+      prediction_read_uses_move_projection(msg->token, profile_name, board)
+          ? prediction_collect_move_projection(msg->board_id, rows, limit,
+                                               &count)
+          : prediction_collect_tree(msg->board_id, msg->token, 0, depth, rows,
+                                    limit, &count);
   if (st != PREDICTION_OK) {
     struct WambleMsg out = {0};
     out.ctrl = WAMBLE_CTRL_ERROR;
@@ -506,6 +675,10 @@ static ServerStatus handle_get_predictions(wamble_socket_t sockfd,
 ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
                             const struct sockaddr_in *cliaddr, int trust_tier,
                             const char *profile_name) {
+  int effective_trust_tier = trust_tier;
+  if (msg) {
+    effective_trust_tier = resolve_profile_trust_tier(msg->token, profile_name);
+  }
   if (msg->ctrl != WAMBLE_CTRL_CLIENT_HELLO && msg->ctrl != WAMBLE_CTRL_ACK) {
     WamblePolicyDecision bypass = {0};
     const char *ctrl_res = ctrl_policy_resource(msg->ctrl);
@@ -539,7 +712,7 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
   }
   switch (msg->ctrl) {
   case WAMBLE_CTRL_CLIENT_HELLO:
-    return handle_client_hello(sockfd, msg, cliaddr);
+    return handle_client_hello(sockfd, msg, cliaddr, profile_name);
   case WAMBLE_CTRL_PLAYER_MOVE:
     if ((msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0)
       send_ack(sockfd, msg, cliaddr);
@@ -555,7 +728,7 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
       const WambleProfile *p = config_get_profile(i);
       if (!p)
         continue;
-      if (!profile_discovery_allowed(msg->token, p, trust_tier))
+      if (!profile_discovery_allowed(msg->token, p, effective_trust_tier))
         continue;
       const char *name = p->name ? p->name : "";
       int need = (int)strlen(name);
@@ -584,7 +757,7 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     struct WambleMsg resp = {0};
     resp.ctrl = WAMBLE_CTRL_PROFILE_INFO;
     memcpy(resp.token, msg->token, TOKEN_LENGTH);
-    if (p && profile_discovery_allowed(msg->token, p, trust_tier)) {
+    if (p && profile_discovery_allowed(msg->token, p, effective_trust_tier)) {
       snprintf(resp.fen, FEN_MAX_LENGTH, "%s;%d;%d;%d", p->name, p->config.port,
                p->advertise, p->visibility);
     } else {
@@ -656,8 +829,9 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     int capacity_bypass =
         policy_check(msg->token, profile_name, "spectate.capacity_bypass",
                      "focus", NULL, NULL, NULL);
-    SpectatorRequestStatus res = spectator_handle_request(
-        msg, cliaddr, trust_tier, capacity_bypass, &new_state, &focus_id);
+    SpectatorRequestStatus res =
+        spectator_handle_request(msg, cliaddr, effective_trust_tier,
+                                 capacity_bypass, &new_state, &focus_id);
     if (!(res == SPECTATOR_OK_FOCUS || res == SPECTATOR_OK_SUMMARY ||
           res == SPECTATOR_OK_STOP)) {
       struct WambleMsg out = {0};
@@ -678,8 +852,8 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
       send_ack(sockfd, msg, cliaddr);
     SpectatorState new_state = SPECTATOR_STATE_IDLE;
     uint64_t focus_id = 0;
-    (void)spectator_handle_request(msg, cliaddr, trust_tier, 0, &new_state,
-                                   &focus_id);
+    (void)spectator_handle_request(msg, cliaddr, effective_trust_tier, 0,
+                                   &new_state, &focus_id);
     return SERVER_OK;
   }
   case WAMBLE_CTRL_GET_PLAYER_STATS: {
@@ -759,7 +933,7 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
   case WAMBLE_CTRL_GET_PREDICTIONS:
     if ((msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0)
       send_ack(sockfd, msg, cliaddr);
-    return handle_get_predictions(sockfd, cliaddr, msg);
+    return handle_get_predictions(sockfd, cliaddr, msg, profile_name);
   case WAMBLE_CTRL_GET_LEGAL_MOVES: {
     WamblePolicyDecision decision;
     memset(&decision, 0, sizeof(decision));

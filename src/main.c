@@ -236,7 +236,9 @@ static int bind_active_config_policy(const char *profile_key,
                                               global_conn_str_size);
   if (db_set_global_store_connection(global_conn_str) != 0 ||
       db_apply_config_policy_rules(profile_key) != 0 ||
-      db_validate_global_policy() != 0) {
+      db_validate_global_policy() != 0 ||
+      db_apply_config_treatment_rules(profile_key) != 0 ||
+      db_validate_global_treatments() != 0) {
     return -1;
   }
   return 0;
@@ -539,7 +541,9 @@ int main(int argc, char *argv[]) {
   {
     const char *profile_key = profile_key_for_runtime(profile);
     if (db_apply_config_policy_rules(profile_key) != 0 ||
-        db_validate_global_policy() != 0) {
+        db_validate_global_policy() != 0 ||
+        db_apply_config_treatment_rules(profile_key) != 0 ||
+        db_validate_global_treatments() != 0) {
       LOG_FATAL("Failed to load/validate trust policy");
       return 1;
     }

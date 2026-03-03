@@ -119,12 +119,15 @@ int main(int argc, char **argv) {
     exec_file(c, "migrations/003_profile_leaderboard_indexes.sql");
     exec_file(c, "migrations/004_profile_session_stats_counters.sql");
     exec_file(c, "migrations/008_profile_identity_sessions.sql");
+    exec_file(c, "migrations/010_profile_prediction_resolution.sql");
+    exec_file(c, "migrations/011_profile_treatment_groups.sql");
   }
   if (do_migrate_global) {
     exec_file(c, "migrations/005_global_identity_trust.sql");
     exec_file(c, "migrations/006_global_config_snapshots.sql");
     exec_file(c, "migrations/007_global_policy_runtime_expansion.sql");
     exec_file(c, "migrations/009_global_identity_tags.sql");
+    exec_file(c, "migrations/011_global_treatment_groups.sql");
   }
   if (do_fixture) {
     exec_file(c, "tests/db/fixture.sql");

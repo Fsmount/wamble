@@ -15,17 +15,10 @@ Core Options (common defaults)
   as the TCP websocket port number.
 - `websocket-path` (string, `/ws`): Websocket HTTP upgrade endpoint path.
   - Must start with `/`.
-- `experiment-enabled` (int, 0): Enable hidden server-side experiment arm
-  assignment for sessions on this profile.
-- `experiment-seed` (int, 0): Per-profile deterministic seed used for arm
-  assignment.
-- `experiment-arms` (int, 1): Number of arms (`N`) for this profile's
-  experiment. Sessions are assigned to arm index `0..N-1`.
-- `experiment-pairings` (string, `*`): Allowed `(current_arm:opponent_arm)`
-  tuples for board assignment within a profile. `*` allows all pairs.
-  - Format: comma-separated tuples like `0:0,0:1,1:*` where `*` is wildcard.
-  - `current_arm` is the requesting player's arm.
-  - `opponent_arm` is the arm of the last mover on that board.
+- `experiment-enabled` (int, 0): Enable treatment-group assignment, directed
+  opponent-group edges, and treatment outputs for this profile.
+- `experiment-seed` (int, 0): Reserved for deterministic experiment behavior
+  that depends on a per-profile seed.
 - `timeout-ms` (int, 100): Reliable send ACK timeout (ms).
 - `max-retries` (int, 3): Reliable send retries.
 - `max-message-size` (int, 126): Fixed message body size (informational).
@@ -246,6 +239,46 @@ Custom Policy Evaluator (optional)
   final allow/deny behavior then follows the caller's own default path.
 - Current runtime authorization paths use DB policy resolution
   (`resolve_policy_decision`) as the source of truth.
+
+Treatment Groups
+- DSL forms:
+  - `(treatment-group group-key priority)`
+  - `(treatment-default group-key)`
+  - `(treatment-assign identity-selector profile-scope group-key priority predicate...)`
+  - `(treatment-edge source-group target-group)`
+  - `(treatment-tag group-key tag-name)`
+  - `(treatment-feature group-key hook-name key value)`
+  - `(treatment-context group-key hook-name key value)`
+  - `(treatment-behavior group-key hook-name key value)`
+  - `(treatment-meta group-key hook-name key value)`
+- `predicate` form:
+  - `(match fact-key op value)`
+- Supported ops: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `exists`, `absent`
+- Resolution model:
+  config DSL materializes into DB rows, sessions persist their assigned
+  `treatment_group_key`, and runtime consumers query actions by hook.
+- Outputs:
+  - `tag`: persistent `global_identity_tags` upsert
+  - `feature`, `context`, `behavior`, `meta`: hook-scoped outputs returned by
+    treatment action lookup
+- Hook keys consumed by runtime:
+  - `prediction.submit`
+    - feature: `prediction.gated`
+    - behavior: `prediction.max_pending`, `prediction.points.multiplier`,
+      `prediction.points.bonus`, `prediction.penalty.multiplier`
+  - `prediction.read`
+    - behavior: `prediction.view_depth_cap`
+  - `scoring.apply`
+    - feature: `scoring.disable`
+    - behavior: `payout.multiplier`, `payout.bonus`
+  - `rating.adjust`
+    - feature: `rating.disable`
+    - behavior: `rating.delta`, `rating.multiplier`
+  - `board.assignment`
+    - feature: `board.assignment.disable`
+    - behavior: `board.score.multiplier`, `board.score.bonus`
+  - `trust.resolve`
+    - behavior: `trust.tier.set`, `trust.tier.delta`, `trust.tier.min`
 
 Examples
 - Computed value:

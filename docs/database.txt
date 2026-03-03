@@ -82,6 +82,45 @@ Tables
   - Primary key: `(global_identity_id, tag)`
   - Indexes: `(tag, global_identity_id)`
 
+- global_treatment_groups (shared global DB)
+  - `id BIGSERIAL PRIMARY KEY`
+  - `group_key VARCHAR(128) NOT NULL`
+  - `priority INTEGER NOT NULL`
+  - `is_default BOOLEAN NOT NULL`
+  - `source VARCHAR(32) NOT NULL`
+  - `snapshot_revision_id BIGINT`
+
+- global_treatment_assignment_rules (shared global DB)
+  - `id BIGSERIAL PRIMARY KEY`
+  - `global_identity_id BIGINT NOT NULL`
+  - `profile_scope VARCHAR(256) NOT NULL`
+  - `group_key VARCHAR(128) NOT NULL`
+  - `priority INTEGER NOT NULL`
+  - `source VARCHAR(32) NOT NULL`
+  - `snapshot_revision_id BIGINT`
+
+- global_treatment_assignment_predicates (shared global DB)
+  - `rule_id BIGINT NOT NULL`
+  - `fact_key VARCHAR(128) NOT NULL`
+  - `op VARCHAR(16) NOT NULL`
+  - typed predicate value columns
+
+- global_treatment_group_edges (shared global DB)
+  - `source_group_key VARCHAR(128) NOT NULL`
+  - `target_group_key VARCHAR(128) NOT NULL`
+  - `source VARCHAR(32) NOT NULL`
+  - `snapshot_revision_id BIGINT`
+
+- global_treatment_group_outputs (shared global DB)
+  - `id BIGSERIAL PRIMARY KEY`
+  - `group_key VARCHAR(128) NOT NULL`
+  - `hook_name VARCHAR(64) NOT NULL`
+  - `output_kind VARCHAR(32) NOT NULL`
+  - `output_key VARCHAR(128) NOT NULL`
+  - typed value columns / fact reference
+  - `source VARCHAR(32) NOT NULL`
+  - `snapshot_revision_id BIGINT`
+
 - global_runtime_config_blobs (shared global DB)
   - `content_hash VARCHAR(32) PRIMARY KEY` (md5 of config text)
   - `config_text TEXT NOT NULL`
@@ -151,8 +190,8 @@ Tables
 
 Migrations
 - 001_profile_initial_schema.sql: creates profile DB tables, indexes, triggers.
-- 002_profile_runtime_metadata.sql: adds persisted experiment/session metadata, board
-  move/reservation metadata, and richer game-result fields.
+- 002_profile_runtime_metadata.sql: adds board move/reservation metadata and
+  richer game-result fields.
 - 003_profile_leaderboard_indexes.sql: adds leaderboard-oriented indexes for payouts,
   sessions, and player rating ordering.
 - 004_profile_session_stats_counters.sql: adds persisted per-session counters
@@ -167,6 +206,9 @@ Migrations
 - 008_profile_identity_sessions.sql: profile DB migration for session identity
   linkage (`sessions.global_identity_id`).
 - 009_global_identity_tags.sql: adds identity tags for bulk policy targeting.
+- 011_treatment_groups.sql: adds persisted treatment groups, assignment rules,
+  outputs, directed edges, session assignment columns, and board last-mover
+  treatment metadata.
 
 Trust and Visibility
 - Client trust resolves from identity-scoped policy only, in deterministic

@@ -1,4 +1,5 @@
 #include "../include/wamble/wamble.h"
+#include "../include/wamble/wamble_db.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -279,110 +280,112 @@ static bool is_board_eligible_for_assignment(const WambleBoard *board) {
          board->result == GAME_RESULT_IN_PROGRESS;
 }
 
-static void board_pairing_allow_all(uint8_t *allow, int arms) {
-  if (!allow || arms <= 0)
-    return;
-  memset(allow, 1, (size_t)arms * (size_t)arms);
-}
-
-static int board_parse_pair_term(const char *p, size_t len, int arms,
-                                 int *out_is_wild, int *out_value) {
-  if (!p || !out_is_wild || !out_value || arms <= 0)
-    return -1;
-  if (len == 1 && p[0] == '*') {
-    *out_is_wild = 1;
-    *out_value = 0;
-    return 0;
-  }
-  if (len == 0 || len > 10)
-    return -1;
-  char tmp[16];
-  memcpy(tmp, p, len);
-  tmp[len] = '\0';
-  char *end = NULL;
-  long v = strtol(tmp, &end, 10);
-  if (!end || *end != '\0' || v < 0 || v >= arms)
-    return -1;
-  *out_is_wild = 0;
-  *out_value = (int)v;
-  return 0;
-}
-
-static int board_build_pairing_matrix(const char *spec, int arms,
-                                      uint8_t *allow) {
-  if (!allow || arms <= 0)
-    return -1;
-  if (!spec || !spec[0] || strcmp(spec, "*") == 0) {
-    board_pairing_allow_all(allow, arms);
-    return 0;
-  }
-
-  memset(allow, 0, (size_t)arms * (size_t)arms);
-  const char *cur = spec;
-  while (*cur) {
-    while (*cur == ' ' || *cur == '\t' || *cur == ',')
-      cur++;
-    if (!*cur)
-      break;
-
-    const char *term = cur;
-    while (*cur && *cur != ',')
-      cur++;
-    const char *end = cur;
-    while (end > term && (end[-1] == ' ' || end[-1] == '\t'))
-      end--;
-    const char *colon = memchr(term, ':', (size_t)(end - term));
-    if (!colon)
-      return -1;
-
-    int lhs_wild = 0, rhs_wild = 0, lhs = 0, rhs = 0;
-    if (board_parse_pair_term(term, (size_t)(colon - term), arms, &lhs_wild,
-                              &lhs) != 0 ||
-        board_parse_pair_term(colon + 1, (size_t)(end - (colon + 1)), arms,
-                              &rhs_wild, &rhs) != 0) {
-      return -1;
-    }
-
-    int i_from = lhs_wild ? 0 : lhs;
-    int i_to = lhs_wild ? (arms - 1) : lhs;
-    int j_from = rhs_wild ? 0 : rhs;
-    int j_to = rhs_wild ? (arms - 1) : rhs;
-    for (int i = i_from; i <= i_to; i++) {
-      for (int j = j_from; j <= j_to; j++) {
-        allow[i * arms + j] = 1;
-      }
-    }
-  }
-
-  return 0;
-}
-
 static int board_pairing_allowed_for_player(const WambleBoard *board,
                                             const WamblePlayer *player) {
   if (!board || !player)
     return 0;
-  if (!get_config()->experiment_enabled || get_config()->experiment_arms <= 1)
-    return 1;
-  if (board->last_mover_arm == WAMBLE_EXPERIMENT_ARM_NULL)
+  if (!get_config()->experiment_enabled)
     return 1;
 
-  int arms = get_config()->experiment_arms;
-  if (arms <= 0)
-    arms = 1;
-  if (arms > 64)
-    arms = 64;
-
-  uint16_t cur_arm = network_experiment_arm_for_token(player->token);
-  uint16_t opp_arm = board->last_mover_arm;
-  if ((int)cur_arm >= arms || (int)opp_arm >= arms)
-    return 1;
-
-  uint8_t allow[64 * 64];
-  if (board_build_pairing_matrix(get_config()->experiment_pairings, arms,
-                                 allow) != 0) {
-    board_pairing_allow_all(allow, arms);
+  char current_group[128] = {0};
+  WambleTreatmentAssignment assignment = {0};
+  if (network_get_session_treatment_group(player->token, current_group,
+                                          sizeof(current_group)) != 0 &&
+      db_get_session_treatment_assignment(player->token, &assignment) ==
+          DB_OK) {
+    snprintf(current_group, sizeof(current_group), "%s", assignment.group_key);
   }
-  return allow[(size_t)cur_arm * (size_t)arms + (size_t)opp_arm] ? 1 : 0;
+  if (!board->last_mover_treatment_group[0] || !current_group[0])
+    return 1;
+  return db_treatment_edge_allows(wamble_runtime_profile_key(), current_group,
+                                  board->last_mover_treatment_group);
+}
+
+static double
+board_assignment_action_number(const WambleTreatmentAction *action, int *ok) {
+  if (ok)
+    *ok = 0;
+  if (!action)
+    return 0.0;
+  if (action->value_type == WAMBLE_TREATMENT_VALUE_INT) {
+    if (ok)
+      *ok = 1;
+    return (double)action->int_value;
+  }
+  if (action->value_type == WAMBLE_TREATMENT_VALUE_DOUBLE) {
+    if (ok)
+      *ok = 1;
+    return action->double_value;
+  }
+  return 0.0;
+}
+
+static int board_assignment_apply_treatment(const WambleBoard *board,
+                                            const WamblePlayer *player,
+                                            double *score) {
+  if (!board || !player || !score)
+    return 0;
+  WambleFact facts[4];
+  int fact_count = 0;
+  memset(facts, 0, sizeof(facts));
+
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "board.id");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+  facts[fact_count].int_value = (int64_t)board->id;
+  fact_count++;
+
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "board.move_count");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+  facts[fact_count].int_value = board->board.fullmove_number;
+  fact_count++;
+
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "player.games_played");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+  facts[fact_count].int_value = player->games_played;
+  fact_count++;
+
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "player.rating");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+  facts[fact_count].double_value = player->rating;
+  fact_count++;
+
+  WambleTreatmentAction actions[16];
+  int action_count = 0;
+  if (db_resolve_treatment_actions(player->token, "", "board.assignment",
+                                   board->last_mover_treatment_group, facts,
+                                   fact_count, actions, 16,
+                                   &action_count) != DB_OK) {
+    return 0;
+  }
+
+  for (int i = 0; i < action_count; i++) {
+    const WambleTreatmentAction *action = &actions[i];
+    if (strcmp(action->output_kind, "feature") == 0 &&
+        strcmp(action->output_key, "board.assignment.disable") == 0 &&
+        action->value_type == WAMBLE_TREATMENT_VALUE_BOOL &&
+        action->bool_value) {
+      *score = 0.0;
+      return -1;
+    }
+    if (strcmp(action->output_kind, "behavior") != 0)
+      continue;
+    int ok = 0;
+    double value = board_assignment_action_number(action, &ok);
+    if (!ok)
+      continue;
+    if (strcmp(action->output_key, "board.score.multiplier") == 0) {
+      *score *= value;
+    } else if (strcmp(action->output_key, "board.score.bonus") == 0) {
+      *score += value;
+    }
+  }
+  if (*score < 0.0)
+    *score = 0.0;
+  return 0;
 }
 
 static double calculate_board_attractiveness(const WambleBoard *board,
@@ -428,6 +431,9 @@ static double calculate_board_attractiveness(const WambleBoard *board,
   }
   double recency_factor = log((double)time_since_assignment);
   score *= recency_factor;
+
+  if (board_assignment_apply_treatment(board, player, &score) < 0)
+    return 0.0;
 
   return score;
 }
@@ -480,8 +486,9 @@ static WambleBoard *load_board_into_cache(uint64_t board_id) {
       (br.created_at > 0) ? br.created_at : wamble_now_wall();
   board->last_assignment_time = br.last_assignment_time;
   board->last_move_time = br.last_move_time;
-  board->last_mover_arm = (br.last_mover_arm >= 0) ? (uint16_t)br.last_mover_arm
-                                                   : WAMBLE_EXPERIMENT_ARM_NULL;
+  snprintf(board->last_mover_treatment_group,
+           sizeof(board->last_mover_treatment_group), "%s",
+           br.last_mover_treatment_group);
   memset(board->reservation_player_token, 0, TOKEN_LENGTH);
   board->reservation_time = br.reservation_time;
   board->reserved_for_white = br.reserved_for_white;
@@ -557,13 +564,20 @@ void board_move_played(uint64_t board_id) {
     WambleBoard *board = &board_cached[idx];
 
     if (board->state == BOARD_STATE_RESERVED) {
-      board->last_mover_arm =
-          network_experiment_arm_for_token(board->reservation_player_token);
+      WambleTreatmentAssignment assignment = {0};
+      board->last_mover_treatment_group[0] = '\0';
+      if (db_get_session_treatment_assignment(board->reservation_player_token,
+                                              &assignment) == DB_OK) {
+        snprintf(board->last_mover_treatment_group,
+                 sizeof(board->last_mover_treatment_group), "%s",
+                 assignment.group_key);
+      }
       board->state = BOARD_STATE_ACTIVE;
       board->last_move_time = wamble_now_wall();
 
       wamble_emit_update_board(board->id, board->fen, "ACTIVE");
-      wamble_emit_update_board_move_meta(board->id, (int)board->last_mover_arm);
+      wamble_emit_update_board_move_meta(board->id,
+                                         board->last_mover_treatment_group);
       wamble_emit_remove_reservation(board->id);
       wamble_emit_update_board_reservation_meta(board->id, 0, false);
 
@@ -572,7 +586,8 @@ void board_move_played(uint64_t board_id) {
       board->reserved_for_white = false;
     } else if (board->state == BOARD_STATE_ACTIVE) {
       board->last_move_time = wamble_now_wall();
-      wamble_emit_update_board_move_meta(board->id, (int)board->last_mover_arm);
+      wamble_emit_update_board_move_meta(board->id,
+                                         board->last_mover_treatment_group);
     }
   }
 
@@ -775,9 +790,9 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
       temp_board.state = BOARD_STATE_DORMANT;
       temp_board.result = GAME_RESULT_IN_PROGRESS;
       temp_board.last_assignment_time = br.last_assignment_time;
-      temp_board.last_mover_arm = (br.last_mover_arm >= 0)
-                                      ? (uint16_t)br.last_mover_arm
-                                      : WAMBLE_EXPERIMENT_ARM_NULL;
+      snprintf(temp_board.last_mover_treatment_group,
+               sizeof(temp_board.last_mover_treatment_group), "%s",
+               br.last_mover_treatment_group);
 
       if (!board_pairing_allowed_for_player(&temp_board, player)) {
         continue;
@@ -862,7 +877,7 @@ static int create_new_board_for_player(WamblePlayer *player) {
   parse_fen_to_bitboard(board->fen, &board->board);
   board->last_move_time = now;
   board->creation_time = now;
-  board->last_mover_arm = WAMBLE_EXPERIMENT_ARM_NULL;
+  board->last_mover_treatment_group[0] = '\0';
 
   apply_reservation_to_board(board, player);
 
