@@ -30,6 +30,8 @@ typedef struct WambleHeader {
 
 #define WAMBLE_HEADER_SIZE (sizeof(WambleHeader))
 #define WAMBLE_MAX_PACKET_SIZE (WAMBLE_HEADER_SIZE + WAMBLE_MAX_PAYLOAD)
+#define WAMBLE_PREDICTION_ENTRY_WIRE_SIZE                                      \
+  (8 + 8 + TOKEN_LENGTH + 8 + 2 + 1 + 1 + 1 + MAX_UCI_LENGTH)
 
 static WAMBLE_THREAD_LOCAL WambleClientSession *client_sessions;
 static WAMBLE_THREAD_LOCAL int num_sessions = 0;
@@ -177,12 +179,29 @@ static NetworkStatus serialize_wamble_msg(const struct WambleMsg *msg,
     payload_len = 2;
     break;
   }
+  case WAMBLE_CTRL_GET_PREDICTIONS: {
+    payload[0] = msg->prediction_depth;
+    payload[1] = msg->prediction_limit;
+    payload_len = 2;
+    break;
+  }
   case WAMBLE_CTRL_PLAYER_MOVE: {
     size_t need = 1 + (size_t)msg->uci_len;
     if (need > WAMBLE_MAX_PAYLOAD)
       return NET_ERR_TRUNCATED;
     payload[0] = msg->uci_len;
     memcpy(&payload[1], msg->uci, msg->uci_len);
+    payload_len = need;
+    break;
+  }
+  case WAMBLE_CTRL_SUBMIT_PREDICTION: {
+    size_t need = 1 + (size_t)msg->uci_len + 8;
+    if (need > WAMBLE_MAX_PAYLOAD)
+      return NET_ERR_TRUNCATED;
+    payload[0] = msg->uci_len;
+    memcpy(&payload[1], msg->uci, msg->uci_len);
+    uint64_t parent_be = host_to_net64(msg->prediction_parent_id);
+    memcpy(&payload[1 + msg->uci_len], &parent_be, 8);
     payload_len = need;
     break;
   }
@@ -349,6 +368,42 @@ static NetworkStatus serialize_wamble_msg(const struct WambleMsg *msg,
     payload_len = need;
     break;
   }
+  case WAMBLE_CTRL_PREDICTION_DATA: {
+    uint8_t count = msg->prediction_count;
+    if (count > WAMBLE_MAX_PREDICTION_ENTRIES)
+      return NET_ERR_INVALID;
+    size_t need = 1 + (size_t)count * WAMBLE_PREDICTION_ENTRY_WIRE_SIZE;
+    if (need > WAMBLE_MAX_PAYLOAD)
+      return NET_ERR_TRUNCATED;
+    payload[0] = count;
+    size_t offset = 1;
+    for (uint8_t i = 0; i < count; i++) {
+      const WamblePredictionEntry *e = &msg->predictions[i];
+      uint64_t id_be = host_to_net64(e->id);
+      uint64_t parent_be = host_to_net64(e->parent_id);
+      uint64_t points_bits = 0;
+      memcpy(&points_bits, &e->points_awarded, sizeof(double));
+      points_bits = host_to_net64(points_bits);
+      uint16_t ply_be = htons(e->target_ply);
+      memcpy(payload + offset, &id_be, 8);
+      offset += 8;
+      memcpy(payload + offset, &parent_be, 8);
+      offset += 8;
+      memcpy(payload + offset, e->token, TOKEN_LENGTH);
+      offset += TOKEN_LENGTH;
+      memcpy(payload + offset, &points_bits, 8);
+      offset += 8;
+      memcpy(payload + offset, &ply_be, 2);
+      offset += 2;
+      payload[offset++] = e->depth;
+      payload[offset++] = e->status;
+      payload[offset++] = e->uci_len;
+      memcpy(payload + offset, e->uci, MAX_UCI_LENGTH);
+      offset += MAX_UCI_LENGTH;
+    }
+    payload_len = need;
+    break;
+  }
   default:
 
     payload_len = 0;
@@ -418,6 +473,13 @@ static NetworkStatus deserialize_wamble_msg(const uint8_t *buffer,
     }
     break;
   }
+  case WAMBLE_CTRL_GET_PREDICTIONS: {
+    if (payload_len > 2)
+      return NET_ERR_INVALID;
+    msg->prediction_depth = (payload_len >= 1) ? payload[0] : 0;
+    msg->prediction_limit = (payload_len >= 2) ? payload[1] : 0;
+    break;
+  }
   case WAMBLE_CTRL_PLAYER_MOVE: {
     if (payload_len < 1)
       return NET_ERR_TRUNCATED;
@@ -426,6 +488,19 @@ static NetworkStatus deserialize_wamble_msg(const uint8_t *buffer,
         (size_t)msg->uci_len > payload_len - 1)
       return NET_ERR_INVALID;
     memcpy(msg->uci, &payload[1], msg->uci_len);
+    break;
+  }
+  case WAMBLE_CTRL_SUBMIT_PREDICTION: {
+    if (payload_len < 1 + 8)
+      return NET_ERR_TRUNCATED;
+    msg->uci_len = payload[0];
+    if ((size_t)msg->uci_len > MAX_UCI_LENGTH ||
+        payload_len != (size_t)1 + msg->uci_len + 8)
+      return NET_ERR_INVALID;
+    memcpy(msg->uci, &payload[1], msg->uci_len);
+    uint64_t parent_be = 0;
+    memcpy(&parent_be, &payload[1 + msg->uci_len], 8);
+    msg->prediction_parent_id = net_to_host64(parent_be);
     break;
   }
   case WAMBLE_CTRL_SERVER_HELLO:
@@ -577,6 +652,48 @@ static NetworkStatus deserialize_wamble_msg(const uint8_t *buffer,
       memcpy(&e->score, &score_be, sizeof(double));
       memcpy(&e->rating, &rating_be, sizeof(double));
       e->games_played = ntohl(games_be);
+    }
+    break;
+  }
+  case WAMBLE_CTRL_PREDICTION_DATA: {
+    if (payload_len < 1)
+      return NET_ERR_TRUNCATED;
+    msg->prediction_count = payload[0];
+    if (msg->prediction_count > WAMBLE_MAX_PREDICTION_ENTRIES)
+      return NET_ERR_INVALID;
+    size_t need =
+        1 + (size_t)msg->prediction_count * WAMBLE_PREDICTION_ENTRY_WIRE_SIZE;
+    if (payload_len < need)
+      return NET_ERR_TRUNCATED;
+    size_t offset = 1;
+    for (uint8_t i = 0; i < msg->prediction_count; i++) {
+      WamblePredictionEntry *e = &msg->predictions[i];
+      uint64_t id_be = 0;
+      uint64_t parent_be = 0;
+      uint64_t points_be = 0;
+      uint16_t ply_be = 0;
+      memcpy(&id_be, payload + offset, 8);
+      offset += 8;
+      memcpy(&parent_be, payload + offset, 8);
+      offset += 8;
+      memcpy(e->token, payload + offset, TOKEN_LENGTH);
+      offset += TOKEN_LENGTH;
+      memcpy(&points_be, payload + offset, 8);
+      offset += 8;
+      memcpy(&ply_be, payload + offset, 2);
+      offset += 2;
+      e->depth = payload[offset++];
+      e->status = payload[offset++];
+      e->uci_len = payload[offset++];
+      memcpy(e->uci, payload + offset, MAX_UCI_LENGTH);
+      offset += MAX_UCI_LENGTH;
+      e->id = net_to_host64(id_be);
+      e->parent_id = net_to_host64(parent_be);
+      points_be = net_to_host64(points_be);
+      memcpy(&e->points_awarded, &points_be, sizeof(double));
+      e->target_ply = ntohs(ply_be);
+      if (e->uci_len > MAX_UCI_LENGTH)
+        return NET_ERR_INVALID;
     }
     break;
   }

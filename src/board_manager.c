@@ -598,6 +598,7 @@ void board_game_completed(uint64_t board_id, GameResult result) {
     transition_to_archived(board, result);
   }
   wamble_mutex_unlock(&board_mutex);
+  prediction_expire_board(board_id);
 }
 
 bool board_is_reserved_for_player(uint64_t board_id,

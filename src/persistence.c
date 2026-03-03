@@ -246,13 +246,48 @@ void wamble_emit_link_session_to_pubkey(const uint8_t *token,
 
 void wamble_emit_record_payout(uint64_t board_id, const uint8_t *token,
                                double points) {
-  if (!token || points <= 0.0)
+  if (!token || points == 0.0)
     return;
   struct WamblePersistenceIntent it = {0};
   it.type = WAMBLE_INTENT_RECORD_PAYOUT;
   it.as.record_payout.board_id = board_id;
   memcpy(it.as.record_payout.token, token, TOKEN_LENGTH);
   it.as.record_payout.points = points;
+  intents_push(it);
+}
+
+void wamble_emit_record_prediction(uint64_t board_id, const uint8_t *token,
+                                   uint64_t parent_id,
+                                   const char *predicted_move_uci,
+                                   int move_number) {
+  if (board_id == 0 || !token || !predicted_move_uci || move_number <= 0)
+    return;
+  struct WamblePersistenceIntent it = {0};
+  it.type = WAMBLE_INTENT_RECORD_PREDICTION;
+  it.as.record_prediction.board_id = board_id;
+  it.as.record_prediction.parent_id = parent_id;
+  memcpy(it.as.record_prediction.token, token, TOKEN_LENGTH);
+  it.as.record_prediction.move_number = move_number;
+  size_t len = strnlen(predicted_move_uci, MAX_UCI_LENGTH - 1);
+  memcpy(it.as.record_prediction.predicted_move_uci, predicted_move_uci, len);
+  it.as.record_prediction.predicted_move_uci[len] = '\0';
+  intents_push(it);
+}
+
+void wamble_emit_resolve_prediction(uint64_t board_id, const uint8_t *token,
+                                    int move_number, const char *status,
+                                    double points_awarded) {
+  if (board_id == 0 || !token || move_number <= 0 || !status)
+    return;
+  struct WamblePersistenceIntent it = {0};
+  it.type = WAMBLE_INTENT_RESOLVE_PREDICTION;
+  it.as.resolve_prediction.board_id = board_id;
+  memcpy(it.as.resolve_prediction.token, token, TOKEN_LENGTH);
+  it.as.resolve_prediction.move_number = move_number;
+  it.as.resolve_prediction.points_awarded = points_awarded;
+  size_t len = strnlen(status, STATUS_MAX_LENGTH - 1);
+  memcpy(it.as.resolve_prediction.status, status, len);
+  it.as.resolve_prediction.status[len] = '\0';
   intents_push(it);
 }
 
@@ -424,6 +459,29 @@ static int apply_one_intent_db(const struct WamblePersistenceIntent *it,
         it->as.update_board_reservation_meta.board_id,
         it->as.update_board_reservation_meta.reservation_time,
         it->as.update_board_reservation_meta.reserved_for_white);
+  case WAMBLE_INTENT_RECORD_PREDICTION: {
+    uint64_t sid = 0;
+    DbStatus st =
+        resolve_session_id_cached(cache, it->as.record_prediction.token, &sid);
+    if (st != DB_OK || sid == 0)
+      return 0;
+    return db_async_create_prediction(
+        it->as.record_prediction.board_id, sid,
+        it->as.record_prediction.parent_id,
+        it->as.record_prediction.predicted_move_uci,
+        it->as.record_prediction.move_number, 0);
+  }
+  case WAMBLE_INTENT_RESOLVE_PREDICTION: {
+    uint64_t sid = 0;
+    DbStatus st =
+        resolve_session_id_cached(cache, it->as.resolve_prediction.token, &sid);
+    if (st != DB_OK || sid == 0)
+      return 0;
+    return db_async_resolve_prediction(
+        it->as.resolve_prediction.board_id, sid,
+        it->as.resolve_prediction.move_number, it->as.resolve_prediction.status,
+        it->as.resolve_prediction.points_awarded);
+  }
   default:
     return 0;
   }
@@ -503,6 +561,10 @@ intent_payload_estimate_bytes(const struct WamblePersistenceIntent *it) {
     return 8 + 4;
   case WAMBLE_INTENT_UPDATE_BOARD_RESERVATION_META:
     return 8 + 8 + 1;
+  case WAMBLE_INTENT_RECORD_PREDICTION:
+    return 16 + TOKEN_LENGTH + MAX_UCI_LENGTH + 4;
+  case WAMBLE_INTENT_RESOLVE_PREDICTION:
+    return 8 + TOKEN_LENGTH + 4 + STATUS_MAX_LENGTH + 8;
   default:
     return sizeof(*it);
   }

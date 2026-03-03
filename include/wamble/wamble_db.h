@@ -42,6 +42,18 @@ DbBoardIdList db_list_boards_by_status(const char *status);
 
 int db_async_record_move(uint64_t board_id, uint64_t session_id,
                          const char *move_uci, int move_number);
+DbStatus db_create_prediction(uint64_t board_id, uint64_t session_id,
+                              uint64_t parent_prediction_id,
+                              const char *predicted_move_uci, int move_number,
+                              int correct_streak, uint64_t *out_prediction_id);
+int db_async_create_prediction(uint64_t board_id, uint64_t session_id,
+                               uint64_t parent_prediction_id,
+                               const char *predicted_move_uci, int move_number,
+                               int correct_streak);
+int db_async_resolve_prediction(uint64_t board_id, uint64_t session_id,
+                                int move_number, const char *status,
+                                double points_awarded);
+DbPredictionsResult db_get_pending_predictions(void);
 
 DbMovesResult db_get_moves_for_board(uint64_t board_id);
 
@@ -55,6 +67,7 @@ int db_async_record_game_result(uint64_t board_id, char winning_side,
 int db_async_record_payout(uint64_t board_id, uint64_t session_id,
                            double points);
 DbStatus db_get_player_total_score(uint64_t session_id, double *out_total);
+DbStatus db_get_player_prediction_score(uint64_t session_id, double *out_total);
 DbStatus db_get_player_rating(uint64_t session_id, double *out_rating);
 int db_async_update_player_rating(uint64_t session_id, double rating);
 
@@ -91,6 +104,8 @@ typedef struct WambleQueryService {
   DbStatus (*get_persistent_session_by_token)(const uint8_t *token,
                                               uint64_t *out_session);
   DbStatus (*get_player_total_score)(uint64_t session_id, double *out_total);
+  DbStatus (*get_player_prediction_score)(uint64_t session_id,
+                                          double *out_total);
   DbStatus (*get_player_rating)(uint64_t session_id, double *out_rating);
   DbStatus (*get_session_games_played)(uint64_t session_id, int *out_games);
   DbLeaderboardResult (*get_leaderboard)(uint64_t requester_session_id,
@@ -119,6 +134,8 @@ typedef enum {
   WAMBLE_INTENT_RECORD_MOVE = 11,
   WAMBLE_INTENT_UPDATE_BOARD_MOVE_META = 12,
   WAMBLE_INTENT_UPDATE_BOARD_RESERVATION_META = 13,
+  WAMBLE_INTENT_RECORD_PREDICTION = 14,
+  WAMBLE_INTENT_RESOLVE_PREDICTION = 15,
 } WambleIntentType;
 
 typedef struct WamblePersistenceIntent {
@@ -185,6 +202,20 @@ typedef struct WamblePersistenceIntent {
       time_t reservation_time;
       int reserved_for_white;
     } update_board_reservation_meta;
+    struct {
+      uint64_t board_id;
+      uint64_t parent_id;
+      uint8_t token[TOKEN_LENGTH];
+      char predicted_move_uci[MAX_UCI_LENGTH];
+      int move_number;
+    } record_prediction;
+    struct {
+      uint64_t board_id;
+      uint8_t token[TOKEN_LENGTH];
+      int move_number;
+      char status[STATUS_MAX_LENGTH];
+      double points_awarded;
+    } resolve_prediction;
   } as;
 } WamblePersistenceIntent;
 

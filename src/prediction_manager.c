@@ -1,0 +1,648 @@
+#include "../include/wamble/wamble.h"
+#include "../include/wamble/wamble_db.h"
+#include <ctype.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+  uint64_t board_id;
+  uint8_t player_token[TOKEN_LENGTH];
+  int correct_streak;
+} PredictionStreak;
+
+static void prediction_set_streak(uint64_t board_id, const uint8_t *token,
+                                  int streak);
+static int prediction_resolve_session_id(const uint8_t *player_token,
+                                         uint64_t *out_session_id);
+
+static WAMBLE_THREAD_LOCAL WamblePrediction *g_predictions = NULL;
+static WAMBLE_THREAD_LOCAL int g_prediction_count = 0;
+static WAMBLE_THREAD_LOCAL int g_prediction_cap = 0;
+static WAMBLE_THREAD_LOCAL PredictionStreak *g_streaks = NULL;
+static WAMBLE_THREAD_LOCAL int g_streak_count = 0;
+static WAMBLE_THREAD_LOCAL int g_streak_cap = 0;
+static WAMBLE_THREAD_LOCAL wamble_mutex_t g_prediction_mutex;
+static WAMBLE_THREAD_LOCAL int g_prediction_mutex_ready = 0;
+#ifdef WAMBLE_TEST_ONLY
+static uint64_t g_next_test_prediction_id = 1;
+#endif
+
+static int prediction_ensure_capacity_locked(int need) {
+  if (need <= g_prediction_cap)
+    return 0;
+  int new_cap = g_prediction_cap > 0 ? g_prediction_cap : 16;
+  while (new_cap < need)
+    new_cap *= 2;
+  WamblePrediction *new_predictions = (WamblePrediction *)realloc(
+      g_predictions, (size_t)new_cap * sizeof(*g_predictions));
+  if (!new_predictions)
+    return -1;
+  memset(new_predictions + g_prediction_cap, 0,
+         (size_t)(new_cap - g_prediction_cap) * sizeof(*new_predictions));
+  g_predictions = new_predictions;
+  g_prediction_cap = new_cap;
+  return 0;
+}
+
+static void prediction_reset_locked(void) {
+  free(g_predictions);
+  free(g_streaks);
+  g_predictions = NULL;
+  g_prediction_count = 0;
+  g_prediction_cap = 0;
+  g_streaks = NULL;
+  g_streak_count = 0;
+  g_streak_cap = 0;
+}
+
+static void prediction_rebuild_streaks_locked(void) {
+  g_streak_count = 0;
+  for (int i = 0; i < g_prediction_count; i++) {
+    const WamblePrediction *pred = &g_predictions[i];
+    if (strcmp(pred->status, "PENDING") != 0)
+      continue;
+    prediction_set_streak(pred->board_id, pred->player_token,
+                          pred->correct_streak);
+  }
+}
+
+static PredictionManagerStatus prediction_load_active_locked(void) {
+  DbPredictionsResult rows = db_get_pending_predictions();
+  if (rows.status != DB_OK)
+    return PREDICTION_MANAGER_ERR_DB_LOAD;
+  if (!rows.rows || rows.count <= 0)
+    return PREDICTION_MANAGER_OK;
+
+  for (int i = 0; i < rows.count; i++) {
+    const DbPredictionRow *src = &rows.rows[i];
+    if (prediction_ensure_capacity_locked(g_prediction_count + 1) != 0)
+      return PREDICTION_MANAGER_ERR_ALLOC;
+    WamblePrediction *dst = &g_predictions[g_prediction_count++];
+    memset(dst, 0, sizeof(*dst));
+    dst->id = src->id;
+    dst->board_id = src->board_id;
+    dst->parent_id = src->parent_prediction_id;
+    memcpy(dst->player_token, src->player_token, TOKEN_LENGTH);
+    snprintf(dst->predicted_move_uci, sizeof(dst->predicted_move_uci), "%s",
+             src->predicted_move_uci);
+    snprintf(dst->status, sizeof(dst->status), "%s", src->status);
+    dst->target_ply = src->move_number;
+    dst->depth = src->depth;
+    dst->correct_streak = src->correct_streak;
+    dst->points_awarded = src->points_awarded;
+    dst->created_at = src->created_at;
+  }
+
+  prediction_rebuild_streaks_locked();
+  return PREDICTION_MANAGER_OK;
+}
+
+static int prediction_resolve_session_id(const uint8_t *player_token,
+                                         uint64_t *out_session_id) {
+  if (out_session_id)
+    *out_session_id = 0;
+  if (!player_token)
+    return -1;
+
+  uint64_t session_id = 0;
+  const WambleQueryService *qs = wamble_get_query_service();
+  if (qs && qs->get_session_by_token &&
+      qs->get_session_by_token(player_token, &session_id) == DB_OK &&
+      session_id > 0) {
+    if (out_session_id)
+      *out_session_id = session_id;
+    return 0;
+  }
+
+  uint16_t experiment_arm = 0;
+  if (network_get_session_experiment_arm(player_token, &experiment_arm) != 0) {
+    experiment_arm = network_experiment_arm_for_token(player_token);
+  }
+  session_id = db_create_session(player_token, 0, (int)experiment_arm);
+  if (session_id > 0) {
+    if (out_session_id)
+      *out_session_id = session_id;
+    return 0;
+  }
+
+  if (qs && qs->get_session_by_token &&
+      qs->get_session_by_token(player_token, &session_id) == DB_OK &&
+      session_id > 0) {
+    if (out_session_id)
+      *out_session_id = session_id;
+    return 0;
+  }
+  return -1;
+}
+
+static int prediction_persist_new_locked(uint64_t board_id,
+                                         const uint8_t *player_token,
+                                         uint64_t parent_prediction_id,
+                                         const char *predicted_move_uci,
+                                         int target_ply, int correct_streak,
+                                         uint64_t *out_prediction_id) {
+  uint64_t session_id = 0;
+  if (prediction_resolve_session_id(player_token, &session_id) == 0 &&
+      session_id > 0 &&
+      db_create_prediction(board_id, session_id, parent_prediction_id,
+                           predicted_move_uci, target_ply, correct_streak,
+                           out_prediction_id) == DB_OK &&
+      (!out_prediction_id || *out_prediction_id > 0)) {
+    return 0;
+  }
+
+#ifdef WAMBLE_TEST_ONLY
+  if (out_prediction_id)
+    *out_prediction_id = g_next_test_prediction_id++;
+  return 0;
+#else
+  (void)board_id;
+  (void)player_token;
+  (void)parent_prediction_id;
+  (void)predicted_move_uci;
+  (void)target_ply;
+  (void)correct_streak;
+  (void)out_prediction_id;
+  return -1;
+#endif
+}
+
+PredictionManagerStatus prediction_manager_init(void) {
+  if (g_prediction_mutex_ready) {
+    wamble_mutex_lock(&g_prediction_mutex);
+    prediction_reset_locked();
+    wamble_mutex_unlock(&g_prediction_mutex);
+    wamble_mutex_destroy(&g_prediction_mutex);
+    g_prediction_mutex_ready = 0;
+  }
+
+  wamble_mutex_init(&g_prediction_mutex);
+  g_prediction_mutex_ready = 1;
+
+  int max_pending = get_config()->prediction_max_pending;
+  if (max_pending < 1)
+    max_pending = 1;
+  g_prediction_cap =
+      max_pending *
+      ((get_config()->max_boards > 0) ? get_config()->max_boards : 1);
+  if (g_prediction_cap < 16)
+    g_prediction_cap = 16;
+  g_streak_cap = g_prediction_cap;
+
+  g_predictions = (WamblePrediction *)calloc((size_t)g_prediction_cap,
+                                             sizeof(*g_predictions));
+  g_streaks =
+      (PredictionStreak *)calloc((size_t)g_streak_cap, sizeof(*g_streaks));
+  if (!g_predictions || !g_streaks) {
+    prediction_reset_locked();
+    return PREDICTION_MANAGER_ERR_ALLOC;
+  }
+
+  PredictionManagerStatus status = PREDICTION_MANAGER_OK;
+  wamble_mutex_lock(&g_prediction_mutex);
+  status = prediction_load_active_locked();
+  wamble_mutex_unlock(&g_prediction_mutex);
+  return status;
+}
+
+static int prediction_current_ply(const WambleBoard *board) {
+  if (!board)
+    return 0;
+  int ply = (board->board.fullmove_number - 1) * 2;
+  if (board->board.turn == 'b')
+    ply += 1;
+  return (ply < 0) ? 0 : ply;
+}
+
+static int prediction_next_ply(const WambleBoard *board) {
+  return prediction_current_ply(board) + 1;
+}
+
+static int prediction_valid_uci(const char *uci) {
+  size_t len = strnlen(uci ? uci : "", MAX_UCI_LENGTH);
+  if (len < 4 || len > 5)
+    return 0;
+  for (size_t i = 0; i < len; i++) {
+    if (!isalnum((unsigned char)uci[i]))
+      return 0;
+  }
+  return 1;
+}
+
+static uint64_t prediction_hash_token(const uint8_t *token) {
+  uint64_t h = 1469598103934665603ULL;
+  for (int i = 0; i < TOKEN_LENGTH; i++) {
+    h ^= token[i];
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
+static int prediction_gated_allowed(const uint8_t *token) {
+  int percent = get_config()->prediction_gated_percent;
+  if (percent <= 0)
+    return 0;
+  if (percent >= 100)
+    return 1;
+  uint64_t h = prediction_hash_token(token) ^
+               (uint64_t)(unsigned int)get_config()->experiment_seed;
+  return (int)(h % 100ULL) < percent;
+}
+
+static int prediction_match_moves(const char *predicted, const char *actual) {
+  if (!predicted || !actual)
+    return 0;
+  if (get_config()->prediction_match_policy &&
+      strcmp(get_config()->prediction_match_policy, "from-to-only") == 0) {
+    return strncmp(predicted, actual, 4) == 0;
+  }
+  return strcmp(predicted, actual) == 0;
+}
+
+static int prediction_find_streak(uint64_t board_id, const uint8_t *token) {
+  for (int i = 0; i < g_streak_count; i++) {
+    if (g_streaks[i].board_id == board_id &&
+        tokens_equal(g_streaks[i].player_token, token)) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+static int prediction_streak_for(uint64_t board_id, const uint8_t *token) {
+  int idx = prediction_find_streak(board_id, token);
+  return (idx >= 0) ? g_streaks[idx].correct_streak : 0;
+}
+
+static void prediction_set_streak(uint64_t board_id, const uint8_t *token,
+                                  int streak) {
+  int idx = prediction_find_streak(board_id, token);
+  if (streak <= 0) {
+    if (idx >= 0)
+      g_streaks[idx] = g_streaks[--g_streak_count];
+    return;
+  }
+  if (idx >= 0) {
+    g_streaks[idx].correct_streak = streak;
+    return;
+  }
+  if (!g_streaks || g_streak_count >= g_streak_cap)
+    return;
+  PredictionStreak *slot = &g_streaks[g_streak_count++];
+  memset(slot, 0, sizeof(*slot));
+  slot->board_id = board_id;
+  memcpy(slot->player_token, token, TOKEN_LENGTH);
+  slot->correct_streak = streak;
+}
+
+static int prediction_pending_count_locked(uint64_t board_id) {
+  int count = 0;
+  for (int i = 0; i < g_prediction_count; i++) {
+    if (g_predictions[i].board_id == board_id &&
+        strcmp(g_predictions[i].status, "PENDING") == 0) {
+      count++;
+    }
+  }
+  return count;
+}
+
+static int prediction_find_pending_locked(uint64_t board_id,
+                                          const uint8_t *token) {
+  for (int i = 0; i < g_prediction_count; i++) {
+    if (g_predictions[i].board_id == board_id &&
+        strcmp(g_predictions[i].status, "PENDING") == 0 &&
+        tokens_equal(g_predictions[i].player_token, token)) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+static int prediction_find_by_id_locked(uint64_t prediction_id) {
+  if (prediction_id == 0)
+    return -1;
+  for (int i = 0; i < g_prediction_count; i++) {
+    if (g_predictions[i].id == prediction_id)
+      return i;
+  }
+  return -1;
+}
+
+static int prediction_policy_allowed(const uint8_t *token, const char *action,
+                                     const char *resource,
+                                     const char *context_key,
+                                     const char *context_value,
+                                     WamblePolicyDecision *out) {
+  const WambleQueryService *qs = wamble_get_query_service();
+  if (!qs || !qs->resolve_policy_decision)
+    return 1;
+  const char *profile = wamble_runtime_profile_key();
+  WamblePolicyDecision decision = {0};
+  DbStatus st = qs->resolve_policy_decision(token, profile ? profile : "",
+                                            action, resource, context_key,
+                                            context_value, &decision);
+  if (st != DB_OK)
+    return 0;
+  if (out)
+    *out = decision;
+  return decision.allowed ? 1 : 0;
+}
+
+static PredictionStatus prediction_submit_allowed(const WambleBoard *board,
+                                                  const uint8_t *player_token) {
+  if (!board || !player_token)
+    return PREDICTION_ERR_INVALID;
+  if (get_config()->prediction_mode == PREDICTION_MODE_DISABLED)
+    return PREDICTION_ERR_DISABLED;
+
+  const char *resource = "streak";
+  if (get_config()->prediction_mode == PREDICTION_MODE_NEXT_SELF_MOVE) {
+    resource = "self";
+    if (!board_is_reserved_for_player(board->id, player_token))
+      return PREDICTION_ERR_NOT_ALLOWED;
+  } else if (get_config()->prediction_mode == PREDICTION_MODE_GATED) {
+    resource = "gated";
+    if (!prediction_gated_allowed(player_token))
+      return PREDICTION_ERR_NOT_ALLOWED;
+  }
+
+  char board_buf[32];
+  snprintf(board_buf, sizeof(board_buf), "%llu", (unsigned long long)board->id);
+  if (!prediction_policy_allowed(player_token, "prediction.submit", resource,
+                                 "board", board_buf, NULL)) {
+    return PREDICTION_ERR_NOT_ALLOWED;
+  }
+  return PREDICTION_OK;
+}
+
+static double prediction_points_for_streak(int streak_before) {
+  int cap = get_config()->prediction_streak_cap;
+  if (cap < 1)
+    cap = 1;
+  int exponent = streak_before;
+  if (exponent < 0)
+    exponent = 0;
+  if (exponent >= cap)
+    exponent = cap - 1;
+  return get_config()->prediction_base_points *
+         pow(get_config()->prediction_streak_multiplier, (double)exponent);
+}
+
+PredictionStatus prediction_submit(WambleBoard *board,
+                                   const uint8_t *player_token,
+                                   const char *predicted_move_uci,
+                                   int trust_tier) {
+  (void)trust_tier;
+  return prediction_submit_with_parent(board, player_token, predicted_move_uci,
+                                       0, 0, NULL);
+}
+
+PredictionStatus prediction_submit_with_parent(WambleBoard *board,
+                                               const uint8_t *player_token,
+                                               const char *predicted_move_uci,
+                                               uint64_t parent_prediction_id,
+                                               int trust_tier,
+                                               uint64_t *out_prediction_id) {
+  (void)trust_tier;
+  PredictionStatus st = prediction_submit_allowed(board, player_token);
+  if (st != PREDICTION_OK)
+    return st;
+  if (!prediction_valid_uci(predicted_move_uci))
+    return PREDICTION_ERR_INVALID;
+  if (!g_prediction_mutex_ready || !g_predictions)
+    return PREDICTION_ERR_INVALID;
+
+  wamble_mutex_lock(&g_prediction_mutex);
+
+  int max_pending = get_config()->prediction_max_pending;
+  if (max_pending < 1)
+    max_pending = 1;
+  if (prediction_pending_count_locked(board->id) >= max_pending) {
+    wamble_mutex_unlock(&g_prediction_mutex);
+    return PREDICTION_ERR_LIMIT;
+  }
+  if (prediction_find_pending_locked(board->id, player_token) >= 0) {
+    wamble_mutex_unlock(&g_prediction_mutex);
+    return PREDICTION_ERR_DUPLICATE;
+  }
+  if (prediction_ensure_capacity_locked(g_prediction_count + 1) != 0) {
+    wamble_mutex_unlock(&g_prediction_mutex);
+    return PREDICTION_ERR_LIMIT;
+  }
+
+  int depth = 0;
+  if (parent_prediction_id > 0) {
+    int parent_idx = prediction_find_by_id_locked(parent_prediction_id);
+    if (parent_idx < 0 || g_predictions[parent_idx].board_id != board->id) {
+      wamble_mutex_unlock(&g_prediction_mutex);
+      return PREDICTION_ERR_NOT_FOUND;
+    }
+    depth = g_predictions[parent_idx].depth + 1;
+  }
+
+  int streak_before = prediction_streak_for(board->id, player_token);
+  uint64_t db_prediction_id = 0;
+  if (prediction_persist_new_locked(
+          board->id, player_token, parent_prediction_id, predicted_move_uci,
+          prediction_next_ply(board), streak_before, &db_prediction_id) != 0 ||
+      db_prediction_id == 0) {
+    wamble_mutex_unlock(&g_prediction_mutex);
+    return PREDICTION_ERR_INVALID;
+  }
+
+  WamblePrediction *slot = &g_predictions[g_prediction_count++];
+  memset(slot, 0, sizeof(*slot));
+  slot->id = db_prediction_id;
+  slot->board_id = board->id;
+  slot->parent_id = parent_prediction_id;
+  memcpy(slot->player_token, player_token, TOKEN_LENGTH);
+  snprintf(slot->predicted_move_uci, sizeof(slot->predicted_move_uci), "%s",
+           predicted_move_uci);
+  snprintf(slot->status, sizeof(slot->status), "PENDING");
+  slot->target_ply = prediction_next_ply(board);
+  slot->depth = depth;
+  slot->correct_streak = streak_before;
+  slot->points_awarded = 0.0;
+  slot->created_at = wamble_now_wall();
+  if (out_prediction_id)
+    *out_prediction_id = slot->id;
+
+  wamble_mutex_unlock(&g_prediction_mutex);
+  return PREDICTION_OK;
+}
+
+PredictionStatus prediction_resolve_move(WambleBoard *board,
+                                         const char *actual_move_uci) {
+  if (!board || !actual_move_uci || !g_prediction_mutex_ready || !g_predictions)
+    return PREDICTION_ERR_INVALID;
+
+  int resolved_ply = prediction_current_ply(board);
+  int resolved_any = 0;
+
+  wamble_mutex_lock(&g_prediction_mutex);
+
+  uint8_t seen_tokens[256][TOKEN_LENGTH];
+  int seen_count = 0;
+
+  for (int i = g_prediction_count - 1; i >= 0; i--) {
+    WamblePrediction *pred = &g_predictions[i];
+    if (pred->board_id != board->id || pred->target_ply != resolved_ply ||
+        strcmp(pred->status, "PENDING") != 0) {
+      continue;
+    }
+
+    int seen = 0;
+    for (int j = 0; j < seen_count; j++) {
+      if (memcmp(seen_tokens[j], pred->player_token, TOKEN_LENGTH) == 0) {
+        seen = 1;
+        break;
+      }
+    }
+    if (!seen && seen_count < (int)(sizeof(seen_tokens) / TOKEN_LENGTH))
+      memcpy(seen_tokens[seen_count++], pred->player_token, TOKEN_LENGTH);
+
+    resolved_any = 1;
+    if (prediction_match_moves(pred->predicted_move_uci, actual_move_uci)) {
+      double points =
+          (get_config()->prediction_mode == PREDICTION_MODE_NEXT_SELF_MOVE)
+              ? get_config()->prediction_base_points
+              : prediction_points_for_streak(pred->correct_streak);
+      pred->points_awarded = points;
+      snprintf(pred->status, sizeof(pred->status), "CORRECT");
+      if (points != 0.0)
+        (void)scoring_apply_prediction_points(pred->player_token, points);
+      prediction_set_streak(board->id, pred->player_token,
+                            pred->correct_streak + 1);
+      wamble_emit_resolve_prediction(board->id, pred->player_token,
+                                     pred->target_ply, pred->status, points);
+    } else {
+      double penalty = -fabs(get_config()->prediction_penalty_incorrect);
+      pred->points_awarded = penalty;
+      snprintf(pred->status, sizeof(pred->status), "INCORRECT");
+      if (penalty != 0.0)
+        (void)scoring_apply_prediction_points(pred->player_token, penalty);
+      prediction_set_streak(board->id, pred->player_token, 0);
+      wamble_emit_resolve_prediction(board->id, pred->player_token,
+                                     pred->target_ply, pred->status, penalty);
+    }
+  }
+
+  if (get_config()->prediction_mode != PREDICTION_MODE_NEXT_SELF_MOVE) {
+    for (int i = g_streak_count - 1; i >= 0; i--) {
+      if (g_streaks[i].board_id != board->id)
+        continue;
+      int participated = 0;
+      for (int j = 0; j < seen_count; j++) {
+        if (memcmp(seen_tokens[j], g_streaks[i].player_token, TOKEN_LENGTH) ==
+            0) {
+          participated = 1;
+          break;
+        }
+      }
+      if (!participated)
+        g_streaks[i] = g_streaks[--g_streak_count];
+    }
+  }
+
+  wamble_mutex_unlock(&g_prediction_mutex);
+  return resolved_any ? PREDICTION_OK : PREDICTION_NONE;
+}
+
+PredictionStatus prediction_collect_tree(uint64_t board_id,
+                                         const uint8_t *requester_token,
+                                         int trust_tier, int max_depth,
+                                         WamblePredictionView *out, int max_out,
+                                         int *out_count) {
+  (void)trust_tier;
+  if (out_count)
+    *out_count = 0;
+  if (!requester_token || !out || max_out <= 0)
+    return PREDICTION_ERR_INVALID;
+
+  WamblePolicyDecision decision = {0};
+  char depth_buf[16];
+  snprintf(depth_buf, sizeof(depth_buf), "%d", max_depth);
+  if (!prediction_policy_allowed(requester_token, "prediction.read", "tree",
+                                 "depth", depth_buf, &decision)) {
+    return PREDICTION_ERR_NOT_ALLOWED;
+  }
+
+  int allowed_depth = get_config()->prediction_view_depth_limit;
+  if (allowed_depth < 0)
+    allowed_depth = 0;
+  if (decision.permission_level >= 0 &&
+      decision.permission_level < allowed_depth)
+    allowed_depth = decision.permission_level;
+  if (max_depth >= 0 && max_depth < allowed_depth)
+    allowed_depth = max_depth;
+
+  wamble_mutex_lock(&g_prediction_mutex);
+  int count = 0;
+  for (int i = 0; i < g_prediction_count && count < max_out; i++) {
+    const WamblePrediction *pred = &g_predictions[i];
+    if (pred->board_id != board_id || pred->depth > allowed_depth)
+      continue;
+    WamblePredictionView *dst = &out[count++];
+    memset(dst, 0, sizeof(*dst));
+    dst->id = pred->id;
+    dst->parent_id = pred->parent_id;
+    dst->board_id = pred->board_id;
+    memcpy(dst->player_token, pred->player_token, TOKEN_LENGTH);
+    snprintf(dst->predicted_move_uci, sizeof(dst->predicted_move_uci), "%s",
+             pred->predicted_move_uci);
+    snprintf(dst->status, sizeof(dst->status), "%s", pred->status);
+    dst->target_ply = pred->target_ply;
+    dst->depth = pred->depth;
+    dst->points_awarded = pred->points_awarded;
+    dst->created_at = pred->created_at;
+  }
+  wamble_mutex_unlock(&g_prediction_mutex);
+
+  if (out_count)
+    *out_count = count;
+  return PREDICTION_OK;
+}
+
+void prediction_clear_board(uint64_t board_id) {
+  if (!g_prediction_mutex_ready)
+    return;
+  wamble_mutex_lock(&g_prediction_mutex);
+  for (int i = g_prediction_count - 1; i >= 0; i--) {
+    if (g_predictions[i].board_id == board_id)
+      g_predictions[i] = g_predictions[--g_prediction_count];
+  }
+  for (int i = g_streak_count - 1; i >= 0; i--) {
+    if (g_streaks[i].board_id == board_id)
+      g_streaks[i] = g_streaks[--g_streak_count];
+  }
+  wamble_mutex_unlock(&g_prediction_mutex);
+}
+
+void prediction_expire_board(uint64_t board_id) {
+  if (!g_prediction_mutex_ready)
+    return;
+
+  wamble_mutex_lock(&g_prediction_mutex);
+  for (int i = 0; i < g_prediction_count; i++) {
+    WamblePrediction *pred = &g_predictions[i];
+    if (pred->board_id != board_id || strcmp(pred->status, "PENDING") != 0)
+      continue;
+    pred->points_awarded = 0.0;
+    snprintf(pred->status, sizeof(pred->status), "EXPIRED");
+    wamble_emit_resolve_prediction(board_id, pred->player_token,
+                                   pred->target_ply, pred->status, 0.0);
+  }
+  wamble_mutex_unlock(&g_prediction_mutex);
+
+  prediction_clear_board(board_id);
+}
+
+int prediction_pending_count(uint64_t board_id) {
+  if (!g_prediction_mutex_ready)
+    return 0;
+  wamble_mutex_lock(&g_prediction_mutex);
+  int count = prediction_pending_count_locked(board_id);
+  wamble_mutex_unlock(&g_prediction_mutex);
+  return count;
+}

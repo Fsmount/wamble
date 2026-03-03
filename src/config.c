@@ -177,6 +177,9 @@ static int cfg_dup_owned(WambleConfig *dst, const WambleConfig *src) {
       src->global_db_name ? strdup(src->global_db_name) : NULL;
   dst->spectator_summary_mode =
       src->spectator_summary_mode ? strdup(src->spectator_summary_mode) : NULL;
+  dst->prediction_match_policy = src->prediction_match_policy
+                                     ? strdup(src->prediction_match_policy)
+                                     : NULL;
   dst->state_dir = src->state_dir ? strdup(src->state_dir) : NULL;
   dst->websocket_path =
       src->websocket_path ? strdup(src->websocket_path) : NULL;
@@ -185,7 +188,8 @@ static int cfg_dup_owned(WambleConfig *dst, const WambleConfig *src) {
   if (!dst->db_host || !dst->db_user || !dst->db_pass || !dst->db_name ||
       !dst->global_db_host || !dst->global_db_user || !dst->global_db_pass ||
       !dst->global_db_name || !dst->spectator_summary_mode ||
-      !dst->websocket_path || !dst->experiment_pairings) {
+      !dst->prediction_match_policy || !dst->websocket_path ||
+      !dst->experiment_pairings) {
     free(dst->db_host);
     free(dst->db_user);
     free(dst->db_pass);
@@ -195,6 +199,7 @@ static int cfg_dup_owned(WambleConfig *dst, const WambleConfig *src) {
     free(dst->global_db_pass);
     free(dst->global_db_name);
     free(dst->spectator_summary_mode);
+    free(dst->prediction_match_policy);
     free(dst->state_dir);
     free(dst->websocket_path);
     free(dst->experiment_pairings);
@@ -216,6 +221,7 @@ static void cfg_free_owned(WambleConfig *cfg) {
   free(cfg->global_db_pass);
   free(cfg->global_db_name);
   free(cfg->spectator_summary_mode);
+  free(cfg->prediction_match_policy);
   free(cfg->state_dir);
   free(cfg->websocket_path);
   free(cfg->experiment_pairings);
@@ -1176,6 +1182,18 @@ static const ConfigVarMap config_map[] = {
     CONF_ITEM("spectator-focus-hz", CONF_INT, spectator_focus_hz),
     CONF_ITEM("spectator-max-focus-per-session", CONF_INT,
               spectator_max_focus_per_session),
+    CONF_ITEM("prediction-mode", CONF_INT, prediction_mode),
+    CONF_ITEM("prediction-base-points", CONF_DOUBLE, prediction_base_points),
+    CONF_ITEM("prediction-streak-multiplier", CONF_DOUBLE,
+              prediction_streak_multiplier),
+    CONF_ITEM("prediction-streak-cap", CONF_INT, prediction_streak_cap),
+    CONF_ITEM("prediction-gated-percent", CONF_INT, prediction_gated_percent),
+    CONF_ITEM("prediction-view-depth-limit", CONF_INT,
+              prediction_view_depth_limit),
+    CONF_ITEM("prediction-penalty-incorrect", CONF_DOUBLE,
+              prediction_penalty_incorrect),
+    CONF_ITEM("prediction-match-policy", CONF_STRING, prediction_match_policy),
+    CONF_ITEM("prediction-max-pending", CONF_INT, prediction_max_pending),
     CONF_ITEM("spectator-summary-mode", CONF_STRING, spectator_summary_mode),
     CONF_ITEM("state-dir", CONF_STRING, state_dir),
     CONF_ITEM("websocket-path", CONF_STRING, websocket_path),
@@ -1271,6 +1289,15 @@ static void config_set_defaults(void) {
   g_config.spectator_summary_hz = 2;
   g_config.spectator_focus_hz = 20;
   g_config.spectator_max_focus_per_session = 1;
+  g_config.prediction_mode = 0;
+  g_config.prediction_gated_percent = 10;
+  g_config.prediction_streak_cap = 10;
+  g_config.prediction_max_pending = 64;
+  g_config.prediction_view_depth_limit = 2;
+  g_config.prediction_base_points = 1.0;
+  g_config.prediction_streak_multiplier = 2.0;
+  g_config.prediction_penalty_incorrect = 0.0;
+  g_config.prediction_match_policy = strdup("exact-uci");
   g_config.spectator_summary_mode = strdup("changes");
   g_config.state_dir = NULL;
   g_config.websocket_path = strdup("/ws");
@@ -1293,6 +1320,7 @@ static void free_profiles(void) {
     free(g_profiles[i].config.global_db_pass);
     free(g_profiles[i].config.global_db_name);
     free(g_profiles[i].config.spectator_summary_mode);
+    free(g_profiles[i].config.prediction_match_policy);
     free(g_profiles[i].config.state_dir);
     free(g_profiles[i].config.websocket_path);
     free(g_profiles[i].config.experiment_pairings);
@@ -1425,6 +1453,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
     g_config.global_db_pass = NULL;
     g_config.global_db_name = NULL;
     g_config.spectator_summary_mode = NULL;
+    g_config.prediction_match_policy = NULL;
     g_config.state_dir = NULL;
     g_config.websocket_path = NULL;
     g_config.experiment_pairings = NULL;
@@ -1438,6 +1467,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
     free(g_config.global_db_pass);
     free(g_config.global_db_name);
     free(g_config.spectator_summary_mode);
+    free(g_config.prediction_match_policy);
     free(g_config.state_dir);
     free(g_config.websocket_path);
     free(g_config.experiment_pairings);
@@ -1619,6 +1649,9 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
           if (base_cfg.spectator_summary_mode)
             cfg.spectator_summary_mode =
                 strdup(base_cfg.spectator_summary_mode);
+          if (base_cfg.prediction_match_policy)
+            cfg.prediction_match_policy =
+                strdup(base_cfg.prediction_match_policy);
           if (base_cfg.state_dir)
             cfg.state_dir = strdup(base_cfg.state_dir);
           if (base_cfg.websocket_path)
@@ -1701,6 +1734,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
             free(g_profiles[i].config.global_db_pass);
             free(g_profiles[i].config.global_db_name);
             free(g_profiles[i].config.spectator_summary_mode);
+            free(g_profiles[i].config.prediction_match_policy);
             free(g_profiles[i].config.state_dir);
             free(g_profiles[i].config.websocket_path);
             free(g_profiles[i].config.experiment_pairings);
@@ -1888,6 +1922,7 @@ int config_restore_snapshot(const void *snapshot) {
     g_config.global_db_pass = NULL;
     g_config.global_db_name = NULL;
     g_config.spectator_summary_mode = NULL;
+    g_config.prediction_match_policy = NULL;
     g_config.state_dir = NULL;
     g_config.websocket_path = NULL;
     g_config.experiment_pairings = NULL;

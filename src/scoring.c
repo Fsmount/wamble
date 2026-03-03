@@ -129,3 +129,14 @@ ScoringStatus calculate_and_distribute_pot(uint64_t board_id) {
   return calculate_and_distribute_pot_for_moves_internal(board_id, board,
                                                          mres.rows, mres.count);
 }
+
+int scoring_apply_prediction_points(const uint8_t *token, double points) {
+  if (!token || points == 0.0)
+    return -1;
+
+  WamblePlayer *player = get_player_by_token(token);
+  if (player) {
+    player->prediction_score += points;
+  }
+  return 0;
+}

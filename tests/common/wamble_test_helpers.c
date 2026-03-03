@@ -328,7 +328,10 @@ int test_db_apply_migrations(const char *schema_name) {
   if (test_db_apply_sql_file("migrations/008_profile_identity_sessions.sql") !=
       0)
     return -1;
-  return test_db_apply_sql_file("migrations/009_global_identity_tags.sql");
+  if (test_db_apply_sql_file("migrations/009_global_identity_tags.sql") != 0)
+    return -1;
+  return test_db_apply_sql_file(
+      "migrations/010_profile_prediction_resolution.sql");
 #else
   (void)schema_name;
   return -1;

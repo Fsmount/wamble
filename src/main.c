@@ -644,6 +644,20 @@ int main(int argc, char *argv[]) {
                   profile_name[0] ? profile_name : "default", (int)tdst);
       }
     }
+    {
+      char profile_name[64];
+      PredictionManagerStatus pmst = PREDICTION_MANAGER_OK;
+      while (profile_runtime_take_prediction_manager_status(
+          &pmst, profile_name, sizeof(profile_name))) {
+        if (pmst < 0) {
+          LOG_ERROR("prediction manager issue profile=%s status=%d",
+                    profile_name[0] ? profile_name : "default", (int)pmst);
+        } else {
+          LOG_WARN("prediction manager issue profile=%s status=%d",
+                   profile_name[0] ? profile_name : "default", (int)pmst);
+        }
+      }
+    }
 
     LOG_DEBUG("Main loop iteration end");
   }

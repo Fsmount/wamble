@@ -499,6 +499,15 @@ typedef struct WambleConfig {
   int spectator_summary_hz;
   int spectator_focus_hz;
   int spectator_max_focus_per_session;
+  int prediction_mode;
+  int prediction_gated_percent;
+  int prediction_streak_cap;
+  int prediction_max_pending;
+  int prediction_view_depth_limit;
+  double prediction_base_points;
+  double prediction_streak_multiplier;
+  double prediction_penalty_incorrect;
+  char *prediction_match_policy;
 
   char *spectator_summary_mode;
 
@@ -637,6 +646,30 @@ typedef enum {
 } ScoringStatus;
 
 typedef enum {
+  PREDICTION_MODE_DISABLED = 0,
+  PREDICTION_MODE_NEXT_SELF_MOVE = 1,
+  PREDICTION_MODE_STREAK = 2,
+  PREDICTION_MODE_GATED = 3,
+} PredictionMode;
+
+typedef enum {
+  PREDICTION_OK = 0,
+  PREDICTION_NONE = 1,
+  PREDICTION_ERR_DISABLED = -1,
+  PREDICTION_ERR_INVALID = -2,
+  PREDICTION_ERR_NOT_ALLOWED = -3,
+  PREDICTION_ERR_LIMIT = -4,
+  PREDICTION_ERR_DUPLICATE = -5,
+  PREDICTION_ERR_NOT_FOUND = -6,
+} PredictionStatus;
+
+typedef enum {
+  PREDICTION_MANAGER_OK = 0,
+  PREDICTION_MANAGER_ERR_ALLOC = -1,
+  PREDICTION_MANAGER_ERR_DB_LOAD = -2,
+} PredictionManagerStatus;
+
+typedef enum {
   SERVER_OK = 0,
   SERVER_ERR_UNSUPPORTED_VERSION = -1,
   SERVER_ERR_UNKNOWN_CTRL = -2,
@@ -658,6 +691,9 @@ int profile_runtime_pump_inline(void);
 int profile_runtime_take_ws_gateway_status(WsGatewayStatus *out_status,
                                            char *out_profile,
                                            size_t out_profile_size);
+int profile_runtime_take_prediction_manager_status(
+    PredictionManagerStatus *out_status, char *out_profile,
+    size_t out_profile_size);
 const char *wamble_runtime_profile_key(void);
 typedef enum {
   PROFILE_TRUST_DECISION_DENIED = 0,
@@ -748,6 +784,26 @@ typedef struct {
 } DbMovesResult;
 
 typedef struct {
+  uint64_t id;
+  uint64_t board_id;
+  uint64_t parent_prediction_id;
+  uint8_t player_token[TOKEN_LENGTH];
+  char predicted_move_uci[MAX_UCI_LENGTH];
+  char status[STATUS_MAX_LENGTH];
+  int move_number;
+  int depth;
+  int correct_streak;
+  double points_awarded;
+  time_t created_at;
+} DbPredictionRow;
+
+typedef struct {
+  DbStatus status;
+  const DbPredictionRow *rows;
+  int count;
+} DbPredictionsResult;
+
+typedef struct {
   uint32_t rank;
   uint64_t session_id;
   double score;
@@ -793,6 +849,9 @@ typedef struct {
 #define WAMBLE_CTRL_LEGAL_MOVES 0x17
 #define WAMBLE_CTRL_GET_LEADERBOARD 0x18
 #define WAMBLE_CTRL_LEADERBOARD_DATA 0x19
+#define WAMBLE_CTRL_SUBMIT_PREDICTION 0x1A
+#define WAMBLE_CTRL_GET_PREDICTIONS 0x1B
+#define WAMBLE_CTRL_PREDICTION_DATA 0x1C
 
 #define get_bit(square) (1ULL << (square))
 
@@ -878,8 +937,13 @@ typedef enum {
 
 #define WAMBLE_MAX_LEGAL_MOVES 218
 #define WAMBLE_MAX_LEADERBOARD_ENTRIES 16
+#define WAMBLE_MAX_PREDICTION_ENTRIES 16
 #define WAMBLE_LEADERBOARD_SCORE 1
 #define WAMBLE_LEADERBOARD_RATING 2
+#define WAMBLE_PREDICTION_STATUS_PENDING 0
+#define WAMBLE_PREDICTION_STATUS_CORRECT 1
+#define WAMBLE_PREDICTION_STATUS_INCORRECT 2
+#define WAMBLE_PREDICTION_STATUS_EXPIRED 3
 
 typedef struct {
   uint8_t from;
@@ -894,6 +958,18 @@ typedef struct {
   double rating;
   uint32_t games_played;
 } WambleLeaderboardEntry;
+
+typedef struct {
+  uint64_t id;
+  uint64_t parent_id;
+  uint8_t token[TOKEN_LENGTH];
+  double points_awarded;
+  uint16_t target_ply;
+  uint8_t depth;
+  uint8_t status;
+  uint8_t uci_len;
+  char uci[MAX_UCI_LENGTH];
+} WamblePredictionEntry;
 
 #pragma pack(push, 1)
 struct WambleMsg {
@@ -917,6 +993,11 @@ struct WambleMsg {
   uint8_t leaderboard_count;
   uint32_t leaderboard_self_rank;
   WambleLeaderboardEntry leaderboard[WAMBLE_MAX_LEADERBOARD_ENTRIES];
+  uint64_t prediction_parent_id;
+  uint8_t prediction_depth;
+  uint8_t prediction_limit;
+  uint8_t prediction_count;
+  WamblePredictionEntry predictions[WAMBLE_MAX_PREDICTION_ENTRIES];
 };
 #pragma pack(pop)
 
@@ -929,6 +1010,7 @@ typedef struct WamblePlayer {
   bool has_persistent_identity;
   time_t last_seen_time;
   double score;
+  double prediction_score;
   double rating;
   int games_played;
 } WamblePlayer;
@@ -994,6 +1076,33 @@ typedef struct WambleMove {
   bool is_white_move;
 } WambleMove;
 
+typedef struct WamblePrediction {
+  uint64_t id;
+  uint64_t board_id;
+  uint64_t parent_id;
+  uint8_t player_token[TOKEN_LENGTH];
+  char predicted_move_uci[MAX_UCI_LENGTH];
+  char status[STATUS_MAX_LENGTH];
+  int target_ply;
+  int depth;
+  int correct_streak;
+  double points_awarded;
+  time_t created_at;
+} WamblePrediction;
+
+typedef struct WamblePredictionView {
+  uint64_t id;
+  uint64_t parent_id;
+  uint64_t board_id;
+  uint8_t player_token[TOKEN_LENGTH];
+  char predicted_move_uci[MAX_UCI_LENGTH];
+  char status[STATUS_MAX_LENGTH];
+  int target_ply;
+  int depth;
+  double points_awarded;
+  time_t created_at;
+} WamblePredictionView;
+
 void board_manager_init(void);
 void board_manager_tick(void);
 WambleBoard *find_board_for_player(WamblePlayer *player);
@@ -1011,6 +1120,7 @@ int board_manager_export(WambleBoard *out, int max, int *out_count,
 int board_manager_import(const WambleBoard *in, int count, uint64_t next_id);
 
 ScoringStatus calculate_and_distribute_pot(uint64_t board_id);
+int scoring_apply_prediction_points(const uint8_t *token, double points);
 
 void player_manager_init(void);
 WamblePlayer *create_new_player(void);
@@ -1033,6 +1143,28 @@ uint64_t rng_u64(void);
 double rng_double(void);
 void rng_bytes(uint8_t *out, size_t len);
 void rng_seed(uint64_t hi, uint64_t lo);
+
+PredictionManagerStatus prediction_manager_init(void);
+PredictionStatus prediction_submit(WambleBoard *board,
+                                   const uint8_t *player_token,
+                                   const char *predicted_move_uci,
+                                   int trust_tier);
+PredictionStatus prediction_submit_with_parent(WambleBoard *board,
+                                               const uint8_t *player_token,
+                                               const char *predicted_move_uci,
+                                               uint64_t parent_prediction_id,
+                                               int trust_tier,
+                                               uint64_t *out_prediction_id);
+PredictionStatus prediction_resolve_move(WambleBoard *board,
+                                         const char *actual_move_uci);
+PredictionStatus prediction_collect_tree(uint64_t board_id,
+                                         const uint8_t *requester_token,
+                                         int trust_tier, int max_depth,
+                                         WamblePredictionView *out, int max_out,
+                                         int *out_count);
+void prediction_clear_board(uint64_t board_id);
+void prediction_expire_board(uint64_t board_id);
+int prediction_pending_count(uint64_t board_id);
 
 typedef enum {
   PERSISTENCE_STATUS_OK = 0,
@@ -1062,6 +1194,13 @@ void wamble_emit_link_session_to_pubkey(const uint8_t *token,
                                         const uint8_t *public_key);
 void wamble_emit_record_payout(uint64_t board_id, const uint8_t *token,
                                double points);
+void wamble_emit_record_prediction(uint64_t board_id, const uint8_t *token,
+                                   uint64_t parent_id,
+                                   const char *predicted_move_uci,
+                                   int move_number);
+void wamble_emit_resolve_prediction(uint64_t board_id, const uint8_t *token,
+                                    int move_number, const char *status,
+                                    double points_awarded);
 void wamble_emit_create_board(uint64_t board_id, const char *fen,
                               const char *status);
 void wamble_emit_record_move(uint64_t board_id, const uint8_t *token,
@@ -1079,6 +1218,8 @@ DbStatus wamble_query_get_persistent_session_by_token(const uint8_t *token,
                                                       uint64_t *out_session);
 DbStatus wamble_query_get_player_total_score(uint64_t session_id,
                                              double *out_total);
+DbStatus wamble_query_get_player_prediction_score(uint64_t session_id,
+                                                  double *out_total);
 DbStatus wamble_query_get_player_rating(uint64_t session_id,
                                         double *out_rating);
 DbStatus wamble_query_get_session_games_played(uint64_t session_id,
