@@ -1,4 +1,5 @@
 #include "common/wamble_test.h"
+#include "common/wamble_test_helpers.h"
 #include "wamble/wamble.h"
 #include "wamble/wamble_db.h"
 
@@ -9,25 +10,18 @@ int unsetenv(const char *name);
 
 static const char *conf_path = "build/test_config.conf";
 
-static void write_config_file(void) {
-  const char *cfg = "(def log-level 3)\n"
-                    "(defn add2 (a b) (+ a b))\n"
-                    "(def timeout-ms (add2 40 2))\n"
-                    "(defmacro inc (x) (do (+ x 1)))\n"
-                    "(def max-retries (inc 3))\n"
-                    "(defprofile base ((def port 8888) (def advertise 1) (def "
-                    "visibility 1)))\n"
-                    "(defprofile canary :inherits base ((def port 8891) (def "
-                    "visibility 2)))\n";
-  FILE *f = fopen(conf_path, "w");
-  if (!f)
-    return;
-  fwrite(cfg, 1, strlen(cfg), f);
-  fclose(f);
-}
-
 WAMBLE_TEST(config_basic_eval) {
-  write_config_file();
+  T_ASSERT_STATUS_OK(wamble_test_write_text_file(
+      conf_path,
+      "(def log-level 3)\n"
+      "(defn add2 (a b) (+ a b))\n"
+      "(def timeout-ms (add2 40 2))\n"
+      "(defmacro inc (x) (do (+ x 1)))\n"
+      "(def max-retries (inc 3))\n"
+      "(defprofile base ((def port 8888) (def advertise 1) (def visibility "
+      "1)))\n"
+      "(defprofile canary :inherits base ((def port 8891) (def visibility "
+      "2)))\n"));
   T_ASSERT_STATUS(config_load(conf_path, NULL, NULL, 0), CONFIG_LOAD_OK);
 
   T_ASSERT_EQ_INT(get_config()->timeout_ms, 42);
@@ -91,7 +85,17 @@ WAMBLE_TEST(config_push_pop_stack) {
 }
 
 WAMBLE_TEST(config_profile_inheritance) {
-  write_config_file();
+  T_ASSERT_STATUS_OK(wamble_test_write_text_file(
+      conf_path,
+      "(def log-level 3)\n"
+      "(defn add2 (a b) (+ a b))\n"
+      "(def timeout-ms (add2 40 2))\n"
+      "(defmacro inc (x) (do (+ x 1)))\n"
+      "(def max-retries (inc 3))\n"
+      "(defprofile base ((def port 8888) (def advertise 1) (def visibility "
+      "1)))\n"
+      "(defprofile canary :inherits base ((def port 8891) (def visibility "
+      "2)))\n"));
   T_ASSERT_STATUS(config_load(conf_path, NULL, NULL, 0), CONFIG_LOAD_OK);
   const WambleProfile *base = config_find_profile("base");
   const WambleProfile *canary = config_find_profile("canary");
@@ -182,6 +186,35 @@ WAMBLE_TEST(config_parse_doubles_and_strings) {
   return 0;
 }
 
+WAMBLE_TEST(config_db_fields_preserve_spacing_and_quotes) {
+  const char *p = "build/test_config_conninfo.conf";
+  const char *cfg =
+      "(def db-host \"127.0.0.1 port=55432 application_name=spoof\")\n"
+      "(def db-user \"user name\")\n"
+      "(def db-pass \"two words\\\\with'quote\")\n"
+      "(def db-name \"main db\")\n"
+      "(def global-db-host \"/tmp pg socket\")\n"
+      "(def global-db-user \"global user\")\n"
+      "(def global-db-pass \"global pass\")\n"
+      "(def global-db-name \"global db\")\n";
+  FILE *f = fopen(p, "w");
+  T_ASSERT(f != NULL);
+  fwrite(cfg, 1, strlen(cfg), f);
+  fclose(f);
+
+  T_ASSERT_STATUS(config_load(p, NULL, NULL, 0), CONFIG_LOAD_OK);
+  T_ASSERT_STREQ(get_config()->db_host,
+                 "127.0.0.1 port=55432 application_name=spoof");
+  T_ASSERT_STREQ(get_config()->db_user, "user name");
+  T_ASSERT_STREQ(get_config()->db_pass, "two words\\\\with'quote");
+  T_ASSERT_STREQ(get_config()->db_name, "main db");
+  T_ASSERT_STREQ(get_config()->global_db_host, "/tmp pg socket");
+  T_ASSERT_STREQ(get_config()->global_db_user, "global user");
+  T_ASSERT_STREQ(get_config()->global_db_pass, "global pass");
+  T_ASSERT_STREQ(get_config()->global_db_name, "global db");
+  return 0;
+}
+
 WAMBLE_TEST(config_treatment_groups_parse) {
   const char *p = "build/test_config_treatments.conf";
   const char *cfg =
@@ -264,6 +297,70 @@ WAMBLE_TEST(config_treatment_groups_parse) {
   return 0;
 }
 
+WAMBLE_TEST(config_profile_nested_policy_and_treatment_rejected) {
+  const char *p = "build/test_config_profile_nested_rules.conf";
+  const char *cfg = "(policy-allow \"*\" \"trust.tier\" \"tier\" 1 \"top\")\n"
+                    "(treatment-group \"top-group\" 10)\n"
+                    "(defprofile alpha ((policy-deny \"*\" \"protocol.ctrl\" "
+                    "\"list_profiles\" \"nested\") "
+                    "(treatment-group \"alpha-only\" 20) "
+                    "(def port 19400)))\n"
+                    "(defprofile beta ((treatment-group \"beta-only\" 30) "
+                    "(def port 19401)))\n";
+  FILE *f = fopen(p, "wb");
+  T_ASSERT(f != NULL);
+  fwrite(cfg, 1, strlen(cfg), f);
+  fclose(f);
+
+  char status[128];
+  T_ASSERT_STATUS(config_load(p, NULL, status, sizeof(status)),
+                  CONFIG_LOAD_IO_ERROR);
+  T_ASSERT(strstr(status, "unsupported") != NULL);
+  return 0;
+}
+
+WAMBLE_TEST(config_profile_nested_policy_rejection_preserves_active_state) {
+  const char *good = "build/test_config_profile_nested_good.conf";
+  const char *good_cfg =
+      "(def port 18888)\n"
+      "(def log-level 2)\n"
+      "(defprofile alpha ((def port 19410) (def advertise 1)))\n";
+  FILE *f = fopen(good, "wb");
+  T_ASSERT(f != NULL);
+  fwrite(good_cfg, 1, strlen(good_cfg), f);
+  fclose(f);
+
+  T_ASSERT_STATUS(config_load(good, NULL, NULL, 0), CONFIG_LOAD_OK);
+  T_ASSERT_EQ_INT(get_config()->port, 18888);
+  T_ASSERT_EQ_INT(get_config()->log_level, 2);
+  T_ASSERT_EQ_INT(config_profile_count(), 1);
+  T_ASSERT(config_find_profile("alpha") != NULL);
+
+  const char *bad = "build/test_config_profile_nested_bad.conf";
+  const char *bad_cfg =
+      "(def port 19999)\n"
+      "(defprofile beta ((policy-deny \"*\" \"protocol.ctrl\" "
+      "\"list_profiles\" \"nested\") (def port 19411)))\n";
+  f = fopen(bad, "wb");
+  T_ASSERT(f != NULL);
+  fwrite(bad_cfg, 1, strlen(bad_cfg), f);
+  fclose(f);
+
+  char status[128];
+  T_ASSERT_STATUS(config_load(bad, NULL, status, sizeof(status)),
+                  CONFIG_LOAD_IO_ERROR);
+  T_ASSERT(strstr(status, "unsupported") != NULL);
+
+  T_ASSERT_EQ_INT(get_config()->port, 18888);
+  T_ASSERT_EQ_INT(get_config()->log_level, 2);
+  T_ASSERT_EQ_INT(config_profile_count(), 1);
+  const WambleProfile *alpha = config_find_profile("alpha");
+  T_ASSERT(alpha != NULL);
+  T_ASSERT_EQ_INT(alpha->config.port, 19410);
+  T_ASSERT(config_find_profile("beta") == NULL);
+  return 0;
+}
+
 WAMBLE_TEST(config_profile_select_and_not_found) {
   const char *p = "build/test_config_profiles.conf";
   const char *cfg = "(def log-level 2)\n"
@@ -281,6 +378,23 @@ WAMBLE_TEST(config_profile_select_and_not_found) {
   ConfigLoadStatus s = config_load(p, "missing", status, sizeof status);
   T_ASSERT_STATUS(s, CONFIG_LOAD_PROFILE_NOT_FOUND);
   T_ASSERT(strstr(status, "profile 'missing' not found") != NULL);
+  return 0;
+}
+
+WAMBLE_TEST(config_profile_reserved_default_runtime_name_rejected) {
+  const char *p = "build/test_config_reserved_profile.conf";
+  char cfg[256];
+  snprintf(cfg, sizeof(cfg), "(defprofile %s ((def port 8812)))\n",
+           WAMBLE_DEFAULT_RUNTIME_EXPORT_NAME);
+  char status[256];
+  FILE *f = fopen(p, "w");
+  T_ASSERT(f != NULL);
+  fwrite(cfg, 1, strlen(cfg), f);
+  fclose(f);
+
+  T_ASSERT_STATUS(config_load(p, NULL, status, sizeof status),
+                  CONFIG_LOAD_IO_ERROR);
+  T_ASSERT(strstr(status, "is reserved") != NULL);
   return 0;
 }
 
@@ -377,38 +491,24 @@ WAMBLE_TEST(config_snapshot_restore_rebuilds_policy_eval) {
   return 0;
 }
 
-static int config_db_exec_sql(const char *sql) {
-  char path[128];
-  static unsigned long seq = 0;
-  snprintf(path, sizeof(path), "build/test_config_db_sql_%lu.sql", ++seq);
-  FILE *f = fopen(path, "wb");
-  if (!f)
-    return -1;
-  fwrite(sql, 1, strlen(sql), f);
-  fclose(f);
-  return test_db_apply_sql_file(path);
-}
-
 static int config_db_prepare(void) {
+  char cfg_path[512];
   if (!wamble_db_available())
     return -1;
   if (test_db_apply_migrations(NULL) != 0)
     return -1;
-  if (config_db_exec_sql(
-          "TRUNCATE TABLE predictions, payouts, game_results, reservations, "
-          "moves, boards, sessions, players, global_policy_rules, "
-          "global_treatment_assignment_predicates, "
-          "global_treatment_assignment_rules, global_treatment_group_outputs, "
-          "global_treatment_group_edges, global_treatment_groups, "
-          "global_runtime_config_revisions, global_runtime_config_blobs, "
-          "global_identities, global_identity_tags RESTART IDENTITY "
-          "CASCADE;") != 0)
+  if (test_db_reset(NULL) != 0)
     return -1;
-  if (config_load(NULL, NULL, NULL, 0) < 0)
+  if (wamble_test_path(cfg_path, sizeof(cfg_path), "config",
+                       "db_runtime.conf") != 0)
     return -1;
-  if (db_set_global_store_connection(wamble_test_dsn()) != 0)
+  if (wamble_test_write_db_config_file(cfg_path, "") != 0)
     return -1;
-  if (db_init(wamble_test_dsn()) != 0)
+  if (config_load(cfg_path, NULL, NULL, 0) < 0)
+    return -1;
+  if (db_set_global_store_connection(NULL) != 0)
+    return -1;
+  if (db_init(NULL) != 0)
     return -1;
   return 0;
 }
@@ -456,7 +556,7 @@ WAMBLE_TEST(config_db_policy_validation_requires_trust_tier_rule) {
   if (config_db_prepare() != 0)
     T_FAIL_SIMPLE("config_db_prepare failed");
   T_ASSERT(db_validate_global_policy() != 0);
-  T_ASSERT_STATUS_OK(config_db_exec_sql(
+  T_ASSERT_STATUS_OK(test_db_apply_sql(
       "INSERT INTO global_policy_rules "
       "(global_identity_id, action, resource, scope, effect, permission_level, "
       " reason, source) "
@@ -474,10 +574,7 @@ WAMBLE_TEST(config_db_policy_precedence_exact_deny_over_group_and_global) {
   const char *cfg_path = "build/test_policy_precedence.conf";
   const char *cfg = "(defprofile alpha ((def advertise 1) (def profile-group "
                     "\"trusted\")))\n";
-  FILE *f = fopen(cfg_path, "wb");
-  T_ASSERT(f != NULL);
-  fwrite(cfg, 1, strlen(cfg), f);
-  fclose(f);
+  T_ASSERT_EQ_INT(wamble_test_write_optional_db_config_file(cfg_path, cfg), 0);
   T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
 
   uint64_t sid = db_create_session(token, 0);
@@ -501,7 +598,7 @@ WAMBLE_TEST(config_db_policy_precedence_exact_deny_over_group_and_global) {
            "(%llu, 'trust.tier', 'tier', 'profile:alpha', 'deny', 0, "
            "'exact_deny', 'manual');",
            (unsigned long long)out.global_identity_id);
-  T_ASSERT_STATUS_OK(config_db_exec_sql(sql));
+  T_ASSERT_STATUS_OK(test_db_apply_sql(sql));
 
   memset(&out, 0, sizeof(out));
   T_ASSERT_STATUS(db_resolve_policy_decision(token, "alpha", "trust.tier",
@@ -529,10 +626,7 @@ WAMBLE_TEST(config_db_policy_default_deny_can_be_overridden_by_treatment) {
       "\"policy.permission_level.set\" 7)\n"
       "(treatment-behavior \"vip\" \"policy.resolve\" "
       "\"policy.reason\" \"experiment_allow\")\n";
-  FILE *f = fopen(cfg_path, "wb");
-  T_ASSERT(f != NULL);
-  fwrite(cfg, 1, strlen(cfg), f);
-  fclose(f);
+  T_ASSERT_EQ_INT(wamble_test_write_optional_db_config_file(cfg_path, cfg), 0);
   T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
   T_ASSERT_STATUS_OK(db_apply_config_treatment_rules("__default__"));
 
@@ -563,15 +657,12 @@ WAMBLE_TEST(config_db_policy_explicit_deny_can_be_overridden_by_treatment) {
       "(treatment-behavior \"vip\" \"policy.resolve\" \"policy.allow\" 1)\n"
       "(treatment-behavior \"vip\" \"policy.resolve\" "
       "\"policy.reason\" \"experiment_override\")\n";
-  FILE *f = fopen(cfg_path, "wb");
-  T_ASSERT(f != NULL);
-  fwrite(cfg, 1, strlen(cfg), f);
-  fclose(f);
+  T_ASSERT_EQ_INT(wamble_test_write_optional_db_config_file(cfg_path, cfg), 0);
   T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
   T_ASSERT_STATUS_OK(db_apply_config_treatment_rules("__default__"));
 
   T_ASSERT(db_create_session(token, 0) > 0);
-  T_ASSERT_STATUS_OK(config_db_exec_sql(
+  T_ASSERT_STATUS_OK(test_db_apply_sql(
       "INSERT INTO global_policy_rules "
       "(global_identity_id, action, resource, scope, effect, permission_level, "
       " reason, source) "
@@ -594,7 +685,7 @@ WAMBLE_TEST(config_db_resolve_assigns_identity_when_session_identity_missing) {
                                  0x70, 0x80, 0x90, 0xa0};
   if (config_db_prepare() != 0)
     T_FAIL_SIMPLE("config_db_prepare failed");
-  T_ASSERT_STATUS_OK(config_db_exec_sql(
+  T_ASSERT_STATUS_OK(test_db_apply_sql(
       "INSERT INTO global_policy_rules "
       "(global_identity_id, action, resource, scope, effect, permission_level, "
       " reason, source) "
@@ -612,7 +703,7 @@ WAMBLE_TEST(config_db_resolve_assigns_identity_when_session_identity_missing) {
 WAMBLE_TEST(config_db_apply_policy_rule_with_identity_selector) {
   if (config_db_prepare() != 0)
     T_FAIL_SIMPLE("config_db_prepare failed");
-  T_ASSERT_STATUS_OK(config_db_exec_sql(
+  T_ASSERT_STATUS_OK(test_db_apply_sql(
       "INSERT INTO global_identities (public_key) "
       "VALUES (decode('00112233445566778899aabbccddeeff00112233445566778899"
       "aabbccddeeff', 'hex'));"));
@@ -621,14 +712,11 @@ WAMBLE_TEST(config_db_apply_policy_rule_with_identity_selector) {
   const char *cfg =
       "(policy-allow \"identity:1\" \"trust.tier\" \"profile:alpha\" 7 "
       "\"seed\")\n";
-  FILE *f = fopen(cfg_path, "wb");
-  T_ASSERT(f != NULL);
-  fwrite(cfg, 1, strlen(cfg), f);
-  fclose(f);
+  T_ASSERT_EQ_INT(wamble_test_write_optional_db_config_file(cfg_path, cfg), 0);
   T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
   T_ASSERT_STATUS_OK(db_apply_config_policy_rules("__default__"));
 
-  T_ASSERT_STATUS_OK(config_db_exec_sql(
+  T_ASSERT_STATUS_OK(test_db_apply_sql(
       "DO $$ BEGIN "
       "IF NOT EXISTS ("
       "  SELECT 1 FROM global_policy_rules "
@@ -646,7 +734,7 @@ WAMBLE_TEST(config_db_apply_policy_rule_with_identity_selector) {
 WAMBLE_TEST(config_db_apply_policy_rule_with_tag_selector) {
   if (config_db_prepare() != 0)
     T_FAIL_SIMPLE("config_db_prepare failed");
-  T_ASSERT_STATUS_OK(config_db_exec_sql(
+  T_ASSERT_STATUS_OK(test_db_apply_sql(
       "INSERT INTO global_identities (public_key) VALUES "
       "(decode('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       "aaaa', 'hex')), "
@@ -659,14 +747,11 @@ WAMBLE_TEST(config_db_apply_policy_rule_with_tag_selector) {
   const char *cfg =
       "(policy-deny \"tag:ops\" \"profile.discover\" \"profile_selector:"
       "internal\" \"seed\")\n";
-  FILE *f = fopen(cfg_path, "wb");
-  T_ASSERT(f != NULL);
-  fwrite(cfg, 1, strlen(cfg), f);
-  fclose(f);
+  T_ASSERT_EQ_INT(wamble_test_write_optional_db_config_file(cfg_path, cfg), 0);
   T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
   T_ASSERT_STATUS_OK(db_apply_config_policy_rules("__default__"));
 
-  T_ASSERT_STATUS_OK(config_db_exec_sql(
+  T_ASSERT_STATUS_OK(test_db_apply_sql(
       "DO $$ DECLARE c INT; BEGIN "
       "SELECT COUNT(*) INTO c FROM global_policy_rules "
       "WHERE action = 'profile.discover' "
@@ -682,7 +767,7 @@ WAMBLE_TEST(config_db_apply_policy_rule_with_tag_selector) {
 WAMBLE_TEST(config_db_reapply_policy_rules_reexpands_tag_selectors) {
   if (config_db_prepare() != 0)
     T_FAIL_SIMPLE("config_db_prepare failed");
-  T_ASSERT_STATUS_OK(config_db_exec_sql(
+  T_ASSERT_STATUS_OK(test_db_apply_sql(
       "INSERT INTO global_identities (public_key) VALUES "
       "(decode('111111111111111111111111111111111111111111111111111111111111"
       "1111', 'hex')), "
@@ -695,14 +780,11 @@ WAMBLE_TEST(config_db_reapply_policy_rules_reexpands_tag_selectors) {
   const char *cfg =
       "(policy-deny \"tag:ops\" \"profile.discover\" \"profile_selector:"
       "internal\" \"seed\")\n";
-  FILE *f = fopen(cfg_path, "wb");
-  T_ASSERT(f != NULL);
-  fwrite(cfg, 1, strlen(cfg), f);
-  fclose(f);
+  T_ASSERT_EQ_INT(wamble_test_write_optional_db_config_file(cfg_path, cfg), 0);
   T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
 
   T_ASSERT_STATUS_OK(db_apply_config_policy_rules("__default__"));
-  T_ASSERT_STATUS_OK(config_db_exec_sql(
+  T_ASSERT_STATUS_OK(test_db_apply_sql(
       "DO $$ DECLARE c INT; BEGIN "
       "SELECT COUNT(*) INTO c FROM global_policy_rules "
       "WHERE action = 'profile.discover' "
@@ -711,12 +793,12 @@ WAMBLE_TEST(config_db_reapply_policy_rules_reexpands_tag_selectors) {
       "IF c <> 1 THEN RAISE EXCEPTION 'expected one expanded rule'; "
       "END IF; END $$;"));
 
-  T_ASSERT_STATUS_OK(config_db_exec_sql(
+  T_ASSERT_STATUS_OK(test_db_apply_sql(
       "INSERT INTO global_identity_tags (global_identity_id, tag) "
       "VALUES (2, 'ops');"));
   T_ASSERT_STATUS_OK(db_apply_config_policy_rules("__default__"));
 
-  T_ASSERT_STATUS_OK(config_db_exec_sql(
+  T_ASSERT_STATUS_OK(test_db_apply_sql(
       "DO $$ DECLARE c INT; BEGIN "
       "SELECT COUNT(*) INTO c FROM global_policy_rules "
       "WHERE action = 'profile.discover' "
@@ -745,10 +827,7 @@ WAMBLE_TEST(config_db_apply_treatment_rules_and_assign_session) {
       "(treatment-tag \"vip\" \"ops\")\n"
       "(treatment-feature \"vip\" \"prediction.gated\" 1)\n"
       "(treatment-meta \"vip\" \"prediction.submit\" \"note\" \"boosted\")\n";
-  FILE *f = fopen(cfg_path, "wb");
-  T_ASSERT(f != NULL);
-  fwrite(cfg, 1, strlen(cfg), f);
-  fclose(f);
+  T_ASSERT_EQ_INT(wamble_test_write_optional_db_config_file(cfg_path, cfg), 0);
   T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
   T_ASSERT_STATUS_OK(db_apply_config_treatment_rules("__default__"));
   T_ASSERT_STATUS_OK(db_validate_global_treatments());
@@ -769,7 +848,7 @@ WAMBLE_TEST(config_db_apply_treatment_rules_and_assign_session) {
                   DB_OK);
   T_ASSERT_STREQ(assignment.group_key, "vip");
 
-  T_ASSERT_STATUS_OK(config_db_exec_sql(
+  T_ASSERT_STATUS_OK(test_db_apply_sql(
       "DO $$ DECLARE c INT; BEGIN "
       "SELECT COUNT(*) INTO c FROM global_identity_tags WHERE tag = 'ops'; "
       "IF c <> 1 THEN RAISE EXCEPTION 'expected treatment tag'; "
@@ -791,10 +870,7 @@ WAMBLE_TEST(config_db_apply_treatment_view_rules) {
       "(treatment-visible-fen \"vip\" \"board.read\" "
       "\"8/8/8/8/8/8/8/8 w - - 0 1\")\n"
       "(treatment-predictions-from-moves \"vip\" \"prediction.read\")\n";
-  FILE *f = fopen(cfg_path, "wb");
-  T_ASSERT(f != NULL);
-  fwrite(cfg, 1, strlen(cfg), f);
-  fclose(f);
+  T_ASSERT_EQ_INT(wamble_test_write_optional_db_config_file(cfg_path, cfg), 0);
   T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
   T_ASSERT_STATUS_OK(db_apply_config_treatment_rules("__default__"));
 
@@ -842,14 +918,11 @@ WAMBLE_TEST(config_db_apply_treatment_edges_without_snapshot_revision) {
                     "(treatment-group \"vip\" 20)\n"
                     "(treatment-default \"control\")\n"
                     "(treatment-edge \"vip\" \"control\")\n";
-  FILE *f = fopen(cfg_path, "wb");
-  T_ASSERT(f != NULL);
-  fwrite(cfg, 1, strlen(cfg), f);
-  fclose(f);
+  T_ASSERT_EQ_INT(wamble_test_write_optional_db_config_file(cfg_path, cfg), 0);
   T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
   T_ASSERT_STATUS_OK(db_apply_config_treatment_rules("__default__"));
   T_ASSERT_EQ_INT(db_treatment_edge_allows("__default__", "vip", "control"), 1);
-  T_ASSERT_STATUS_OK(config_db_exec_sql(
+  T_ASSERT_STATUS_OK(test_db_apply_sql(
       "DO $$ DECLARE c INT; BEGIN "
       "SELECT COUNT(*) INTO c FROM global_treatment_group_edges "
       "WHERE source_group_key = 'vip' AND target_group_key = 'control' "
@@ -874,10 +947,7 @@ WAMBLE_TEST(config_db_treatment_reassigns_when_runtime_facts_arrive) {
                     "(match \"session.games\" \"gte\" 3))\n"
                     "(treatment-feature \"control\" \"prediction.gated\" 0)\n"
                     "(treatment-feature \"vip\" \"prediction.gated\" 1)\n";
-  FILE *f = fopen(cfg_path, "wb");
-  T_ASSERT(f != NULL);
-  fwrite(cfg, 1, strlen(cfg), f);
-  fclose(f);
+  T_ASSERT_EQ_INT(wamble_test_write_optional_db_config_file(cfg_path, cfg), 0);
   T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
   T_ASSERT_STATUS_OK(db_apply_config_treatment_rules("__default__"));
   T_ASSERT_STATUS_OK(db_validate_global_treatments());
@@ -914,6 +984,97 @@ WAMBLE_TEST(config_db_treatment_reassigns_when_runtime_facts_arrive) {
   return 0;
 }
 
+WAMBLE_TEST(config_db_logout_unlinks_persistent_identity_and_clears_treatment) {
+  uint8_t public_key[32] = {0};
+  WambleIntentBuffer intents = {0};
+  WamblePlayer *player = NULL;
+  int selected_bytes = 0;
+  int attempted = 0;
+  int failures = 0;
+  for (int i = 0; i < 32; i++)
+    public_key[i] = (uint8_t)(0xa0 + i);
+
+  if (config_db_prepare() != 0)
+    T_FAIL_SIMPLE("config_db_prepare failed");
+  const char *cfg_path = "build/test_logout_clears_treatment.conf";
+  const char *cfg = "(def experiment-enabled 1)\n"
+                    "(treatment-group \"vip\" 20)\n"
+                    "(treatment-default \"vip\")\n"
+                    "(treatment-feature \"vip\" \"prediction.gated\" 1)\n";
+  T_ASSERT_EQ_INT(wamble_test_write_optional_db_config_file(cfg_path, cfg), 0);
+  T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
+  T_ASSERT_STATUS_OK(db_apply_config_treatment_rules("__default__"));
+  wamble_set_query_service(wamble_get_db_query_service());
+  player_manager_init();
+  wamble_intents_init(&intents);
+  wamble_set_intent_buffer(&intents);
+
+  player = create_new_player();
+  char seed_sql[1024];
+  uint64_t session_id = 0;
+  char public_key_hex[65];
+  T_ASSERT(player != NULL);
+  session_id = db_create_session(player->token, 0);
+  T_ASSERT(session_id > 0);
+  for (int i = 0; i < 32; i++)
+    snprintf(public_key_hex + (i * 2), 3, "%02x", public_key[i]);
+  snprintf(
+      seed_sql, sizeof(seed_sql),
+      "INSERT INTO global_identities (public_key) "
+      "VALUES (decode('%s', 'hex')) "
+      "ON CONFLICT (public_key) DO NOTHING;"
+      "INSERT INTO players (public_key, rating) "
+      "VALUES (decode('%s', 'hex'), 1200) "
+      "ON CONFLICT (public_key) DO NOTHING;"
+      "UPDATE sessions SET player_id = (SELECT id FROM players WHERE "
+      "public_key "
+      "= decode('%s', 'hex')), "
+      "global_identity_id = (SELECT id FROM global_identities WHERE public_key "
+      "= decode('%s', 'hex')) "
+      "WHERE id = %llu;",
+      public_key_hex, public_key_hex, public_key_hex, public_key_hex,
+      (unsigned long long)session_id);
+  T_ASSERT_STATUS_OK(test_db_apply_sql(seed_sql));
+
+  T_ASSERT(attach_persistent_identity(player->token, public_key) != NULL);
+  wamble_intents_clear(&intents);
+  db_cleanup_thread();
+
+  uint64_t persistent_session_id = 0;
+  T_ASSERT_STATUS(wamble_query_get_persistent_session_by_token(
+                      player->token, &persistent_session_id),
+                  DB_OK);
+  T_ASSERT(persistent_session_id > 0);
+
+  WambleTreatmentAction actions[8];
+  int action_count = 0;
+  T_ASSERT_STATUS(db_resolve_treatment_actions(player->token, "",
+                                               "prediction.submit", NULL, NULL,
+                                               0, actions, 8, &action_count),
+                  DB_OK);
+  T_ASSERT(action_count > 0);
+
+  WambleTreatmentAssignment assignment = {0};
+  T_ASSERT_STATUS(
+      db_get_session_treatment_assignment(player->token, &assignment), DB_OK);
+  T_ASSERT_STREQ(assignment.group_key, "vip");
+
+  T_ASSERT_EQ_INT(detach_persistent_identity(player->token), 0);
+  T_ASSERT_EQ_INT(wamble_apply_intents_with_db_checked(
+                      &intents, 0, 0, &selected_bytes, &attempted, &failures),
+                  PERSISTENCE_STATUS_OK);
+  T_ASSERT_EQ_INT(failures, 0);
+  T_ASSERT_STATUS(wamble_query_get_persistent_session_by_token(
+                      player->token, &persistent_session_id),
+                  DB_NOT_FOUND);
+  T_ASSERT_STATUS(
+      db_get_session_treatment_assignment(player->token, &assignment),
+      DB_NOT_FOUND);
+  wamble_set_intent_buffer(NULL);
+  wamble_intents_free(&intents);
+  return 0;
+}
+
 WAMBLE_TEST(config_network_treatment_group_refreshes_after_reassignment) {
   uint8_t token[TOKEN_LENGTH] = {0xde, 0xad, 0xbe, 0xef, 0x10, 0x20,
                                  0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
@@ -929,10 +1090,7 @@ WAMBLE_TEST(config_network_treatment_group_refreshes_after_reassignment) {
                     "(match \"session.games\" \"gte\" 3))\n"
                     "(treatment-feature \"control\" \"prediction.gated\" 0)\n"
                     "(treatment-feature \"vip\" \"prediction.gated\" 1)\n";
-  FILE *f = fopen(cfg_path, "wb");
-  T_ASSERT(f != NULL);
-  fwrite(cfg, 1, strlen(cfg), f);
-  fclose(f);
+  T_ASSERT_EQ_INT(wamble_test_write_optional_db_config_file(cfg_path, cfg), 0);
   T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
   T_ASSERT_STATUS_OK(db_apply_config_treatment_rules("__default__"));
   T_ASSERT(db_create_session(token, 0) > 0);
@@ -983,10 +1141,8 @@ WAMBLE_TEST(config_db_treatment_scopes_by_profile_source) {
       "(treatment-default \"control\")\n"
       "(treatment-feature \"control\" \"prediction.gated\" 1)\n"
       "(treatment-edge \"control\" \"vip\")\n";
-  FILE *f = fopen(alpha_path, "wb");
-  T_ASSERT(f != NULL);
-  fwrite(alpha_cfg, 1, strlen(alpha_cfg), f);
-  fclose(f);
+  T_ASSERT_EQ_INT(
+      wamble_test_write_optional_db_config_file(alpha_path, alpha_cfg), 0);
   T_ASSERT_STATUS(config_load(alpha_path, NULL, NULL, 0), CONFIG_LOAD_OK);
   T_ASSERT_STATUS_OK(db_apply_config_treatment_rules("alpha"));
 
@@ -997,10 +1153,8 @@ WAMBLE_TEST(config_db_treatment_scopes_by_profile_source) {
       "(treatment-group \"vip\" 20)\n"
       "(treatment-default \"vip\")\n"
       "(treatment-feature \"control\" \"prediction.gated\" 0)\n";
-  f = fopen(beta_path, "wb");
-  T_ASSERT(f != NULL);
-  fwrite(beta_cfg, 1, strlen(beta_cfg), f);
-  fclose(f);
+  T_ASSERT_EQ_INT(
+      wamble_test_write_optional_db_config_file(beta_path, beta_cfg), 0);
   T_ASSERT_STATUS(config_load(beta_path, NULL, NULL, 0), CONFIG_LOAD_OK);
   T_ASSERT_STATUS_OK(db_apply_config_treatment_rules("beta"));
   T_ASSERT_STATUS_OK(db_validate_global_treatments());
@@ -1053,8 +1207,15 @@ WAMBLE_TESTS_ADD_EX_SM(config_perf_parse_medium, WAMBLE_SUITE_PERFORMANCE,
 WAMBLE_TESTS_ADD_EX_SM(config_stress_many_profiles, WAMBLE_SUITE_STRESS,
                        "config", NULL, NULL, 15000);
 WAMBLE_TESTS_ADD_FM(config_parse_doubles_and_strings, "config");
+WAMBLE_TESTS_ADD_FM(config_db_fields_preserve_spacing_and_quotes, "config");
 WAMBLE_TESTS_ADD_FM(config_treatment_groups_parse, "config");
+WAMBLE_TESTS_ADD_FM(config_profile_nested_policy_and_treatment_rejected,
+                    "config");
+WAMBLE_TESTS_ADD_FM(
+    config_profile_nested_policy_rejection_preserves_active_state, "config");
 WAMBLE_TESTS_ADD_FM(config_profile_select_and_not_found, "config");
+WAMBLE_TESTS_ADD_FM(config_profile_reserved_default_runtime_name_rejected,
+                    "config");
 WAMBLE_TESTS_ADD_FM(config_profile_inheritance_variants, "config");
 WAMBLE_TESTS_ADD_FM(config_profile_missing_base_skipped, "config");
 WAMBLE_TESTS_ADD_FM(config_env_getenv_unset, "config");
@@ -1081,6 +1242,9 @@ WAMBLE_TESTS_ADD_DB_FM(
     config_db_apply_treatment_edges_without_snapshot_revision, "config");
 WAMBLE_TESTS_ADD_DB_FM(config_db_treatment_reassigns_when_runtime_facts_arrive,
                        "config");
+WAMBLE_TESTS_ADD_DB_FM(
+    config_db_logout_unlinks_persistent_identity_and_clears_treatment,
+    "config");
 WAMBLE_TESTS_ADD_DB_FM(
     config_network_treatment_group_refreshes_after_reassignment, "config");
 WAMBLE_TESTS_ADD_DB_FM(config_db_treatment_scopes_by_profile_source, "config");

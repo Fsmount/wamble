@@ -4,7 +4,6 @@
 #include "../include/wamble/wamble.h"
 
 struct WambleQueryService;
-
 int db_init(const char *connection_string);
 int db_set_global_store_connection(const char *connection_string);
 int db_validate_global_policy(void);
@@ -25,13 +24,9 @@ DbStatus db_assign_session_treatment(const uint8_t *token, const char *profile,
                                      WambleTreatmentAssignment *out);
 DbStatus db_get_session_treatment_assignment(const uint8_t *token,
                                              WambleTreatmentAssignment *out);
-DbStatus db_get_session_by_token(const uint8_t *token, uint64_t *out_session);
-DbStatus db_get_persistent_session_by_token(const uint8_t *token,
-                                            uint64_t *out_session);
 void db_async_update_session_last_seen(uint64_t session_id);
 
 uint64_t db_create_board(const char *fen);
-DbStatus db_get_max_board_id(uint64_t *out_max_id);
 int db_insert_board(uint64_t board_id, const char *fen, const char *status);
 int db_async_update_board(uint64_t board_id, const char *fen,
                           const char *status);
@@ -41,9 +36,6 @@ int db_async_update_board_move_meta(uint64_t board_id,
 int db_async_update_board_reservation_meta(uint64_t board_id,
                                            time_t reservation_time,
                                            int reserved_for_white);
-
-DbBoardResult db_get_board(uint64_t board_id);
-DbBoardIdList db_list_boards_by_status(const char *status);
 
 int db_async_record_move(uint64_t board_id, uint64_t session_id,
                          const char *move_uci, int move_number);
@@ -60,8 +52,6 @@ int db_async_resolve_prediction(uint64_t board_id, uint64_t session_id,
                                 double points_awarded);
 DbPredictionsResult db_get_pending_predictions(void);
 
-DbMovesResult db_get_moves_for_board(uint64_t board_id);
-
 int db_async_create_reservation(uint64_t board_id, uint64_t session_id,
                                 int timeout_seconds, int reserved_for_white);
 void db_async_remove_reservation(uint64_t board_id);
@@ -71,20 +61,10 @@ int db_async_record_game_result(uint64_t board_id, char winning_side,
                                 const char *termination_reason);
 int db_async_record_payout(uint64_t board_id, uint64_t session_id,
                            double points);
-DbStatus db_get_player_total_score(uint64_t session_id, double *out_total);
-DbStatus db_get_player_prediction_score(uint64_t session_id, double *out_total);
-DbStatus db_get_player_rating(uint64_t session_id, double *out_rating);
 int db_async_update_player_rating(uint64_t session_id, double rating);
 
-DbStatus db_get_active_session_count(int *out_count);
-DbStatus db_get_longest_game_moves(int *out_max_moves);
-DbStatus db_get_session_games_played(uint64_t session_id, int *out_games);
 DbLeaderboardResult db_get_leaderboard(uint64_t requester_session_id,
                                        uint8_t leaderboard_type, int limit);
-
-uint64_t db_create_player(const uint8_t *public_key);
-uint64_t db_get_player_by_public_key(const uint8_t *public_key);
-int db_async_link_session_to_player(uint64_t session_id, uint64_t player_id);
 
 void db_expire_reservations(void);
 
@@ -123,14 +103,27 @@ typedef struct WambleQueryService {
                                           double *out_total);
   DbStatus (*get_player_rating)(uint64_t session_id, double *out_rating);
   DbStatus (*get_session_games_played)(uint64_t session_id, int *out_games);
+  DbStatus (*get_persistent_player_stats)(
+      const uint8_t *public_key, WamblePersistentPlayerStats *out_stats);
   DbLeaderboardResult (*get_leaderboard)(uint64_t requester_session_id,
                                          uint8_t leaderboard_type, int limit);
   DbMovesResult (*get_moves_for_board)(uint64_t board_id);
+  int (*link_session_to_pubkey)(uint64_t session_id, const uint8_t *public_key);
+  int (*unlink_session_identity)(uint64_t session_id);
+  DbStatus (*get_session_treatment_assignment)(const uint8_t *token,
+                                               WambleTreatmentAssignment *out);
   DbStatus (*resolve_policy_decision)(const uint8_t *token, const char *profile,
                                       const char *action, const char *resource,
                                       const char *context_key,
                                       const char *context_value,
                                       WamblePolicyDecision *out);
+  DbStatus (*resolve_treatment_actions)(
+      const uint8_t *token, const char *profile, const char *hook_name,
+      const char *opponent_group_key, const WambleFact *facts, int fact_count,
+      WambleTreatmentAction *out, int max_out, int *out_count);
+  int (*treatment_edge_allows)(const char *profile,
+                               const char *source_group_key,
+                               const char *target_group_key);
 } WambleQueryService;
 
 const WambleQueryService *wamble_get_db_query_service(void);
@@ -151,6 +144,8 @@ typedef enum {
   WAMBLE_INTENT_UPDATE_BOARD_RESERVATION_META = 13,
   WAMBLE_INTENT_RECORD_PREDICTION = 14,
   WAMBLE_INTENT_RESOLVE_PREDICTION = 15,
+  WAMBLE_INTENT_UNLINK_SESSION_IDENTITY = 16,
+  WAMBLE_INTENT_UPDATE_PLAYER_RATING = 17,
 } WambleIntentType;
 
 typedef struct WamblePersistenceIntent {
@@ -198,10 +193,17 @@ typedef struct WamblePersistenceIntent {
       uint8_t public_key[32];
     } link_session_to_pubkey;
     struct {
+      uint8_t token[TOKEN_LENGTH];
+    } unlink_session_identity;
+    struct {
       uint64_t board_id;
       uint8_t token[TOKEN_LENGTH];
       double points;
     } record_payout;
+    struct {
+      uint8_t token[TOKEN_LENGTH];
+      double rating;
+    } update_player_rating;
     struct {
       uint64_t board_id;
       uint8_t token[TOKEN_LENGTH];

@@ -47,6 +47,19 @@ uint64_t wamble_now_nanos(void) {
 #endif
 }
 
+void wamble_sleep_ms(int ms) {
+  if (ms <= 0)
+    return;
+#if defined(WAMBLE_PLATFORM_WINDOWS)
+  Sleep((DWORD)ms);
+#else
+  struct timeval tv;
+  tv.tv_sec = ms / 1000;
+  tv.tv_usec = (ms % 1000) * 1000;
+  select(0, NULL, NULL, NULL, &tv);
+#endif
+}
+
 int gmtime_w(struct tm *out_tm, const time_t *timer) {
 #if defined(WAMBLE_PLATFORM_WINDOWS)
   return (gmtime_s(out_tm, timer) == 0) ? 1 : 0;

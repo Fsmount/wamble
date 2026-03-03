@@ -34,6 +34,22 @@ static void exec_sql(PGconn *c, const char *sql) {
   PQclear(r);
 }
 
+static int schema_name_valid(const char *schema) {
+  if (!schema || !schema[0])
+    return 0;
+  unsigned char c0 = (unsigned char)schema[0];
+  if (!((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') || c0 == '_'))
+    return 0;
+  for (int i = 1; schema[i]; i++) {
+    unsigned char c = (unsigned char)schema[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '_')) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static void exec_file(PGconn *c, const char *path) {
   FILE *f = fopen(path, "rb");
   if (!f) {
@@ -83,10 +99,12 @@ int main(int argc, char **argv) {
 
   PGconn *c = connect_env();
   if (schema && *schema) {
+    if (!schema_name_valid(schema))
+      die("invalid schema name");
     char buf[256];
-    snprintf(buf, sizeof buf, "CREATE SCHEMA IF NOT EXISTS %s", schema);
+    snprintf(buf, sizeof buf, "CREATE SCHEMA IF NOT EXISTS \"%s\"", schema);
     exec_sql(c, buf);
-    snprintf(buf, sizeof buf, "SET search_path TO %s", schema);
+    snprintf(buf, sizeof buf, "SET search_path TO \"%s\"", schema);
     exec_sql(c, buf);
   }
   if (do_reset) {

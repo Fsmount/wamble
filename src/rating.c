@@ -1,5 +1,4 @@
 #include "../include/wamble/wamble.h"
-#include "../include/wamble/wamble_db.h"
 #include <string.h>
 
 static double rating_action_number(const WambleTreatmentAction *action,
@@ -59,7 +58,7 @@ static void rating_apply_treatment_adjustments(const WambleBoard *board,
 
   WambleTreatmentAction actions[16];
   int action_count = 0;
-  if (db_resolve_treatment_actions(
+  if (wamble_query_resolve_treatment_actions(
           player->token, "", "rating.adjust", board->last_mover_treatment_group,
           facts, fact_count, actions, 16, &action_count) != DB_OK) {
     return;
@@ -96,9 +95,10 @@ void update_player_ratings(WambleBoard *board) {
   if (mres.status != DB_OK || !mres.rows || mres.count <= 0)
     return;
 
-  uint8_t seen[TOKEN_LENGTH * 64];
+  uint8_t *seen = calloc((size_t)mres.count, TOKEN_LENGTH);
+  if (!seen)
+    return;
   int seen_count = 0;
-  memset(seen, 0, sizeof(seen));
 
   for (int i = 0; i < mres.count; i++) {
     const uint8_t *token = mres.rows[i].player_token;
@@ -109,7 +109,7 @@ void update_player_ratings(WambleBoard *board) {
         break;
       }
     }
-    if (already_seen || seen_count >= 64)
+    if (already_seen)
       continue;
     memcpy(&seen[seen_count * TOKEN_LENGTH], token, TOKEN_LENGTH);
     seen_count++;
@@ -128,7 +128,8 @@ void update_player_ratings(WambleBoard *board) {
     uint64_t session_id = 0;
     if (wamble_query_get_session_by_token(token, &session_id) == DB_OK &&
         session_id > 0) {
-      (void)db_async_update_player_rating(session_id, player->rating);
+      wamble_emit_update_player_rating(token, player->rating);
     }
   }
+  free(seen);
 }

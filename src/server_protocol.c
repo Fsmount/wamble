@@ -1,6 +1,4 @@
 #include "../include/wamble/wamble.h"
-#include "../include/wamble/wamble_db.h"
-
 typedef struct {
   int used;
   uint8_t token[TOKEN_LENGTH];
@@ -8,19 +6,33 @@ typedef struct {
   int count;
 } RequestRateLimitEntry;
 
-static WAMBLE_THREAD_LOCAL RequestRateLimitEntry g_rate_limit_entries[1024];
+static WAMBLE_THREAD_LOCAL RequestRateLimitEntry *g_rate_limit_entries = NULL;
+static WAMBLE_THREAD_LOCAL int g_rate_limit_capacity = 0;
+
+static int ensure_rate_limit_entries(void) {
+  int desired = get_config()->max_client_sessions;
+  if (desired <= 0)
+    desired = 1;
+  if (g_rate_limit_entries && g_rate_limit_capacity == desired)
+    return 0;
+
+  RequestRateLimitEntry *next = calloc((size_t)desired, sizeof(*next));
+  if (!next)
+    return -1;
+  free(g_rate_limit_entries);
+  g_rate_limit_entries = next;
+  g_rate_limit_capacity = desired;
+  return 0;
+}
 
 static int policy_check(const uint8_t *token, const char *profile_name,
                         const char *action, const char *resource,
                         const char *context_key, const char *context_value,
                         WamblePolicyDecision *out_decision) {
-  const WambleQueryService *qs = wamble_get_query_service();
-  if (!qs || !qs->resolve_policy_decision)
-    return 0;
   WamblePolicyDecision decision;
-  DbStatus st =
-      qs->resolve_policy_decision(token, profile_name, action, resource,
-                                  context_key, context_value, &decision);
+  DbStatus st = wamble_query_resolve_policy_decision(
+      token, profile_name, action, resource, context_key, context_value,
+      &decision);
   if (st != DB_OK)
     return 0;
   if (out_decision)
@@ -30,11 +42,8 @@ static int policy_check(const uint8_t *token, const char *profile_name,
 
 static int resolve_profile_trust_tier(const uint8_t *token,
                                       const char *profile_name) {
-  const WambleQueryService *qs = wamble_get_query_service();
-  if (!qs || !qs->resolve_policy_decision)
-    return 0;
   WamblePolicyDecision trust_decision;
-  DbStatus st = qs->resolve_policy_decision(
+  DbStatus st = wamble_query_resolve_policy_decision(
       token, profile_name, "trust.tier", "tier", NULL, NULL, &trust_decision);
   int trust_tier = (st == DB_OK && trust_decision.allowed)
                        ? trust_decision.permission_level
@@ -59,9 +68,9 @@ static int resolve_profile_trust_tier(const uint8_t *token,
 
   WambleTreatmentAction actions[8];
   int action_count = 0;
-  if (db_resolve_treatment_actions(token, profile_name ? profile_name : "",
-                                   "trust.resolve", NULL, facts, fact_count,
-                                   actions, 8, &action_count) == DB_OK) {
+  if (wamble_query_resolve_treatment_actions(
+          token, profile_name ? profile_name : "", "trust.resolve", NULL, facts,
+          fact_count, actions, 8, &action_count) == DB_OK) {
     for (int i = 0; i < action_count; i++) {
       if (strcmp(actions[i].output_kind, "behavior") != 0)
         continue;
@@ -131,7 +140,7 @@ static void write_visible_board_fen(const uint8_t *token,
   int fact_count = collect_board_treatment_facts(board, facts, 3);
   WambleTreatmentAction actions[8];
   int action_count = 0;
-  if (db_resolve_treatment_actions(
+  if (wamble_query_resolve_treatment_actions(
           token, profile_name ? profile_name : "", "board.read",
           board->last_mover_treatment_group, facts, fact_count, actions, 8,
           &action_count) != DB_OK) {
@@ -158,7 +167,7 @@ static int prediction_read_uses_move_projection(const uint8_t *token,
   int fact_count = collect_board_treatment_facts(board, facts, 3);
   WambleTreatmentAction actions[8];
   int action_count = 0;
-  if (db_resolve_treatment_actions(
+  if (wamble_query_resolve_treatment_actions(
           token, profile_name ? profile_name : "", "prediction.read",
           board->last_mover_treatment_group, facts, fact_count, actions, 8,
           &action_count) != DB_OK) {
@@ -219,30 +228,27 @@ static DiscoverPolicyDecision resolve_discovery_policy_for_action(
     const uint8_t *token, const WambleProfile *p, const char *action) {
   if (!token || !p || !p->name)
     return DISCOVER_POLICY_NO_RULE;
-  const WambleQueryService *qs = wamble_get_query_service();
-  if (!qs || !qs->resolve_policy_decision)
-    return DISCOVER_POLICY_NO_RULE;
 
   WamblePolicyDecision decision;
   char resource[256];
   DbStatus st;
 
   snprintf(resource, sizeof(resource), "profile:%s", p->name);
-  st = qs->resolve_policy_decision(token, p->name, action, resource, NULL, NULL,
-                                   &decision);
+  st = wamble_query_resolve_policy_decision(token, p->name, action, resource,
+                                            NULL, NULL, &decision);
   if (st == DB_OK && decision.rule_id > 0)
     return decision.allowed ? DISCOVER_POLICY_ALLOW : DISCOVER_POLICY_DENY;
 
   if (p->group && p->group[0]) {
     snprintf(resource, sizeof(resource), "profile_selector:%s", p->group);
-    st = qs->resolve_policy_decision(token, p->name, action, resource, NULL,
-                                     NULL, &decision);
+    st = wamble_query_resolve_policy_decision(token, p->name, action, resource,
+                                              NULL, NULL, &decision);
     if (st == DB_OK && decision.rule_id > 0)
       return decision.allowed ? DISCOVER_POLICY_ALLOW : DISCOVER_POLICY_DENY;
   }
 
-  st = qs->resolve_policy_decision(token, p->name, action, "*", NULL, NULL,
-                                   &decision);
+  st = wamble_query_resolve_policy_decision(token, p->name, action, "*", NULL,
+                                            NULL, &decision);
   if (st == DB_OK && decision.rule_id > 0)
     return decision.allowed ? DISCOVER_POLICY_ALLOW : DISCOVER_POLICY_DENY;
   return DISCOVER_POLICY_NO_RULE;
@@ -251,15 +257,16 @@ static DiscoverPolicyDecision resolve_discovery_policy_for_action(
 static int rate_limit_allowed(const uint8_t *token, int max_per_sec) {
   if (!token || max_per_sec <= 0)
     return 1;
+  if (ensure_rate_limit_entries() != 0)
+    return 0;
   uint64_t now = wamble_now_mono_millis();
   int match_idx = -1;
   int free_idx = -1;
-  int oldest_idx = 0;
-  uint64_t oldest_ms = UINT64_MAX;
-  for (int i = 0; i < (int)(sizeof(g_rate_limit_entries) /
-                            sizeof(g_rate_limit_entries[0]));
-       i++) {
+  for (int i = 0; i < g_rate_limit_capacity; i++) {
     RequestRateLimitEntry *e = &g_rate_limit_entries[i];
+    if (e->used && now >= e->window_start_ms + 1000) {
+      memset(e, 0, sizeof(*e));
+    }
     if (!e->used) {
       if (free_idx < 0)
         free_idx = i;
@@ -268,10 +275,6 @@ static int rate_limit_allowed(const uint8_t *token, int max_per_sec) {
     if (tokens_equal(e->token, token)) {
       match_idx = i;
       break;
-    }
-    if (e->window_start_ms < oldest_ms) {
-      oldest_ms = e->window_start_ms;
-      oldest_idx = i;
     }
   }
 
@@ -283,8 +286,9 @@ static int rate_limit_allowed(const uint8_t *token, int max_per_sec) {
       entry->count = 0;
     }
   } else {
-    int idx = (free_idx >= 0) ? free_idx : oldest_idx;
-    entry = &g_rate_limit_entries[idx];
+    if (free_idx < 0)
+      return 0;
+    entry = &g_rate_limit_entries[free_idx];
     entry->used = 1;
     memcpy(entry->token, token, TOKEN_LENGTH);
     entry->window_start_ms = now;
@@ -294,6 +298,21 @@ static int rate_limit_allowed(const uint8_t *token, int max_per_sec) {
     return 0;
   entry->count++;
   return 1;
+}
+
+static const uint8_t *
+rate_limit_key_for_message(const struct WambleMsg *msg,
+                           const struct sockaddr_in *cliaddr,
+                           uint8_t key_buf[TOKEN_LENGTH]) {
+  if (!msg)
+    return NULL;
+  if (msg->ctrl != WAMBLE_CTRL_CLIENT_HELLO || !cliaddr)
+    return msg->token;
+  memset(key_buf, 0, TOKEN_LENGTH);
+  key_buf[0] = WAMBLE_CTRL_CLIENT_HELLO;
+  memcpy(&key_buf[1], &cliaddr->sin_addr.s_addr,
+         sizeof(cliaddr->sin_addr.s_addr));
+  return key_buf;
 }
 
 static int profile_discovery_allowed(const uint8_t *token,
@@ -520,6 +539,24 @@ static ServerStatus handle_client_hello(wamble_socket_t sockfd,
   return SERVER_OK;
 }
 
+static ServerStatus handle_client_goodbye(const struct WambleMsg *msg) {
+  WamblePlayer *player = get_player_by_token(msg->token);
+  if (!player)
+    return SERVER_ERR_UNKNOWN_PLAYER;
+  spectator_discard_by_token(msg->token);
+  discard_player_by_token(msg->token);
+  return SERVER_OK;
+}
+
+static ServerStatus handle_logout(const struct WambleMsg *msg) {
+  WamblePlayer *player = get_player_by_token(msg->token);
+  if (!player)
+    return SERVER_ERR_UNKNOWN_PLAYER;
+  if (detach_persistent_identity(msg->token) != 0)
+    return SERVER_ERR_INTERNAL;
+  return SERVER_OK;
+}
+
 static ServerStatus handle_player_move(wamble_socket_t sockfd,
                                        const struct WambleMsg *msg,
                                        const struct sockaddr_in *cliaddr,
@@ -679,14 +716,17 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
   if (msg) {
     effective_trust_tier = resolve_profile_trust_tier(msg->token, profile_name);
   }
-  if (msg->ctrl != WAMBLE_CTRL_CLIENT_HELLO && msg->ctrl != WAMBLE_CTRL_ACK) {
+  if (msg->ctrl != WAMBLE_CTRL_ACK) {
     WamblePolicyDecision bypass = {0};
     const char *ctrl_res = ctrl_policy_resource(msg->ctrl);
     int bypass_rate_limit =
         policy_check(msg->token, profile_name, "rate_limit.bypass", "request",
                      "ctrl", ctrl_res, &bypass);
     int max_per_sec = get_config()->rate_limit_requests_per_sec;
-    if (!bypass_rate_limit && !rate_limit_allowed(msg->token, max_per_sec)) {
+    uint8_t rate_key[TOKEN_LENGTH];
+    const uint8_t *limit_token =
+        rate_limit_key_for_message(msg, cliaddr, rate_key);
+    if (!bypass_rate_limit && !rate_limit_allowed(limit_token, max_per_sec)) {
       struct WambleMsg out = {0};
       out.ctrl = WAMBLE_CTRL_ERROR;
       memcpy(out.token, msg->token, TOKEN_LENGTH);
@@ -699,8 +739,7 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
       return SERVER_ERR_FORBIDDEN;
     }
   }
-  if (msg->ctrl != WAMBLE_CTRL_CLIENT_HELLO && msg->ctrl != WAMBLE_CTRL_ACK &&
-      msg->ctrl != WAMBLE_CTRL_LOGIN_REQUEST) {
+  if (msg->ctrl != WAMBLE_CTRL_ACK && msg->ctrl != WAMBLE_CTRL_LOGIN_REQUEST) {
     WamblePolicyDecision decision;
     memset(&decision, 0, sizeof(decision));
     const char *ctrl_res = ctrl_policy_resource(msg->ctrl);
@@ -713,6 +752,10 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
   switch (msg->ctrl) {
   case WAMBLE_CTRL_CLIENT_HELLO:
     return handle_client_hello(sockfd, msg, cliaddr, profile_name);
+  case WAMBLE_CTRL_CLIENT_GOODBYE:
+    if ((msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0)
+      send_ack(sockfd, msg, cliaddr);
+    return handle_client_goodbye(msg);
   case WAMBLE_CTRL_PLAYER_MOVE:
     if ((msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0)
       send_ack(sockfd, msg, cliaddr);
@@ -749,9 +792,17 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     return SERVER_OK;
   }
   case WAMBLE_CTRL_GET_PROFILE_INFO: {
-    char name[MAX_UCI_LENGTH + 1];
-    int nlen = msg->uci_len < MAX_UCI_LENGTH ? msg->uci_len : MAX_UCI_LENGTH;
-    memcpy(name, msg->uci, (size_t)nlen);
+    char name[PROFILE_NAME_MAX_LENGTH];
+    int nlen = 0;
+    if (msg->profile_name[0] || msg->profile_name_len > 0) {
+      nlen = msg->profile_name_len < (PROFILE_NAME_MAX_LENGTH - 1)
+                 ? msg->profile_name_len
+                 : (PROFILE_NAME_MAX_LENGTH - 1);
+      memcpy(name, msg->profile_name, (size_t)nlen);
+    } else {
+      nlen = msg->uci_len < MAX_UCI_LENGTH ? msg->uci_len : MAX_UCI_LENGTH;
+      memcpy(name, msg->uci, (size_t)nlen);
+    }
     name[nlen] = '\0';
     const WambleProfile *p = config_find_profile(name);
     struct WambleMsg resp = {0};
@@ -761,7 +812,7 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
       snprintf(resp.fen, FEN_MAX_LENGTH, "%s;%d;%d;%d", p->name, p->config.port,
                p->advertise, p->visibility);
     } else {
-      snprintf(resp.fen, FEN_MAX_LENGTH, "NOTFOUND;%s", name);
+      snprintf(resp.fen, FEN_MAX_LENGTH, "NOTFOUND;%.80s", name);
     }
     if (send_reliable_message(sockfd, &resp, cliaddr, get_config()->timeout_ms,
                               get_config()->max_retries) != 0) {
@@ -803,6 +854,10 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     }
     return player ? SERVER_OK : SERVER_ERR_LOGIN_FAILED;
   }
+  case WAMBLE_CTRL_LOGOUT:
+    if ((msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0)
+      send_ack(sockfd, msg, cliaddr);
+    return handle_logout(msg);
   case WAMBLE_CTRL_SPECTATE_GAME: {
     if ((msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0)
       send_ack(sockfd, msg, cliaddr);
@@ -927,12 +982,8 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     return SERVER_OK;
   }
   case WAMBLE_CTRL_SUBMIT_PREDICTION:
-    if ((msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0)
-      send_ack(sockfd, msg, cliaddr);
     return handle_submit_prediction(sockfd, msg, cliaddr);
   case WAMBLE_CTRL_GET_PREDICTIONS:
-    if ((msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0)
-      send_ack(sockfd, msg, cliaddr);
     return handle_get_predictions(sockfd, cliaddr, msg, profile_name);
   case WAMBLE_CTRL_GET_LEGAL_MOVES: {
     WamblePolicyDecision decision;

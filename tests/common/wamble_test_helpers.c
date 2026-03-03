@@ -2,6 +2,7 @@
 #include "wamble_test_helpers.h"
 
 #include "wamble/wamble.h"
+#include "wamble/wamble_db.h"
 
 #include <errno.h>
 #ifdef WAMBLE_ENABLE_DB
@@ -30,6 +31,38 @@ static int write_file(const char *path, const char *fmt, ...) {
   va_end(ap);
   fclose(f);
   return 0;
+}
+
+static int append_text(char *out, size_t out_len, size_t *offset,
+                       const char *text) {
+  const char *src = text ? text : "";
+  if (!out || !offset || *offset >= out_len)
+    return -1;
+  while (*src) {
+    if (*offset + 1 >= out_len)
+      return -1;
+    out[(*offset)++] = *src++;
+  }
+  out[*offset] = '\0';
+  return 0;
+}
+
+static int append_escaped_string(char *out, size_t out_len, size_t *offset,
+                                 const char *text) {
+  const char *src = text ? text : "";
+  if (append_text(out, out_len, offset, "\"") != 0)
+    return -1;
+  while (*src) {
+    if (*src == '"' || *src == '\\') {
+      if (append_text(out, out_len, offset, "\\") != 0)
+        return -1;
+    }
+    if (*offset + 1 >= out_len)
+      return -1;
+    out[(*offset)++] = *src++;
+  }
+  out[*offset] = '\0';
+  return append_text(out, out_len, offset, "\"");
 }
 
 const char *wamble_test_dsn(void) {
@@ -112,6 +145,76 @@ int wamble_test_write_config(const char *path, int port, int timeout_ms,
                     db_name ? db_name : "wamble_test", log_level);
 }
 
+int wamble_test_db_config_lines(char *out, size_t out_len) {
+#ifdef WAMBLE_ENABLE_DB
+  const char *dsn = wamble_test_dsn();
+  char *errmsg = NULL;
+  if (!out || out_len == 0 || !dsn || !*dsn)
+    return -1;
+
+  PQconninfoOption *opts = PQconninfoParse(dsn, &errmsg);
+  if (!opts) {
+    if (errmsg)
+      PQfreemem(errmsg);
+    return -1;
+  }
+
+  const char *host = "localhost";
+  const char *port = "5432";
+  const char *user = "wamble";
+  const char *pass = "wamble";
+  const char *dbname = "wamble";
+  for (PQconninfoOption *opt = opts; opt && opt->keyword; opt++) {
+    if (!opt->val || !opt->val[0])
+      continue;
+    if (strcmp(opt->keyword, "host") == 0)
+      host = opt->val;
+    else if (strcmp(opt->keyword, "port") == 0)
+      port = opt->val;
+    else if (strcmp(opt->keyword, "user") == 0)
+      user = opt->val;
+    else if (strcmp(opt->keyword, "password") == 0)
+      pass = opt->val;
+    else if (strcmp(opt->keyword, "dbname") == 0)
+      dbname = opt->val;
+  }
+
+  size_t offset = 0;
+  out[0] = '\0';
+  if (append_text(out, out_len, &offset, "(def db-host ") != 0 ||
+      append_escaped_string(out, out_len, &offset, host) != 0 ||
+      append_text(out, out_len, &offset, ")\n(def db-port ") != 0 ||
+      append_text(out, out_len, &offset, port) != 0 ||
+      append_text(out, out_len, &offset, ")\n(def db-user ") != 0 ||
+      append_escaped_string(out, out_len, &offset, user) != 0 ||
+      append_text(out, out_len, &offset, ")\n(def db-pass ") != 0 ||
+      append_escaped_string(out, out_len, &offset, pass) != 0 ||
+      append_text(out, out_len, &offset, ")\n(def db-name ") != 0 ||
+      append_escaped_string(out, out_len, &offset, dbname) != 0 ||
+      append_text(out, out_len, &offset, ")\n(def global-db-host ") != 0 ||
+      append_escaped_string(out, out_len, &offset, host) != 0 ||
+      append_text(out, out_len, &offset, ")\n(def global-db-port ") != 0 ||
+      append_text(out, out_len, &offset, port) != 0 ||
+      append_text(out, out_len, &offset, ")\n(def global-db-user ") != 0 ||
+      append_escaped_string(out, out_len, &offset, user) != 0 ||
+      append_text(out, out_len, &offset, ")\n(def global-db-pass ") != 0 ||
+      append_escaped_string(out, out_len, &offset, pass) != 0 ||
+      append_text(out, out_len, &offset, ")\n(def global-db-name ") != 0 ||
+      append_escaped_string(out, out_len, &offset, dbname) != 0 ||
+      append_text(out, out_len, &offset, ")\n") != 0) {
+    PQconninfoFree(opts);
+    return -1;
+  }
+
+  PQconninfoFree(opts);
+  return 0;
+#else
+  (void)out;
+  (void)out_len;
+  return -1;
+#endif
+}
+
 int wamble_test_state_dir(char *out, size_t out_len) {
   return wamble_test_path(out, out_len, "state", NULL);
 }
@@ -174,6 +277,44 @@ int wamble_test_mkstemp_file(char *out, size_t out_len, const char *subdir,
   return 0;
 }
 
+int wamble_test_write_text_file(const char *path, const char *text) {
+  if (!path || !text)
+    return -1;
+  return write_file(path, "%s", text);
+}
+
+int wamble_test_write_optional_db_config_file(const char *path,
+                                              const char *suffix) {
+  char db_cfg[1024];
+  FILE *f = NULL;
+  if (!path || !suffix)
+    return -1;
+  f = fopen(path, "wb");
+  if (!f)
+    return -1;
+  if (wamble_test_db_config_lines(db_cfg, sizeof(db_cfg)) == 0)
+    fwrite(db_cfg, 1, strlen(db_cfg), f);
+  fwrite(suffix, 1, strlen(suffix), f);
+  fclose(f);
+  return 0;
+}
+
+int wamble_test_write_db_config_file(const char *path, const char *suffix) {
+  char db_cfg[1024];
+  FILE *f = NULL;
+  if (!path || !suffix)
+    return -1;
+  if (wamble_test_db_config_lines(db_cfg, sizeof(db_cfg)) != 0)
+    return -1;
+  f = fopen(path, "wb");
+  if (!f)
+    return -1;
+  fwrite(db_cfg, 1, strlen(db_cfg), f);
+  fwrite(suffix, 1, strlen(suffix), f);
+  fclose(f);
+  return 0;
+}
+
 int wamble_test_set_state_env(void) {
   char path[512];
   if (wamble_test_mkstemp_file(path, sizeof path, "state", "state_") != 0)
@@ -215,16 +356,34 @@ static int exec1(PGconn *c, const char *sql) {
 }
 #endif
 
+static int schema_name_valid(const char *schema_name) {
+  if (!schema_name || !schema_name[0])
+    return 0;
+  unsigned char c0 = (unsigned char)schema_name[0];
+  if (!((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') || c0 == '_'))
+    return 0;
+  for (int i = 1; schema_name[i]; i++) {
+    unsigned char c = (unsigned char)schema_name[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '_')) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 int test_db_create_schema_if_needed(const char *schema_name) {
   if (!schema_name || !*schema_name)
     return 0;
+  if (!schema_name_valid(schema_name))
+    return -1;
 
 #ifdef WAMBLE_ENABLE_DB
   PGconn *c = db_connect();
   if (!c)
     return -1;
   char sql[256];
-  snprintf(sql, sizeof sql, "CREATE SCHEMA IF NOT EXISTS %s", schema_name);
+  snprintf(sql, sizeof sql, "CREATE SCHEMA IF NOT EXISTS \"%s\"", schema_name);
   int rc = exec1(c, sql);
   PQfinish(c);
   return rc;
@@ -237,13 +396,15 @@ int test_db_create_schema_if_needed(const char *schema_name) {
 int test_db_set_search_path(const char *schema_name) {
   if (!schema_name || !*schema_name)
     return 0;
+  if (!schema_name_valid(schema_name))
+    return -1;
 
 #ifdef WAMBLE_ENABLE_DB
   PGconn *c = db_connect();
   if (!c)
     return -1;
   char sql[256];
-  snprintf(sql, sizeof sql, "SET search_path TO %s", schema_name);
+  snprintf(sql, sizeof sql, "SET search_path TO \"%s\"", schema_name);
   int rc = exec1(c, sql);
   PQfinish(c);
   return rc;
@@ -391,16 +552,27 @@ int test_db_reset(const char *schema_name) {
   if (!c)
     return -1;
   if (schema_name && *schema_name) {
+    if (!schema_name_valid(schema_name)) {
+      PQfinish(c);
+      return -1;
+    }
     char sqlsp[256];
-    snprintf(sqlsp, sizeof sqlsp, "SET search_path TO %s", schema_name);
+    snprintf(sqlsp, sizeof sqlsp, "SET search_path TO \"%s\"", schema_name);
     if (exec1(c, sqlsp) != 0) {
       PQfinish(c);
       return -1;
     }
   }
-  if (exec1(c,
-            "TRUNCATE TABLE predictions, payouts, game_results, reservations, "
-            "moves, boards, sessions, players RESTART IDENTITY CASCADE") != 0) {
+  if (exec1(
+          c,
+          "TRUNCATE TABLE predictions, payouts, game_results, reservations, "
+          "moves, boards, sessions, players, global_policy_rules, "
+          "global_treatment_assignment_predicates, "
+          "global_treatment_assignment_rules, global_treatment_group_outputs, "
+          "global_treatment_group_edges, global_treatment_groups, "
+          "global_runtime_config_revisions, global_runtime_config_blobs, "
+          "global_identities, global_identity_tags RESTART IDENTITY "
+          "CASCADE") != 0) {
     PQfinish(c);
     return -1;
   }
@@ -414,16 +586,32 @@ int test_db_reset(const char *schema_name) {
 
 #ifdef WAMBLE_ENABLE_DB
 int test_db_drop_schema(const char *schema_name) {
-  if (!schema_name || !*schema_name)
+  if (!schema_name || !*schema_name || !schema_name_valid(schema_name))
     return -1;
   PGconn *c = db_connect();
   if (!c)
     return -1;
   char sql[256];
-  snprintf(sql, sizeof sql, "DROP SCHEMA IF EXISTS %s CASCADE", schema_name);
+  snprintf(sql, sizeof sql, "DROP SCHEMA IF EXISTS \"%s\" CASCADE",
+           schema_name);
   int rc = exec1(c, sql);
   PQfinish(c);
   return rc;
+}
+
+int test_db_apply_sql(const char *sql) {
+  char path[128];
+  static unsigned long seq = 0;
+  FILE *f = NULL;
+  if (!sql)
+    return -1;
+  snprintf(path, sizeof(path), "build/test_db_sql_%lu.sql", ++seq);
+  f = fopen(path, "wb");
+  if (!f)
+    return -1;
+  fwrite(sql, 1, strlen(sql), f);
+  fclose(f);
+  return test_db_apply_sql_file(path);
 }
 
 int test_db_reset_schema(const char *schema_name) {
@@ -445,3 +633,25 @@ int test_db_reset_schema(const char *schema_name) {
   return -1;
 }
 #endif
+
+int wamble_test_prepare_db(const char *cfg_path, const char *cfg_suffix,
+                           const char *extra_sql) {
+  if (!cfg_path || !cfg_suffix || !wamble_db_available())
+    return -1;
+  if (test_db_apply_migrations(NULL) != 0)
+    return -1;
+  if (test_db_reset(NULL) != 0)
+    return -1;
+  if (wamble_test_write_db_config_file(cfg_path, cfg_suffix) != 0)
+    return -1;
+  if (config_load(cfg_path, NULL, NULL, 0) != CONFIG_LOAD_OK)
+    return -1;
+  if (db_set_global_store_connection(NULL) != 0)
+    return -1;
+  if (db_init(NULL) != 0)
+    return -1;
+  wamble_set_query_service(wamble_get_db_query_service());
+  if (extra_sql && extra_sql[0] && test_db_apply_sql(extra_sql) != 0)
+    return -1;
+  return 0;
+}

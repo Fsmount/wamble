@@ -3,6 +3,7 @@
 #endif
 #include "wamble_test.h"
 #include "wamble/wamble.h"
+#include "wamble/wamble_db.h"
 
 #if defined(__GNUC__)
 __attribute__((weak)) void wamble_register_tests(void) {}
@@ -514,6 +515,10 @@ static int run_one_isolated(const wamble_test_case *tc, int timeout_ms,
             (timeout_ms > 0 ? timeout_ms
                             : (tc->timeout_ms > 0 ? tc->timeout_ms : 5000)),
             g_seed);
+    set_thread_config(NULL);
+    wamble_set_query_service(NULL);
+    wamble_set_intent_buffer(NULL);
+    wamble_persistence_clear_status();
     if (g_seed != 0) {
       srand((unsigned)g_seed);
     }
@@ -785,6 +790,10 @@ int wamble_test_main(int argc, char **argv) {
             (timeout_ms > 0 ? timeout_ms
                             : (tc->timeout_ms > 0 ? tc->timeout_ms : 5000)),
             g_seed);
+    set_thread_config(NULL);
+    wamble_set_query_service(NULL);
+    wamble_set_intent_buffer(NULL);
+    wamble_persistence_clear_status();
     if (g_seed != 0)
       srand((unsigned)g_seed);
     if (tc->setup)

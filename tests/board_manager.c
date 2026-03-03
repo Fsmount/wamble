@@ -1,25 +1,12 @@
 #include "common/wamble_test.h"
-#include "common/wamble_test_helpers.h"
 #include "wamble/wamble.h"
 
-static int setup_managers(void) {
-  char msg[128];
-  (void)config_load(NULL, NULL, msg, sizeof(msg));
-  player_manager_init();
-  board_manager_init();
-  return 0;
-}
-
-static int setup_managers_with_config(const char *path) {
-  char msg[128];
-  (void)config_load(path, NULL, msg, sizeof(msg));
-  player_manager_init();
-  board_manager_init();
-  return 0;
-}
-
 WAMBLE_TEST(board_reservation_flow) {
-  T_ASSERT_EQ_INT(setup_managers(), 0);
+  char msg[128];
+  T_ASSERT_STATUS(config_load(NULL, NULL, msg, sizeof(msg)),
+                  CONFIG_LOAD_DEFAULTS);
+  player_manager_init();
+  board_manager_init();
 
   WamblePlayer *p = create_new_player();
   T_ASSERT(p != NULL);
@@ -32,7 +19,11 @@ WAMBLE_TEST(board_reservation_flow) {
 }
 
 WAMBLE_TEST(board_move_transitions_to_active) {
-  T_ASSERT_EQ_INT(setup_managers(), 0);
+  char msg[128];
+  T_ASSERT_STATUS(config_load(NULL, NULL, msg, sizeof(msg)),
+                  CONFIG_LOAD_DEFAULTS);
+  player_manager_init();
+  board_manager_init();
 
   WamblePlayer *p = create_new_player();
   T_ASSERT(p != NULL);
@@ -47,7 +38,11 @@ WAMBLE_TEST(board_move_transitions_to_active) {
 }
 
 WAMBLE_TEST(board_release_cancels_reservation) {
-  T_ASSERT_EQ_INT(setup_managers(), 0);
+  char msg[128];
+  T_ASSERT_STATUS(config_load(NULL, NULL, msg, sizeof(msg)),
+                  CONFIG_LOAD_DEFAULTS);
+  player_manager_init();
+  board_manager_init();
 
   WamblePlayer *p = create_new_player();
   T_ASSERT(p != NULL);
@@ -62,7 +57,11 @@ WAMBLE_TEST(board_release_cancels_reservation) {
 }
 
 WAMBLE_TEST(board_complete_archives) {
-  T_ASSERT_EQ_INT(setup_managers(), 0);
+  char msg[128];
+  T_ASSERT_STATUS(config_load(NULL, NULL, msg, sizeof(msg)),
+                  CONFIG_LOAD_DEFAULTS);
+  player_manager_init();
+  board_manager_init();
 
   WamblePlayer *p = create_new_player();
   T_ASSERT(p != NULL);
@@ -78,7 +77,11 @@ WAMBLE_TEST(board_complete_archives) {
 }
 
 WAMBLE_TEST(board_reservation_timeout_transitions_to_dormant) {
-  T_ASSERT_EQ_INT(setup_managers(), 0);
+  char msg[128];
+  T_ASSERT_STATUS(config_load(NULL, NULL, msg, sizeof(msg)),
+                  CONFIG_LOAD_DEFAULTS);
+  player_manager_init();
+  board_manager_init();
   WamblePlayer *p = create_new_player();
   T_ASSERT(p != NULL);
   WambleBoard *b = find_board_for_player(p);
@@ -94,7 +97,11 @@ WAMBLE_TEST(board_reservation_timeout_transitions_to_dormant) {
 }
 
 WAMBLE_TEST(board_inactivity_timeout_transitions_to_dormant) {
-  T_ASSERT_EQ_INT(setup_managers(), 0);
+  char msg[128];
+  T_ASSERT_STATUS(config_load(NULL, NULL, msg, sizeof(msg)),
+                  CONFIG_LOAD_DEFAULTS);
+  player_manager_init();
+  board_manager_init();
   WamblePlayer *p = create_new_player();
   T_ASSERT(p != NULL);
   WambleBoard *b = find_board_for_player(p);
