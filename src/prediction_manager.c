@@ -24,9 +24,23 @@ static WAMBLE_THREAD_LOCAL int g_streak_count = 0;
 static WAMBLE_THREAD_LOCAL int g_streak_cap = 0;
 static WAMBLE_THREAD_LOCAL wamble_mutex_t g_prediction_mutex;
 static WAMBLE_THREAD_LOCAL int g_prediction_mutex_ready = 0;
-#ifdef WAMBLE_TEST_ONLY
-static uint64_t g_next_test_prediction_id = 1;
-#endif
+
+static int prediction_ensure_streak_capacity_locked(int need) {
+  if (need <= g_streak_cap)
+    return 0;
+  int new_cap = g_streak_cap > 0 ? g_streak_cap : 16;
+  while (new_cap < need)
+    new_cap *= 2;
+  PredictionStreak *new_streaks = (PredictionStreak *)realloc(
+      g_streaks, (size_t)new_cap * sizeof(*g_streaks));
+  if (!new_streaks)
+    return -1;
+  memset(new_streaks + g_streak_cap, 0,
+         (size_t)(new_cap - g_streak_cap) * sizeof(*new_streaks));
+  g_streaks = new_streaks;
+  g_streak_cap = new_cap;
+  return 0;
+}
 
 static int prediction_ensure_capacity_locked(int need) {
   if (need <= g_prediction_cap)
@@ -42,7 +56,7 @@ static int prediction_ensure_capacity_locked(int need) {
          (size_t)(new_cap - g_prediction_cap) * sizeof(*new_predictions));
   g_predictions = new_predictions;
   g_prediction_cap = new_cap;
-  return 0;
+  return prediction_ensure_streak_capacity_locked(new_cap);
 }
 
 static void prediction_reset_locked(void) {
@@ -147,12 +161,6 @@ static int prediction_persist_new_locked(uint64_t board_id,
       (!out_prediction_id || *out_prediction_id > 0)) {
     return 0;
   }
-
-#ifdef WAMBLE_TEST_ONLY
-  if (out_prediction_id)
-    *out_prediction_id = g_next_test_prediction_id++;
-  return 0;
-#else
   (void)board_id;
   (void)player_token;
   (void)parent_prediction_id;
@@ -161,7 +169,6 @@ static int prediction_persist_new_locked(uint64_t board_id,
   (void)correct_streak;
   (void)out_prediction_id;
   return -1;
-#endif
 }
 
 PredictionManagerStatus prediction_manager_init(void) {
@@ -397,6 +404,21 @@ static int prediction_find_streak(uint64_t board_id, const uint8_t *token) {
 static int prediction_streak_for(uint64_t board_id, const uint8_t *token) {
   int idx = prediction_find_streak(board_id, token);
   return (idx >= 0) ? g_streaks[idx].correct_streak : 0;
+}
+
+static int prediction_participated_in_ply_locked(uint64_t board_id,
+                                                 int target_ply,
+                                                 const uint8_t *token) {
+  if (!token)
+    return 0;
+  for (int i = 0; i < g_prediction_count; i++) {
+    const WamblePrediction *pred = &g_predictions[i];
+    if (pred->board_id != board_id || pred->target_ply != target_ply)
+      continue;
+    if (tokens_equal(pred->player_token, token))
+      return 1;
+  }
+  return 0;
 }
 
 static void prediction_set_streak(uint64_t board_id, const uint8_t *token,
@@ -681,25 +703,12 @@ PredictionStatus prediction_resolve_move(WambleBoard *board,
 
   wamble_mutex_lock(&g_prediction_mutex);
 
-  uint8_t seen_tokens[256][TOKEN_LENGTH];
-  int seen_count = 0;
-
   for (int i = g_prediction_count - 1; i >= 0; i--) {
     WamblePrediction *pred = &g_predictions[i];
     if (pred->board_id != board->id || pred->target_ply != resolved_ply ||
         strcmp(pred->status, "PENDING") != 0) {
       continue;
     }
-
-    int seen = 0;
-    for (int j = 0; j < seen_count; j++) {
-      if (memcmp(seen_tokens[j], pred->player_token, TOKEN_LENGTH) == 0) {
-        seen = 1;
-        break;
-      }
-    }
-    if (!seen && seen_count < (int)(sizeof(seen_tokens) / TOKEN_LENGTH))
-      memcpy(seen_tokens[seen_count++], pred->player_token, TOKEN_LENGTH);
 
     resolved_any = 1;
     if (prediction_match_moves(pred->predicted_move_uci, actual_move_uci)) {
@@ -735,14 +744,8 @@ PredictionStatus prediction_resolve_move(WambleBoard *board,
     for (int i = g_streak_count - 1; i >= 0; i--) {
       if (g_streaks[i].board_id != board->id)
         continue;
-      int participated = 0;
-      for (int j = 0; j < seen_count; j++) {
-        if (memcmp(seen_tokens[j], g_streaks[i].player_token, TOKEN_LENGTH) ==
-            0) {
-          participated = 1;
-          break;
-        }
-      }
+      int participated = prediction_participated_in_ply_locked(
+          board->id, resolved_ply, g_streaks[i].player_token);
       if (!participated)
         g_streaks[i] = g_streaks[--g_streak_count];
     }

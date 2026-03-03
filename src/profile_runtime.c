@@ -78,6 +78,10 @@ static void profile_runtime_shutdown(RunningProfile *rp);
 static int profile_has_inline_runtime_locked(void);
 static void profile_runtime_set_profile_key(const char *profile_name);
 static int profile_runtime_enabled(const WambleProfile *p);
+static char *profile_runtime_snapshot_template(const RunningProfile *rp);
+
+static int consume_fail_next_restart_bind(void) { return 0; }
+static int consume_fail_next_restart_start(void) { return 0; }
 
 static void ensure_mutex_init(void) {
   if (!g_mutex_initialized) {
@@ -269,6 +273,37 @@ static int profile_runtime_config_max_payload_bytes(const RunningProfile *rp) {
   return 64 * 1024;
 }
 
+static int profile_runtime_flush_intents(RunningProfile *rp, int max_batches) {
+  if (!rp || max_batches <= 0)
+    return 1;
+  wamble_set_query_service(rp->qs);
+  wamble_set_intent_buffer(&rp->intents_buf);
+  uint64_t now_ms = wamble_now_mono_millis();
+  for (int i = 0; i < max_batches; i++) {
+    int attempted = 0;
+    int failures = 0;
+    int batch_limit =
+        profile_runtime_config_max_intents(rp, rp->intents_buf.count);
+    int payload_limit = profile_runtime_config_max_payload_bytes(rp);
+    wamble_persistence_clear_status();
+    PersistenceStatus st = wamble_apply_intents_with_db_checked(
+        &rp->intents_buf, batch_limit, payload_limit, NULL, &attempted,
+        &failures);
+    int pending = rp->intents_buf.count;
+    rp->last_flush_ms = now_ms;
+    if (pending <= 0)
+      return 1;
+    if (st == PERSISTENCE_STATUS_OK || st == PERSISTENCE_STATUS_EMPTY) {
+      if (pending <= 0 || attempted <= 0)
+        break;
+      continue;
+    }
+    if (attempted <= 0 || st == PERSISTENCE_STATUS_APPLY_FAIL)
+      break;
+  }
+  return rp->intents_buf.count <= 0;
+}
+
 static char *wamble_strndup_local(const char *src, size_t len) {
   char *out = (char *)malloc(len + 1);
   if (!out)
@@ -347,6 +382,10 @@ typedef struct {
 } AdoptEnvContext;
 
 static void *profile_thread_main(void *arg);
+static void free_running(RunningProfile *rp);
+static int copy_profile_config_for_runtime(RunningProfile *rp,
+                                           const WambleProfile *p);
+static int copy_default_config_for_runtime(RunningProfile *rp);
 
 static void runtime_cfg_free_owned(WambleConfig *cfg) {
   if (!cfg)
@@ -402,10 +441,6 @@ static int adopt_profile_from_env(const char *name, const char *value,
   if (g_running_count >= ctx->capacity)
     return 0;
 
-  const WambleProfile *p = config_find_profile(name);
-  if (!p || !profile_runtime_enabled(p))
-    return 0;
-
   char *endptr = NULL;
   unsigned long long handle = strtoull(value, &endptr, 10);
   if (!value || value[0] == '\0' || (endptr && *endptr != '\0'))
@@ -416,17 +451,23 @@ static int adopt_profile_from_env(const char *name, const char *value,
     return 0;
 
   RunningProfile *rp = &g_running[g_running_count];
-  rp->name = wamble_strdup_local(p->name);
-  if (!rp->name || runtime_cfg_dup_from(&rp->cfg, &p->config) != 0) {
-    free(rp->name);
-    runtime_cfg_free_owned(&rp->cfg);
-    if (rp->state_path) {
-      free(rp->state_path);
-      rp->state_path = NULL;
+  int is_default_runtime =
+      (strcmp(name, WAMBLE_DEFAULT_RUNTIME_EXPORT_NAME) == 0);
+  if (is_default_runtime) {
+    if (copy_default_config_for_runtime(rp) != 0) {
+      free_running(rp);
+      ctx->status = PROFILE_START_THREAD_ERROR;
+      return 1;
     }
-    rp->name = NULL;
-    ctx->status = PROFILE_START_THREAD_ERROR;
-    return 1;
+  } else {
+    const WambleProfile *p = config_find_profile(name);
+    if (!p || !profile_runtime_enabled(p))
+      return 0;
+    if (copy_profile_config_for_runtime(rp, p) != 0) {
+      free_running(rp);
+      ctx->status = PROFILE_START_THREAD_ERROR;
+      return 1;
+    }
   }
 
   rp->sockfd = sock;
@@ -520,6 +561,11 @@ typedef struct Prebound {
   wamble_socket_t sockfd;
 } Prebound;
 
+typedef struct RestartSpec {
+  char *name;
+  WambleConfig cfg;
+} RestartSpec;
+
 static void close_prebound_entries(Prebound *pb, int start, int count) {
   if (!pb)
     return;
@@ -541,26 +587,118 @@ static void mark_profiles_stop(RunningProfile *profiles, int count) {
   }
 }
 
-static int copy_profile_config_for_runtime(RunningProfile *rp,
-                                           const WambleProfile *p) {
-  if (!rp || !p || !p->name)
+static int copy_named_config_for_runtime(RunningProfile *rp, const char *name,
+                                         const WambleConfig *cfg) {
+  if (!rp || !cfg)
     return -1;
-  rp->name = strdup(p->name);
-  if (!rp->name || runtime_cfg_dup_from(&rp->cfg, &p->config) != 0) {
+  memset(rp, 0, sizeof(*rp));
+  if (name) {
+    rp->name = strdup(name);
+    if (!rp->name)
+      return -1;
+  }
+  if (runtime_cfg_dup_from(&rp->cfg, cfg) != 0) {
+    free(rp->name);
+    rp->name = NULL;
     return -1;
   }
   return 0;
 }
 
+static int copy_profile_config_for_runtime(RunningProfile *rp,
+                                           const WambleProfile *p) {
+  if (!rp || !p || !p->name)
+    return -1;
+  return copy_named_config_for_runtime(rp, p->name, &p->config);
+}
+
 static int copy_default_config_for_runtime(RunningProfile *rp) {
   if (!rp)
     return -1;
-  memset(rp, 0, sizeof(*rp));
-  rp->name = NULL;
-  if (runtime_cfg_dup_from(&rp->cfg, get_config()) != 0) {
-    return -1;
+  return copy_named_config_for_runtime(rp, NULL, get_config());
+}
+
+static void free_restart_specs(RestartSpec *specs, int count) {
+  if (!specs)
+    return;
+  for (int i = 0; i < count; i++) {
+    free(specs[i].name);
+    runtime_cfg_free_owned(&specs[i].cfg);
   }
+  free(specs);
+}
+
+static int snapshot_restart_specs_from_running(const RunningProfile *running,
+                                               int count,
+                                               RestartSpec **out_specs) {
+  if (out_specs)
+    *out_specs = NULL;
+  if (!running || count <= 0)
+    return 0;
+
+  RestartSpec *specs = calloc((size_t)count, sizeof(*specs));
+  if (!specs)
+    return -1;
+  for (int i = 0; i < count; i++) {
+    if (running[i].name) {
+      specs[i].name = strdup(running[i].name);
+      if (!specs[i].name) {
+        free_restart_specs(specs, count);
+        return -1;
+      }
+    }
+    if (runtime_cfg_dup_from(&specs[i].cfg, &running[i].cfg) != 0) {
+      free_restart_specs(specs, count);
+      return -1;
+    }
+  }
+  if (out_specs)
+    *out_specs = specs;
   return 0;
+}
+
+static wamble_socket_t create_prebound_socket(const WambleConfig *cfg,
+                                              ProfileStartStatus *out_status) {
+  if (!cfg) {
+    if (out_status)
+      *out_status = PROFILE_START_SOCKET_ERROR;
+    return WAMBLE_INVALID_SOCKET;
+  }
+  if (consume_fail_next_restart_bind()) {
+    if (out_status)
+      *out_status = PROFILE_START_BIND_ERROR;
+    return WAMBLE_INVALID_SOCKET;
+  }
+  wamble_socket_t sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (sockfd == WAMBLE_INVALID_SOCKET) {
+    if (out_status)
+      *out_status = PROFILE_START_SOCKET_ERROR;
+    return WAMBLE_INVALID_SOCKET;
+  }
+  int optval = 1;
+  (void)setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (const char *)&optval,
+                   sizeof(optval));
+  int buffer_size = cfg->buffer_size;
+  (void)setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (const char *)&buffer_size,
+                   sizeof(buffer_size));
+  (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (const char *)&buffer_size,
+                   sizeof(buffer_size));
+
+  struct sockaddr_in servaddr;
+  memset(&servaddr, 0, sizeof(servaddr));
+  servaddr.sin_family = AF_INET;
+  servaddr.sin_addr.s_addr = INADDR_ANY;
+  servaddr.sin_port = htons((uint16_t)cfg->port);
+  if (bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
+    wamble_close_socket(sockfd);
+    if (out_status)
+      *out_status = PROFILE_START_BIND_ERROR;
+    return WAMBLE_INVALID_SOCKET;
+  }
+  (void)wamble_set_nonblocking(sockfd);
+  if (out_status)
+    *out_status = PROFILE_START_OK;
+  return sockfd;
 }
 
 static ProfileStartStatus start_running_from_prebound(Prebound *pb, int count,
@@ -603,6 +741,74 @@ static ProfileStartStatus start_running_from_prebound(Prebound *pb, int count,
       close_prebound_entries(pb, i + 1, count);
       join_and_cleanup_profiles(running, count, 1);
       return PROFILE_START_NO_SOCKET;
+    }
+    if (consume_fail_next_restart_start()) {
+      close_prebound_entries(pb, i + 1, count);
+      join_and_cleanup_profiles(running, count, 1);
+      return PROFILE_START_THREAD_ERROR;
+    }
+    rp->run_inline = (inline_single_ok && count == 1) ? 1 : 0;
+    rp->thread = 0;
+    if (!rp->run_inline &&
+        wamble_thread_create(&rp->thread, profile_thread_main, rp) != 0) {
+      close_prebound_entries(pb, i + 1, count);
+      mark_profiles_stop(running, i);
+      join_and_cleanup_profiles(running, count, 1);
+      return PROFILE_START_THREAD_ERROR;
+    }
+  }
+
+  if (out_run)
+    *out_run = running;
+  if (out_count)
+    *out_count = count;
+  return PROFILE_START_OK;
+}
+
+static ProfileStartStatus
+start_running_from_restart_specs(Prebound *pb, const RestartSpec *specs,
+                                 int count, RunningProfile **out_run,
+                                 int *out_count, int inline_single_ok) {
+  if (out_run)
+    *out_run = NULL;
+  if (out_count)
+    *out_count = 0;
+  if (!pb || !specs || count <= 0)
+    return PROFILE_START_OK;
+
+  RunningProfile *running = calloc((size_t)count, sizeof(RunningProfile));
+  if (!running)
+    return PROFILE_START_THREAD_ERROR;
+
+  for (int i = 0; i < count; i++) {
+    running[i].sockfd = WAMBLE_INVALID_SOCKET;
+    running[i].thread = 0;
+  }
+
+  for (int i = 0; i < count; i++) {
+    RunningProfile *rp = &running[i];
+    if (copy_named_config_for_runtime(rp, specs[i].name, &specs[i].cfg) != 0) {
+      close_prebound_entries(pb, i, count);
+      join_and_cleanup_profiles(running, count, 1);
+      return PROFILE_START_THREAD_ERROR;
+    }
+
+    rp->sockfd = pb[i].sockfd;
+    pb[i].sockfd = WAMBLE_INVALID_SOCKET;
+    rp->should_stop = 0;
+    rp->needs_update = 0;
+    rp->state_path = NULL;
+    rp->ready_for_exec = 0;
+
+    if (rp->sockfd == WAMBLE_INVALID_SOCKET) {
+      close_prebound_entries(pb, i + 1, count);
+      join_and_cleanup_profiles(running, count, 1);
+      return PROFILE_START_NO_SOCKET;
+    }
+    if (consume_fail_next_restart_start()) {
+      close_prebound_entries(pb, i + 1, count);
+      join_and_cleanup_profiles(running, count, 1);
+      return PROFILE_START_THREAD_ERROR;
     }
     rp->run_inline = (inline_single_ok && count == 1) ? 1 : 0;
     rp->thread = 0;
@@ -752,12 +958,13 @@ static Prebound *preflight_and_bind_all(int *out_count,
   int pb_count = 0;
   for (int i = 0; i < count; i++) {
     const WambleProfile *p = profiles[i];
-    wamble_socket_t sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    ProfileStartStatus socket_status = PROFILE_START_OK;
+    wamble_socket_t sockfd = create_prebound_socket(&p->config, &socket_status);
     if (sockfd == WAMBLE_INVALID_SOCKET) {
-      if (out_status)
-        *out_status = PROFILE_START_SOCKET_ERROR;
       for (int k = 0; k < pb_count; k++)
         wamble_close_socket(pb[k].sockfd);
+      if (out_status)
+        *out_status = socket_status;
       free(pb);
       free(profiles);
       free(profile_idx);
@@ -765,35 +972,6 @@ static Prebound *preflight_and_bind_all(int *out_count,
         *out_count = 0;
       return NULL;
     }
-    int optval = 1;
-    (void)setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (const char *)&optval,
-                     sizeof(optval));
-    int buffer_size = p->config.buffer_size;
-    (void)setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (const char *)&buffer_size,
-                     sizeof(buffer_size));
-    (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (const char *)&buffer_size,
-                     sizeof(buffer_size));
-
-    struct sockaddr_in servaddr;
-    memset(&servaddr, 0, sizeof(servaddr));
-    servaddr.sin_family = AF_INET;
-    servaddr.sin_addr.s_addr = INADDR_ANY;
-    servaddr.sin_port = htons((uint16_t)p->config.port);
-    if (bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr)) <
-        0) {
-      for (int k = 0; k < pb_count; k++)
-        wamble_close_socket(pb[k].sockfd);
-      if (out_status)
-        *out_status = PROFILE_START_BIND_ERROR;
-      free(pb);
-      free(profiles);
-      free(profile_idx);
-      if (out_count)
-        *out_count = 0;
-      return NULL;
-    }
-
-    (void)wamble_set_nonblocking(sockfd);
     pb[pb_count].profile_index = profile_idx[i];
     pb[pb_count].sockfd = sockfd;
     pb_count++;
@@ -806,6 +984,62 @@ static Prebound *preflight_and_bind_all(int *out_count,
     *out_status =
         (pb_count > 0) ? PROFILE_START_OK : PROFILE_START_DEFAULT_RUNTIME;
   return pb;
+}
+
+static Prebound *
+preflight_and_bind_restart_specs(const RestartSpec *specs, int count,
+                                 ProfileStartStatus *out_status) {
+  if (out_status)
+    *out_status = PROFILE_START_OK;
+  if (!specs || count <= 0)
+    return NULL;
+
+  Prebound *pb = calloc((size_t)count, sizeof(*pb));
+  if (!pb) {
+    if (out_status)
+      *out_status = PROFILE_START_THREAD_ERROR;
+    return NULL;
+  }
+  for (int i = 0; i < count; i++) {
+    pb[i].profile_index = -1;
+    pb[i].sockfd = WAMBLE_INVALID_SOCKET;
+  }
+
+  for (int i = 0; i < count; i++) {
+    ProfileStartStatus socket_status = PROFILE_START_OK;
+    pb[i].sockfd = create_prebound_socket(&specs[i].cfg, &socket_status);
+    if (pb[i].sockfd == WAMBLE_INVALID_SOCKET) {
+      close_prebound_entries(pb, 0, count);
+      free(pb);
+      if (out_status)
+        *out_status = socket_status;
+      return NULL;
+    }
+  }
+  return pb;
+}
+
+static ProfileStartStatus
+restore_running_from_restart_specs(const RestartSpec *specs, int count,
+                                   int inline_single_ok) {
+  ProfileStartStatus st = PROFILE_START_OK;
+  Prebound *pb = preflight_and_bind_restart_specs(specs, count, &st);
+  if (st != PROFILE_START_OK)
+    return st;
+
+  RunningProfile *restored = NULL;
+  int restored_count = 0;
+  st = start_running_from_restart_specs(pb, specs, count, &restored,
+                                        &restored_count, inline_single_ok);
+  free(pb);
+  if (st != PROFILE_START_OK)
+    return st;
+
+  wamble_mutex_lock(&g_mutex);
+  g_running = restored;
+  g_running_count = restored_count;
+  wamble_mutex_unlock(&g_mutex);
+  return PROFILE_START_OK;
 }
 
 static int profile_runtime_enabled(const WambleProfile *p) {
@@ -840,6 +1074,34 @@ static int profile_runtime_enabled(const WambleProfile *p) {
   return 0;
 }
 
+static char *profile_runtime_snapshot_template(const RunningProfile *rp) {
+  const char *base = NULL;
+#if defined(WAMBLE_PLATFORM_POSIX)
+  const char sep = '/';
+  const char *fallback = "/tmp";
+#else
+  const char sep = '\\';
+  const char *fallback = ".";
+#endif
+  if (rp && rp->cfg.state_dir && rp->cfg.state_dir[0])
+    base = rp->cfg.state_dir;
+  if (!base || !base[0])
+    base = fallback;
+  const char *leaf = "wamble_state_prof_XXXXXX";
+  size_t base_len = strlen(base);
+  int need_sep =
+      (base_len > 0 && base[base_len - 1] != '/' && base[base_len - 1] != '\\')
+          ? 1
+          : 0;
+  size_t total = base_len + (size_t)need_sep + strlen(leaf) + 1;
+  char *tmpl = (char *)malloc(total);
+  if (!tmpl)
+    return NULL;
+  snprintf(tmpl, total, "%s%s%s", base, need_sep ? (char[2]){sep, '\0'} : "",
+           leaf);
+  return tmpl;
+}
+
 static void profile_runtime_prepare_exec_snapshot(RunningProfile *rp) {
 #if defined(WAMBLE_PLATFORM_POSIX)
   int should_prepare = 0;
@@ -850,7 +1112,11 @@ static void profile_runtime_prepare_exec_snapshot(RunningProfile *rp) {
   if (!should_prepare)
     return;
 
-  char tmpl[] = "/tmp/wamble_state_prof_XXXXXX";
+  if (!profile_runtime_flush_intents(rp, 64))
+    return;
+  char *tmpl = profile_runtime_snapshot_template(rp);
+  if (!tmpl)
+    return;
   int tfd = wamble_mkstemp(tmpl);
   if (tfd >= 0)
     close(tfd);
@@ -865,6 +1131,7 @@ static void profile_runtime_prepare_exec_snapshot(RunningProfile *rp) {
     rp->ready_for_exec = 1;
     wamble_mutex_unlock(&g_mutex);
   }
+  free(tmpl);
 #elif defined(WAMBLE_PLATFORM_WINDOWS)
   int should_prepare = 0;
   wamble_mutex_lock(&g_mutex);
@@ -874,7 +1141,11 @@ static void profile_runtime_prepare_exec_snapshot(RunningProfile *rp) {
   if (!should_prepare)
     return;
 
-  char tmpl[] = "wamble_state_prof_XXXXXX";
+  if (!profile_runtime_flush_intents(rp, 64))
+    return;
+  char *tmpl = profile_runtime_snapshot_template(rp);
+  if (!tmpl)
+    return;
   int tfd = wamble_mkstemp(tmpl);
   if (tfd >= 0)
     _close(tfd);
@@ -888,6 +1159,7 @@ static void profile_runtime_prepare_exec_snapshot(RunningProfile *rp) {
     rp->ready_for_exec = 1;
     wamble_mutex_unlock(&g_mutex);
   }
+  free(tmpl);
 #else
   (void)rp;
 #endif
@@ -998,7 +1270,10 @@ static WsGatewayStatus profile_ws_reconcile(RunningProfile *rp) {
   }
 
   if (rp->ws_gateway) {
-    if (ws_gateway_matches(rp->ws_gateway, profile_ws_port(rp), rp->cfg.port,
+    int cur_udp = wamble_socket_bound_port(rp->sockfd);
+    if (cur_udp <= 0)
+      cur_udp = rp->cfg.port;
+    if (ws_gateway_matches(rp->ws_gateway, profile_ws_port(rp), cur_udp,
                            rp->cfg.websocket_path)) {
       return WS_GATEWAY_OK;
     }
@@ -1006,9 +1281,12 @@ static WsGatewayStatus profile_ws_reconcile(RunningProfile *rp) {
     rp->ws_gateway = NULL;
   }
 
+  int udp_port = wamble_socket_bound_port(rp->sockfd);
+  if (udp_port <= 0)
+    udp_port = rp->cfg.port;
   WsGatewayStatus ws_status = WS_GATEWAY_OK;
   rp->ws_gateway = ws_gateway_start(
-      rp->name ? rp->name : "default", profile_ws_port(rp), rp->cfg.port,
+      rp->name ? rp->name : "default", profile_ws_port(rp), udp_port,
       rp->cfg.websocket_path, rp->cfg.max_client_sessions, &ws_status);
   if (!rp->ws_gateway) {
     publish_ws_gateway_status(ws_status, rp->name);
@@ -1056,29 +1334,7 @@ static int profile_runtime_init(RunningProfile *rp) {
   rp->last_cleanup = wamble_now_wall();
   rp->last_tick = rp->last_cleanup;
   rp->last_flush_ms = 0;
-  {
-    uint64_t now_ms = wamble_now_mono_millis();
-    for (int i = 0; i < 64; i++) {
-      int attempted = 0;
-      int failures = 0;
-      int batch_limit =
-          profile_runtime_config_max_intents(rp, rp->intents_buf.count);
-      int payload_limit = profile_runtime_config_max_payload_bytes(rp);
-      wamble_persistence_clear_status();
-      PersistenceStatus st = wamble_apply_intents_with_db_checked(
-          &rp->intents_buf, batch_limit, payload_limit, NULL, &attempted,
-          &failures);
-      int pending = rp->intents_buf.count;
-      rp->last_flush_ms = now_ms;
-      if (st == PERSISTENCE_STATUS_OK || st == PERSISTENCE_STATUS_EMPTY) {
-        if (pending <= 0 || attempted <= 0)
-          break;
-        continue;
-      }
-      if (attempted <= 0 || st == PERSISTENCE_STATUS_APPLY_FAIL)
-        break;
-    }
-  }
+  profile_runtime_flush_intents(rp, 64);
 
   if (rp->state_path && rp->state_path[0]) {
     if (state_load_from_file(rp->state_path) == 0) {
@@ -1090,27 +1346,7 @@ static int profile_runtime_init(RunningProfile *rp) {
     rp->state_path = NULL;
   }
   if (rp->sockfd == WAMBLE_INVALID_SOCKET) {
-    uint64_t now_ms = wamble_now_mono_millis();
-    for (int i = 0; i < 64; i++) {
-      int attempted = 0;
-      int failures = 0;
-      int batch_limit =
-          profile_runtime_config_max_intents(rp, rp->intents_buf.count);
-      int payload_limit = profile_runtime_config_max_payload_bytes(rp);
-      wamble_persistence_clear_status();
-      PersistenceStatus st = wamble_apply_intents_with_db_checked(
-          &rp->intents_buf, batch_limit, payload_limit, NULL, &attempted,
-          &failures);
-      int pending = rp->intents_buf.count;
-      rp->last_flush_ms = now_ms;
-      if (st == PERSISTENCE_STATUS_OK || st == PERSISTENCE_STATUS_EMPTY) {
-        if (pending <= 0 || attempted <= 0)
-          break;
-        continue;
-      }
-      if (attempted <= 0 || st == PERSISTENCE_STATUS_APPLY_FAIL)
-        break;
-    }
+    profile_runtime_flush_intents(rp, 64);
     wamble_intents_free(&rp->intents_buf);
     wamble_set_intent_buffer(NULL);
     return -1;
@@ -1125,29 +1361,7 @@ static void profile_runtime_shutdown(RunningProfile *rp) {
     return;
   wamble_set_query_service(rp->qs);
   wamble_set_intent_buffer(&rp->intents_buf);
-  {
-    uint64_t now_ms = wamble_now_mono_millis();
-    for (int i = 0; i < 64; i++) {
-      int attempted = 0;
-      int failures = 0;
-      int batch_limit =
-          profile_runtime_config_max_intents(rp, rp->intents_buf.count);
-      int payload_limit = profile_runtime_config_max_payload_bytes(rp);
-      wamble_persistence_clear_status();
-      PersistenceStatus st = wamble_apply_intents_with_db_checked(
-          &rp->intents_buf, batch_limit, payload_limit, NULL, &attempted,
-          &failures);
-      int pending = rp->intents_buf.count;
-      rp->last_flush_ms = now_ms;
-      if (st == PERSISTENCE_STATUS_OK || st == PERSISTENCE_STATUS_EMPTY) {
-        if (pending <= 0 || attempted <= 0)
-          break;
-        continue;
-      }
-      if (attempted <= 0 || st == PERSISTENCE_STATUS_APPLY_FAIL)
-        break;
-    }
-  }
+  profile_runtime_flush_intents(rp, 64);
   wamble_intents_free(&rp->intents_buf);
   wamble_set_intent_buffer(NULL);
   if (rp->ws_gateway) {
@@ -1195,6 +1409,7 @@ static void profile_runtime_step(RunningProfile *rp) {
     rp->last_cleanup = now;
   }
   if (now - rp->last_tick > 1) {
+    player_manager_tick();
     board_manager_tick();
     spectator_manager_tick();
     rp->last_tick = now;
@@ -1205,26 +1420,7 @@ static void profile_runtime_step(RunningProfile *rp) {
     if (pending > 0 &&
         (pending >= PERSIST_FLUSH_EAGER_COUNT ||
          (now_ms - rp->last_flush_ms) >= PERSIST_FLUSH_INTERVAL_MS)) {
-      for (int i = 0; i < PERSIST_FLUSH_MAX_BATCHES_PER_CYCLE; i++) {
-        int attempted = 0;
-        int failures = 0;
-        int batch_limit =
-            profile_runtime_config_max_intents(rp, rp->intents_buf.count);
-        int payload_limit = profile_runtime_config_max_payload_bytes(rp);
-        wamble_persistence_clear_status();
-        PersistenceStatus st = wamble_apply_intents_with_db_checked(
-            &rp->intents_buf, batch_limit, payload_limit, NULL, &attempted,
-            &failures);
-        pending = rp->intents_buf.count;
-        rp->last_flush_ms = now_ms;
-        if (st == PERSISTENCE_STATUS_OK || st == PERSISTENCE_STATUS_EMPTY) {
-          if (pending <= 0 || attempted <= 0)
-            break;
-          continue;
-        }
-        if (attempted <= 0 || st == PERSISTENCE_STATUS_APPLY_FAIL)
-          break;
-      }
+      profile_runtime_flush_intents(rp, PERSIST_FLUSH_MAX_BATCHES_PER_CYCLE);
     }
   }
   profile_runtime_send_spectator_updates(rp);
@@ -1408,6 +1604,24 @@ static int runtime_cfg_socket_identity_equals(const WambleConfig *a,
   return a->port == b->port;
 }
 
+static int runtime_cfg_requires_restart(const WambleConfig *a,
+                                        const WambleConfig *b) {
+  if (!a || !b)
+    return 1;
+  return a->buffer_size != b->buffer_size ||
+         a->max_client_sessions != b->max_client_sessions ||
+         a->max_boards != b->max_boards || a->min_boards != b->min_boards ||
+         a->max_players != b->max_players ||
+         !cfg_str_eq(a->db_host, b->db_host) ||
+         !cfg_str_eq(a->db_user, b->db_user) ||
+         !cfg_str_eq(a->db_pass, b->db_pass) ||
+         !cfg_str_eq(a->db_name, b->db_name) ||
+         !cfg_str_eq(a->global_db_host, b->global_db_host) ||
+         !cfg_str_eq(a->global_db_user, b->global_db_user) ||
+         !cfg_str_eq(a->global_db_pass, b->global_db_pass) ||
+         !cfg_str_eq(a->global_db_name, b->global_db_name);
+}
+
 static int runtime_cfg_equals(const WambleConfig *a, const WambleConfig *b) {
   if (!a || !b)
     return 0;
@@ -1474,8 +1688,31 @@ static int running_profiles_can_refresh_in_place(int desired_profiles) {
     if (!runtime_cfg_socket_identity_equals(&g_running[i].cfg,
                                             &p_match->config))
       return 0;
+    if (runtime_cfg_requires_restart(&g_running[i].cfg, &p_match->config))
+      return 0;
   }
   return 1;
+}
+
+static int running_profiles_require_same_socket_restart(int desired_profiles) {
+  if (!running_profiles_match_configured(desired_profiles))
+    return 0;
+  for (int i = 0; i < g_running_count; i++) {
+    const WambleProfile *p_match = find_profile_by_name(g_running[i].name);
+    if (!p_match)
+      return 0;
+    if (!runtime_cfg_socket_identity_equals(&g_running[i].cfg,
+                                            &p_match->config))
+      return 0;
+  }
+  for (int i = 0; i < g_running_count; i++) {
+    const WambleProfile *p_match = find_profile_by_name(g_running[i].name);
+    if (p_match &&
+        runtime_cfg_requires_restart(&g_running[i].cfg, &p_match->config)) {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 static int default_runtime_can_refresh_in_place(void) {
@@ -1483,7 +1720,8 @@ static int default_runtime_can_refresh_in_place(void) {
     return 0;
   if (g_running[0].name != NULL)
     return 0;
-  return runtime_cfg_socket_identity_equals(&g_running[0].cfg, get_config());
+  return runtime_cfg_socket_identity_equals(&g_running[0].cfg, get_config()) &&
+         !runtime_cfg_requires_restart(&g_running[0].cfg, get_config());
 }
 
 static void refresh_running_profile_configs(void) {
@@ -1542,6 +1780,12 @@ ProfileStartStatus reconcile_profile_listeners(void) {
       wamble_mutex_unlock(&g_mutex);
       return PROFILE_START_OK;
     }
+    RestartSpec *old_specs = NULL;
+    if (snapshot_restart_specs_from_running(g_running, g_running_count,
+                                            &old_specs) != 0) {
+      wamble_mutex_unlock(&g_mutex);
+      return PROFILE_START_THREAD_ERROR;
+    }
     RunningProfile *old = g_running;
     int old_count = g_running_count;
     mark_profiles_stop(old, old_count);
@@ -1553,8 +1797,12 @@ ProfileStartStatus reconcile_profile_listeners(void) {
     RunningProfile *new_running = NULL;
     int new_count = 0;
     ProfileStartStatus dst = start_default_runtime(&new_running, &new_count, 1);
-    if (dst != PROFILE_START_OK)
+    if (dst != PROFILE_START_OK) {
+      (void)restore_running_from_restart_specs(old_specs, old_count, 1);
+      free_restart_specs(old_specs, old_count);
       return dst;
+    }
+    free_restart_specs(old_specs, old_count);
     wamble_mutex_lock(&g_mutex);
     g_running = new_running;
     g_running_count = new_count;
@@ -1568,12 +1816,67 @@ ProfileStartStatus reconcile_profile_listeners(void) {
     return PROFILE_START_OK;
   }
 
+  if (running_profiles_require_same_socket_restart(desired_profiles)) {
+    RestartSpec *old_specs = NULL;
+    if (snapshot_restart_specs_from_running(g_running, g_running_count,
+                                            &old_specs) != 0) {
+      wamble_mutex_unlock(&g_mutex);
+      return PROFILE_START_THREAD_ERROR;
+    }
+    RunningProfile *old = g_running;
+    int old_count = g_running_count;
+    mark_profiles_stop(old, old_count);
+    g_running = NULL;
+    g_running_count = 0;
+    g_prepare_exec = 0;
+    wamble_mutex_unlock(&g_mutex);
+
+    join_and_cleanup_profiles(old, old_count, 1);
+
+    int new_count = 0;
+    ProfileStartStatus st = PROFILE_START_OK;
+    Prebound *pb = preflight_and_bind_all(&new_count, &st);
+    if (st != PROFILE_START_OK) {
+      if (pb)
+        free(pb);
+      (void)restore_running_from_restart_specs(old_specs, old_count, 1);
+      free_restart_specs(old_specs, old_count);
+      return st;
+    }
+
+    RunningProfile *new_running = NULL;
+    int started_count = 0;
+    st = start_running_from_prebound(pb, new_count, &new_running,
+                                     &started_count, 1);
+    free(pb);
+    if (st != PROFILE_START_OK) {
+      (void)restore_running_from_restart_specs(old_specs, old_count, 1);
+      free_restart_specs(old_specs, old_count);
+      return st;
+    }
+
+    free_restart_specs(old_specs, old_count);
+    wamble_mutex_lock(&g_mutex);
+    g_running = new_running;
+    g_running_count = started_count;
+    wamble_mutex_unlock(&g_mutex);
+    return PROFILE_START_OK;
+  }
+
   int new_count = 0;
   ProfileStartStatus st = PROFILE_START_OK;
   Prebound *pb = preflight_and_bind_all(&new_count, &st);
   if (st != PROFILE_START_OK) {
     wamble_mutex_unlock(&g_mutex);
     return st;
+  }
+  RestartSpec *old_specs = NULL;
+  if (snapshot_restart_specs_from_running(g_running, g_running_count,
+                                          &old_specs) != 0) {
+    close_prebound_entries(pb, 0, new_count);
+    free(pb);
+    wamble_mutex_unlock(&g_mutex);
+    return PROFILE_START_THREAD_ERROR;
   }
   RunningProfile *old = g_running;
   int old_count = g_running_count;
@@ -1591,10 +1894,13 @@ ProfileStartStatus reconcile_profile_listeners(void) {
                                    1);
   if (st != PROFILE_START_OK) {
     free(pb);
+    (void)restore_running_from_restart_specs(old_specs, old_count, 1);
+    free_restart_specs(old_specs, old_count);
     return st;
   }
 
   free(pb);
+  free_restart_specs(old_specs, old_count);
 
   wamble_mutex_lock(&g_mutex);
   g_running = new_running;
@@ -1617,12 +1923,14 @@ ProfileExportStatus profile_export_inherited_sockets(char *out_buf,
   int count = 0;
   for (int i = 0; i < g_running_count; i++) {
     RunningProfile *rp = &g_running[i];
-    if (!rp->name || rp->sockfd == WAMBLE_INVALID_SOCKET)
+    if (rp->sockfd == WAMBLE_INVALID_SOCKET)
       continue;
 
     char part[128];
+    const char *export_name =
+        rp->name ? rp->name : WAMBLE_DEFAULT_RUNTIME_EXPORT_NAME;
     unsigned long long sock_val = (unsigned long long)rp->sockfd;
-    snprintf(part, sizeof(part), "%s=%llu", rp->name, sock_val);
+    snprintf(part, sizeof(part), "%s=%llu", export_name, sock_val);
     size_t need = strlen(part);
     size_t sep = (written > 0) ? 1u : 0u;
     if ((size_t)written + sep + need >= out_buf_size) {
@@ -1728,11 +2036,13 @@ ProfileExportStatus profile_prepare_state_save_and_inherit(
     return PROFILE_EXPORT_NOT_READY;
   }
   for (int i = 0; i < g_running_count; i++) {
-    if (!g_running[i].name || !g_running[i].state_path)
+    if (!g_running[i].state_path)
       continue;
     char part[512];
-    snprintf(part, sizeof(part), "%s=%s", g_running[i].name,
-             g_running[i].state_path);
+    const char *export_name = g_running[i].name
+                                  ? g_running[i].name
+                                  : WAMBLE_DEFAULT_RUNTIME_EXPORT_NAME;
+    snprintf(part, sizeof(part), "%s=%s", export_name, g_running[i].state_path);
     size_t need = strlen(part);
     size_t sep = (written > 0) ? 1u : 0u;
     if ((size_t)written + sep + need >= out_state_map_size) {

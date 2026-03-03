@@ -222,19 +222,12 @@ static const char *profile_key_for_runtime(const char *profile) {
   return (profile && profile[0]) ? profile : "__default__";
 }
 
-static void build_global_conn_string_from_active_config(char *out,
-                                                        size_t out_size) {
-  snprintf(out, out_size, "dbname=%s user=%s password=%s host=%s",
-           get_config()->global_db_name, get_config()->global_db_user,
-           get_config()->global_db_pass, get_config()->global_db_host);
-}
-
 static int bind_active_config_policy(const char *profile_key,
                                      char *global_conn_str,
                                      size_t global_conn_str_size) {
-  build_global_conn_string_from_active_config(global_conn_str,
-                                              global_conn_str_size);
-  if (db_set_global_store_connection(global_conn_str) != 0 ||
+  if (global_conn_str && global_conn_str_size > 0)
+    global_conn_str[0] = '\0';
+  if (db_set_global_store_connection(NULL) != 0 ||
       db_apply_config_policy_rules(profile_key) != 0 ||
       db_validate_global_policy() != 0 ||
       db_apply_config_treatment_rules(profile_key) != 0 ||
@@ -509,22 +502,14 @@ int main(int argc, char *argv[]) {
   sigaction(SIGUSR2, &sc, NULL);
 #endif
 
-  char db_conn_str[256];
-  char global_conn_str[256];
+  char global_conn_str[512];
   char topology_err[256];
   if (validate_db_topology(topology_err, sizeof(topology_err)) != 0) {
     LOG_FATAL("Invalid DB topology: %s", topology_err);
     return 1;
   }
-  snprintf(db_conn_str, sizeof(db_conn_str),
-           "dbname=%s user=%s password=%s host=%s", get_config()->db_name,
-           get_config()->db_user, get_config()->db_pass, get_config()->db_host);
-  snprintf(global_conn_str, sizeof(global_conn_str),
-           "dbname=%s user=%s password=%s host=%s",
-           get_config()->global_db_name, get_config()->global_db_user,
-           get_config()->global_db_pass, get_config()->global_db_host);
-
-  if (db_set_global_store_connection(global_conn_str) != 0) {
+  global_conn_str[0] = '\0';
+  if (db_set_global_store_connection(NULL) != 0) {
     LOG_FATAL("Failed to configure shared global store connection");
     return 1;
   }
@@ -549,7 +534,7 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  if (db_init(db_conn_str) != 0) {
+  if (db_init(NULL) != 0) {
     LOG_FATAL("Failed to initialize database");
     return 1;
   }

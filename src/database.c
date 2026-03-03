@@ -10,6 +10,31 @@ static WAMBLE_THREAD_LOCAL PGconn *db_global_conn_tls = NULL;
 static bool db_initialized = false;
 static char g_global_conn_str[512];
 static int g_global_conn_configured = 0;
+static DbBoardIdList db_list_boards_by_status(const char *status);
+static DbBoardResult db_get_board(uint64_t board_id);
+static DbMovesResult db_get_moves_for_board(uint64_t board_id);
+static DbStatus db_get_longest_game_moves(int *out_max_moves);
+static DbStatus db_get_active_session_count(int *out_count);
+static DbStatus db_get_max_board_id(uint64_t *out_max_id);
+static DbStatus db_get_session_by_token(const uint8_t *token,
+                                        uint64_t *out_session);
+static DbStatus db_get_persistent_session_by_token(const uint8_t *token,
+                                                   uint64_t *out_session);
+static DbStatus db_get_player_total_score(uint64_t session_id,
+                                          double *out_total);
+static DbStatus db_get_player_prediction_score(uint64_t session_id,
+                                               double *out_total);
+static DbStatus db_get_player_rating(uint64_t session_id, double *out_rating);
+static DbStatus db_get_session_games_played(uint64_t session_id,
+                                            int *out_games);
+static DbStatus
+db_get_persistent_player_stats(const uint8_t *public_key,
+                               WamblePersistentPlayerStats *out_stats);
+static uint64_t db_create_player(const uint8_t *public_key);
+static uint64_t db_get_player_by_public_key(const uint8_t *public_key);
+static int db_async_link_session_to_pubkey(uint64_t session_id,
+                                           const uint8_t *public_key);
+static int db_async_unlink_session_identity(uint64_t session_id);
 static void bytes_to_hex(const uint8_t *bytes, int len, char *hex_out);
 static uint64_t db_global_identity_create_anonymous(void);
 static int db_ensure_global_treatment_schema(void);
@@ -21,10 +46,76 @@ static const char *db_treatment_profile_key(const char *profile) {
   return (profile_key && profile_key[0]) ? profile_key : "__default__";
 }
 
-static void build_conn_string_from_cfg(const WambleConfig *cfg, char *out,
-                                       size_t outlen) {
-  snprintf(out, outlen, "dbname=%s user=%s password=%s host=%s", cfg->db_name,
-           cfg->db_user, cfg->db_pass, cfg->db_host);
+static int append_conninfo_text(char *out, size_t out_size, size_t *offset,
+                                const char *text) {
+  if (!out || out_size == 0 || !offset)
+    return -1;
+  const char *src = text ? text : "";
+  while (*src) {
+    if (*offset + 1 >= out_size)
+      return -1;
+    out[*offset] = *src;
+    (*offset)++;
+    src++;
+  }
+  out[*offset] = '\0';
+  return 0;
+}
+
+static int append_conninfo_quoted_value(char *out, size_t out_size,
+                                        size_t *offset, const char *value) {
+  const char *src = value ? value : "";
+  if (append_conninfo_text(out, out_size, offset, "'") != 0)
+    return -1;
+  while (*src) {
+    if (*src == '\'' || *src == '\\') {
+      if (append_conninfo_text(out, out_size, offset, "\\") != 0)
+        return -1;
+    }
+    if (*offset + 1 >= out_size)
+      return -1;
+    out[*offset] = *src;
+    (*offset)++;
+    src++;
+  }
+  out[*offset] = '\0';
+  return append_conninfo_text(out, out_size, offset, "'");
+}
+
+static int build_conninfo_from_cfg(const WambleConfig *cfg, int use_global,
+                                   char *out, size_t out_size) {
+  if (!cfg || !out || out_size == 0)
+    return -1;
+  out[0] = '\0';
+
+  const char *db_name = use_global ? cfg->global_db_name : cfg->db_name;
+  const char *db_user = use_global ? cfg->global_db_user : cfg->db_user;
+  const char *db_pass = use_global ? cfg->global_db_pass : cfg->db_pass;
+  const char *db_host = use_global ? cfg->global_db_host : cfg->db_host;
+  int db_port = use_global ? cfg->global_db_port : cfg->db_port;
+
+  size_t offset = 0;
+  if (append_conninfo_text(out, out_size, &offset, "dbname=") != 0 ||
+      append_conninfo_quoted_value(out, out_size, &offset, db_name) != 0 ||
+      append_conninfo_text(out, out_size, &offset, " user=") != 0 ||
+      append_conninfo_quoted_value(out, out_size, &offset, db_user) != 0 ||
+      append_conninfo_text(out, out_size, &offset, " password=") != 0 ||
+      append_conninfo_quoted_value(out, out_size, &offset, db_pass) != 0 ||
+      append_conninfo_text(out, out_size, &offset, " host=") != 0 ||
+      append_conninfo_quoted_value(out, out_size, &offset, db_host) != 0) {
+    out[0] = '\0';
+    return -1;
+  }
+  if (db_port > 0) {
+    char port_buf[32];
+    snprintf(port_buf, sizeof(port_buf), "%d", db_port);
+    if (append_conninfo_text(out, out_size, &offset, " port=") != 0 ||
+        append_conninfo_quoted_value(out, out_size, &offset, port_buf) != 0) {
+      out[0] = '\0';
+      return -1;
+    }
+  }
+  return 0;
 }
 
 static PGconn *ensure_connection(void) {
@@ -39,21 +130,10 @@ static PGconn *ensure_connection(void) {
     }
     return db_conn_tls;
   }
-  char conn[256];
-#ifdef WAMBLE_TEST_ONLY
-  {
-    const char *env_dsn = getenv("WAMBLE_TEST_DSN");
-    if (env_dsn && *env_dsn) {
-      db_conn_tls = PQconnectdb(env_dsn);
-    } else {
-      build_conn_string_from_cfg(get_config(), conn, sizeof conn);
-      db_conn_tls = PQconnectdb(conn);
-    }
-  }
-#else
-  build_conn_string_from_cfg(get_config(), conn, sizeof conn);
+  char conn[512];
+  if (build_conninfo_from_cfg(get_config(), 0, conn, sizeof conn) != 0)
+    return NULL;
   db_conn_tls = PQconnectdb(conn);
-#endif
   if (PQstatus(db_conn_tls) != CONNECTION_OK) {
     PQfinish(db_conn_tls);
     db_conn_tls = NULL;
@@ -78,10 +158,9 @@ static PGconn *ensure_global_connection(void) {
   if (g_global_conn_configured && g_global_conn_str[0]) {
     db_global_conn_tls = PQconnectdb(g_global_conn_str);
   } else {
-    char conn[256];
-    snprintf(conn, sizeof(conn), "dbname=%s user=%s password=%s host=%s",
-             get_config()->global_db_name, get_config()->global_db_user,
-             get_config()->global_db_pass, get_config()->global_db_host);
+    char conn[512];
+    if (build_conninfo_from_cfg(get_config(), 1, conn, sizeof conn) != 0)
+      return NULL;
     db_global_conn_tls = PQconnectdb(conn);
   }
   if (PQstatus(db_global_conn_tls) != CONNECTION_OK) {
@@ -133,8 +212,13 @@ static PGresult *pq_exec_params_global_locked(const char *command, int nParams,
 }
 
 int db_set_global_store_connection(const char *connection_string) {
-  if (!connection_string || !connection_string[0])
-    return -1;
+  char derived_conn[512];
+  if (!connection_string || !connection_string[0]) {
+    if (build_conninfo_from_cfg(get_config(), 1, derived_conn,
+                                sizeof derived_conn) != 0)
+      return -1;
+    connection_string = derived_conn;
+  }
   size_t n = strlen(connection_string);
   if (n >= sizeof(g_global_conn_str))
     return -1;
@@ -826,13 +910,11 @@ db_global_identity_resolve_or_create_pubkey(const uint8_t *public_key) {
     return 0;
   if (db_ensure_global_identity_schema() != 0)
     return 0;
-  const char *query =
-      "WITH upsert AS ("
-      "  INSERT INTO global_identities (public_key)"
-      "  VALUES (decode($1, 'hex'))"
-      "  ON CONFLICT (public_key) DO NOTHING"
-      ") "
-      "SELECT id FROM global_identities WHERE public_key = decode($1, 'hex')";
+  const char *query = "INSERT INTO global_identities (public_key) "
+                      "VALUES (decode($1, 'hex')) "
+                      "ON CONFLICT (public_key) DO UPDATE "
+                      "SET public_key = EXCLUDED.public_key "
+                      "RETURNING id";
   char public_key_hex[65];
   bytes_to_hex(public_key, 32, public_key_hex);
   const char *paramValues[] = {public_key_hex};
@@ -2116,16 +2198,25 @@ const WambleQueryService *wamble_get_db_query_service(void) {
     svc.get_player_prediction_score = db_get_player_prediction_score;
     svc.get_player_rating = db_get_player_rating;
     svc.get_session_games_played = db_get_session_games_played;
+    svc.get_persistent_player_stats = db_get_persistent_player_stats;
     svc.get_leaderboard = db_get_leaderboard;
     svc.get_moves_for_board = db_get_moves_for_board;
+    svc.link_session_to_pubkey = db_async_link_session_to_pubkey;
+    svc.unlink_session_identity = db_async_unlink_session_identity;
+    svc.get_session_treatment_assignment = db_get_session_treatment_assignment;
     svc.resolve_policy_decision = db_resolve_policy_decision;
+    svc.resolve_treatment_actions = db_resolve_treatment_actions;
+    svc.treatment_edge_allows = db_treatment_edge_allows;
     initialized = 1;
   }
   return &svc;
 }
 
 static const WambleQueryService *get_query_service(void) {
-  return wamble_get_query_service();
+  const WambleQueryService *qs = wamble_get_query_service();
+  if (qs)
+    return qs;
+  return wamble_get_db_query_service();
 }
 
 static DbBoardIdList query_list_error(void) {
@@ -2264,6 +2355,14 @@ DbStatus wamble_query_get_session_games_played(uint64_t session_id,
   return qs->get_session_games_played(session_id, out_games);
 }
 
+DbStatus wamble_query_get_persistent_player_stats(
+    const uint8_t *public_key, WamblePersistentPlayerStats *out_stats) {
+  const WambleQueryService *qs = get_query_service();
+  if (!qs || !qs->get_persistent_player_stats)
+    return DB_ERR_EXEC;
+  return qs->get_persistent_player_stats(public_key, out_stats);
+}
+
 DbLeaderboardResult wamble_query_get_leaderboard(uint64_t requester_session_id,
                                                  uint8_t leaderboard_type,
                                                  int limit) {
@@ -2271,6 +2370,47 @@ DbLeaderboardResult wamble_query_get_leaderboard(uint64_t requester_session_id,
   if (!qs || !qs->get_leaderboard)
     return query_leaderboard_error();
   return qs->get_leaderboard(requester_session_id, leaderboard_type, limit);
+}
+
+DbStatus
+wamble_query_get_session_treatment_assignment(const uint8_t *token,
+                                              WambleTreatmentAssignment *out) {
+  const WambleQueryService *qs = get_query_service();
+  if (!qs || !qs->get_session_treatment_assignment)
+    return DB_ERR_EXEC;
+  return qs->get_session_treatment_assignment(token, out);
+}
+
+DbStatus wamble_query_resolve_policy_decision(
+    const uint8_t *token, const char *profile, const char *action,
+    const char *resource, const char *context_key, const char *context_value,
+    WamblePolicyDecision *out) {
+  const WambleQueryService *qs = get_query_service();
+  if (!qs || !qs->resolve_policy_decision)
+    return DB_ERR_EXEC;
+  return qs->resolve_policy_decision(token, profile, action, resource,
+                                     context_key, context_value, out);
+}
+
+DbStatus wamble_query_resolve_treatment_actions(
+    const uint8_t *token, const char *profile, const char *hook_name,
+    const char *opponent_group_key, const WambleFact *facts, int fact_count,
+    WambleTreatmentAction *out, int max_out, int *out_count) {
+  const WambleQueryService *qs = get_query_service();
+  if (!qs || !qs->resolve_treatment_actions)
+    return DB_ERR_EXEC;
+  return qs->resolve_treatment_actions(token, profile, hook_name,
+                                       opponent_group_key, facts, fact_count,
+                                       out, max_out, out_count);
+}
+
+int wamble_query_treatment_edge_allows(const char *profile,
+                                       const char *source_group_key,
+                                       const char *target_group_key) {
+  const WambleQueryService *qs = get_query_service();
+  if (!qs || !qs->treatment_edge_allows)
+    return 0;
+  return qs->treatment_edge_allows(profile, source_group_key, target_group_key);
 }
 
 uint64_t db_create_session(const uint8_t *token, uint64_t player_id) {
@@ -2357,7 +2497,8 @@ uint64_t db_create_session(const uint8_t *token, uint64_t player_id) {
   return session_id;
 }
 
-DbStatus db_get_session_by_token(const uint8_t *token, uint64_t *out_session) {
+static DbStatus db_get_session_by_token(const uint8_t *token,
+                                        uint64_t *out_session) {
   if (!out_session || !token)
     return DB_ERR_BAD_DATA;
   uint64_t now_ms = wamble_now_mono_millis();
@@ -2417,8 +2558,8 @@ DbStatus db_get_session_by_token(const uint8_t *token, uint64_t *out_session) {
   return DB_OK;
 }
 
-DbStatus db_get_persistent_session_by_token(const uint8_t *token,
-                                            uint64_t *out_session) {
+static DbStatus db_get_persistent_session_by_token(const uint8_t *token,
+                                                   uint64_t *out_session) {
   if (!out_session || !token)
     return DB_ERR_BAD_DATA;
   uint64_t now_ms = wamble_now_mono_millis();
@@ -2516,7 +2657,7 @@ uint64_t db_create_board(const char *fen) {
   return board_id;
 }
 
-DbStatus db_get_max_board_id(uint64_t *out_max_id) {
+static DbStatus db_get_max_board_id(uint64_t *out_max_id) {
   if (!out_max_id)
     return DB_ERR_BAD_DATA;
   const char *query = "SELECT MAX(id) FROM boards";
@@ -2679,7 +2820,7 @@ int db_async_update_board_reservation_meta(uint64_t board_id,
   return 0;
 }
 
-DbBoardResult db_get_board(uint64_t board_id) {
+static DbBoardResult db_get_board(uint64_t board_id) {
   DbBoardResult out = {0};
   out.status = DB_NOT_FOUND;
   out.reserved_for_white = false;
@@ -2734,7 +2875,7 @@ DbBoardResult db_get_board(uint64_t board_id) {
   return out;
 }
 
-DbBoardIdList db_list_boards_by_status(const char *status) {
+static DbBoardIdList db_list_boards_by_status(const char *status) {
   DbBoardIdList out = {0};
   out.status = DB_ERR_EXEC;
   const char *query =
@@ -2994,7 +3135,7 @@ DbPredictionsResult db_get_pending_predictions(void) {
   return out;
 }
 
-DbMovesResult db_get_moves_for_board(uint64_t board_id) {
+static DbMovesResult db_get_moves_for_board(uint64_t board_id) {
   DbMovesResult out = {0};
   out.status = DB_ERR_EXEC;
   const char *query =
@@ -3230,7 +3371,8 @@ int db_async_record_payout(uint64_t board_id, uint64_t session_id,
   return 0;
 }
 
-DbStatus db_get_player_total_score(uint64_t session_id, double *out_total) {
+static DbStatus db_get_player_total_score(uint64_t session_id,
+                                          double *out_total) {
   if (!out_total)
     return DB_ERR_BAD_DATA;
   const char *query = "SELECT COALESCE(total_score, 0) FROM sessions "
@@ -3266,8 +3408,8 @@ DbStatus db_get_player_total_score(uint64_t session_id, double *out_total) {
   return DB_OK;
 }
 
-DbStatus db_get_player_prediction_score(uint64_t session_id,
-                                        double *out_total) {
+static DbStatus db_get_player_prediction_score(uint64_t session_id,
+                                               double *out_total) {
   if (!out_total)
     return DB_ERR_BAD_DATA;
   const char *query =
@@ -3303,7 +3445,7 @@ DbStatus db_get_player_prediction_score(uint64_t session_id,
   return DB_OK;
 }
 
-DbStatus db_get_player_rating(uint64_t session_id, double *out_rating) {
+static DbStatus db_get_player_rating(uint64_t session_id, double *out_rating) {
   if (!out_rating)
     return DB_ERR_BAD_DATA;
   const char *query = "SELECT COALESCE(p.rating, 0) FROM players p "
@@ -3362,7 +3504,7 @@ int db_async_update_player_rating(uint64_t session_id, double rating) {
   return 0;
 }
 
-DbStatus db_get_active_session_count(int *out_count) {
+static DbStatus db_get_active_session_count(int *out_count) {
   if (!out_count)
     return DB_ERR_BAD_DATA;
   const char *query = "SELECT COUNT(*) FROM sessions WHERE last_seen_at > "
@@ -3388,7 +3530,7 @@ DbStatus db_get_active_session_count(int *out_count) {
   return DB_OK;
 }
 
-DbStatus db_get_longest_game_moves(int *out_max_moves) {
+static DbStatus db_get_longest_game_moves(int *out_max_moves) {
   if (!out_max_moves)
     return DB_ERR_BAD_DATA;
   const char *query = "SELECT COALESCE(MAX(move_number), 0) FROM moves m "
@@ -3415,7 +3557,8 @@ DbStatus db_get_longest_game_moves(int *out_max_moves) {
   return DB_OK;
 }
 
-DbStatus db_get_session_games_played(uint64_t session_id, int *out_games) {
+static DbStatus db_get_session_games_played(uint64_t session_id,
+                                            int *out_games) {
   if (!out_games)
     return DB_ERR_BAD_DATA;
   const char *query = "SELECT COALESCE(games_played, 0) FROM sessions "
@@ -3448,6 +3591,65 @@ DbStatus db_get_session_games_played(uint64_t session_id, int *out_games) {
   }
   PQclear(res);
   *out_games = (int)games_played;
+  return DB_OK;
+}
+
+static DbStatus
+db_get_persistent_player_stats(const uint8_t *public_key,
+                               WamblePersistentPlayerStats *out_stats) {
+  if (!public_key || !out_stats)
+    return DB_ERR_BAD_DATA;
+
+  const char *query = "SELECT COALESCE(SUM(s.total_score), 0), "
+                      "COALESCE(SUM(s.total_prediction_score), 0), "
+                      "COALESCE(p.rating, 0), "
+                      "COALESCE(SUM(s.games_played), 0) "
+                      "FROM players p "
+                      "LEFT JOIN sessions s ON s.player_id = p.id "
+                      "WHERE p.public_key = decode($1, 'hex') "
+                      "GROUP BY p.id, p.rating";
+
+  char public_key_hex[65];
+  bytes_to_hex(public_key, 32, public_key_hex);
+  const char *paramValues[] = {public_key_hex};
+
+  PGresult *res =
+      pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
+  if (!res)
+    return DB_ERR_CONN;
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    PQclear(res);
+    return DB_ERR_EXEC;
+  }
+  if (PQntuples(res) == 0) {
+    PQclear(res);
+    return DB_NOT_FOUND;
+  }
+
+  char *endptr = NULL;
+  out_stats->score = strtod(PQgetvalue(res, 0, 0), &endptr);
+  if (!endptr || *endptr != '\0') {
+    PQclear(res);
+    return DB_ERR_BAD_DATA;
+  }
+  out_stats->prediction_score = strtod(PQgetvalue(res, 0, 1), &endptr);
+  if (!endptr || *endptr != '\0') {
+    PQclear(res);
+    return DB_ERR_BAD_DATA;
+  }
+  out_stats->rating = strtod(PQgetvalue(res, 0, 2), &endptr);
+  if (!endptr || *endptr != '\0') {
+    PQclear(res);
+    return DB_ERR_BAD_DATA;
+  }
+  long games_played = strtol(PQgetvalue(res, 0, 3), &endptr, 10);
+  if (!endptr || *endptr != '\0' || games_played < 0) {
+    PQclear(res);
+    return DB_ERR_BAD_DATA;
+  }
+  PQclear(res);
+
+  out_stats->games_played = (int)games_played;
   return DB_OK;
 }
 
@@ -3559,17 +3761,21 @@ DbLeaderboardResult db_get_leaderboard(uint64_t requester_session_id,
 
 void db_tick(void) { db_expire_reservations(); }
 
-uint64_t db_create_player(const uint8_t *public_key) {
-  const char *query = "INSERT INTO players (public_key) VALUES (decode($1, "
-                      "'hex')) RETURNING id";
+static uint64_t db_create_player(const uint8_t *public_key) {
+  const char *query =
+      "INSERT INTO players (public_key, rating) VALUES (decode($1, 'hex'), $2) "
+      "RETURNING id";
 
   char public_key_hex[65];
+  char rating_str[32];
   bytes_to_hex(public_key, 32, public_key_hex);
+  snprintf(rating_str, sizeof(rating_str), "%d",
+           get_config() ? get_config()->default_rating : 1200);
 
-  const char *paramValues[] = {public_key_hex};
+  const char *paramValues[] = {public_key_hex, rating_str};
 
   PGresult *res =
-      pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
+      pq_exec_params_locked(query, 2, NULL, paramValues, NULL, NULL, 0);
 
   if (!res)
     return 0;
@@ -3583,7 +3789,7 @@ uint64_t db_create_player(const uint8_t *public_key) {
   return player_id;
 }
 
-uint64_t db_get_player_by_public_key(const uint8_t *public_key) {
+static uint64_t db_get_player_by_public_key(const uint8_t *public_key) {
   const char *query =
       "SELECT id FROM players WHERE public_key = decode($1, 'hex')";
 
@@ -3607,13 +3813,18 @@ uint64_t db_get_player_by_public_key(const uint8_t *public_key) {
   return player_id;
 }
 
-int db_async_link_session_to_player(uint64_t session_id, uint64_t player_id) {
+static int db_async_link_session_to_pubkey(uint64_t session_id,
+                                           const uint8_t *public_key) {
   const char *query = "UPDATE sessions SET player_id = $2, global_identity_id "
                       "= $3 WHERE id = $1";
-
-  uint8_t public_key[32];
-  if (db_get_player_public_key_by_id(player_id, public_key) != 0)
+  if (!public_key)
     return -1;
+  uint64_t player_id = db_get_player_by_public_key(public_key);
+  if (player_id == 0)
+    player_id = db_create_player(public_key);
+  if (player_id == 0)
+    return -1;
+
   uint64_t global_identity_id =
       db_global_identity_resolve_or_create_pubkey(public_key);
   if (global_identity_id == 0)
@@ -3631,6 +3842,42 @@ int db_async_link_session_to_player(uint64_t session_id, uint64_t player_id) {
 
   PGresult *res =
       pq_exec_params_locked(query, 3, NULL, paramValues, NULL, NULL, 0);
+
+  if (!res)
+    return -1;
+  if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+    PQclear(res);
+    return -1;
+  }
+
+  PQclear(res);
+  memset(tls_persistent_session_cache, 0, sizeof(tls_persistent_session_cache));
+  tls_persistent_session_cache_next = 0;
+  return 0;
+}
+
+static int db_async_unlink_session_identity(uint64_t session_id) {
+  const char *query =
+      "UPDATE sessions "
+      "SET player_id = NULL, global_identity_id = $2, "
+      "    treatment_group_key = NULL, treatment_rule_id = NULL, "
+      "    treatment_snapshot_revision_id = NULL, treatment_assigned_at = NULL "
+      "WHERE id = $1";
+
+  uint64_t global_identity_id = db_global_identity_create_anonymous();
+  if (global_identity_id == 0)
+    return -1;
+
+  char session_id_str[32];
+  char identity_id_str[32];
+  snprintf(session_id_str, sizeof(session_id_str), "%" PRIu64, session_id);
+  snprintf(identity_id_str, sizeof(identity_id_str), "%" PRIu64,
+           global_identity_id);
+
+  const char *paramValues[] = {session_id_str, identity_id_str};
+
+  PGresult *res =
+      pq_exec_params_locked(query, 2, NULL, paramValues, NULL, NULL, 0);
 
   if (!res)
     return -1;

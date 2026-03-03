@@ -24,6 +24,7 @@ static LispEnv *g_policy_env = NULL;
 static char *g_last_loaded_source = NULL;
 static wamble_mutex_t g_policy_eval_mutex;
 static int g_policy_eval_mutex_ready = 0;
+static int g_profile_local_unsupported_seen = 0;
 typedef struct {
   const WambleConfig **data;
   int count;
@@ -182,6 +183,8 @@ static LispValue *builtin_treatment_visible_fen(struct LispEnv *env,
                                                 LispValue *args);
 static LispValue *builtin_treatment_predictions_from_moves(struct LispEnv *env,
                                                            LispValue *args);
+static LispValue *builtin_profile_local_unsupported(LispEnv *env,
+                                                    LispValue *args);
 
 static void policy_rules_free(WamblePolicyRuleSpec *rules, int count);
 static int policy_rule_dup(WamblePolicyRuleSpec *dst,
@@ -1242,26 +1245,6 @@ static int eval_i64_arg(LispEnv *env, LispValue *expr, int64_t *out) {
   return 0;
 }
 
-static int eval_double_arg(LispEnv *env, LispValue *expr, double *out) {
-  if (!out)
-    return -1;
-  LispValue *v = eval_expr(env, expr);
-  if (!v)
-    return -1;
-  if (v->type == LISP_VALUE_FLOAT) {
-    *out = v->as.real;
-    free_lisp_value(v);
-    return 0;
-  }
-  if (v->type == LISP_VALUE_INTEGER) {
-    *out = (double)v->as.integer;
-    free_lisp_value(v);
-    return 0;
-  }
-  free_lisp_value(v);
-  return -1;
-}
-
 static int eval_treatment_value_arg(LispEnv *env, LispValue *expr,
                                     WambleTreatmentValueSpec *out) {
   if (!out)
@@ -1816,6 +1799,14 @@ static LispValue *builtin_defprofile(LispEnv *env, LispValue *args) {
   return make_value(LISP_VALUE_NIL);
 }
 
+static LispValue *builtin_profile_local_unsupported(LispEnv *env,
+                                                    LispValue *args) {
+  (void)env;
+  (void)args;
+  g_profile_local_unsupported_seen = 1;
+  return make_value(LISP_VALUE_NIL);
+}
+
 typedef enum { CONF_INT, CONF_DOUBLE, CONF_STRING } ConfigType;
 
 typedef struct {
@@ -1851,10 +1842,12 @@ static const ConfigVarMap config_map[] = {
     CONF_ITEM("max-moves-per-board", CONF_INT, max_moves_per_board),
     CONF_ITEM("max-contributors", CONF_INT, max_contributors),
     CONF_ITEM("db-host", CONF_STRING, db_host),
+    CONF_ITEM("db-port", CONF_INT, db_port),
     CONF_ITEM("db-user", CONF_STRING, db_user),
     CONF_ITEM("db-pass", CONF_STRING, db_pass),
     CONF_ITEM("db-name", CONF_STRING, db_name),
     CONF_ITEM("global-db-host", CONF_STRING, global_db_host),
+    CONF_ITEM("global-db-port", CONF_INT, global_db_port),
     CONF_ITEM("global-db-user", CONF_STRING, global_db_user),
     CONF_ITEM("global-db-pass", CONF_STRING, global_db_pass),
     CONF_ITEM("global-db-name", CONF_STRING, global_db_name),
@@ -1965,10 +1958,12 @@ static void config_set_defaults(void) {
   g_config.max_moves_per_board = 1000;
   g_config.max_contributors = 100;
   g_config.db_host = strdup("localhost");
+  g_config.db_port = 5432;
   g_config.db_user = strdup("wamble");
   g_config.db_pass = strdup("wamble");
   g_config.db_name = strdup("wamble");
   g_config.global_db_host = strdup("localhost");
+  g_config.global_db_port = 5432;
   g_config.global_db_user = strdup("wamble");
   g_config.global_db_pass = strdup("wamble");
   g_config.global_db_name = strdup("wamble_global");
@@ -2171,6 +2166,7 @@ static LispEnv *build_policy_env_from_source(const char *source) {
 
 ConfigLoadStatus config_load(const char *filename, const char *profile,
                              char *status_msg, size_t status_msg_size) {
+  void *rollback_snapshot = NULL;
   if (!g_policy_eval_mutex_ready) {
     if (wamble_mutex_init(&g_policy_eval_mutex) == 0) {
       g_policy_eval_mutex_ready = 1;
@@ -2178,6 +2174,14 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
   }
   if (status_msg && status_msg_size)
     status_msg[0] = '\0';
+  if (g_config.db_host && g_config.db_user && g_config.db_pass &&
+      g_config.db_name && g_config.global_db_host && g_config.global_db_user &&
+      g_config.global_db_pass && g_config.global_db_name &&
+      g_config.spectator_summary_mode && g_config.prediction_match_policy &&
+      g_config.websocket_path) {
+    rollback_snapshot = config_create_snapshot();
+  }
+  g_profile_local_unsupported_seen = 0;
   LispEnv *prev_policy_env = policy_env_swap(NULL);
   policy_rules_free(g_policy_rules, g_policy_rule_count);
   g_policy_rules = NULL;
@@ -2227,6 +2231,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
   if (!filename) {
     if (prev_policy_env)
       lisp_env_free(prev_policy_env);
+    config_free_snapshot(rollback_snapshot);
     if (status_msg && status_msg_size)
       snprintf(status_msg, status_msg_size, "defaults: no file provided");
     return CONFIG_LOAD_DEFAULTS;
@@ -2236,6 +2241,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
   if (!f) {
     if (prev_policy_env)
       lisp_env_free(prev_policy_env);
+    config_free_snapshot(rollback_snapshot);
     if (status_msg && status_msg_size)
       snprintf(status_msg, status_msg_size, "defaults: cannot open %s",
                filename);
@@ -2352,10 +2358,59 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
           const char *pname = prof->as.pair.car->as.symbol;
 
           LispEnv *profile_env = lisp_env_create(env);
+          {
+            const char *unsupported[] = {
+                "policy-allow",
+                "policy-deny",
+                "treatment-group",
+                "treatment-default",
+                "treatment-assign",
+                "treatment-edge",
+                "treatment-tag",
+                "treatment-feature",
+                "treatment-context",
+                "treatment-behavior",
+                "treatment-meta",
+                "treatment-visible-fen",
+                "treatment-predictions-from-moves",
+            };
+            for (size_t u = 0; u < sizeof(unsupported) / sizeof(unsupported[0]);
+                 u++) {
+              LispValue *sym = make_value(LISP_VALUE_SYMBOL);
+              LispValue *fn = make_value(LISP_VALUE_BUILTIN);
+              sym->as.symbol = strdup(unsupported[u]);
+              fn->as.builtin = builtin_profile_local_unsupported;
+              lisp_env_put(profile_env, sym, fn);
+              free_lisp_value(sym);
+              free_lisp_value(fn);
+            }
+          }
           for (LispValue *v = prof->as.pair.cdr;
                v && v->type == LISP_VALUE_PAIR; v = v->as.pair.cdr) {
             LispValue *res = eval_expr(profile_env, v->as.pair.car);
             free_lisp_value(res);
+          }
+          if (g_profile_local_unsupported_seen) {
+            if (status_msg && status_msg_size) {
+              snprintf(
+                  status_msg, status_msg_size,
+                  "unsupported policy/treatment declaration inside defprofile");
+            }
+            lisp_env_free(profile_env);
+            free(processed);
+            free(plist);
+            g_profile_count = built;
+            free_profiles();
+            free_lisp_value(profiles);
+            (void)policy_env_swap(prev_policy_env);
+            prev_policy_env = NULL;
+            if (env)
+              lisp_env_free(env);
+            free(source);
+            if (rollback_snapshot)
+              (void)config_restore_snapshot(rollback_snapshot);
+            config_free_snapshot(rollback_snapshot);
+            return CONFIG_LOAD_IO_ERROR;
           }
 
           char *base_name = NULL;
@@ -2458,6 +2513,42 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
             free_lisp_value(val);
           }
 
+          if (strcmp(pname, WAMBLE_DEFAULT_RUNTIME_EXPORT_NAME) == 0) {
+            if (status_msg && status_msg_size) {
+              snprintf(status_msg, status_msg_size,
+                       "profile name '%s' is reserved",
+                       WAMBLE_DEFAULT_RUNTIME_EXPORT_NAME);
+            }
+            free(profile_group);
+            free(overlaid.db_host);
+            free(overlaid.db_user);
+            free(overlaid.db_pass);
+            free(overlaid.db_name);
+            free(overlaid.global_db_host);
+            free(overlaid.global_db_user);
+            free(overlaid.global_db_pass);
+            free(overlaid.global_db_name);
+            free(overlaid.spectator_summary_mode);
+            free(overlaid.prediction_match_policy);
+            free(overlaid.state_dir);
+            free(overlaid.websocket_path);
+            lisp_env_free(profile_env);
+            free(processed);
+            free(plist);
+            g_profile_count = built;
+            free_profiles();
+            free_lisp_value(profiles);
+            (void)policy_env_swap(prev_policy_env);
+            prev_policy_env = NULL;
+            if (env)
+              lisp_env_free(env);
+            free(source);
+            if (rollback_snapshot)
+              (void)config_restore_snapshot(rollback_snapshot);
+            config_free_snapshot(rollback_snapshot);
+            return CONFIG_LOAD_IO_ERROR;
+          }
+
           g_profiles[i].name = strdup(pname);
           g_profiles[i].group = profile_group;
           g_profiles[i].config = overlaid;
@@ -2543,6 +2634,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
       if (env)
         lisp_env_free(env);
       free(source);
+      config_free_snapshot(rollback_snapshot);
       return CONFIG_LOAD_PROFILE_NOT_FOUND;
     }
   }
@@ -2559,6 +2651,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
         snprintf(status_msg, status_msg_size, "loaded %s (source copy failed)",
                  filename);
       free(source);
+      config_free_snapshot(rollback_snapshot);
       return CONFIG_LOAD_IO_ERROR;
     }
     free(g_last_loaded_source);
@@ -2567,6 +2660,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
   if (status_msg && status_msg_size)
     snprintf(status_msg, status_msg_size, "loaded %s", filename);
   free(source);
+  config_free_snapshot(rollback_snapshot);
   return CONFIG_LOAD_OK;
 }
 

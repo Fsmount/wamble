@@ -1,5 +1,4 @@
 #include "../include/wamble/wamble.h"
-#include "../include/wamble/wamble_db.h"
 #include <string.h>
 
 typedef struct {
@@ -79,7 +78,7 @@ static void scoring_apply_treatment_adjustments(const WambleBoard *board,
 
   WambleTreatmentAction actions[16];
   int action_count = 0;
-  if (db_resolve_treatment_actions(
+  if (wamble_query_resolve_treatment_actions(
           player->token, "", "scoring.apply", board->last_mover_treatment_group,
           facts, fact_count, actions, 16, &action_count) != DB_OK) {
     return;

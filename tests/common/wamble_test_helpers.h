@@ -12,12 +12,19 @@ int wamble_test_path(char *out, size_t out_len, const char *subdir,
                      const char *name);
 int wamble_test_mkstemp_file(char *out, size_t out_len, const char *subdir,
                              const char *prefix);
+int wamble_test_write_text_file(const char *path, const char *text);
+int wamble_test_write_optional_db_config_file(const char *path,
+                                              const char *suffix);
+int wamble_test_write_db_config_file(const char *path, const char *suffix);
+int wamble_test_prepare_db(const char *cfg_path, const char *cfg_suffix,
+                           const char *extra_sql);
 
 int wamble_test_write_config(const char *path, int port, int timeout_ms,
                              int inactivity_timeout, int reservation_timeout,
                              const char *db_host, const char *db_user,
                              const char *db_pass, const char *db_name,
                              int log_level);
+int wamble_test_db_config_lines(char *out, size_t out_len);
 
 int wamble_test_state_dir(char *out, size_t out_len);
 int wamble_test_set_state_env(void);
@@ -27,6 +34,7 @@ void wamble_metric(const char *name, const char *fmt, ...);
 
 int test_db_create_schema_if_needed(const char *schema_name);
 int test_db_set_search_path(const char *schema_name);
+int test_db_apply_sql(const char *sql);
 int test_db_apply_sql_file(const char *sql_path);
 int test_db_apply_migrations(const char *schema_name);
 int test_db_apply_fixture(const char *schema_name);

@@ -251,6 +251,15 @@ void wamble_emit_link_session_to_pubkey(const uint8_t *token,
   intents_push(it);
 }
 
+void wamble_emit_unlink_session_identity(const uint8_t *token) {
+  if (!token)
+    return;
+  struct WamblePersistenceIntent it = {0};
+  it.type = WAMBLE_INTENT_UNLINK_SESSION_IDENTITY;
+  memcpy(it.as.unlink_session_identity.token, token, TOKEN_LENGTH);
+  intents_push(it);
+}
+
 void wamble_emit_record_payout(uint64_t board_id, const uint8_t *token,
                                double points) {
   if (!token || points == 0.0)
@@ -260,6 +269,16 @@ void wamble_emit_record_payout(uint64_t board_id, const uint8_t *token,
   it.as.record_payout.board_id = board_id;
   memcpy(it.as.record_payout.token, token, TOKEN_LENGTH);
   it.as.record_payout.points = points;
+  intents_push(it);
+}
+
+void wamble_emit_update_player_rating(const uint8_t *token, double rating) {
+  if (!token)
+    return;
+  struct WamblePersistenceIntent it = {0};
+  it.type = WAMBLE_INTENT_UPDATE_PLAYER_RATING;
+  memcpy(it.as.update_player_rating.token, token, TOKEN_LENGTH);
+  it.as.update_player_rating.rating = rating;
   intents_push(it);
 }
 
@@ -341,7 +360,7 @@ static DbStatus resolve_session_id_cached(SessionResolveCache *cache,
   }
 
   uint64_t sid = 0;
-  DbStatus st = db_get_session_by_token(token, &sid);
+  DbStatus st = wamble_query_get_session_by_token(token, &sid);
   if (cache && cache->items && cache->count < cache->capacity) {
     SessionResolveEntry *ent = &cache->items[cache->count++];
     memcpy(ent->token, token, TOKEN_LENGTH);
@@ -419,20 +438,23 @@ static int apply_one_intent_db(const struct WamblePersistenceIntent *it,
     return sid > 0 ? 0 : -1;
   }
   case WAMBLE_INTENT_LINK_SESSION_TO_PUBKEY: {
+    const WambleQueryService *qs = wamble_get_query_service();
     uint64_t sid = 0;
     if (resolve_session_id_cached(cache, it->as.link_session_to_pubkey.token,
                                   &sid) != DB_OK ||
-        sid == 0)
+        sid == 0 || !qs || !qs->link_session_to_pubkey)
       return -1;
-    uint64_t pid =
-        db_get_player_by_public_key(it->as.link_session_to_pubkey.public_key);
-    if (pid == 0) {
-      pid = db_create_player(it->as.link_session_to_pubkey.public_key);
-    }
-    if (pid > 0) {
-      return db_async_link_session_to_player(sid, pid);
-    }
-    return -1;
+    return qs->link_session_to_pubkey(sid,
+                                      it->as.link_session_to_pubkey.public_key);
+  }
+  case WAMBLE_INTENT_UNLINK_SESSION_IDENTITY: {
+    const WambleQueryService *qs = wamble_get_query_service();
+    uint64_t sid = 0;
+    if (resolve_session_id_cached(cache, it->as.unlink_session_identity.token,
+                                  &sid) != DB_OK ||
+        sid == 0 || !qs || !qs->unlink_session_identity)
+      return -1;
+    return qs->unlink_session_identity(sid);
   }
   case WAMBLE_INTENT_RECORD_PAYOUT: {
     uint64_t sid = 0;
@@ -442,6 +464,15 @@ static int apply_one_intent_db(const struct WamblePersistenceIntent *it,
       return 0;
     return db_async_record_payout(it->as.record_payout.board_id, sid,
                                   it->as.record_payout.points);
+  }
+  case WAMBLE_INTENT_UPDATE_PLAYER_RATING: {
+    uint64_t sid = 0;
+    DbStatus st = resolve_session_id_cached(
+        cache, it->as.update_player_rating.token, &sid);
+    if (st != DB_OK || sid == 0)
+      return 0;
+    return db_async_update_player_rating(sid,
+                                         it->as.update_player_rating.rating);
   }
   case WAMBLE_INTENT_CREATE_BOARD:
     return db_insert_board(it->as.create_board.board_id,
@@ -559,8 +590,12 @@ intent_payload_estimate_bytes(const struct WamblePersistenceIntent *it) {
     return TOKEN_LENGTH + 12;
   case WAMBLE_INTENT_LINK_SESSION_TO_PUBKEY:
     return TOKEN_LENGTH + 32;
+  case WAMBLE_INTENT_UNLINK_SESSION_IDENTITY:
+    return TOKEN_LENGTH;
   case WAMBLE_INTENT_RECORD_PAYOUT:
     return 8 + TOKEN_LENGTH + 8;
+  case WAMBLE_INTENT_UPDATE_PLAYER_RATING:
+    return TOKEN_LENGTH + 8;
   case WAMBLE_INTENT_RECORD_MOVE:
     return 8 + TOKEN_LENGTH + MAX_UCI_LENGTH + 4;
   case WAMBLE_INTENT_UPDATE_BOARD_MOVE_META:

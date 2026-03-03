@@ -472,10 +472,12 @@ typedef struct WambleConfig {
   int max_moves_per_board;
   int max_contributors;
   char *db_host;
+  int db_port;
   char *db_user;
   char *db_pass;
   char *db_name;
   char *global_db_host;
+  int global_db_port;
   char *global_db_user;
   char *global_db_pass;
   char *global_db_name;
@@ -520,6 +522,8 @@ typedef enum {
   CONFIG_LOAD_PROFILE_NOT_FOUND = -1,
   CONFIG_LOAD_IO_ERROR = -2,
 } ConfigLoadStatus;
+
+#define WAMBLE_DEFAULT_RUNTIME_EXPORT_NAME "__wamble_default_runtime__"
 
 ConfigLoadStatus config_load(const char *filename, const char *profile,
                              char *status_msg, size_t status_msg_size);
@@ -803,6 +807,7 @@ uint64_t wamble_now_mono_millis(void);
 time_t wamble_now_wall(void);
 
 uint64_t wamble_now_nanos(void);
+void wamble_sleep_ms(int ms);
 
 static inline void wamble_log(int level, const char *file, int line,
                               const char *func, const char *level_str,
@@ -840,6 +845,7 @@ static inline void wamble_log(int level, const char *file, int line,
 
 #define FEN_MAX_LENGTH 90
 #define MAX_UCI_LENGTH 6
+#define PROFILE_NAME_MAX_LENGTH 256
 #define TOKEN_LENGTH 16
 #define STATUS_MAX_LENGTH 17
 
@@ -1067,6 +1073,8 @@ struct WambleMsg {
   uint32_t seq_num;
   uint8_t uci_len;
   char uci[MAX_UCI_LENGTH];
+  uint8_t profile_name_len;
+  char profile_name[PROFILE_NAME_MAX_LENGTH];
   char fen[FEN_MAX_LENGTH];
   uint16_t error_code;
   char error_reason[FEN_MAX_LENGTH];
@@ -1100,6 +1108,13 @@ typedef struct WamblePlayer {
   double rating;
   int games_played;
 } WamblePlayer;
+
+typedef struct WamblePersistentPlayerStats {
+  double score;
+  double prediction_score;
+  double rating;
+  int games_played;
+} WamblePersistentPlayerStats;
 
 typedef struct WambleBoard {
   char fen[FEN_MAX_LENGTH];
@@ -1210,6 +1225,7 @@ void player_manager_init(void);
 WamblePlayer *create_new_player(void);
 WamblePlayer *attach_persistent_identity(const uint8_t *token,
                                          const uint8_t *public_key);
+int detach_persistent_identity(const uint8_t *token);
 void format_token_for_url(const uint8_t *token, char *url_buffer);
 int decode_token_from_url(const char *url_string, uint8_t *token_buffer);
 void player_manager_tick(void);
@@ -1277,8 +1293,10 @@ void wamble_emit_update_session_last_seen(const uint8_t *token);
 void wamble_emit_create_session(const uint8_t *token, uint64_t player_id);
 void wamble_emit_link_session_to_pubkey(const uint8_t *token,
                                         const uint8_t *public_key);
+void wamble_emit_unlink_session_identity(const uint8_t *token);
 void wamble_emit_record_payout(uint64_t board_id, const uint8_t *token,
                                double points);
+void wamble_emit_update_player_rating(const uint8_t *token, double rating);
 void wamble_emit_record_prediction(uint64_t board_id, const uint8_t *token,
                                    uint64_t parent_id,
                                    const char *predicted_move_uci,
@@ -1309,9 +1327,25 @@ DbStatus wamble_query_get_player_rating(uint64_t session_id,
                                         double *out_rating);
 DbStatus wamble_query_get_session_games_played(uint64_t session_id,
                                                int *out_games);
+DbStatus wamble_query_get_persistent_player_stats(
+    const uint8_t *public_key, WamblePersistentPlayerStats *out_stats);
 DbLeaderboardResult wamble_query_get_leaderboard(uint64_t requester_session_id,
                                                  uint8_t leaderboard_type,
                                                  int limit);
+DbStatus
+wamble_query_get_session_treatment_assignment(const uint8_t *token,
+                                              WambleTreatmentAssignment *out);
+DbStatus wamble_query_resolve_policy_decision(
+    const uint8_t *token, const char *profile, const char *action,
+    const char *resource, const char *context_key, const char *context_value,
+    WamblePolicyDecision *out);
+DbStatus wamble_query_resolve_treatment_actions(
+    const uint8_t *token, const char *profile, const char *hook_name,
+    const char *opponent_group_key, const WambleFact *facts, int fact_count,
+    WambleTreatmentAction *out, int max_out, int *out_count);
+int wamble_query_treatment_edge_allows(const char *profile,
+                                       const char *source_group_key,
+                                       const char *target_group_key);
 
 wamble_socket_t create_and_bind_socket(int port);
 int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
@@ -1323,6 +1357,11 @@ int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
                           int max_retries);
 int send_unreliable_packet(wamble_socket_t sockfd, const struct WambleMsg *msg,
                            const struct sockaddr_in *cliaddr);
+int receive_message_timeout(wamble_socket_t sockfd, struct WambleMsg *msg,
+                            struct sockaddr_in *cliaddr, int timeout_ms);
+int receive_and_ack(wamble_socket_t sockfd, struct WambleMsg *msg,
+                    struct sockaddr_in *cliaddr, int timeout_ms);
+int wamble_socket_bound_port(wamble_socket_t sock);
 ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
                             const struct sockaddr_in *cliaddr, int trust_tier,
                             const char *profile_name);
@@ -1367,6 +1406,7 @@ spectator_handle_request(const struct WambleMsg *msg,
                          const struct sockaddr_in *cliaddr, int trust_tier,
                          int capacity_bypass, SpectatorState *out_state,
                          uint64_t *out_focus_board_id);
+void spectator_discard_by_token(const uint8_t *token);
 
 int spectator_collect_updates(struct SpectatorUpdate *out, int max);
 int spectator_collect_notifications(struct SpectatorUpdate *out, int max);

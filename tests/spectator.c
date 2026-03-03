@@ -1,154 +1,153 @@
 #include "common/wamble_test.h"
-#include "common/wamble_test_helpers.h"
 #include "wamble/wamble.h"
 
-static void setup_default(void) {
+WAMBLE_TEST(spectator_summary_and_focus_flow) {
   char msg[128];
-  (void)config_load(NULL, NULL, msg, sizeof(msg));
+  T_ASSERT_STATUS(config_load(NULL, NULL, msg, sizeof(msg)),
+                  CONFIG_LOAD_DEFAULTS);
   spectator_manager_init();
   board_manager_init();
   player_manager_init();
-}
 
-static void teardown_default(void) { spectator_manager_shutdown(); }
-
-static void make_addr(struct sockaddr_in *out) {
-  memset(out, 0, sizeof(*out));
-  out->sin_family = AF_INET;
-  out->sin_port = htons((uint16_t)get_config()->port);
-  out->sin_addr.s_addr = htonl(0x7F000001);
-}
-
-static int ensure_active_and_reserved(uint64_t *out_active_id,
-                                      uint64_t *out_reserved_id) {
-  WamblePlayer *p1 = create_new_player();
-  if (!p1)
-    return -1;
-  WambleBoard *b1 = find_board_for_player(p1);
-  if (!b1)
-    return -1;
-  if (out_reserved_id)
-    *out_reserved_id = b1->id;
-  board_move_played(b1->id);
-  if (out_active_id)
-    *out_active_id = b1->id;
-  return 0;
-}
-
-WAMBLE_TEST(spectator_summary_and_focus_flow) {
-  setup_default();
-
-  uint64_t active_id = 0, reserved_id = 0;
-  T_ASSERT_EQ_INT(ensure_active_and_reserved(&active_id, &reserved_id), 0);
-  T_ASSERT(active_id != 0);
+  WamblePlayer *player = create_new_player();
+  T_ASSERT(player != NULL);
+  WambleBoard *board = find_board_for_player(player);
+  T_ASSERT(board != NULL);
+  uint64_t active_id = board->id;
+  board_move_played(board->id);
 
   struct sockaddr_in addr;
-  make_addr(&addr);
-  uint8_t tok_sum[TOKEN_LENGTH] = {1};
-  uint8_t tok_foc[TOKEN_LENGTH] = {2};
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons((uint16_t)get_config()->port);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-  struct WambleMsg msum = {0};
-  msum.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
-  memcpy(msum.token, tok_sum, TOKEN_LENGTH);
-  msum.board_id = 0;
-  SpectatorState st = SPECTATOR_STATE_IDLE;
+  uint8_t summary_token[TOKEN_LENGTH] = {1};
+  uint8_t focus_token[TOKEN_LENGTH] = {2};
+
+  struct WambleMsg summary = {0};
+  summary.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  memcpy(summary.token, summary_token, TOKEN_LENGTH);
+
+  SpectatorState state = SPECTATOR_STATE_IDLE;
   uint64_t focus = 0;
-  SpectatorRequestStatus rs =
-      spectator_handle_request(&msum, &addr, 0, 0, &st, &focus);
-  T_ASSERT_EQ_INT(rs, SPECTATOR_OK_SUMMARY);
-  T_ASSERT_EQ_INT(st, SPECTATOR_STATE_SUMMARY);
+  T_ASSERT_EQ_INT(
+      spectator_handle_request(&summary, &addr, 0, 0, &state, &focus),
+      SPECTATOR_OK_SUMMARY);
+  T_ASSERT_EQ_INT(state, SPECTATOR_STATE_SUMMARY);
 
-  struct WambleMsg mfoc = {0};
-  mfoc.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
-  memcpy(mfoc.token, tok_foc, TOKEN_LENGTH);
-  mfoc.board_id = active_id;
-  st = SPECTATOR_STATE_IDLE;
+  struct WambleMsg game = {0};
+  game.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  memcpy(game.token, focus_token, TOKEN_LENGTH);
+  game.board_id = active_id;
+  state = SPECTATOR_STATE_IDLE;
   focus = 0;
-  rs = spectator_handle_request(&mfoc, &addr, 0, 0, &st, &focus);
-  T_ASSERT_EQ_INT(rs, SPECTATOR_OK_FOCUS);
-  T_ASSERT_EQ_INT(st, SPECTATOR_STATE_FOCUS);
+  T_ASSERT_EQ_INT(spectator_handle_request(&game, &addr, 0, 0, &state, &focus),
+                  SPECTATOR_OK_FOCUS);
+  T_ASSERT_EQ_INT(state, SPECTATOR_STATE_FOCUS);
   T_ASSERT_EQ_INT((int)focus, (int)active_id);
 
-  SpectatorUpdate upds[16];
-  int n = spectator_collect_updates(upds, 16);
-  T_ASSERT(n > 0);
-  int saw_sum = 0, saw_focus = 0;
-  for (int i = 0; i < n; i++) {
-    if (tokens_equal(upds[i].token, tok_sum))
-      saw_sum = 1;
-    if (tokens_equal(upds[i].token, tok_foc) && upds[i].board_id == active_id)
+  SpectatorUpdate updates[16];
+  int count = spectator_collect_updates(updates, 16);
+  int saw_summary = 0;
+  int saw_focus = 0;
+  for (int i = 0; i < count; i++) {
+    if (tokens_equal(updates[i].token, summary_token))
+      saw_summary = 1;
+    if (tokens_equal(updates[i].token, focus_token) &&
+        updates[i].board_id == active_id) {
       saw_focus = 1;
+    }
   }
-  T_ASSERT(saw_sum && saw_focus);
+  T_ASSERT(saw_summary);
+  T_ASSERT(saw_focus);
 
-  teardown_default();
+  spectator_manager_shutdown();
   return 0;
 }
 
 WAMBLE_TEST(spectator_visibility_and_capacity) {
-  setup_default();
+  char msg[128];
+  T_ASSERT_STATUS(config_load(NULL, NULL, msg, sizeof(msg)),
+                  CONFIG_LOAD_DEFAULTS);
+  spectator_manager_init();
+  board_manager_init();
+  player_manager_init();
 
-  uint64_t active_id = 0;
-  uint64_t reserved_id = 0;
-  T_ASSERT_EQ_INT(ensure_active_and_reserved(&active_id, &reserved_id), 0);
+  WamblePlayer *player = create_new_player();
+  T_ASSERT(player != NULL);
+  WambleBoard *board = find_board_for_player(player);
+  T_ASSERT(board != NULL);
+  uint64_t active_id = board->id;
+  board_move_played(board->id);
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons((uint16_t)get_config()->port);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
   WambleConfig cfg = *get_config();
   cfg.spectator_visibility = 1;
-  set_thread_config(&cfg);
+  wamble_config_push(&cfg);
 
-  struct sockaddr_in addr;
-  make_addr(&addr);
-  uint8_t tok[TOKEN_LENGTH] = {3};
-  struct WambleMsg m = {0};
-  m.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
-  memcpy(m.token, tok, TOKEN_LENGTH);
-  m.board_id = 0;
-  SpectatorState st = SPECTATOR_STATE_IDLE;
+  uint8_t denied_token[TOKEN_LENGTH] = {3};
+  struct WambleMsg denied = {0};
+  denied.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  memcpy(denied.token, denied_token, TOKEN_LENGTH);
+  SpectatorState state = SPECTATOR_STATE_IDLE;
   uint64_t focus = 0;
-  SpectatorRequestStatus rs =
-      spectator_handle_request(&m, &addr, 0, 0, &st, &focus);
-  T_ASSERT_EQ_INT(rs, SPECTATOR_ERR_VISIBILITY);
+  T_ASSERT_EQ_INT(
+      spectator_handle_request(&denied, &addr, 0, 0, &state, &focus),
+      SPECTATOR_ERR_VISIBILITY);
+
+  wamble_config_pop();
 
   cfg = *get_config();
   cfg.spectator_visibility = 0;
   cfg.max_spectators = 1;
-  set_thread_config(&cfg);
+  wamble_config_push(&cfg);
 
-  uint8_t t1[TOKEN_LENGTH] = {4};
-  uint8_t t2[TOKEN_LENGTH] = {5};
-  struct WambleMsg mf1 = {0}, mf2 = {0};
-  mf1.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
-  mf1.board_id = active_id;
-  memcpy(mf1.token, t1, TOKEN_LENGTH);
-  st = SPECTATOR_STATE_IDLE;
+  uint8_t first_token[TOKEN_LENGTH] = {4};
+  uint8_t second_token[TOKEN_LENGTH] = {5};
+  struct WambleMsg first = {0};
+  struct WambleMsg second = {0};
+  first.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  first.board_id = active_id;
+  memcpy(first.token, first_token, TOKEN_LENGTH);
+  second.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  second.board_id = active_id;
+  memcpy(second.token, second_token, TOKEN_LENGTH);
+
+  state = SPECTATOR_STATE_IDLE;
   focus = 0;
-  rs = spectator_handle_request(&mf1, &addr, 0, 0, &st, &focus);
-  T_ASSERT_EQ_INT(rs, SPECTATOR_OK_FOCUS);
+  T_ASSERT_EQ_INT(spectator_handle_request(&first, &addr, 0, 0, &state, &focus),
+                  SPECTATOR_OK_FOCUS);
 
-  mf2.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
-  mf2.board_id = active_id;
-  memcpy(mf2.token, t2, TOKEN_LENGTH);
-  st = SPECTATOR_STATE_IDLE;
+  state = SPECTATOR_STATE_IDLE;
   focus = 0;
-  rs = spectator_handle_request(&mf2, &addr, 0, 0, &st, &focus);
-  T_ASSERT_EQ_INT(rs, SPECTATOR_ERR_FULL);
-  rs = spectator_handle_request(&mf2, &addr, 0, 1, &st, &focus);
-  T_ASSERT_EQ_INT(rs, SPECTATOR_OK_FOCUS);
+  T_ASSERT_EQ_INT(
+      spectator_handle_request(&second, &addr, 0, 0, &state, &focus),
+      SPECTATOR_ERR_FULL);
+  T_ASSERT_EQ_INT(
+      spectator_handle_request(&second, &addr, 0, 1, &state, &focus),
+      SPECTATOR_OK_FOCUS);
 
-  struct WambleMsg mstop = {0};
-  mstop.ctrl = WAMBLE_CTRL_SPECTATE_STOP;
-  memcpy(mstop.token, t1, TOKEN_LENGTH);
-  st = SPECTATOR_STATE_FOCUS;
+  struct WambleMsg stop = {0};
+  stop.ctrl = WAMBLE_CTRL_SPECTATE_STOP;
+  memcpy(stop.token, first_token, TOKEN_LENGTH);
+  state = SPECTATOR_STATE_FOCUS;
   focus = active_id;
-  rs = spectator_handle_request(&mstop, &addr, 0, 0, &st, &focus);
-  T_ASSERT_EQ_INT(rs, SPECTATOR_OK_STOP);
+  T_ASSERT_EQ_INT(spectator_handle_request(&stop, &addr, 0, 0, &state, &focus),
+                  SPECTATOR_OK_STOP);
 
-  st = SPECTATOR_STATE_IDLE;
+  state = SPECTATOR_STATE_IDLE;
   focus = 0;
-  rs = spectator_handle_request(&mf1, &addr, 0, 0, &st, &focus);
-  T_ASSERT_EQ_INT(rs, SPECTATOR_OK_FOCUS);
+  T_ASSERT_EQ_INT(spectator_handle_request(&first, &addr, 0, 0, &state, &focus),
+                  SPECTATOR_OK_FOCUS);
 
-  teardown_default();
+  spectator_manager_shutdown();
+  wamble_config_pop();
   return 0;
 }
 
