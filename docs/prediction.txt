@@ -1,0 +1,71 @@
+Wamble Prediction
+=================
+
+Overview
+- Lets sessions submit move predictions against the next half-move on a board.
+- Prediction scoring is separate from normal board pot scoring.
+- Predictions may reference an earlier prediction, which lets the server expose
+  a prediction tree for the active board.
+
+Modes
+- `prediction-mode = 0`: disabled.
+- `prediction-mode = 1`: only the currently reserved mover may predict their
+  next move.
+- `prediction-mode = 2`: allowed sessions may predict the next half-move and
+  build a streak across correct predictions.
+- `prediction-mode = 3`: same as mode 2, plus deterministic session gating via
+  `prediction-gated-percent`.
+
+Scoring
+- Correct predictions award `prediction-base-points` in mode 1.
+- Correct predictions award
+  `prediction-base-points * prediction-streak-multiplier^streak_before`
+  in modes 2 and 3, capped by `prediction-streak-cap`.
+- Incorrect predictions apply `prediction-penalty-incorrect` as a negative
+  prediction score delta when configured.
+- Prediction rewards update `player->prediction_score`, not `player->score`.
+- Session aggregates are stored in `sessions.total_prediction_score`.
+
+Policy
+- Submit access uses policy action `prediction.submit`.
+- Submit resources are `self`, `streak`, or `gated`, depending on mode.
+- Submit requests pass `board=<board-id>` as context when the runtime has it.
+- Tree reads use policy action `prediction.read` with resource `tree`.
+- Tree reads pass `depth=<requested-depth>` as context.
+- For `prediction.read`, the resolved policy `permission_level` is treated as
+  the maximum readable tree depth.
+
+Tree Reads
+- Each prediction may reference `parent_prediction_id`.
+- Root predictions have no parent.
+- Tree reads return flat rows with `id`, `parent_id`, `board_id`,
+  predictor token, move, status, target ply, depth, awarded points, and
+  creation time.
+- Consumers reconstruct the tree by linking `parent_id` to `id`.
+- The effective depth limit is the minimum of:
+  - `prediction-view-depth-limit`
+  - requested depth
+  - policy `permission_level` for `prediction.read`
+
+Persistence
+- Prediction submissions are stored in `predictions`.
+- Prediction resolution updates `status`, `points_awarded`, and `resolved_at`.
+- Resolved prediction totals are rolled into `sessions.total_prediction_score`.
+
+API
+- `prediction_manager_init()`.
+- `prediction_submit()`, `prediction_submit_with_parent()`.
+- `prediction_resolve_move()`.
+- `prediction_collect_tree()`.
+- `prediction_clear_board()`, `prediction_pending_count()`.
+
+References
+- Config (see docs/configuration.txt): `prediction-mode`,
+  `prediction-base-points`, `prediction-streak-multiplier`,
+  `prediction-streak-cap`, `prediction-gated-percent`,
+  `prediction-penalty-incorrect`, `prediction-match-policy`,
+  `prediction-max-pending`, `prediction-view-depth-limit`.
+- Protocol (see docs/network_protocol.txt): `SUBMIT_PREDICTION`,
+  `GET_PREDICTIONS`, `PREDICTION_DATA`.
+- Scoring (see docs/scoring.txt): normal board pot scoring remains separate.
+- Database (see docs/database.txt): tables `predictions`, `sessions`.

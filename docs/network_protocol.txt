@@ -114,6 +114,33 @@ Control Codes
     - `count * struct { uint32 rank_be; uint64 session_id_be; uint64 score_bits_be; uint64 rating_bits_be; uint32 games_played_be; }`
   - `score_bits_be` and `rating_bits_be` are IEEE-754 double bit patterns in big-endian order.
   - Maximum entries per packet: 16.
+- `0x1A` SUBMIT_PREDICTION (client to server): Submit a prediction for the next
+  half-move on `board_id`.
+  - Payload: `uint8 uci_len; char uci[uci_len]; uint64 parent_prediction_id_be`.
+  - `parent_prediction_id_be = 0` means a root prediction.
+- `0x1B` GET_PREDICTIONS (client to server): Request prediction tree rows for a
+  board.
+  - Payload: `uint8 depth; uint8 limit`.
+  - `depth = 0` lets the server use its configured default depth cap.
+  - `limit` is capped by the implementation maximum entries per packet.
+- `0x1C` PREDICTION_DATA (server to client): Prediction tree response or submit
+  confirmation.
+  - Payload:
+    - `uint8 count`
+    - `count * struct {`
+      `uint64 id_be;`
+      `uint64 parent_id_be;`
+      `uint8 token[16];`
+      `uint64 points_bits_be;`
+      `uint16 target_ply_be;`
+      `uint8 depth;`
+      `uint8 status;`
+      `uint8 uci_len;`
+      `char uci[6];`
+      `}`
+  - `status`: `0=pending`, `1=correct`, `2=incorrect`, `3=expired`.
+  - `points_bits_be` is an IEEE-754 double bit pattern in big-endian order.
+  - Maximum entries per packet: 16.
 
 Reliability
 - Reliable messages are sent with a sequence number (`seq_num`).
@@ -165,6 +192,7 @@ References
 - Players: docs/player_management.txt (LOGIN_REQUEST, LOGIN_*, GET_PLAYER_STATS, PLAYER_STATS_DATA)
 - Move engine: docs/move_engine.txt (PLAYER_MOVE, BOARD_UPDATE, GET_LEGAL_MOVES, LEGAL_MOVES)
 - Profiles runtime: docs/runtime_and_state.txt (LIST_PROFILES, PROFILES_LIST, GET_PROFILE_INFO, PROFILE_INFO)
+- Prediction: docs/prediction.txt (SUBMIT_PREDICTION, GET_PREDICTIONS, PREDICTION_DATA)
 
 WebSocket Bridge
 - Endpoint: `ws://<host>:<websocket-port><websocket-path>`

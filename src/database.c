@@ -603,6 +603,8 @@ static WAMBLE_THREAD_LOCAL uint64_t *tls_ids;
 static WAMBLE_THREAD_LOCAL int tls_ids_cap;
 static WAMBLE_THREAD_LOCAL WambleMove *tls_moves;
 static WAMBLE_THREAD_LOCAL int tls_moves_cap;
+static WAMBLE_THREAD_LOCAL DbPredictionRow *tls_predictions;
+static WAMBLE_THREAD_LOCAL int tls_predictions_cap;
 
 enum {
   TOKEN_READ_CACHE_CAP = 256,
@@ -1167,6 +1169,7 @@ const WambleQueryService *wamble_get_db_query_service(void) {
     svc.get_session_by_token = db_get_session_by_token;
     svc.get_persistent_session_by_token = db_get_persistent_session_by_token;
     svc.get_player_total_score = db_get_player_total_score;
+    svc.get_player_prediction_score = db_get_player_prediction_score;
     svc.get_player_rating = db_get_player_rating;
     svc.get_session_games_played = db_get_session_games_played;
     svc.get_leaderboard = db_get_leaderboard;
@@ -1205,6 +1208,14 @@ static DbBoardResult query_board_error(void) {
 
 static DbMovesResult query_moves_error(void) {
   DbMovesResult out = {0};
+  out.status = DB_ERR_EXEC;
+  out.rows = NULL;
+  out.count = 0;
+  return out;
+}
+
+static DbPredictionsResult query_predictions_error(void) {
+  DbPredictionsResult out = {0};
   out.status = DB_ERR_EXEC;
   out.rows = NULL;
   out.count = 0;
@@ -1286,6 +1297,14 @@ DbStatus wamble_query_get_player_total_score(uint64_t session_id,
   return qs->get_player_total_score(session_id, out_total);
 }
 
+DbStatus wamble_query_get_player_prediction_score(uint64_t session_id,
+                                                  double *out_total) {
+  const WambleQueryService *qs = get_query_service();
+  if (!qs || !qs->get_player_prediction_score)
+    return DB_ERR_EXEC;
+  return qs->get_player_prediction_score(session_id, out_total);
+}
+
 DbStatus wamble_query_get_player_rating(uint64_t session_id,
                                         double *out_rating) {
   const WambleQueryService *qs = get_query_service();
@@ -1313,6 +1332,15 @@ DbLeaderboardResult wamble_query_get_leaderboard(uint64_t requester_session_id,
 
 uint64_t db_create_session(const uint8_t *token, uint64_t player_id,
                            int experiment_arm) {
+  if (!token)
+    return 0;
+
+  uint64_t existing_session_id = 0;
+  if (db_get_session_by_token(token, &existing_session_id) == DB_OK &&
+      existing_session_id > 0) {
+    return existing_session_id;
+  }
+
   const char *query = "INSERT INTO sessions (token, player_id, "
                       "global_identity_id, config_revision_id, "
                       "policy_snapshot_revision_id, experiment_arm) "
@@ -1365,6 +1393,10 @@ uint64_t db_create_session(const uint8_t *token, uint64_t player_id,
     return 0;
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     PQclear(res);
+    if (db_get_session_by_token(token, &existing_session_id) == DB_OK &&
+        existing_session_id > 0) {
+      return existing_session_id;
+    }
     return 0;
   }
 
@@ -1842,6 +1874,190 @@ int db_async_record_move(uint64_t board_id, uint64_t session_id,
   return 0;
 }
 
+DbStatus db_create_prediction(uint64_t board_id, uint64_t session_id,
+                              uint64_t parent_prediction_id,
+                              const char *predicted_move_uci, int move_number,
+                              int correct_streak, uint64_t *out_prediction_id) {
+  const char *query =
+      "INSERT INTO predictions (board_id, session_id, predicted_move_uci, "
+      "move_number, parent_prediction_id, correct_streak, status) "
+      "VALUES ($1, $2, $3, $4, NULLIF($5, '0')::bigint, $6, 'PENDING') "
+      "RETURNING id";
+
+  char board_id_str[32];
+  char session_id_str[32];
+  char move_number_str[16];
+  char parent_id_str[32];
+  char correct_streak_str[16];
+
+  snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
+  snprintf(session_id_str, sizeof(session_id_str), "%lu", session_id);
+  snprintf(move_number_str, sizeof(move_number_str), "%d", move_number);
+  snprintf(parent_id_str, sizeof(parent_id_str), "%lu", parent_prediction_id);
+  snprintf(correct_streak_str, sizeof(correct_streak_str), "%d",
+           correct_streak);
+
+  const char *paramValues[] = {board_id_str,       session_id_str,
+                               predicted_move_uci, move_number_str,
+                               parent_id_str,      correct_streak_str};
+  PGresult *res =
+      pq_exec_params_locked(query, 6, NULL, paramValues, NULL, NULL, 0);
+
+  if (!res)
+    return DB_ERR_EXEC;
+  if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+    PQclear(res);
+    return DB_ERR_EXEC;
+  }
+
+  if (out_prediction_id)
+    *out_prediction_id = strtoull(PQgetvalue(res, 0, 0), NULL, 10);
+  PQclear(res);
+  return DB_OK;
+}
+
+int db_async_create_prediction(uint64_t board_id, uint64_t session_id,
+                               uint64_t parent_prediction_id,
+                               const char *predicted_move_uci, int move_number,
+                               int correct_streak) {
+  uint64_t prediction_id = 0;
+  DbStatus st = db_create_prediction(board_id, session_id, parent_prediction_id,
+                                     predicted_move_uci, move_number,
+                                     correct_streak, &prediction_id);
+  return st == DB_OK ? 0 : -1;
+}
+
+int db_async_resolve_prediction(uint64_t board_id, uint64_t session_id,
+                                int move_number, const char *status,
+                                double points_awarded) {
+  const char *query =
+      "WITH upd AS ("
+      "  UPDATE predictions "
+      "  SET status = $4, points_awarded = $5, resolved_at = NOW() "
+      "  WHERE board_id = $1 AND session_id = $2 AND move_number = $3 "
+      "    AND status = 'PENDING' "
+      "  RETURNING session_id, points_awarded"
+      ") "
+      "UPDATE sessions s "
+      "SET total_prediction_score = s.total_prediction_score + "
+      "upd.points_awarded "
+      "FROM upd WHERE s.id = upd.session_id";
+
+  char board_id_str[32];
+  char session_id_str[32];
+  char move_number_str[16];
+  char points_str[32];
+
+  snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
+  snprintf(session_id_str, sizeof(session_id_str), "%lu", session_id);
+  snprintf(move_number_str, sizeof(move_number_str), "%d", move_number);
+  snprintf(points_str, sizeof(points_str), "%.4f", points_awarded);
+
+  const char *paramValues[] = {board_id_str, session_id_str, move_number_str,
+                               status, points_str};
+  PGresult *res =
+      pq_exec_params_locked(query, 5, NULL, paramValues, NULL, NULL, 0);
+
+  if (!res)
+    return -1;
+  if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+    PQclear(res);
+    return -1;
+  }
+
+  PQclear(res);
+  return 0;
+}
+
+DbPredictionsResult db_get_pending_predictions(void) {
+  DbPredictionsResult out = {0};
+  out.status = DB_OK;
+  out.rows = NULL;
+  out.count = 0;
+
+  const char *query =
+      "WITH RECURSIVE active_tree AS ("
+      "  SELECT p.id, p.parent_prediction_id "
+      "  FROM predictions p "
+      "  WHERE p.status = 'PENDING' "
+      "  UNION "
+      "  SELECT parent.id, parent.parent_prediction_id "
+      "  FROM predictions parent "
+      "  JOIN active_tree child ON child.parent_prediction_id = parent.id"
+      "), "
+      "prediction_depths AS ("
+      "  SELECT p.id, p.parent_prediction_id, 0 AS depth "
+      "  FROM predictions p "
+      "  WHERE p.parent_prediction_id IS NULL "
+      "  UNION ALL "
+      "  SELECT child.id, child.parent_prediction_id, parent.depth + 1 "
+      "  FROM predictions child "
+      "  JOIN prediction_depths parent ON child.parent_prediction_id = "
+      "parent.id"
+      ") "
+      "SELECT p.id, p.board_id, COALESCE(p.parent_prediction_id, 0), "
+      "encode(s.token, 'hex'), p.predicted_move_uci, p.status, p.move_number, "
+      "COALESCE(d.depth, 0), COALESCE(p.correct_streak, 0), p.points_awarded, "
+      "EXTRACT(EPOCH FROM p.created_at)::bigint "
+      "FROM predictions p "
+      "JOIN active_tree a ON a.id = p.id "
+      "JOIN sessions s ON s.id = p.session_id "
+      "LEFT JOIN prediction_depths d ON d.id = p.id "
+      "ORDER BY p.created_at ASC, p.id ASC";
+
+  PGresult *res = pq_exec_params_locked(query, 0, NULL, NULL, NULL, NULL, 0);
+  if (!res)
+    return query_predictions_error();
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    PQclear(res);
+    return query_predictions_error();
+  }
+
+  int count = PQntuples(res);
+  if (count <= 0) {
+    PQclear(res);
+    return out;
+  }
+
+  if (count > tls_predictions_cap) {
+    DbPredictionRow *rows = (DbPredictionRow *)realloc(
+        tls_predictions, (size_t)count * sizeof(*tls_predictions));
+    if (!rows) {
+      PQclear(res);
+      return query_predictions_error();
+    }
+    tls_predictions = rows;
+    tls_predictions_cap = count;
+  }
+
+  for (int i = 0; i < count; i++) {
+    memset(&tls_predictions[i], 0, sizeof(tls_predictions[i]));
+    tls_predictions[i].id = strtoull(PQgetvalue(res, i, 0), NULL, 10);
+    tls_predictions[i].board_id = strtoull(PQgetvalue(res, i, 1), NULL, 10);
+    tls_predictions[i].parent_prediction_id =
+        strtoull(PQgetvalue(res, i, 2), NULL, 10);
+    hex_to_bytes(PQgetvalue(res, i, 3), tls_predictions[i].player_token,
+                 TOKEN_LENGTH);
+    strncpy(tls_predictions[i].predicted_move_uci, PQgetvalue(res, i, 4),
+            MAX_UCI_LENGTH - 1);
+    strncpy(tls_predictions[i].status, PQgetvalue(res, i, 5),
+            STATUS_MAX_LENGTH - 1);
+    tls_predictions[i].move_number =
+        (int)strtol(PQgetvalue(res, i, 6), NULL, 10);
+    tls_predictions[i].depth = (int)strtol(PQgetvalue(res, i, 7), NULL, 10);
+    tls_predictions[i].correct_streak =
+        (int)strtol(PQgetvalue(res, i, 8), NULL, 10);
+    tls_predictions[i].points_awarded = strtod(PQgetvalue(res, i, 9), NULL);
+    tls_predictions[i].created_at =
+        (time_t)strtoull(PQgetvalue(res, i, 10), NULL, 10);
+  }
+
+  PQclear(res);
+  out.rows = tls_predictions;
+  out.count = count;
+  return out;
+}
+
 DbMovesResult db_get_moves_for_board(uint64_t board_id) {
   DbMovesResult out = {0};
   out.status = DB_ERR_EXEC;
@@ -2089,6 +2305,43 @@ DbStatus db_get_player_total_score(uint64_t session_id, double *out_total) {
 
   const char *paramValues[] = {session_id_str};
 
+  PGresult *res =
+      pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
+
+  if (!res)
+    return DB_ERR_CONN;
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    PQclear(res);
+    return DB_ERR_EXEC;
+  }
+  if (PQntuples(res) == 0) {
+    PQclear(res);
+    return DB_NOT_FOUND;
+  }
+
+  char *endptr;
+  double total = strtod(PQgetvalue(res, 0, 0), &endptr);
+  if (*endptr != '\0') {
+    PQclear(res);
+    return DB_ERR_BAD_DATA;
+  }
+  PQclear(res);
+  *out_total = total;
+  return DB_OK;
+}
+
+DbStatus db_get_player_prediction_score(uint64_t session_id,
+                                        double *out_total) {
+  if (!out_total)
+    return DB_ERR_BAD_DATA;
+  const char *query =
+      "SELECT COALESCE(total_prediction_score, 0) FROM sessions "
+      "WHERE id = $1";
+
+  char session_id_str[32];
+  snprintf(session_id_str, sizeof(session_id_str), "%lu", session_id);
+
+  const char *paramValues[] = {session_id_str};
   PGresult *res =
       pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
 

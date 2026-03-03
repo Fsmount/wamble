@@ -69,6 +69,29 @@ Database Connections
   many queued persistence intents are selected for DB apply.
 - `persistence-max-payload-bytes` (int, 65536): Upper bound per flush cycle for
   estimated total payload of selected persistence intents.
+- `prediction-mode` (int, 0): Prediction feature mode.
+  - `0`: disabled.
+  - `1`: only the currently reserved player may predict the next move.
+  - `2`: free prediction streak mode; any allowed predictor may predict the
+    next half-move.
+  - `3`: gated streak mode; mode `2` behaviour plus deterministic session
+    gating based on `prediction-gated-percent`.
+- `prediction-base-points` (double, 1.0): Base points for a correct prediction.
+- `prediction-streak-multiplier` (double, 2.0): Multiplier applied to each
+  successive correct streak step in modes `2` and `3`.
+- `prediction-streak-cap` (int, 10): Maximum streak depth counted for scoring.
+- `prediction-gated-percent` (int, 10): Percent of sessions allowed to predict
+  in mode `3`.
+- `prediction-view-depth-limit` (int, 2): Default maximum depth exposed when
+  reading prediction trees.
+- `prediction-penalty-incorrect` (double, 0.0): Optional points deducted for
+  wrong predictions.
+- `prediction-match-policy` (string, `exact-uci`): Matching mode for predicted
+  moves.
+  - `exact-uci`: promotion piece must match exactly.
+  - `from-to-only`: only the first four UCI characters must match.
+- `prediction-max-pending` (int, 64): Maximum in-flight predictions tracked per
+  board.
 Spectator Settings
 - `max-spectators` (int, 1024; -1 for no cap): Capacity limit for focused spectators at the server.
    Bypass is policy-controlled via `spectate.capacity_bypass` / `focus`. Bypass-focused sessions are counted outside the `max-spectators` pool.
@@ -193,7 +216,8 @@ Policy Rule Builtins
     `spectate_update`, `logout`, `login_success`, `login_failed`,
     `get_player_stats`, `player_stats_data`, `get_profile_info`,
     `profiles_list`, `spectate_stop`, `get_legal_moves`, `legal_moves`,
-    `get_leaderboard`, `leaderboard_data`, `unknown`.
+    `get_leaderboard`, `leaderboard_data`, `submit_prediction`,
+    `get_predictions`, `prediction_data`, `unknown`.
   - `game.move`: query resources `play`, `legal`.
   - `spectate.access`: query resource `view`; context `mode=summary|focus`.
   - `spectate.capacity_bypass`: query resource `focus`.
@@ -201,6 +225,10 @@ Policy Rule Builtins
     `ctrl=<control-resource>`.
   - `stats.read`: query resource `player`.
   - `leaderboard.read`: query resource `global`.
+  - `prediction.submit`: query resources `self`, `streak`, `gated`.
+    Context currently includes `board=<board-id>` when available.
+  - `prediction.read`: query resource `tree`; context `depth=<n>`.
+    The rule permission level is treated as the maximum readable depth cap.
 - Example:
   `(policy-allow "identity:42" "trust.tier" "profile:private" 5 "manual grant")`
   `(policy-deny "tag:contractors" "profile.discover" "profile_selector:internal" "hide internal profiles")`

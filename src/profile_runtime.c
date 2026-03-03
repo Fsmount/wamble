@@ -52,6 +52,10 @@ typedef struct TrustDecisionStatusEvent {
   ProfileTrustDecisionStatus status;
   char profile[64];
 } TrustDecisionStatusEvent;
+typedef struct PredictionManagerStatusEvent {
+  PredictionManagerStatus status;
+  char profile[64];
+} PredictionManagerStatusEvent;
 enum { WS_STATUS_QUEUE_CAP = 64 };
 static WsGatewayStatusEvent g_ws_status_queue[WS_STATUS_QUEUE_CAP];
 static int g_ws_status_head = 0;
@@ -62,6 +66,12 @@ static TrustDecisionStatusEvent g_trust_status_queue[TRUST_STATUS_QUEUE_CAP];
 static int g_trust_status_head = 0;
 static int g_trust_status_tail = 0;
 static int g_trust_status_count = 0;
+enum { PREDICTION_MANAGER_STATUS_QUEUE_CAP = 64 };
+static PredictionManagerStatusEvent
+    g_prediction_manager_status_queue[PREDICTION_MANAGER_STATUS_QUEUE_CAP];
+static int g_prediction_manager_status_head = 0;
+static int g_prediction_manager_status_tail = 0;
+static int g_prediction_manager_status_count = 0;
 
 static void free_running(RunningProfile *rp);
 static void profile_runtime_shutdown(RunningProfile *rp);
@@ -79,6 +89,9 @@ static void ensure_mutex_init(void) {
     g_trust_status_head = 0;
     g_trust_status_tail = 0;
     g_trust_status_count = 0;
+    g_prediction_manager_status_head = 0;
+    g_prediction_manager_status_tail = 0;
+    g_prediction_manager_status_count = 0;
   }
 }
 
@@ -165,6 +178,55 @@ int profile_runtime_take_trust_decision_status(
     TrustDecisionStatusEvent ev = g_trust_status_queue[g_trust_status_head];
     g_trust_status_head = (g_trust_status_head + 1) % TRUST_STATUS_QUEUE_CAP;
     g_trust_status_count--;
+    if (out_profile && out_profile_size > 0) {
+      snprintf(out_profile, out_profile_size, "%s", ev.profile);
+    }
+    if (out_status)
+      *out_status = ev.status;
+    wamble_mutex_unlock(&g_mutex);
+    return 1;
+  }
+  wamble_mutex_unlock(&g_mutex);
+  return 0;
+}
+
+static void publish_prediction_manager_status(PredictionManagerStatus status,
+                                              const char *profile_name) {
+  ensure_mutex_init();
+  wamble_mutex_lock(&g_mutex);
+  if (g_prediction_manager_status_count >=
+      PREDICTION_MANAGER_STATUS_QUEUE_CAP) {
+    g_prediction_manager_status_head = (g_prediction_manager_status_head + 1) %
+                                       PREDICTION_MANAGER_STATUS_QUEUE_CAP;
+    g_prediction_manager_status_count--;
+  }
+  PredictionManagerStatusEvent *ev =
+      &g_prediction_manager_status_queue[g_prediction_manager_status_tail];
+  ev->status = status;
+  snprintf(ev->profile, sizeof(ev->profile), "%s",
+           (profile_name && profile_name[0]) ? profile_name : "default");
+  g_prediction_manager_status_tail = (g_prediction_manager_status_tail + 1) %
+                                     PREDICTION_MANAGER_STATUS_QUEUE_CAP;
+  g_prediction_manager_status_count++;
+  wamble_mutex_unlock(&g_mutex);
+}
+
+int profile_runtime_take_prediction_manager_status(
+    PredictionManagerStatus *out_status, char *out_profile,
+    size_t out_profile_size) {
+  ensure_mutex_init();
+  if (out_status)
+    *out_status = PREDICTION_MANAGER_OK;
+  if (out_profile && out_profile_size > 0)
+    out_profile[0] = '\0';
+
+  wamble_mutex_lock(&g_mutex);
+  if (g_prediction_manager_status_count > 0) {
+    PredictionManagerStatusEvent ev =
+        g_prediction_manager_status_queue[g_prediction_manager_status_head];
+    g_prediction_manager_status_head = (g_prediction_manager_status_head + 1) %
+                                       PREDICTION_MANAGER_STATUS_QUEUE_CAP;
+    g_prediction_manager_status_count--;
     if (out_profile && out_profile_size > 0) {
       snprintf(out_profile, out_profile_size, "%s", ev.profile);
     }
@@ -990,6 +1052,11 @@ static int profile_runtime_init(RunningProfile *rp) {
 
   player_manager_init();
   board_manager_init();
+  {
+    PredictionManagerStatus st = prediction_manager_init();
+    if (st != PREDICTION_MANAGER_OK)
+      publish_prediction_manager_status(st, rp->name);
+  }
   rp->ws_retry_enabled = 1;
   rp->last_cleanup = wamble_now_wall();
   rp->last_tick = rp->last_cleanup;

@@ -254,6 +254,10 @@ WamblePlayer *get_player_by_token(const uint8_t *token) {
       double score = 0.0;
       if (wamble_query_get_player_total_score(session_id, &score) == DB_OK)
         player->score = score;
+      double prediction_score = 0.0;
+      if (wamble_query_get_player_prediction_score(session_id,
+                                                   &prediction_score) == DB_OK)
+        player->prediction_score = prediction_score;
       double r = 0.0;
       if (wamble_query_get_player_rating(session_id, &r) == DB_OK)
         player->rating = (r > 0.0) ? r : (double)get_config()->default_rating;
@@ -319,6 +323,7 @@ WamblePlayer *create_new_player(void) {
     player->has_persistent_identity = 0;
     player->last_seen_time = wamble_now_wall();
     player->score = 0.0;
+    player->prediction_score = 0.0;
     player->rating = (double)get_config()->default_rating;
     player->games_played = 0;
     wamble_emit_create_session(candidate_token, 0);

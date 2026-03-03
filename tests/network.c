@@ -12,6 +12,8 @@ static void sleep_ms(int ms) {
 static int g_mock_rate_bypass = 0;
 static int g_mock_discover_override = 0;
 
+static int fill_server_addr(wamble_socket_t srv, struct sockaddr_in *out);
+
 static DbStatus
 mock_resolve_policy_decision(const uint8_t *token, const char *profile,
                              const char *action, const char *resource,
@@ -34,7 +36,9 @@ mock_resolve_policy_decision(const uint8_t *token, const char *profile,
 
   if (strcmp(action, "protocol.ctrl") == 0 &&
       (strcmp(resource, "list_profiles") == 0 ||
-       strcmp(resource, "get_profile_info") == 0)) {
+       strcmp(resource, "get_profile_info") == 0 ||
+       strcmp(resource, "submit_prediction") == 0 ||
+       strcmp(resource, "get_predictions") == 0)) {
     out->allowed = 1;
     out->rule_id = 1;
     snprintf(out->effect, sizeof(out->effect), "%s", "allow");
@@ -61,6 +65,14 @@ mock_resolve_policy_decision(const uint8_t *token, const char *profile,
     out->allowed = 1;
     out->permission_level = 0;
     out->rule_id = 4;
+    snprintf(out->effect, sizeof(out->effect), "%s", "allow");
+    return DB_OK;
+  }
+  if (strcmp(action, "prediction.submit") == 0 ||
+      strcmp(action, "prediction.read") == 0) {
+    out->allowed = 1;
+    out->permission_level = 2;
+    out->rule_id = 5;
     snprintf(out->effect, sizeof(out->effect), "%s", "allow");
     return DB_OK;
   }
@@ -276,6 +288,118 @@ WAMBLE_TEST(leaderboard_data_roundtrip) {
   T_ASSERT_EQ_INT((int)ctx.msg.leaderboard[0].games_played, 12);
   T_ASSERT(fabs(ctx.msg.leaderboard[0].score - 150.5) < 1e-9);
   T_ASSERT(fabs(ctx.msg.leaderboard[0].rating - 1210.0) < 1e-9);
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(submit_prediction_roundtrip) {
+  config_load(NULL, NULL, NULL, 0);
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+  struct sockaddr_in dst;
+  T_ASSERT_STATUS_OK(fill_server_addr(srv, &dst));
+
+  struct WambleMsg out = {0};
+  out.ctrl = WAMBLE_CTRL_SUBMIT_PREDICTION;
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    out.token[i] = (uint8_t)(0x44 + i);
+  out.board_id = 77;
+  out.prediction_parent_id = 1234;
+  strcpy(out.uci, "e2e4");
+  out.uci_len = 4;
+  T_ASSERT_STATUS_OK(send_unreliable_packet(cli, &out, &dst));
+
+  struct WambleMsg in;
+  struct sockaddr_in from;
+  int got = -1;
+  for (int i = 0; i < 200; i++) {
+    int rc = receive_message(srv, &in, &from);
+    if (rc > 0) {
+      got = rc;
+      break;
+    }
+    sleep_ms(2);
+  }
+  T_ASSERT(got > 0);
+  T_ASSERT_EQ_INT(in.ctrl, WAMBLE_CTRL_SUBMIT_PREDICTION);
+  T_ASSERT_EQ_INT((int)in.board_id, 77);
+  T_ASSERT_EQ_INT((int)in.prediction_parent_id, 1234);
+  T_ASSERT_EQ_INT((int)in.uci_len, 4);
+  T_ASSERT_STREQ(in.uci, "e2e4");
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(prediction_data_roundtrip) {
+  config_load(NULL, NULL, NULL, 0);
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  RecvCtx ctx = {0};
+  ctx.sock = cli;
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, (wamble_thread_func_t)recv_one, &ctx) ==
+           0);
+
+  struct WambleMsg out = {0};
+  out.ctrl = WAMBLE_CTRL_PREDICTION_DATA;
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    out.token[i] = (uint8_t)(0x30 + i);
+  out.board_id = 55;
+  out.prediction_count = 2;
+  out.predictions[0].id = 1;
+  out.predictions[0].parent_id = 0;
+  memcpy(out.predictions[0].token, out.token, TOKEN_LENGTH);
+  out.predictions[0].points_awarded = 1.5;
+  out.predictions[0].target_ply = 4;
+  out.predictions[0].depth = 0;
+  out.predictions[0].status = WAMBLE_PREDICTION_STATUS_CORRECT;
+  out.predictions[0].uci_len = 4;
+  memcpy(out.predictions[0].uci, "e2e4", 4);
+  out.predictions[1].id = 2;
+  out.predictions[1].parent_id = 1;
+  memcpy(out.predictions[1].token, out.token, TOKEN_LENGTH);
+  out.predictions[1].points_awarded = 0.0;
+  out.predictions[1].target_ply = 5;
+  out.predictions[1].depth = 1;
+  out.predictions[1].status = WAMBLE_PREDICTION_STATUS_PENDING;
+  out.predictions[1].uci_len = 4;
+  memcpy(out.predictions[1].uci, "e7e5", 4);
+
+  T_ASSERT_STATUS_OK(send_unreliable_packet(srv, &out, &cliaddr));
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+
+  T_ASSERT_EQ_INT(ctx.received, 1);
+  T_ASSERT_EQ_INT(ctx.msg.ctrl, WAMBLE_CTRL_PREDICTION_DATA);
+  T_ASSERT_EQ_INT((int)ctx.msg.prediction_count, 2);
+  T_ASSERT_EQ_INT((int)ctx.msg.predictions[0].id, 1);
+  T_ASSERT_EQ_INT((int)ctx.msg.predictions[1].parent_id, 1);
+  T_ASSERT_EQ_INT((int)ctx.msg.predictions[1].depth, 1);
+  T_ASSERT_EQ_INT((int)ctx.msg.predictions[0].status,
+                  WAMBLE_PREDICTION_STATUS_CORRECT);
+  T_ASSERT_EQ_INT((int)ctx.msg.predictions[1].status,
+                  WAMBLE_PREDICTION_STATUS_PENDING);
+  T_ASSERT(fabs(ctx.msg.predictions[0].points_awarded - 1.5) < 1e-9);
 
   wamble_close_socket(cli);
   wamble_close_socket(srv);
@@ -1098,6 +1222,78 @@ WAMBLE_TEST(server_protocol_profile_discover_override_lists_hidden) {
   return 0;
 }
 
+WAMBLE_TEST(server_protocol_prediction_submit_and_read) {
+  T_ASSERT_STATUS(config_load(NULL, NULL, NULL, 0), CONFIG_LOAD_DEFAULTS);
+  player_manager_init();
+  board_manager_init();
+  prediction_manager_init();
+  setup_mock_query_service();
+  g_mock_rate_bypass = 1;
+
+  WamblePlayer *player = create_new_player();
+  T_ASSERT(player != NULL);
+  WambleBoard *board = find_board_for_player(player);
+  T_ASSERT(board != NULL);
+  memcpy(board->reservation_player_token, player->token, TOKEN_LENGTH);
+  board->reserved_for_white = (board->board.turn == 'w');
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  struct WambleMsg submit = {0};
+  submit.ctrl = WAMBLE_CTRL_SUBMIT_PREDICTION;
+  memcpy(submit.token, player->token, TOKEN_LENGTH);
+  submit.board_id = board->id;
+  submit.uci_len = 4;
+  memcpy(submit.uci, "e2e4", 4);
+
+  RecvAckCtx rx_submit = {0};
+  rx_submit.sock = cli;
+  wamble_thread_t th_submit;
+  T_ASSERT(wamble_thread_create(&th_submit, (wamble_thread_func_t)recv_ack_one,
+                                &rx_submit) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &submit, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_submit, NULL));
+  T_ASSERT_EQ_INT(rx_submit.received, 1);
+  T_ASSERT_EQ_INT(rx_submit.msg.ctrl, WAMBLE_CTRL_PREDICTION_DATA);
+  T_ASSERT_EQ_INT((int)rx_submit.msg.prediction_count, 1);
+  T_ASSERT_EQ_INT((int)rx_submit.msg.predictions[0].uci_len, 4);
+
+  struct WambleMsg getp = {0};
+  getp.ctrl = WAMBLE_CTRL_GET_PREDICTIONS;
+  memcpy(getp.token, player->token, TOKEN_LENGTH);
+  getp.board_id = board->id;
+  getp.prediction_depth = 2;
+  getp.prediction_limit = 8;
+
+  RecvAckCtx rx_get = {0};
+  rx_get.sock = cli;
+  wamble_thread_t th_get;
+  T_ASSERT(wamble_thread_create(&th_get, (wamble_thread_func_t)recv_ack_one,
+                                &rx_get) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &getp, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_get, NULL));
+  T_ASSERT_EQ_INT(rx_get.received, 1);
+  T_ASSERT_EQ_INT(rx_get.msg.ctrl, WAMBLE_CTRL_PREDICTION_DATA);
+  T_ASSERT_EQ_INT((int)rx_get.msg.prediction_count, 1);
+  T_ASSERT_EQ_INT((int)rx_get.msg.predictions[0].id, 1);
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
 WAMBLE_TESTS_BEGIN_NAMED(wamble_register_tests_network)
 WAMBLE_TESTS_ADD_SM(token_base64url_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
@@ -1108,6 +1304,10 @@ WAMBLE_TESTS_ADD_SM(experiment_arm_deterministic_and_bounded_when_enabled,
 WAMBLE_TESTS_ADD_SM(spectate_update_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
 WAMBLE_TESTS_ADD_SM(leaderboard_data_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
+                    "network");
+WAMBLE_TESTS_ADD_SM(submit_prediction_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
+                    "network");
+WAMBLE_TESTS_ADD_SM(prediction_data_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
 WAMBLE_TESTS_ADD_SM(reliable_ack_success, WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(malformed_tiny_packet_rejected, WAMBLE_SUITE_FUNCTIONAL,
@@ -1123,6 +1323,8 @@ WAMBLE_TESTS_ADD_SM(player_move_valid_uci_accept, WAMBLE_SUITE_FUNCTIONAL,
 WAMBLE_TESTS_ADD_SM(server_protocol_rate_limit_enforced_and_bypassable,
                     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(server_protocol_profile_discover_override_lists_hidden,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(server_protocol_prediction_submit_and_read,
                     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(spectate_stop_accept, WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(reserved_nonzero_rejected, WAMBLE_SUITE_FUNCTIONAL,

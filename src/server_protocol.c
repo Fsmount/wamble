@@ -227,9 +227,69 @@ static const char *ctrl_policy_resource(uint8_t ctrl) {
     return "get_leaderboard";
   case WAMBLE_CTRL_LEADERBOARD_DATA:
     return "leaderboard_data";
+  case WAMBLE_CTRL_SUBMIT_PREDICTION:
+    return "submit_prediction";
+  case WAMBLE_CTRL_GET_PREDICTIONS:
+    return "get_predictions";
+  case WAMBLE_CTRL_PREDICTION_DATA:
+    return "prediction_data";
   default:
     return "unknown";
   }
+}
+
+static uint8_t prediction_status_code(const char *status) {
+  if (!status)
+    return WAMBLE_PREDICTION_STATUS_PENDING;
+  if (strcmp(status, "CORRECT") == 0)
+    return WAMBLE_PREDICTION_STATUS_CORRECT;
+  if (strcmp(status, "INCORRECT") == 0)
+    return WAMBLE_PREDICTION_STATUS_INCORRECT;
+  if (strcmp(status, "EXPIRED") == 0)
+    return WAMBLE_PREDICTION_STATUS_EXPIRED;
+  return WAMBLE_PREDICTION_STATUS_PENDING;
+}
+
+static void fill_prediction_entry(WamblePredictionEntry *dst,
+                                  const WamblePredictionView *src) {
+  if (!dst || !src)
+    return;
+  memset(dst, 0, sizeof(*dst));
+  dst->id = src->id;
+  dst->parent_id = src->parent_id;
+  memcpy(dst->token, src->player_token, TOKEN_LENGTH);
+  dst->points_awarded = src->points_awarded;
+  dst->target_ply = (src->target_ply >= 0 && src->target_ply <= 65535)
+                        ? (uint16_t)src->target_ply
+                        : 0;
+  dst->depth = (src->depth >= 0 && src->depth <= 255) ? (uint8_t)src->depth : 0;
+  dst->status = prediction_status_code(src->status);
+  dst->uci_len = (uint8_t)strnlen(src->predicted_move_uci, MAX_UCI_LENGTH);
+  memcpy(dst->uci, src->predicted_move_uci, dst->uci_len);
+}
+
+static ServerStatus
+send_prediction_rows(wamble_socket_t sockfd, const struct sockaddr_in *cliaddr,
+                     const uint8_t *token, uint64_t board_id,
+                     const WamblePredictionView *rows, int count) {
+  struct WambleMsg response = {0};
+  response.ctrl = WAMBLE_CTRL_PREDICTION_DATA;
+  memcpy(response.token, token, TOKEN_LENGTH);
+  response.board_id = board_id;
+  if (count < 0)
+    count = 0;
+  if (count > WAMBLE_MAX_PREDICTION_ENTRIES)
+    count = WAMBLE_MAX_PREDICTION_ENTRIES;
+  response.prediction_count = (uint8_t)count;
+  for (int i = 0; i < count; i++) {
+    fill_prediction_entry(&response.predictions[i], &rows[i]);
+  }
+  if (send_reliable_message(sockfd, &response, cliaddr,
+                            get_config()->timeout_ms,
+                            get_config()->max_retries) != 0) {
+    return SERVER_ERR_SEND_FAILED;
+  }
+  return SERVER_OK;
 }
 
 static ServerStatus handle_client_hello(wamble_socket_t sockfd,
@@ -330,6 +390,7 @@ static ServerStatus handle_player_move(wamble_socket_t sockfd,
 
   wamble_emit_record_move(board->id, player->token, uci_move,
                           board->board.fullmove_number);
+  (void)prediction_resolve_move(board, uci_move);
 
   board_move_played(board->id);
   board_release_reservation(board->id);
@@ -363,6 +424,83 @@ static ServerStatus handle_player_move(wamble_socket_t sockfd,
   }
 
   return SERVER_OK;
+}
+
+static ServerStatus
+handle_submit_prediction(wamble_socket_t sockfd, const struct WambleMsg *msg,
+                         const struct sockaddr_in *cliaddr) {
+  WambleBoard *board = get_board_by_id(msg->board_id);
+  if (!board)
+    return SERVER_ERR_UNKNOWN_BOARD;
+
+  char uci[MAX_UCI_LENGTH + 1];
+  uint8_t uci_len =
+      msg->uci_len < MAX_UCI_LENGTH ? msg->uci_len : MAX_UCI_LENGTH;
+  memcpy(uci, msg->uci, uci_len);
+  uci[uci_len] = '\0';
+
+  uint64_t prediction_id = 0;
+  PredictionStatus st = prediction_submit_with_parent(
+      board, msg->token, uci, msg->prediction_parent_id, 0, &prediction_id);
+  if (st != PREDICTION_OK) {
+    struct WambleMsg out = {0};
+    out.ctrl = WAMBLE_CTRL_ERROR;
+    memcpy(out.token, msg->token, TOKEN_LENGTH);
+    out.error_code = (uint16_t)(2000 - st);
+    snprintf(out.error_reason, sizeof(out.error_reason),
+             "prediction_submit_failed");
+    if (send_reliable_message(sockfd, &out, cliaddr, get_config()->timeout_ms,
+                              get_config()->max_retries) != 0) {
+      return SERVER_ERR_SEND_FAILED;
+    }
+    return SERVER_ERR_FORBIDDEN;
+  }
+
+  WamblePredictionView rows[WAMBLE_MAX_PREDICTION_ENTRIES];
+  int count = 0;
+  if (prediction_collect_tree(
+          board->id, msg->token, 0, get_config()->prediction_view_depth_limit,
+          rows, WAMBLE_MAX_PREDICTION_ENTRIES, &count) != PREDICTION_OK) {
+    count = 0;
+  }
+  for (int i = 0; i < count; i++) {
+    if (rows[i].id == prediction_id) {
+      return send_prediction_rows(sockfd, cliaddr, msg->token, board->id,
+                                  &rows[i], 1);
+    }
+  }
+  return send_prediction_rows(sockfd, cliaddr, msg->token, board->id, NULL, 0);
+}
+
+static ServerStatus handle_get_predictions(wamble_socket_t sockfd,
+                                           const struct sockaddr_in *cliaddr,
+                                           const struct WambleMsg *msg) {
+  WamblePredictionView rows[WAMBLE_MAX_PREDICTION_ENTRIES];
+  int count = 0;
+  int depth = msg->prediction_depth;
+  if (depth <= 0)
+    depth = get_config()->prediction_view_depth_limit;
+  int limit = msg->prediction_limit;
+  if (limit <= 0 || limit > WAMBLE_MAX_PREDICTION_ENTRIES)
+    limit = WAMBLE_MAX_PREDICTION_ENTRIES;
+
+  PredictionStatus st = prediction_collect_tree(msg->board_id, msg->token, 0,
+                                                depth, rows, limit, &count);
+  if (st != PREDICTION_OK) {
+    struct WambleMsg out = {0};
+    out.ctrl = WAMBLE_CTRL_ERROR;
+    memcpy(out.token, msg->token, TOKEN_LENGTH);
+    out.error_code = (uint16_t)(2100 - st);
+    snprintf(out.error_reason, sizeof(out.error_reason),
+             "prediction_read_failed");
+    if (send_reliable_message(sockfd, &out, cliaddr, get_config()->timeout_ms,
+                              get_config()->max_retries) != 0) {
+      return SERVER_ERR_SEND_FAILED;
+    }
+    return SERVER_ERR_FORBIDDEN;
+  }
+  return send_prediction_rows(sockfd, cliaddr, msg->token, msg->board_id, rows,
+                              count);
 }
 
 ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
@@ -614,6 +752,14 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     }
     return SERVER_OK;
   }
+  case WAMBLE_CTRL_SUBMIT_PREDICTION:
+    if ((msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0)
+      send_ack(sockfd, msg, cliaddr);
+    return handle_submit_prediction(sockfd, msg, cliaddr);
+  case WAMBLE_CTRL_GET_PREDICTIONS:
+    if ((msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0)
+      send_ack(sockfd, msg, cliaddr);
+    return handle_get_predictions(sockfd, cliaddr, msg);
   case WAMBLE_CTRL_GET_LEGAL_MOVES: {
     WamblePolicyDecision decision;
     memset(&decision, 0, sizeof(decision));
