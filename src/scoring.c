@@ -1,4 +1,4 @@
-#include "../include/wamble/wamble.h"
+#include "wamble/wamble.h"
 #include <string.h>
 
 typedef struct {
@@ -7,23 +7,45 @@ typedef struct {
   int black_moves;
 } PlayerContribution;
 
-static double scoring_action_number(const WambleTreatmentAction *action,
-                                    int *ok) {
-  if (ok)
-    *ok = 0;
-  if (!action)
-    return 0.0;
-  if (action->value_type == WAMBLE_TREATMENT_VALUE_INT) {
-    if (ok)
-      *ok = 1;
-    return (double)action->int_value;
+static int scoring_map_find(const uint8_t *map_tokens, const int *map_values,
+                            int map_size, const uint8_t *token) {
+  if (!map_tokens || !map_values || map_size <= 0 || !token)
+    return -1;
+  int idx = (int)(wamble_token_hash32(token) % (uint32_t)map_size);
+  for (int n = 0; n < map_size; n++) {
+    int slot = map_values[idx];
+    if (slot < 0)
+      return -1;
+    if (memcmp(&map_tokens[idx * TOKEN_LENGTH], token, TOKEN_LENGTH) == 0)
+      return slot;
+    idx++;
+    if (idx == map_size)
+      idx = 0;
   }
-  if (action->value_type == WAMBLE_TREATMENT_VALUE_DOUBLE) {
-    if (ok)
-      *ok = 1;
-    return action->double_value;
+  return -1;
+}
+
+static int scoring_map_insert(uint8_t *map_tokens, int *map_values,
+                              int map_size, const uint8_t *token, int value) {
+  if (!map_tokens || !map_values || map_size <= 0 || !token || value < 0)
+    return -1;
+  int idx = (int)(wamble_token_hash32(token) % (uint32_t)map_size);
+  for (int n = 0; n < map_size; n++) {
+    int slot = map_values[idx];
+    if (slot < 0) {
+      memcpy(&map_tokens[idx * TOKEN_LENGTH], token, TOKEN_LENGTH);
+      map_values[idx] = value;
+      return 0;
+    }
+    if (memcmp(&map_tokens[idx * TOKEN_LENGTH], token, TOKEN_LENGTH) == 0) {
+      map_values[idx] = value;
+      return 0;
+    }
+    idx++;
+    if (idx == map_size)
+      idx = 0;
   }
-  return 0.0;
+  return -1;
 }
 
 static void scoring_apply_treatment_adjustments(const WambleBoard *board,
@@ -96,7 +118,7 @@ static void scoring_apply_treatment_adjustments(const WambleBoard *board,
     if (strcmp(action->output_kind, "behavior") != 0)
       continue;
     int ok = 0;
-    double value = scoring_action_number(action, &ok);
+    double value = wamble_treatment_action_number(action, &ok);
     if (!ok)
       continue;
     if (strcmp(action->output_key, "payout.multiplier") == 0) {
@@ -112,37 +134,53 @@ static void scoring_apply_treatment_adjustments(const WambleBoard *board,
 static ScoringStatus calculate_and_distribute_pot_for_moves_internal(
     uint64_t board_id, WambleBoard *board, const WambleMove *moves,
     int num_moves) {
+  const WambleConfig *cfg = get_config();
   if (!board)
     return SCORING_ERR_INVALID;
   if (!moves || num_moves <= 0)
     return SCORING_NONE;
+  if (!cfg || cfg->max_contributors <= 0)
+    return SCORING_NONE;
 
-  PlayerContribution *contributions = malloc(
-      sizeof(PlayerContribution) * (size_t)get_config()->max_contributors);
+  int max_contributors = cfg->max_contributors;
+  int map_size = (max_contributors * 2) + 1;
+  PlayerContribution *contributions =
+      malloc(sizeof(PlayerContribution) * (size_t)max_contributors);
+  int *contrib_map_values = NULL;
+  uint8_t *contrib_map_tokens = NULL;
   if (!contributions) {
     return SCORING_ERR_DB;
   }
+  if (map_size > 0) {
+    contrib_map_values = malloc(sizeof(int) * (size_t)map_size);
+    contrib_map_tokens = calloc((size_t)map_size, TOKEN_LENGTH);
+  }
+  if (!contrib_map_values || !contrib_map_tokens) {
+    free(contrib_map_tokens);
+    free(contrib_map_values);
+    free(contributions);
+    return SCORING_ERR_DB;
+  }
+  for (int i = 0; i < map_size; i++)
+    contrib_map_values[i] = -1;
+
   int num_contributors = 0;
   int total_white_moves = 0;
   int total_black_moves = 0;
 
   for (int i = 0; i < num_moves; i++) {
     const WambleMove *move = &moves[i];
-    int contributor_index = -1;
-    for (int j = 0; j < num_contributors; j++) {
-      if (tokens_equal(contributions[j].player_token, move->player_token)) {
-        contributor_index = j;
-        break;
-      }
-    }
+    int contributor_index = scoring_map_find(
+        contrib_map_tokens, contrib_map_values, map_size, move->player_token);
 
-    if (contributor_index == -1 &&
-        num_contributors < get_config()->max_contributors) {
+    if (contributor_index == -1 && num_contributors < max_contributors) {
       contributor_index = num_contributors++;
       memcpy(contributions[contributor_index].player_token, move->player_token,
              TOKEN_LENGTH);
       contributions[contributor_index].white_moves = 0;
       contributions[contributor_index].black_moves = 0;
+      (void)scoring_map_insert(contrib_map_tokens, contrib_map_values, map_size,
+                               move->player_token, contributor_index);
     }
 
     if (contributor_index != -1) {
@@ -160,12 +198,12 @@ static ScoringStatus calculate_and_distribute_pot_for_moves_internal(
   double black_pot = 0.0;
 
   if (board->result == GAME_RESULT_WHITE_WINS) {
-    white_pot = get_config()->max_pot;
+    white_pot = cfg->max_pot;
   } else if (board->result == GAME_RESULT_BLACK_WINS) {
-    black_pot = get_config()->max_pot;
+    black_pot = cfg->max_pot;
   } else if (board->result == GAME_RESULT_DRAW) {
-    white_pot = get_config()->max_pot / 2.0;
-    black_pot = get_config()->max_pot / 2.0;
+    white_pot = cfg->max_pot / 2.0;
+    black_pot = cfg->max_pot / 2.0;
   }
 
   for (int i = 0; i < num_contributors; i++) {
@@ -198,6 +236,8 @@ static ScoringStatus calculate_and_distribute_pot_for_moves_internal(
     }
   }
 
+  free(contrib_map_tokens);
+  free(contrib_map_values);
   free(contributions);
   return SCORING_OK;
 }

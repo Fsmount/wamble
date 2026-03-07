@@ -680,7 +680,7 @@ int db_load_config_snapshot(const char *profile_key, char **out_config_text) {
     PQclear(res);
     return -1;
   }
-  *out_config_text = strdup(txt);
+  *out_config_text = wamble_strdup(txt);
   PQclear(res);
   return *out_config_text ? 0 : -1;
 }
@@ -2193,6 +2193,7 @@ const WambleQueryService *wamble_get_db_query_service(void) {
     svc.get_active_session_count = db_get_active_session_count;
     svc.get_max_board_id = db_get_max_board_id;
     svc.get_session_by_token = db_get_session_by_token;
+    svc.create_session = db_create_session;
     svc.get_persistent_session_by_token = db_get_persistent_session_by_token;
     svc.get_player_total_score = db_get_player_total_score;
     svc.get_player_prediction_score = db_get_player_prediction_score;
@@ -2201,6 +2202,8 @@ const WambleQueryService *wamble_get_db_query_service(void) {
     svc.get_persistent_player_stats = db_get_persistent_player_stats;
     svc.get_leaderboard = db_get_leaderboard;
     svc.get_moves_for_board = db_get_moves_for_board;
+    svc.get_pending_predictions = db_get_pending_predictions;
+    svc.create_prediction = db_create_prediction;
     svc.link_session_to_pubkey = db_async_link_session_to_pubkey;
     svc.unlink_session_identity = db_async_unlink_session_identity;
     svc.get_session_treatment_assignment = db_get_session_treatment_assignment;
@@ -2286,6 +2289,13 @@ DbMovesResult wamble_query_get_moves_for_board(uint64_t board_id) {
   return qs->get_moves_for_board(board_id);
 }
 
+DbPredictionsResult wamble_query_get_pending_predictions(void) {
+  const WambleQueryService *qs = get_query_service();
+  if (!qs || !qs->get_pending_predictions)
+    return query_predictions_error();
+  return qs->get_pending_predictions();
+}
+
 DbStatus wamble_query_get_longest_game_moves(int *out_max_moves) {
   const WambleQueryService *qs = get_query_service();
   if (!qs || !qs->get_longest_game_moves)
@@ -2313,6 +2323,34 @@ DbStatus wamble_query_get_session_by_token(const uint8_t *token,
   if (!qs || !qs->get_session_by_token)
     return DB_ERR_EXEC;
   return qs->get_session_by_token(token, out_session);
+}
+
+DbStatus wamble_query_create_session(const uint8_t *token, uint64_t player_id,
+                                     uint64_t *out_session) {
+  if (out_session)
+    *out_session = 0;
+  const WambleQueryService *qs = get_query_service();
+  if (!qs || !qs->create_session)
+    return DB_ERR_EXEC;
+  uint64_t sid = qs->create_session(token, player_id);
+  if (sid == 0)
+    return DB_ERR_EXEC;
+  if (out_session)
+    *out_session = sid;
+  return DB_OK;
+}
+
+DbStatus wamble_query_create_prediction(uint64_t board_id, uint64_t session_id,
+                                        uint64_t parent_prediction_id,
+                                        const char *predicted_move_uci,
+                                        int move_number, int correct_streak,
+                                        uint64_t *out_prediction_id) {
+  const WambleQueryService *qs = get_query_service();
+  if (!qs || !qs->create_prediction)
+    return DB_ERR_EXEC;
+  return qs->create_prediction(board_id, session_id, parent_prediction_id,
+                               predicted_move_uci, move_number, correct_streak,
+                               out_prediction_id);
 }
 
 DbStatus wamble_query_get_persistent_session_by_token(const uint8_t *token,
@@ -2625,7 +2663,7 @@ void db_async_update_session_last_seen(uint64_t session_id) {
   const char *query = "UPDATE sessions SET last_seen_at = NOW() WHERE id = $1";
 
   char session_id_str[32];
-  snprintf(session_id_str, sizeof(session_id_str), "%lu", session_id);
+  snprintf(session_id_str, sizeof(session_id_str), "%" PRIu64, session_id);
 
   const char *paramValues[] = {session_id_str};
 
@@ -2720,7 +2758,7 @@ int db_async_update_board(uint64_t board_id, const char *fen,
                       "NOW() WHERE id = $1";
 
   char board_id_str[32];
-  snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
+  snprintf(board_id_str, sizeof(board_id_str), "%" PRIu64, board_id);
 
   const char *paramValues[] = {board_id_str, fen, status};
 
@@ -2743,7 +2781,7 @@ int db_async_update_board_assignment_time(uint64_t board_id) {
       "UPDATE boards SET last_assignment_time = NOW() WHERE id = $1";
 
   char board_id_str[32];
-  snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
+  snprintf(board_id_str, sizeof(board_id_str), "%" PRIu64, board_id);
 
   const char *paramValues[] = {board_id_str};
 
@@ -2768,7 +2806,7 @@ int db_async_update_board_move_meta(uint64_t board_id,
                       "WHERE id = $1";
 
   char board_id_str[32];
-  snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
+  snprintf(board_id_str, sizeof(board_id_str), "%" PRIu64, board_id);
 
   const char *paramValues[] = {board_id_str, last_mover_treatment_group};
 
@@ -2797,7 +2835,7 @@ int db_async_update_board_reservation_meta(uint64_t board_id,
   char board_id_str[32];
   char reservation_time_str[32];
   char reserved_str[2];
-  snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
+  snprintf(board_id_str, sizeof(board_id_str), "%" PRIu64, board_id);
   snprintf(reservation_time_str, sizeof(reservation_time_str), "%lld",
            (long long)reservation_time);
   reserved_str[0] = reserved_for_white ? 't' : 'f';
@@ -2838,7 +2876,7 @@ static DbBoardResult db_get_board(uint64_t board_id) {
       "WHERE b.id = $1";
 
   char board_id_str[32];
-  snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
+  snprintf(board_id_str, sizeof(board_id_str), "%" PRIu64, board_id);
 
   const char *paramValues[] = {board_id_str};
 
@@ -2930,8 +2968,8 @@ int db_async_record_move(uint64_t board_id, uint64_t session_id,
   char session_id_str[32];
   char move_number_str[16];
 
-  snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
-  snprintf(session_id_str, sizeof(session_id_str), "%lu", session_id);
+  snprintf(board_id_str, sizeof(board_id_str), "%" PRIu64, board_id);
+  snprintf(session_id_str, sizeof(session_id_str), "%" PRIu64, session_id);
   snprintf(move_number_str, sizeof(move_number_str), "%d", move_number);
 
   const char *paramValues[] = {board_id_str, session_id_str, move_uci,
@@ -2967,10 +3005,11 @@ DbStatus db_create_prediction(uint64_t board_id, uint64_t session_id,
   char parent_id_str[32];
   char correct_streak_str[16];
 
-  snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
-  snprintf(session_id_str, sizeof(session_id_str), "%lu", session_id);
+  snprintf(board_id_str, sizeof(board_id_str), "%" PRIu64, board_id);
+  snprintf(session_id_str, sizeof(session_id_str), "%" PRIu64, session_id);
   snprintf(move_number_str, sizeof(move_number_str), "%d", move_number);
-  snprintf(parent_id_str, sizeof(parent_id_str), "%lu", parent_prediction_id);
+  snprintf(parent_id_str, sizeof(parent_id_str), "%" PRIu64,
+           parent_prediction_id);
   snprintf(correct_streak_str, sizeof(correct_streak_str), "%d",
            correct_streak);
 
@@ -3025,8 +3064,8 @@ int db_async_resolve_prediction(uint64_t board_id, uint64_t session_id,
   char move_number_str[16];
   char points_str[32];
 
-  snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
-  snprintf(session_id_str, sizeof(session_id_str), "%lu", session_id);
+  snprintf(board_id_str, sizeof(board_id_str), "%" PRIu64, board_id);
+  snprintf(session_id_str, sizeof(session_id_str), "%" PRIu64, session_id);
   snprintf(move_number_str, sizeof(move_number_str), "%d", move_number);
   snprintf(points_str, sizeof(points_str), "%.4f", points_awarded);
 
@@ -3147,7 +3186,7 @@ static DbMovesResult db_get_moves_for_board(uint64_t board_id) {
       "ORDER BY m.move_number";
 
   char board_id_str[32];
-  snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
+  snprintf(board_id_str, sizeof(board_id_str), "%" PRIu64, board_id);
 
   const char *paramValues[] = {board_id_str};
 
@@ -3224,8 +3263,8 @@ int db_async_create_reservation(uint64_t board_id, uint64_t session_id,
   char timeout_str[16];
   char reserved_str[2];
 
-  snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
-  snprintf(session_id_str, sizeof(session_id_str), "%lu", session_id);
+  snprintf(board_id_str, sizeof(board_id_str), "%" PRIu64, board_id);
+  snprintf(session_id_str, sizeof(session_id_str), "%" PRIu64, session_id);
   snprintf(timeout_str, sizeof(timeout_str), "%d", timeout_seconds);
   reserved_str[0] = reserved_for_white ? 't' : 'f';
   reserved_str[1] = '\0';
@@ -3283,7 +3322,7 @@ void db_async_remove_reservation(uint64_t board_id) {
   const char *query = "DELETE FROM reservations WHERE board_id = $1";
 
   char board_id_str[32];
-  snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
+  snprintf(board_id_str, sizeof(board_id_str), "%" PRIu64, board_id);
 
   const char *paramValues[] = {board_id_str};
 
@@ -3318,7 +3357,7 @@ int db_async_record_game_result(uint64_t board_id, char winning_side,
   char move_count_str[16];
   char duration_str[16];
 
-  snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
+  snprintf(board_id_str, sizeof(board_id_str), "%" PRIu64, board_id);
   winning_side_str[0] = winning_side;
   winning_side_str[1] = '\0';
   snprintf(move_count_str, sizeof(move_count_str), "%d", move_count);
@@ -3351,8 +3390,8 @@ int db_async_record_payout(uint64_t board_id, uint64_t session_id,
   char session_id_str[32];
   char points_str[32];
 
-  snprintf(board_id_str, sizeof(board_id_str), "%lu", board_id);
-  snprintf(session_id_str, sizeof(session_id_str), "%lu", session_id);
+  snprintf(board_id_str, sizeof(board_id_str), "%" PRIu64, board_id);
+  snprintf(session_id_str, sizeof(session_id_str), "%" PRIu64, session_id);
   snprintf(points_str, sizeof(points_str), "%.4f", points);
 
   const char *paramValues[] = {board_id_str, session_id_str, points_str};
@@ -3379,7 +3418,7 @@ static DbStatus db_get_player_total_score(uint64_t session_id,
                       "WHERE id = $1";
 
   char session_id_str[32];
-  snprintf(session_id_str, sizeof(session_id_str), "%lu", session_id);
+  snprintf(session_id_str, sizeof(session_id_str), "%" PRIu64, session_id);
 
   const char *paramValues[] = {session_id_str};
 
@@ -3417,7 +3456,7 @@ static DbStatus db_get_player_prediction_score(uint64_t session_id,
       "WHERE id = $1";
 
   char session_id_str[32];
-  snprintf(session_id_str, sizeof(session_id_str), "%lu", session_id);
+  snprintf(session_id_str, sizeof(session_id_str), "%" PRIu64, session_id);
 
   const char *paramValues[] = {session_id_str};
   PGresult *res =
@@ -3452,7 +3491,7 @@ static DbStatus db_get_player_rating(uint64_t session_id, double *out_rating) {
                       "JOIN sessions s ON s.player_id = p.id WHERE s.id = $1";
 
   char session_id_str[32];
-  snprintf(session_id_str, sizeof(session_id_str), "%lu", session_id);
+  snprintf(session_id_str, sizeof(session_id_str), "%" PRIu64, session_id);
 
   const char *paramValues[] = {session_id_str};
 
@@ -3488,7 +3527,7 @@ int db_async_update_player_rating(uint64_t session_id, double rating) {
 
   char session_id_str[32];
   char rating_str[32];
-  snprintf(session_id_str, sizeof(session_id_str), "%lu", session_id);
+  snprintf(session_id_str, sizeof(session_id_str), "%" PRIu64, session_id);
   snprintf(rating_str, sizeof(rating_str), "%.4f", rating);
 
   const char *paramValues[] = {session_id_str, rating_str};
@@ -3565,7 +3604,7 @@ static DbStatus db_get_session_games_played(uint64_t session_id,
                       "WHERE id = $1";
 
   char session_id_str[32];
-  snprintf(session_id_str, sizeof(session_id_str), "%lu", session_id);
+  snprintf(session_id_str, sizeof(session_id_str), "%" PRIu64, session_id);
 
   const char *paramValues[] = {session_id_str};
 

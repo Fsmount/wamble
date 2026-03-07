@@ -34,6 +34,15 @@ typedef struct WambleHeader {
   (8 + 8 + TOKEN_LENGTH + 8 + 2 + 1 + 1 + 1 + MAX_UCI_LENGTH)
 #define WAMBLE_PENDING_PACKET_CAP 64
 
+typedef struct WambleClientSession {
+  struct sockaddr_in addr;
+  uint8_t token[TOKEN_LENGTH];
+  uint32_t last_seq_num;
+  time_t last_seen;
+  uint32_t next_seq_num;
+  char treatment_group_key[128];
+} WambleClientSession;
+
 static WAMBLE_THREAD_LOCAL WambleClientSession *client_sessions;
 static WAMBLE_THREAD_LOCAL int num_sessions = 0;
 static WAMBLE_THREAD_LOCAL uint32_t global_seq_num = 1;
@@ -108,8 +117,7 @@ static void session_map_put(const struct sockaddr_in *addr, int index) {
     int cur = session_index_map[i];
     if (cur >= 0) {
       const struct sockaddr_in *saddr = &client_sessions[cur].addr;
-      if (saddr->sin_addr.s_addr == addr->sin_addr.s_addr &&
-          saddr->sin_port == addr->sin_port) {
+      if (sockaddr_in_equal(saddr, addr)) {
         session_index_map[i] = index;
         return;
       }
@@ -130,8 +138,7 @@ static int session_map_get(const struct sockaddr_in *addr) {
       return -1;
     if (cur >= 0) {
       const struct sockaddr_in *saddr = &client_sessions[cur].addr;
-      if (saddr->sin_addr.s_addr == addr->sin_addr.s_addr &&
-          saddr->sin_port == addr->sin_port)
+      if (sockaddr_in_equal(saddr, addr))
         return cur;
     }
     i = session_map_next(i, cap);
@@ -209,6 +216,42 @@ static int pending_packet_pop(uint8_t *data, size_t cap, size_t *out_len,
       pending_packet_cap > WAMBLE_PENDING_PACKET_CAP)
     pending_packets_release();
   return 1;
+}
+
+static int ctrl_is_supported(uint8_t ctrl) {
+  switch (ctrl) {
+  case WAMBLE_CTRL_CLIENT_HELLO:
+  case WAMBLE_CTRL_SERVER_HELLO:
+  case WAMBLE_CTRL_PLAYER_MOVE:
+  case WAMBLE_CTRL_BOARD_UPDATE:
+  case WAMBLE_CTRL_ACK:
+  case WAMBLE_CTRL_LIST_PROFILES:
+  case WAMBLE_CTRL_GET_PREDICTIONS:
+  case WAMBLE_CTRL_SUBMIT_PREDICTION:
+  case WAMBLE_CTRL_PREDICTION_DATA:
+  case WAMBLE_CTRL_PROFILE_INFO:
+  case WAMBLE_CTRL_GET_PROFILE_INFO:
+  case WAMBLE_CTRL_PROFILES_LIST:
+  case WAMBLE_CTRL_ERROR:
+  case WAMBLE_CTRL_SERVER_NOTIFICATION:
+  case WAMBLE_CTRL_CLIENT_GOODBYE:
+  case WAMBLE_CTRL_SPECTATE_GAME:
+  case WAMBLE_CTRL_SPECTATE_STOP:
+  case WAMBLE_CTRL_SPECTATE_UPDATE:
+  case WAMBLE_CTRL_LOGIN_REQUEST:
+  case WAMBLE_CTRL_LOGOUT:
+  case WAMBLE_CTRL_LOGIN_SUCCESS:
+  case WAMBLE_CTRL_LOGIN_FAILED:
+  case WAMBLE_CTRL_GET_PLAYER_STATS:
+  case WAMBLE_CTRL_PLAYER_STATS_DATA:
+  case WAMBLE_CTRL_GET_LEGAL_MOVES:
+  case WAMBLE_CTRL_LEGAL_MOVES:
+  case WAMBLE_CTRL_GET_LEADERBOARD:
+  case WAMBLE_CTRL_LEADERBOARD_DATA:
+    return 1;
+  default:
+    return 0;
+  }
 }
 
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
@@ -988,7 +1031,7 @@ int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
                     struct sockaddr_in *cliaddr) {
   network_ensure_thread_state_initialized();
   wamble_socklen_t len = sizeof(*cliaddr);
-  static uint8_t receive_buffer[WAMBLE_MAX_PACKET_SIZE];
+  uint8_t receive_buffer[WAMBLE_MAX_PACKET_SIZE];
   size_t pending_len = 0;
   int pending_rc = pending_packet_pop(receive_buffer, sizeof(receive_buffer),
                                       &pending_len, cliaddr);
@@ -1015,33 +1058,7 @@ int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
     return -1;
   }
 
-  if (msg->ctrl != WAMBLE_CTRL_CLIENT_HELLO &&
-      msg->ctrl != WAMBLE_CTRL_SERVER_HELLO &&
-      msg->ctrl != WAMBLE_CTRL_PLAYER_MOVE &&
-      msg->ctrl != WAMBLE_CTRL_BOARD_UPDATE && msg->ctrl != WAMBLE_CTRL_ACK &&
-      msg->ctrl != WAMBLE_CTRL_LIST_PROFILES &&
-      msg->ctrl != WAMBLE_CTRL_GET_PREDICTIONS &&
-      msg->ctrl != WAMBLE_CTRL_SUBMIT_PREDICTION &&
-      msg->ctrl != WAMBLE_CTRL_PREDICTION_DATA &&
-      msg->ctrl != WAMBLE_CTRL_PROFILE_INFO &&
-      msg->ctrl != WAMBLE_CTRL_GET_PROFILE_INFO &&
-      msg->ctrl != WAMBLE_CTRL_PROFILES_LIST &&
-      msg->ctrl != WAMBLE_CTRL_ERROR &&
-      msg->ctrl != WAMBLE_CTRL_SERVER_NOTIFICATION &&
-      msg->ctrl != WAMBLE_CTRL_CLIENT_GOODBYE &&
-      msg->ctrl != WAMBLE_CTRL_SPECTATE_GAME &&
-      msg->ctrl != WAMBLE_CTRL_SPECTATE_STOP &&
-      msg->ctrl != WAMBLE_CTRL_SPECTATE_UPDATE &&
-      msg->ctrl != WAMBLE_CTRL_LOGIN_REQUEST &&
-      msg->ctrl != WAMBLE_CTRL_LOGOUT &&
-      msg->ctrl != WAMBLE_CTRL_LOGIN_SUCCESS &&
-      msg->ctrl != WAMBLE_CTRL_LOGIN_FAILED &&
-      msg->ctrl != WAMBLE_CTRL_GET_PLAYER_STATS &&
-      msg->ctrl != WAMBLE_CTRL_PLAYER_STATS_DATA &&
-      msg->ctrl != WAMBLE_CTRL_GET_LEGAL_MOVES &&
-      msg->ctrl != WAMBLE_CTRL_LEGAL_MOVES &&
-      msg->ctrl != WAMBLE_CTRL_GET_LEADERBOARD &&
-      msg->ctrl != WAMBLE_CTRL_LEADERBOARD_DATA) {
+  if (!ctrl_is_supported(msg->ctrl)) {
     return -1;
   }
   if (msg->uci_len > MAX_UCI_LENGTH) {
@@ -1104,7 +1121,7 @@ void send_ack(wamble_socket_t sockfd, const struct WambleMsg *msg,
   memset(ack_msg.uci, 0, MAX_UCI_LENGTH);
   memset(ack_msg.fen, 0, FEN_MAX_LENGTH);
 
-  static uint8_t send_buffer[WAMBLE_MAX_PACKET_SIZE];
+  uint8_t send_buffer[WAMBLE_MAX_PACKET_SIZE];
   size_t serialized_size = 0;
   if (serialize_wamble_msg(&ack_msg, send_buffer, sizeof(send_buffer),
                            &serialized_size, 0) != NET_OK) {
@@ -1150,7 +1167,7 @@ int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     reliable_msg.seq_num = session->next_seq_num++;
   }
 
-  static uint8_t send_buffer[WAMBLE_MAX_PACKET_SIZE];
+  uint8_t send_buffer[WAMBLE_MAX_PACKET_SIZE];
   size_t serialized_size = 0;
   uint8_t send_flags = reliable_msg.flags;
   if (serialize_wamble_msg(&reliable_msg, send_buffer, sizeof(send_buffer),
@@ -1192,7 +1209,7 @@ int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
 #endif
     if (sel > 0) {
       for (int drained = 0; drained < 64; drained++) {
-        static uint8_t ack_buffer[WAMBLE_MAX_PACKET_SIZE];
+        uint8_t ack_buffer[WAMBLE_MAX_PACKET_SIZE];
         struct WambleMsg ack_msg;
         struct sockaddr_in ack_cliaddr;
         wamble_socklen_t ack_len = sizeof(ack_cliaddr);
@@ -1316,29 +1333,6 @@ int wamble_socket_bound_port(wamble_socket_t sock) {
   if (getsockname(sock, (struct sockaddr *)&addr, &len) != 0)
     return -1;
   return (int)ntohs(addr.sin_port);
-}
-
-int receive_message_timeout(wamble_socket_t sockfd, struct WambleMsg *msg,
-                            struct sockaddr_in *cliaddr, int timeout_ms) {
-  if (timeout_ms <= 0)
-    timeout_ms = 600;
-  uint64_t deadline = wamble_now_mono_millis() + (uint64_t)timeout_ms;
-  for (;;) {
-    int rc = receive_message(sockfd, msg, cliaddr);
-    if (rc > 0)
-      return rc;
-    if (wamble_now_mono_millis() >= deadline)
-      return 0;
-    wamble_sleep_ms(2);
-  }
-}
-
-int receive_and_ack(wamble_socket_t sockfd, struct WambleMsg *msg,
-                    struct sockaddr_in *cliaddr, int timeout_ms) {
-  int rc = receive_message_timeout(sockfd, msg, cliaddr, timeout_ms);
-  if (rc > 0)
-    send_ack(sockfd, msg, cliaddr);
-  return rc;
 }
 
 int decode_token_from_url(const char *url_string, uint8_t *token_buffer) {

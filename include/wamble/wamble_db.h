@@ -96,6 +96,7 @@ typedef struct WambleQueryService {
   DbStatus (*get_active_session_count)(int *out_count);
   DbStatus (*get_max_board_id)(uint64_t *out_max_id);
   DbStatus (*get_session_by_token)(const uint8_t *token, uint64_t *out_session);
+  uint64_t (*create_session)(const uint8_t *token, uint64_t player_id);
   DbStatus (*get_persistent_session_by_token)(const uint8_t *token,
                                               uint64_t *out_session);
   DbStatus (*get_player_total_score)(uint64_t session_id, double *out_total);
@@ -108,6 +109,12 @@ typedef struct WambleQueryService {
   DbLeaderboardResult (*get_leaderboard)(uint64_t requester_session_id,
                                          uint8_t leaderboard_type, int limit);
   DbMovesResult (*get_moves_for_board)(uint64_t board_id);
+  DbPredictionsResult (*get_pending_predictions)(void);
+  DbStatus (*create_prediction)(uint64_t board_id, uint64_t session_id,
+                                uint64_t parent_prediction_id,
+                                const char *predicted_move_uci, int move_number,
+                                int correct_streak,
+                                uint64_t *out_prediction_id);
   int (*link_session_to_pubkey)(uint64_t session_id, const uint8_t *public_key);
   int (*unlink_session_identity)(uint64_t session_id);
   DbStatus (*get_session_treatment_assignment)(const uint8_t *token,
@@ -246,7 +253,6 @@ void wamble_set_query_service(const WambleQueryService *svc);
 const WambleQueryService *wamble_get_query_service(void);
 
 void wamble_set_intent_buffer(struct WambleIntentBuffer *buf);
-struct WambleIntentBuffer *wamble_get_intent_buffer(void);
 
 void wamble_intents_init(struct WambleIntentBuffer *buf);
 void wamble_intents_free(struct WambleIntentBuffer *buf);

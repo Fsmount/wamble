@@ -701,7 +701,7 @@ int parse_fen_to_bitboard(const char *fen, Board *board) {
   return 0;
 }
 
-void bitboard_to_fen(const Board *board, char *fen) {
+static void bitboard_to_fen(const Board *board, char *fen) {
   char *fen_ptr = fen;
 
   for (int rank = 7; rank >= 0; rank--) {

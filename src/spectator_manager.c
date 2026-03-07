@@ -1,4 +1,5 @@
 #include "../include/wamble/wamble.h"
+#include <inttypes.h>
 #include <string.h>
 
 typedef struct SpectatorEntry {
@@ -98,36 +99,6 @@ static int is_board_eligible(const WambleBoard *b) {
   return (b->state == BOARD_STATE_ACTIVE || b->state == BOARD_STATE_RESERVED);
 }
 
-static int collect_board_treatment_facts(const WambleBoard *board,
-                                         WambleFact *facts, int max_facts) {
-  int fact_count = 0;
-  if (!board || !facts || max_facts <= 0)
-    return 0;
-  if (fact_count < max_facts) {
-    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
-             "board.id");
-    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
-    facts[fact_count].int_value = (int64_t)board->id;
-    fact_count++;
-  }
-  if (fact_count < max_facts) {
-    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
-             "board.fen");
-    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_STRING;
-    snprintf(facts[fact_count].string_value,
-             sizeof(facts[fact_count].string_value), "%s", board->fen);
-    fact_count++;
-  }
-  if (fact_count < max_facts) {
-    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
-             "board.move_count");
-    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
-    facts[fact_count].int_value = board->board.fullmove_number;
-    fact_count++;
-  }
-  return fact_count;
-}
-
 static void spectator_write_visible_fen(const uint8_t *token,
                                         const WambleBoard *board, char *out_fen,
                                         size_t out_fen_size) {
@@ -141,7 +112,7 @@ static void spectator_write_visible_fen(const uint8_t *token,
     return;
   WambleFact facts[3];
   memset(facts, 0, sizeof(facts));
-  int fact_count = collect_board_treatment_facts(board, facts, 3);
+  int fact_count = wamble_collect_board_treatment_facts(board, facts, 3);
   WambleTreatmentAction actions[8];
   int action_count = 0;
   if (wamble_query_resolve_treatment_actions(
@@ -387,8 +358,8 @@ void spectator_manager_tick(void) {
           e->has_pending_notice = 1;
           e->pending_notice_board_id = e->focus_board_id;
           snprintf(e->pending_notice, sizeof(e->pending_notice),
-                   "focus ended (disabled) on board %lu",
-                   (unsigned long)e->focus_board_id);
+                   "focus ended (disabled) on board %" PRIu64,
+                   e->focus_board_id);
         }
         e->state = SPECTATOR_STATE_SUMMARY;
         e->focus_board_id = 0;
@@ -402,8 +373,8 @@ void spectator_manager_tick(void) {
             e->has_pending_notice = 1;
             e->pending_notice_board_id = e->focus_board_id;
             snprintf(e->pending_notice, sizeof(e->pending_notice),
-                     "focused game finished (board %lu)",
-                     (unsigned long)e->focus_board_id);
+                     "focused game finished (board %" PRIu64 ")",
+                     e->focus_board_id);
           }
           e->state = SPECTATOR_STATE_SUMMARY;
           e->focus_board_id = 0;

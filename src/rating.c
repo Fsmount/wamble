@@ -1,23 +1,45 @@
-#include "../include/wamble/wamble.h"
+#include "wamble/wamble.h"
 #include <string.h>
 
-static double rating_action_number(const WambleTreatmentAction *action,
-                                   int *ok) {
-  if (ok)
-    *ok = 0;
-  if (!action)
-    return 0.0;
-  if (action->value_type == WAMBLE_TREATMENT_VALUE_INT) {
-    if (ok)
-      *ok = 1;
-    return (double)action->int_value;
+static int rating_seen_map_index(const uint8_t *map_tokens,
+                                 const int *map_slots, int map_size,
+                                 const uint8_t *token) {
+  if (!map_tokens || !map_slots || map_size <= 0 || !token)
+    return -1;
+  int idx = (int)(wamble_token_hash32(token) % (uint32_t)map_size);
+  for (int n = 0; n < map_size; n++) {
+    int slot = map_slots[idx];
+    if (slot < 0)
+      return -1;
+    if (memcmp(&map_tokens[idx * TOKEN_LENGTH], token, TOKEN_LENGTH) == 0)
+      return slot;
+    idx++;
+    if (idx == map_size)
+      idx = 0;
   }
-  if (action->value_type == WAMBLE_TREATMENT_VALUE_DOUBLE) {
-    if (ok)
-      *ok = 1;
-    return action->double_value;
+  return -1;
+}
+
+static int rating_seen_map_insert(uint8_t *map_tokens, int *map_slots,
+                                  int map_size, const uint8_t *token,
+                                  int seen_slot) {
+  if (!map_tokens || !map_slots || map_size <= 0 || !token || seen_slot < 0)
+    return -1;
+  int idx = (int)(wamble_token_hash32(token) % (uint32_t)map_size);
+  for (int n = 0; n < map_size; n++) {
+    int slot = map_slots[idx];
+    if (slot < 0) {
+      memcpy(&map_tokens[idx * TOKEN_LENGTH], token, TOKEN_LENGTH);
+      map_slots[idx] = seen_slot;
+      return 0;
+    }
+    if (memcmp(&map_tokens[idx * TOKEN_LENGTH], token, TOKEN_LENGTH) == 0)
+      return 0;
+    idx++;
+    if (idx == map_size)
+      idx = 0;
   }
-  return 0.0;
+  return -1;
 }
 
 static void rating_apply_treatment_adjustments(const WambleBoard *board,
@@ -76,7 +98,7 @@ static void rating_apply_treatment_adjustments(const WambleBoard *board,
     if (strcmp(action->output_kind, "behavior") != 0)
       continue;
     int ok = 0;
-    double value = rating_action_number(action, &ok);
+    double value = wamble_treatment_action_number(action, &ok);
     if (!ok)
       continue;
     if (strcmp(action->output_key, "rating.delta") == 0) {
@@ -98,20 +120,31 @@ void update_player_ratings(WambleBoard *board) {
   uint8_t *seen = calloc((size_t)mres.count, TOKEN_LENGTH);
   if (!seen)
     return;
+  int map_size = (mres.count * 2) + 1;
+  int *seen_slots = NULL;
+  uint8_t *seen_map_tokens = NULL;
+  if (map_size > 0) {
+    seen_slots = malloc(sizeof(int) * (size_t)map_size);
+    seen_map_tokens = calloc((size_t)map_size, TOKEN_LENGTH);
+  }
+  if (!seen_slots || !seen_map_tokens) {
+    free(seen_slots);
+    free(seen_map_tokens);
+    free(seen);
+    return;
+  }
+  for (int i = 0; i < map_size; i++)
+    seen_slots[i] = -1;
   int seen_count = 0;
 
   for (int i = 0; i < mres.count; i++) {
     const uint8_t *token = mres.rows[i].player_token;
-    int already_seen = 0;
-    for (int j = 0; j < seen_count; j++) {
-      if (memcmp(&seen[j * TOKEN_LENGTH], token, TOKEN_LENGTH) == 0) {
-        already_seen = 1;
-        break;
-      }
-    }
-    if (already_seen)
+    if (rating_seen_map_index(seen_map_tokens, seen_slots, map_size, token) >=
+        0)
       continue;
     memcpy(&seen[seen_count * TOKEN_LENGTH], token, TOKEN_LENGTH);
+    (void)rating_seen_map_insert(seen_map_tokens, seen_slots, map_size, token,
+                                 seen_count);
     seen_count++;
   }
 
@@ -131,5 +164,7 @@ void update_player_ratings(WambleBoard *board) {
       wamble_emit_update_player_rating(token, player->rating);
     }
   }
+  free(seen_map_tokens);
+  free(seen_slots);
   free(seen);
 }

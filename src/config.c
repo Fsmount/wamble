@@ -152,9 +152,9 @@ static LispValue *lisp_env_get(LispEnv *env, LispValue *symbol);
 static void free_lisp_value(LispValue *v);
 static LispValue *make_value(LispValueType type);
 static LispValue *copy_lisp_value(const LispValue *v);
-void lisp_env_free(LispEnv *env);
-LispEnv *lisp_env_create(LispEnv *parent);
-void lisp_env_put(LispEnv *env, LispValue *symbol, LispValue *value);
+static void lisp_env_free(LispEnv *env);
+static LispEnv *lisp_env_create(LispEnv *parent);
+static void lisp_env_put(LispEnv *env, LispValue *symbol, LispValue *value);
 static LispValue *eval_expr(struct LispEnv *env, LispValue *expr);
 static LispValue *eval_list(struct LispEnv *env, LispValue *list);
 static LispValue *make_function(struct LispEnv *env, LispValue *params,
@@ -223,26 +223,27 @@ static int cfg_dup_owned(WambleConfig *dst, const WambleConfig *src) {
     return -1;
   memset(dst, 0, sizeof(*dst));
   *dst = *src;
-  dst->db_host = src->db_host ? strdup(src->db_host) : NULL;
-  dst->db_user = src->db_user ? strdup(src->db_user) : NULL;
-  dst->db_pass = src->db_pass ? strdup(src->db_pass) : NULL;
-  dst->db_name = src->db_name ? strdup(src->db_name) : NULL;
+  dst->db_host = src->db_host ? wamble_strdup(src->db_host) : NULL;
+  dst->db_user = src->db_user ? wamble_strdup(src->db_user) : NULL;
+  dst->db_pass = src->db_pass ? wamble_strdup(src->db_pass) : NULL;
+  dst->db_name = src->db_name ? wamble_strdup(src->db_name) : NULL;
   dst->global_db_host =
-      src->global_db_host ? strdup(src->global_db_host) : NULL;
+      src->global_db_host ? wamble_strdup(src->global_db_host) : NULL;
   dst->global_db_user =
-      src->global_db_user ? strdup(src->global_db_user) : NULL;
+      src->global_db_user ? wamble_strdup(src->global_db_user) : NULL;
   dst->global_db_pass =
-      src->global_db_pass ? strdup(src->global_db_pass) : NULL;
+      src->global_db_pass ? wamble_strdup(src->global_db_pass) : NULL;
   dst->global_db_name =
-      src->global_db_name ? strdup(src->global_db_name) : NULL;
-  dst->spectator_summary_mode =
-      src->spectator_summary_mode ? strdup(src->spectator_summary_mode) : NULL;
-  dst->prediction_match_policy = src->prediction_match_policy
-                                     ? strdup(src->prediction_match_policy)
-                                     : NULL;
-  dst->state_dir = src->state_dir ? strdup(src->state_dir) : NULL;
+      src->global_db_name ? wamble_strdup(src->global_db_name) : NULL;
+  dst->spectator_summary_mode = src->spectator_summary_mode
+                                    ? wamble_strdup(src->spectator_summary_mode)
+                                    : NULL;
+  dst->prediction_match_policy =
+      src->prediction_match_policy ? wamble_strdup(src->prediction_match_policy)
+                                   : NULL;
+  dst->state_dir = src->state_dir ? wamble_strdup(src->state_dir) : NULL;
   dst->websocket_path =
-      src->websocket_path ? strdup(src->websocket_path) : NULL;
+      src->websocket_path ? wamble_strdup(src->websocket_path) : NULL;
   if (!dst->db_host || !dst->db_user || !dst->db_pass || !dst->db_name ||
       !dst->global_db_host || !dst->global_db_user || !dst->global_db_pass ||
       !dst->global_db_name || !dst->spectator_summary_mode ||
@@ -314,16 +315,18 @@ static int policy_rule_dup(WamblePolicyRuleSpec *dst,
   dst->permission_level = src->permission_level;
   dst->not_before_at = src->not_before_at;
   dst->not_after_at = src->not_after_at;
-  dst->identity_selector =
-      src->identity_selector ? strdup(src->identity_selector) : strdup("*");
-  dst->action = src->action ? strdup(src->action) : NULL;
-  dst->resource = src->resource ? strdup(src->resource) : NULL;
-  dst->effect = src->effect ? strdup(src->effect) : NULL;
-  dst->reason = src->reason ? strdup(src->reason) : strdup("");
-  dst->policy_version =
-      src->policy_version ? strdup(src->policy_version) : strdup("v1");
-  dst->context_key = src->context_key ? strdup(src->context_key) : NULL;
-  dst->context_value = src->context_value ? strdup(src->context_value) : NULL;
+  dst->identity_selector = src->identity_selector
+                               ? wamble_strdup(src->identity_selector)
+                               : wamble_strdup("*");
+  dst->action = src->action ? wamble_strdup(src->action) : NULL;
+  dst->resource = src->resource ? wamble_strdup(src->resource) : NULL;
+  dst->effect = src->effect ? wamble_strdup(src->effect) : NULL;
+  dst->reason = src->reason ? wamble_strdup(src->reason) : wamble_strdup("");
+  dst->policy_version = src->policy_version ? wamble_strdup(src->policy_version)
+                                            : wamble_strdup("v1");
+  dst->context_key = src->context_key ? wamble_strdup(src->context_key) : NULL;
+  dst->context_value =
+      src->context_value ? wamble_strdup(src->context_value) : NULL;
   if (!dst->identity_selector || !dst->action || !dst->resource ||
       !dst->effect || !dst->reason || !dst->policy_version ||
       (src->context_key && !dst->context_key) ||
@@ -364,8 +367,9 @@ static int treatment_value_dup(WambleTreatmentValueSpec *dst,
     return -1;
   memset(dst, 0, sizeof(*dst));
   *dst = *src;
-  dst->string_value = src->string_value ? strdup(src->string_value) : NULL;
-  dst->fact_key = src->fact_key ? strdup(src->fact_key) : NULL;
+  dst->string_value =
+      src->string_value ? wamble_strdup(src->string_value) : NULL;
+  dst->fact_key = src->fact_key ? wamble_strdup(src->fact_key) : NULL;
   if ((src->string_value && !dst->string_value) ||
       (src->fact_key && !dst->fact_key)) {
     treatment_value_clear(dst);
@@ -394,7 +398,7 @@ static int treatment_group_dup(WambleTreatmentGroupSpec *dst,
   if (!dst || !src)
     return -1;
   memset(dst, 0, sizeof(*dst));
-  dst->group_key = src->group_key ? strdup(src->group_key) : NULL;
+  dst->group_key = src->group_key ? wamble_strdup(src->group_key) : NULL;
   dst->priority = src->priority;
   dst->is_default = src->is_default;
   if (!dst->group_key) {
@@ -452,11 +456,12 @@ static int treatment_rule_dup(WambleTreatmentRuleSpec *dst,
   if (!dst || !src)
     return -1;
   memset(dst, 0, sizeof(*dst));
-  dst->identity_selector =
-      src->identity_selector ? strdup(src->identity_selector) : strdup("*");
-  dst->profile_scope =
-      src->profile_scope ? strdup(src->profile_scope) : strdup("*");
-  dst->group_key = src->group_key ? strdup(src->group_key) : NULL;
+  dst->identity_selector = src->identity_selector
+                               ? wamble_strdup(src->identity_selector)
+                               : wamble_strdup("*");
+  dst->profile_scope = src->profile_scope ? wamble_strdup(src->profile_scope)
+                                          : wamble_strdup("*");
+  dst->group_key = src->group_key ? wamble_strdup(src->group_key) : NULL;
   dst->priority = src->priority;
   dst->predicate_count = src->predicate_count;
   if (!dst->identity_selector || !dst->profile_scope || !dst->group_key) {
@@ -471,11 +476,12 @@ static int treatment_rule_dup(WambleTreatmentRuleSpec *dst,
       return -1;
     }
     for (int i = 0; i < src->predicate_count; i++) {
-      dst->predicates[i].fact_key = src->predicates[i].fact_key
-                                        ? strdup(src->predicates[i].fact_key)
-                                        : NULL;
+      dst->predicates[i].fact_key =
+          src->predicates[i].fact_key
+              ? wamble_strdup(src->predicates[i].fact_key)
+              : NULL;
       dst->predicates[i].op =
-          src->predicates[i].op ? strdup(src->predicates[i].op) : NULL;
+          src->predicates[i].op ? wamble_strdup(src->predicates[i].op) : NULL;
       if (!dst->predicates[i].fact_key || !dst->predicates[i].op ||
           treatment_value_dup(&dst->predicates[i].value,
                               &src->predicates[i].value) != 0) {
@@ -526,9 +532,9 @@ static int treatment_edge_dup(WambleTreatmentEdgeSpec *dst,
     return -1;
   memset(dst, 0, sizeof(*dst));
   dst->source_group_key =
-      src->source_group_key ? strdup(src->source_group_key) : NULL;
+      src->source_group_key ? wamble_strdup(src->source_group_key) : NULL;
   dst->target_group_key =
-      src->target_group_key ? strdup(src->target_group_key) : NULL;
+      src->target_group_key ? wamble_strdup(src->target_group_key) : NULL;
   if (!dst->source_group_key || !dst->target_group_key) {
     treatment_edge_clear(dst);
     return -1;
@@ -577,10 +583,11 @@ static int treatment_output_dup(WambleTreatmentOutputSpec *dst,
   if (!dst || !src)
     return -1;
   memset(dst, 0, sizeof(*dst));
-  dst->group_key = src->group_key ? strdup(src->group_key) : NULL;
-  dst->hook_name = src->hook_name ? strdup(src->hook_name) : strdup("*");
-  dst->output_kind = src->output_kind ? strdup(src->output_kind) : NULL;
-  dst->output_key = src->output_key ? strdup(src->output_key) : NULL;
+  dst->group_key = src->group_key ? wamble_strdup(src->group_key) : NULL;
+  dst->hook_name =
+      src->hook_name ? wamble_strdup(src->hook_name) : wamble_strdup("*");
+  dst->output_kind = src->output_kind ? wamble_strdup(src->output_kind) : NULL;
+  dst->output_key = src->output_key ? wamble_strdup(src->output_key) : NULL;
   if (!dst->group_key || !dst->hook_name || !dst->output_kind ||
       !dst->output_key || treatment_value_dup(&dst->value, &src->value) != 0) {
     treatment_output_clear(dst);
@@ -624,10 +631,10 @@ static LispValue *copy_lisp_value(const LispValue *v) {
       new_v->as.func->refcount++;
     break;
   case LISP_VALUE_SYMBOL:
-    new_v->as.symbol = strdup(v->as.symbol);
+    new_v->as.symbol = wamble_strdup(v->as.symbol);
     break;
   case LISP_VALUE_STRING:
-    new_v->as.string = strdup(v->as.string);
+    new_v->as.string = wamble_strdup(v->as.string);
     break;
   case LISP_VALUE_PAIR:
     new_v->as.pair.car = copy_lisp_value(v->as.pair.car);
@@ -668,7 +675,7 @@ static void free_lisp_value(LispValue *v) {
   free(v);
 }
 
-void lisp_env_free(LispEnv *env) {
+static void lisp_env_free(LispEnv *env) {
   if (!env)
     return;
   free_lisp_value(env->vars);
@@ -696,7 +703,7 @@ static LispValue *cons(LispValue *car, LispValue *cdr) {
 
 static LispValue *make_string_value(const char *s) {
   LispValue *v = make_value(LISP_VALUE_STRING);
-  v->as.string = strdup(s ? s : "");
+  v->as.string = wamble_strdup(s ? s : "");
   if (!v->as.string) {
     free(v);
     return NULL;
@@ -886,13 +893,13 @@ static LispValue *eval_expr(LispEnv *env, LispValue *expr) {
   return make_value(LISP_VALUE_NIL);
 }
 
-LispEnv *lisp_env_create(LispEnv *parent) {
+static LispEnv *lisp_env_create(LispEnv *parent) {
   LispEnv *env = calloc(1, sizeof(LispEnv));
   env->parent = parent;
   return env;
 }
 
-void lisp_env_put(LispEnv *env, LispValue *symbol, LispValue *value) {
+static void lisp_env_put(LispEnv *env, LispValue *symbol, LispValue *value) {
   LispValue *var = make_value(LISP_VALUE_PAIR);
   var->as.pair.car = copy_lisp_value(symbol);
   var->as.pair.cdr = copy_lisp_value(value);
@@ -1126,7 +1133,7 @@ static LispValue *builtin_getenv(LispEnv *env, LispValue *args) {
   const char *val = getenv(name_v->as.string);
   free_lisp_value(name_v);
   LispValue *res = make_value(LISP_VALUE_STRING);
-  res->as.string = strdup(val ? val : "");
+  res->as.string = wamble_strdup(val ? val : "");
   return res;
 }
 
@@ -1210,7 +1217,7 @@ static int eval_string_arg(LispEnv *env, LispValue *expr, char **out) {
     free_lisp_value(v);
     return -1;
   }
-  *out = strdup(v->as.string);
+  *out = wamble_strdup(v->as.string);
   free_lisp_value(v);
   return *out ? 0 : -1;
 }
@@ -1271,7 +1278,7 @@ static int eval_treatment_value_arg(LispEnv *env, LispValue *expr,
     return -1;
   if (v->type == LISP_VALUE_STRING && v->as.string) {
     out->type = WAMBLE_TREATMENT_VALUE_STRING;
-    out->string_value = strdup(v->as.string);
+    out->string_value = wamble_strdup(v->as.string);
   } else if (v->type == LISP_VALUE_INTEGER) {
     out->type = WAMBLE_TREATMENT_VALUE_INT;
     out->int_value = v->as.integer;
@@ -1300,13 +1307,13 @@ static LispValue *builtin_policy_record(LispEnv *env, LispValue *args,
 
   WamblePolicyRuleSpec rule;
   memset(&rule, 0, sizeof(rule));
-  rule.identity_selector = strdup("*");
-  rule.reason = strdup("");
-  rule.policy_version = strdup("v1");
+  rule.identity_selector = wamble_strdup("*");
+  rule.reason = wamble_strdup("");
+  rule.policy_version = wamble_strdup("v1");
   rule.permission_level = 0;
   rule.not_before_at = 0;
   rule.not_after_at = 0;
-  rule.effect = strdup(effect ? effect : "deny");
+  rule.effect = wamble_strdup(effect ? effect : "deny");
   if (!rule.identity_selector || !rule.reason || !rule.policy_version ||
       !rule.effect) {
     policy_rule_clear(&rule);
@@ -1473,8 +1480,8 @@ static LispValue *builtin_treatment_assign(LispEnv *env, LispValue *args) {
   if (!args || args->type != LISP_VALUE_PAIR)
     return make_value(LISP_VALUE_NIL);
   WambleTreatmentRuleSpec rule = {0};
-  rule.identity_selector = strdup("*");
-  rule.profile_scope = strdup("*");
+  rule.identity_selector = wamble_strdup("*");
+  rule.profile_scope = wamble_strdup("*");
   if (!rule.identity_selector || !rule.profile_scope) {
     treatment_rule_clear(&rule);
     return make_value(LISP_VALUE_NIL);
@@ -1547,8 +1554,8 @@ static LispValue *builtin_treatment_output_record(LispEnv *env, LispValue *args,
   if (!args || args->type != LISP_VALUE_PAIR)
     return make_value(LISP_VALUE_NIL);
   WambleTreatmentOutputSpec out = {0};
-  out.output_kind = strdup(kind);
-  out.hook_name = strdup("*");
+  out.output_kind = wamble_strdup(kind);
+  out.hook_name = wamble_strdup("*");
   if (!out.output_kind || !out.hook_name) {
     treatment_output_clear(&out);
     return make_value(LISP_VALUE_NIL);
@@ -1580,7 +1587,8 @@ static LispValue *builtin_treatment_output_record(LispEnv *env, LispValue *args,
     } else {
       if (strcmp(kind, "tag") == 0) {
         out.value.type = WAMBLE_TREATMENT_VALUE_STRING;
-        out.value.string_value = strdup(out.output_key ? out.output_key : "");
+        out.value.string_value =
+            wamble_strdup(out.output_key ? out.output_key : "");
       } else if (eval_treatment_value_arg(env, a->as.pair.car, &out.value) !=
                  0) {
         break;
@@ -1591,7 +1599,7 @@ static LispValue *builtin_treatment_output_record(LispEnv *env, LispValue *args,
   }
   if (strcmp(kind, "tag") == 0 && out.output_key && out.value.type == 0) {
     out.value.type = WAMBLE_TREATMENT_VALUE_STRING;
-    out.value.string_value = strdup(out.output_key);
+    out.value.string_value = wamble_strdup(out.output_key);
   }
   int ok = (out.group_key && out.output_kind && out.output_key) ? 1 : 0;
   if (ok && treatment_outputs_append(&out) != 0)
@@ -1609,8 +1617,8 @@ static LispValue *builtin_treatment_view_record(LispEnv *env, LispValue *args,
   if (!args || args->type != LISP_VALUE_PAIR || !output_key)
     return make_value(LISP_VALUE_NIL);
   WambleTreatmentOutputSpec out = {0};
-  out.output_kind = strdup("view");
-  out.output_key = strdup(output_key);
+  out.output_kind = wamble_strdup("view");
+  out.output_key = wamble_strdup(output_key);
   if (!out.output_kind || !out.output_key) {
     treatment_output_clear(&out);
     return make_value(LISP_VALUE_NIL);
@@ -1676,8 +1684,8 @@ static LispValue *builtin_treatment_predictions_from_moves(LispEnv *env,
   WambleTreatmentOutputSpec out = {0};
   out.group_key = NULL;
   out.hook_name = NULL;
-  out.output_kind = strdup("view");
-  out.output_key = strdup("prediction.source");
+  out.output_kind = wamble_strdup("view");
+  out.output_key = wamble_strdup("prediction.source");
   if (!out.output_kind || !out.output_key) {
     treatment_output_clear(&out);
     return make_value(LISP_VALUE_NIL);
@@ -1696,7 +1704,7 @@ static LispValue *builtin_treatment_predictions_from_moves(LispEnv *env,
     }
   }
   out.value.type = WAMBLE_TREATMENT_VALUE_STRING;
-  out.value.string_value = strdup("moves");
+  out.value.string_value = wamble_strdup("moves");
   int ok = (out.group_key && out.hook_name && out.output_kind &&
             out.output_key && out.value.string_value)
                ? 1
@@ -1740,11 +1748,11 @@ static LispValue *builtin_defprofile(LispEnv *env, LispValue *args) {
         const char *base_name = base_cell->as.pair.car->as.symbol;
 
         LispValue *def_sym = make_value(LISP_VALUE_SYMBOL);
-        def_sym->as.symbol = strdup("def");
+        def_sym->as.symbol = wamble_strdup("def");
         LispValue *inherits_sym = make_value(LISP_VALUE_SYMBOL);
-        inherits_sym->as.symbol = strdup("inherits");
+        inherits_sym->as.symbol = wamble_strdup("inherits");
         LispValue *base_str = make_value(LISP_VALUE_STRING);
-        base_str->as.string = strdup(base_name);
+        base_str->as.string = wamble_strdup(base_name);
 
         LispValue *def_call = make_value(LISP_VALUE_PAIR);
         def_call->as.pair.car = def_sym;
@@ -1775,7 +1783,7 @@ static LispValue *builtin_defprofile(LispEnv *env, LispValue *args) {
     profile_vars = make_value(LISP_VALUE_NIL);
 
   LispValue *profiles_sym = make_value(LISP_VALUE_SYMBOL);
-  profiles_sym->as.symbol = strdup("*profiles*");
+  profiles_sym->as.symbol = wamble_strdup("*profiles*");
 
   LispValue *profiles = lisp_env_get(env, profiles_sym);
   if (profiles->type == LISP_VALUE_NIL) {
@@ -1900,7 +1908,7 @@ static void populate_config_from_env(LispEnv *env) {
     const ConfigVarMap *item = &config_map[i];
     LispValue sym;
     sym.type = LISP_VALUE_SYMBOL;
-    sym.as.symbol = strdup(item->name);
+    sym.as.symbol = wamble_strdup(item->name);
 
     LispValue *val = lisp_env_get(env, &sym);
     free(sym.as.symbol);
@@ -1926,7 +1934,7 @@ static void populate_config_from_env(LispEnv *env) {
     case CONF_STRING:
       if (val->type == LISP_VALUE_STRING) {
         free(*(char **)target);
-        *(char **)target = strdup(val->as.string);
+        *(char **)target = wamble_strdup(val->as.string);
       }
       break;
     }
@@ -1957,16 +1965,16 @@ static void config_set_defaults(void) {
   g_config.max_pot = 20.0;
   g_config.max_moves_per_board = 1000;
   g_config.max_contributors = 100;
-  g_config.db_host = strdup("localhost");
+  g_config.db_host = wamble_strdup("localhost");
   g_config.db_port = 5432;
-  g_config.db_user = strdup("wamble");
-  g_config.db_pass = strdup("wamble");
-  g_config.db_name = strdup("wamble");
-  g_config.global_db_host = strdup("localhost");
+  g_config.db_user = wamble_strdup("wamble");
+  g_config.db_pass = wamble_strdup("wamble");
+  g_config.db_name = wamble_strdup("wamble");
+  g_config.global_db_host = wamble_strdup("localhost");
   g_config.global_db_port = 5432;
-  g_config.global_db_user = strdup("wamble");
-  g_config.global_db_pass = strdup("wamble");
-  g_config.global_db_name = strdup("wamble_global");
+  g_config.global_db_user = wamble_strdup("wamble");
+  g_config.global_db_pass = wamble_strdup("wamble");
+  g_config.global_db_name = wamble_strdup("wamble_global");
   g_config.select_timeout_usec = 100000;
   g_config.cleanup_interval_sec = 60;
   g_config.max_token_attempts = 1000;
@@ -1994,10 +2002,10 @@ static void config_set_defaults(void) {
   g_config.prediction_base_points = 1.0;
   g_config.prediction_streak_multiplier = 2.0;
   g_config.prediction_penalty_incorrect = 0.0;
-  g_config.prediction_match_policy = strdup("exact-uci");
-  g_config.spectator_summary_mode = strdup("changes");
+  g_config.prediction_match_policy = wamble_strdup("exact-uci");
+  g_config.spectator_summary_mode = wamble_strdup("changes");
   g_config.state_dir = NULL;
-  g_config.websocket_path = strdup("/ws");
+  g_config.websocket_path = wamble_strdup("/ws");
 }
 
 static void free_profiles(void) {
@@ -2045,9 +2053,9 @@ static LispEnv *build_policy_env_from_source(const char *source) {
     lisp_env_free(env);
     return NULL;
   }
-  def_sym->as.symbol = strdup("def");
+  def_sym->as.symbol = wamble_strdup("def");
   def_builtin->as.builtin = builtin_def;
-  defprofile_sym->as.symbol = strdup("defprofile");
+  defprofile_sym->as.symbol = wamble_strdup("defprofile");
   defprofile_builtin->as.builtin = builtin_defprofile;
   if (!def_sym->as.symbol || !defprofile_sym->as.symbol) {
     free_lisp_value(def_sym);
@@ -2103,7 +2111,7 @@ static LispEnv *build_policy_env_from_source(const char *source) {
       lisp_env_free(env);
       return NULL;
     }
-    sym->as.symbol = strdup(builtins[i].name);
+    sym->as.symbol = wamble_strdup(builtins[i].name);
     fn->as.builtin = builtins[i].fn;
     if (!sym->as.symbol) {
       free_lisp_value(sym);
@@ -2260,7 +2268,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
   LispEnv *env = lisp_env_create(NULL);
 
   LispValue *def_sym = make_value(LISP_VALUE_SYMBOL);
-  def_sym->as.symbol = strdup("def");
+  def_sym->as.symbol = wamble_strdup("def");
   LispValue *def_builtin = make_value(LISP_VALUE_BUILTIN);
   def_builtin->as.builtin = builtin_def;
   lisp_env_put(env, def_sym, def_builtin);
@@ -2268,7 +2276,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
   free_lisp_value(def_builtin);
 
   LispValue *defprofile_sym = make_value(LISP_VALUE_SYMBOL);
-  defprofile_sym->as.symbol = strdup("defprofile");
+  defprofile_sym->as.symbol = wamble_strdup("defprofile");
   LispValue *defprofile_builtin = make_value(LISP_VALUE_BUILTIN);
   defprofile_builtin->as.builtin = builtin_defprofile;
   lisp_env_put(env, defprofile_sym, defprofile_builtin);
@@ -2307,7 +2315,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
   };
   for (size_t i = 0; i < sizeof(builtins) / sizeof(builtins[0]); i++) {
     LispValue *sym = make_value(LISP_VALUE_SYMBOL);
-    sym->as.symbol = strdup(builtins[i].name);
+    sym->as.symbol = wamble_strdup(builtins[i].name);
     LispValue *fn = make_value(LISP_VALUE_BUILTIN);
     fn->as.builtin = builtins[i].fn;
     lisp_env_put(env, sym, fn);
@@ -2328,7 +2336,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
 
   {
     LispValue *profiles_sym = make_value(LISP_VALUE_SYMBOL);
-    profiles_sym->as.symbol = strdup("*profiles*");
+    profiles_sym->as.symbol = wamble_strdup("*profiles*");
     LispValue *profiles = lisp_env_get(env, profiles_sym);
     free_lisp_value(profiles_sym);
 
@@ -2378,7 +2386,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
                  u++) {
               LispValue *sym = make_value(LISP_VALUE_SYMBOL);
               LispValue *fn = make_value(LISP_VALUE_BUILTIN);
-              sym->as.symbol = strdup(unsupported[u]);
+              sym->as.symbol = wamble_strdup(unsupported[u]);
               fn->as.builtin = builtin_profile_local_unsupported;
               lisp_env_put(profile_env, sym, fn);
               free_lisp_value(sym);
@@ -2421,7 +2429,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
             LispValue *val = lisp_env_get(profile_env, &sym);
             if (val->type == LISP_VALUE_STRING && val->as.string &&
                 val->as.string[0] != '\0') {
-              base_name = strdup(val->as.string);
+              base_name = wamble_strdup(val->as.string);
             }
             free_lisp_value(val);
           }
@@ -2455,24 +2463,24 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
           }
 
           WambleConfig cfg = base_cfg;
-          cfg.db_host = strdup(base_cfg.db_host);
-          cfg.db_user = strdup(base_cfg.db_user);
-          cfg.db_pass = strdup(base_cfg.db_pass);
-          cfg.db_name = strdup(base_cfg.db_name);
-          cfg.global_db_host = strdup(base_cfg.global_db_host);
-          cfg.global_db_user = strdup(base_cfg.global_db_user);
-          cfg.global_db_pass = strdup(base_cfg.global_db_pass);
-          cfg.global_db_name = strdup(base_cfg.global_db_name);
+          cfg.db_host = wamble_strdup(base_cfg.db_host);
+          cfg.db_user = wamble_strdup(base_cfg.db_user);
+          cfg.db_pass = wamble_strdup(base_cfg.db_pass);
+          cfg.db_name = wamble_strdup(base_cfg.db_name);
+          cfg.global_db_host = wamble_strdup(base_cfg.global_db_host);
+          cfg.global_db_user = wamble_strdup(base_cfg.global_db_user);
+          cfg.global_db_pass = wamble_strdup(base_cfg.global_db_pass);
+          cfg.global_db_name = wamble_strdup(base_cfg.global_db_name);
           if (base_cfg.spectator_summary_mode)
             cfg.spectator_summary_mode =
-                strdup(base_cfg.spectator_summary_mode);
+                wamble_strdup(base_cfg.spectator_summary_mode);
           if (base_cfg.prediction_match_policy)
             cfg.prediction_match_policy =
-                strdup(base_cfg.prediction_match_policy);
+                wamble_strdup(base_cfg.prediction_match_policy);
           if (base_cfg.state_dir)
-            cfg.state_dir = strdup(base_cfg.state_dir);
+            cfg.state_dir = wamble_strdup(base_cfg.state_dir);
           if (base_cfg.websocket_path)
-            cfg.websocket_path = strdup(base_cfg.websocket_path);
+            cfg.websocket_path = wamble_strdup(base_cfg.websocket_path);
 
           WambleConfig saved = g_config;
           g_config = cfg;
@@ -2485,7 +2493,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
           int db_isolated = base_db_isolated;
           char *profile_group = NULL;
           if (base_group)
-            profile_group = strdup(base_group);
+            profile_group = wamble_strdup(base_group);
           {
             LispValue sym;
             sym.type = LISP_VALUE_SYMBOL;
@@ -2508,7 +2516,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
             val = lisp_env_get(profile_env, &sym);
             if (val->type == LISP_VALUE_STRING) {
               free(profile_group);
-              profile_group = strdup(val->as.string);
+              profile_group = wamble_strdup(val->as.string);
             }
             free_lisp_value(val);
           }
@@ -2549,7 +2557,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
             return CONFIG_LOAD_IO_ERROR;
           }
 
-          g_profiles[i].name = strdup(pname);
+          g_profiles[i].name = wamble_strdup(pname);
           g_profiles[i].group = profile_group;
           g_profiles[i].config = overlaid;
           g_profiles[i].advertise = advertise;
@@ -2645,7 +2653,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
     lisp_env_free(prev_policy_env);
   env = NULL;
   {
-    char *loaded_copy = strdup(source);
+    char *loaded_copy = wamble_strdup(source);
     if (!loaded_copy) {
       if (status_msg && status_msg_size)
         snprintf(status_msg, status_msg_size, "loaded %s (source copy failed)",
@@ -2713,9 +2721,9 @@ void *config_create_snapshot(void) {
     for (int i = 0; i < g_profile_count; i++) {
       snap->profiles[i] = g_profiles[i];
       snap->profiles[i].name =
-          g_profiles[i].name ? strdup(g_profiles[i].name) : NULL;
+          g_profiles[i].name ? wamble_strdup(g_profiles[i].name) : NULL;
       snap->profiles[i].group =
-          g_profiles[i].group ? strdup(g_profiles[i].group) : NULL;
+          g_profiles[i].group ? wamble_strdup(g_profiles[i].group) : NULL;
       if (cfg_dup_owned(&snap->profiles[i].config, &g_profiles[i].config) !=
               0 ||
           !snap->profiles[i].name) {
@@ -2859,7 +2867,7 @@ void *config_create_snapshot(void) {
     }
   }
   if (g_last_loaded_source) {
-    snap->source_text = strdup(g_last_loaded_source);
+    snap->source_text = wamble_strdup(g_last_loaded_source);
     if (!snap->source_text) {
       treatment_outputs_free(snap->treatment_outputs,
                              snap->treatment_output_count);
@@ -2876,6 +2884,9 @@ void *config_create_snapshot(void) {
   }
   return snap;
 }
+
+static int
+config_restore_snapshot_policy_and_treatments(const ConfigSnapshot *snap);
 
 int config_restore_snapshot(const void *snapshot) {
   const ConfigSnapshot *snap = (const ConfigSnapshot *)snapshot;
@@ -2921,89 +2932,11 @@ int config_restore_snapshot(const void *snapshot) {
   if (snap->profile_count <= 0 || !snap->profiles) {
     g_profiles = NULL;
     g_profile_count = 0;
-    if (snap->policy_rule_count > 0 && snap->policy_rules) {
-      g_policy_rules = (WamblePolicyRuleSpec *)calloc(
-          (size_t)snap->policy_rule_count, sizeof(WamblePolicyRuleSpec));
-      if (!g_policy_rules)
-        return -1;
-      g_policy_rule_count = snap->policy_rule_count;
-      for (int i = 0; i < snap->policy_rule_count; i++) {
-        if (policy_rule_dup(&g_policy_rules[i], &snap->policy_rules[i]) != 0) {
-          policy_rules_free(g_policy_rules, g_policy_rule_count);
-          g_policy_rules = NULL;
-          g_policy_rule_count = 0;
-          return -1;
-        }
-      }
-    }
-    if (snap->treatment_group_count > 0 && snap->treatment_groups) {
-      g_treatment_groups = (WambleTreatmentGroupSpec *)calloc(
-          (size_t)snap->treatment_group_count,
-          sizeof(WambleTreatmentGroupSpec));
-      if (!g_treatment_groups)
-        return -1;
-      g_treatment_group_count = snap->treatment_group_count;
-      for (int i = 0; i < snap->treatment_group_count; i++) {
-        if (treatment_group_dup(&g_treatment_groups[i],
-                                &snap->treatment_groups[i]) != 0) {
-          treatment_groups_free(g_treatment_groups, g_treatment_group_count);
-          g_treatment_groups = NULL;
-          g_treatment_group_count = 0;
-          return -1;
-        }
-      }
-    }
-    if (snap->treatment_rule_count > 0 && snap->treatment_rules) {
-      g_treatment_rules = (WambleTreatmentRuleSpec *)calloc(
-          (size_t)snap->treatment_rule_count, sizeof(WambleTreatmentRuleSpec));
-      if (!g_treatment_rules)
-        return -1;
-      g_treatment_rule_count = snap->treatment_rule_count;
-      for (int i = 0; i < snap->treatment_rule_count; i++) {
-        if (treatment_rule_dup(&g_treatment_rules[i],
-                               &snap->treatment_rules[i]) != 0) {
-          treatment_rules_free(g_treatment_rules, g_treatment_rule_count);
-          g_treatment_rules = NULL;
-          g_treatment_rule_count = 0;
-          return -1;
-        }
-      }
-    }
-    if (snap->treatment_edge_count > 0 && snap->treatment_edges) {
-      g_treatment_edges = (WambleTreatmentEdgeSpec *)calloc(
-          (size_t)snap->treatment_edge_count, sizeof(WambleTreatmentEdgeSpec));
-      if (!g_treatment_edges)
-        return -1;
-      g_treatment_edge_count = snap->treatment_edge_count;
-      for (int i = 0; i < snap->treatment_edge_count; i++) {
-        if (treatment_edge_dup(&g_treatment_edges[i],
-                               &snap->treatment_edges[i]) != 0) {
-          treatment_edges_free(g_treatment_edges, g_treatment_edge_count);
-          g_treatment_edges = NULL;
-          g_treatment_edge_count = 0;
-          return -1;
-        }
-      }
-    }
-    if (snap->treatment_output_count > 0 && snap->treatment_outputs) {
-      g_treatment_outputs = (WambleTreatmentOutputSpec *)calloc(
-          (size_t)snap->treatment_output_count,
-          sizeof(WambleTreatmentOutputSpec));
-      if (!g_treatment_outputs)
-        return -1;
-      g_treatment_output_count = snap->treatment_output_count;
-      for (int i = 0; i < snap->treatment_output_count; i++) {
-        if (treatment_output_dup(&g_treatment_outputs[i],
-                                 &snap->treatment_outputs[i]) != 0) {
-          treatment_outputs_free(g_treatment_outputs, g_treatment_output_count);
-          g_treatment_outputs = NULL;
-          g_treatment_output_count = 0;
-          return -1;
-        }
-      }
-    }
+    if (config_restore_snapshot_policy_and_treatments(snap) != 0)
+      return -1;
     free(g_last_loaded_source);
-    g_last_loaded_source = snap->source_text ? strdup(snap->source_text) : NULL;
+    g_last_loaded_source =
+        snap->source_text ? wamble_strdup(snap->source_text) : NULL;
     LispEnv *rebuilt = NULL;
     if (snap->source_text && snap->source_text[0]) {
       rebuilt = build_policy_env_from_source(snap->source_text);
@@ -3023,112 +2956,22 @@ int config_restore_snapshot(const void *snapshot) {
   for (int i = 0; i < snap->profile_count; i++) {
     g_profiles[i] = snap->profiles[i];
     g_profiles[i].name =
-        snap->profiles[i].name ? strdup(snap->profiles[i].name) : NULL;
+        snap->profiles[i].name ? wamble_strdup(snap->profiles[i].name) : NULL;
     g_profiles[i].group =
-        snap->profiles[i].group ? strdup(snap->profiles[i].group) : NULL;
+        snap->profiles[i].group ? wamble_strdup(snap->profiles[i].group) : NULL;
     if (cfg_dup_owned(&g_profiles[i].config, &snap->profiles[i].config) != 0 ||
         !g_profiles[i].name) {
       free_profiles();
       return -1;
     }
   }
-  if (snap->policy_rule_count > 0 && snap->policy_rules) {
-    g_policy_rules = (WamblePolicyRuleSpec *)calloc(
-        (size_t)snap->policy_rule_count, sizeof(WamblePolicyRuleSpec));
-    if (!g_policy_rules) {
-      free_profiles();
-      return -1;
-    }
-    g_policy_rule_count = snap->policy_rule_count;
-    for (int i = 0; i < snap->policy_rule_count; i++) {
-      if (policy_rule_dup(&g_policy_rules[i], &snap->policy_rules[i]) != 0) {
-        policy_rules_free(g_policy_rules, g_policy_rule_count);
-        g_policy_rules = NULL;
-        g_policy_rule_count = 0;
-        free_profiles();
-        return -1;
-      }
-    }
-  }
-  if (snap->treatment_group_count > 0 && snap->treatment_groups) {
-    g_treatment_groups = (WambleTreatmentGroupSpec *)calloc(
-        (size_t)snap->treatment_group_count, sizeof(WambleTreatmentGroupSpec));
-    if (!g_treatment_groups) {
-      free_profiles();
-      return -1;
-    }
-    g_treatment_group_count = snap->treatment_group_count;
-    for (int i = 0; i < snap->treatment_group_count; i++) {
-      if (treatment_group_dup(&g_treatment_groups[i],
-                              &snap->treatment_groups[i]) != 0) {
-        treatment_groups_free(g_treatment_groups, g_treatment_group_count);
-        g_treatment_groups = NULL;
-        g_treatment_group_count = 0;
-        free_profiles();
-        return -1;
-      }
-    }
-  }
-  if (snap->treatment_rule_count > 0 && snap->treatment_rules) {
-    g_treatment_rules = (WambleTreatmentRuleSpec *)calloc(
-        (size_t)snap->treatment_rule_count, sizeof(WambleTreatmentRuleSpec));
-    if (!g_treatment_rules) {
-      free_profiles();
-      return -1;
-    }
-    g_treatment_rule_count = snap->treatment_rule_count;
-    for (int i = 0; i < snap->treatment_rule_count; i++) {
-      if (treatment_rule_dup(&g_treatment_rules[i],
-                             &snap->treatment_rules[i]) != 0) {
-        treatment_rules_free(g_treatment_rules, g_treatment_rule_count);
-        g_treatment_rules = NULL;
-        g_treatment_rule_count = 0;
-        free_profiles();
-        return -1;
-      }
-    }
-  }
-  if (snap->treatment_edge_count > 0 && snap->treatment_edges) {
-    g_treatment_edges = (WambleTreatmentEdgeSpec *)calloc(
-        (size_t)snap->treatment_edge_count, sizeof(WambleTreatmentEdgeSpec));
-    if (!g_treatment_edges) {
-      free_profiles();
-      return -1;
-    }
-    g_treatment_edge_count = snap->treatment_edge_count;
-    for (int i = 0; i < snap->treatment_edge_count; i++) {
-      if (treatment_edge_dup(&g_treatment_edges[i],
-                             &snap->treatment_edges[i]) != 0) {
-        treatment_edges_free(g_treatment_edges, g_treatment_edge_count);
-        g_treatment_edges = NULL;
-        g_treatment_edge_count = 0;
-        free_profiles();
-        return -1;
-      }
-    }
-  }
-  if (snap->treatment_output_count > 0 && snap->treatment_outputs) {
-    g_treatment_outputs = (WambleTreatmentOutputSpec *)calloc(
-        (size_t)snap->treatment_output_count,
-        sizeof(WambleTreatmentOutputSpec));
-    if (!g_treatment_outputs) {
-      free_profiles();
-      return -1;
-    }
-    g_treatment_output_count = snap->treatment_output_count;
-    for (int i = 0; i < snap->treatment_output_count; i++) {
-      if (treatment_output_dup(&g_treatment_outputs[i],
-                               &snap->treatment_outputs[i]) != 0) {
-        treatment_outputs_free(g_treatment_outputs, g_treatment_output_count);
-        g_treatment_outputs = NULL;
-        g_treatment_output_count = 0;
-        free_profiles();
-        return -1;
-      }
-    }
+  if (config_restore_snapshot_policy_and_treatments(snap) != 0) {
+    free_profiles();
+    return -1;
   }
   free(g_last_loaded_source);
-  g_last_loaded_source = snap->source_text ? strdup(snap->source_text) : NULL;
+  g_last_loaded_source =
+      snap->source_text ? wamble_strdup(snap->source_text) : NULL;
 
   LispEnv *rebuilt = NULL;
   if (snap->source_text && snap->source_text[0]) {
@@ -3139,6 +2982,93 @@ int config_restore_snapshot(const void *snapshot) {
   LispEnv *old_env = policy_env_swap(rebuilt);
   if (old_env)
     lisp_env_free(old_env);
+  return 0;
+}
+
+static int
+config_restore_snapshot_policy_and_treatments(const ConfigSnapshot *snap) {
+  if (!snap)
+    return -1;
+  if (snap->policy_rule_count > 0 && snap->policy_rules) {
+    g_policy_rules = (WamblePolicyRuleSpec *)calloc(
+        (size_t)snap->policy_rule_count, sizeof(WamblePolicyRuleSpec));
+    if (!g_policy_rules)
+      return -1;
+    g_policy_rule_count = snap->policy_rule_count;
+    for (int i = 0; i < snap->policy_rule_count; i++) {
+      if (policy_rule_dup(&g_policy_rules[i], &snap->policy_rules[i]) != 0) {
+        policy_rules_free(g_policy_rules, g_policy_rule_count);
+        g_policy_rules = NULL;
+        g_policy_rule_count = 0;
+        return -1;
+      }
+    }
+  }
+  if (snap->treatment_group_count > 0 && snap->treatment_groups) {
+    g_treatment_groups = (WambleTreatmentGroupSpec *)calloc(
+        (size_t)snap->treatment_group_count, sizeof(WambleTreatmentGroupSpec));
+    if (!g_treatment_groups)
+      return -1;
+    g_treatment_group_count = snap->treatment_group_count;
+    for (int i = 0; i < snap->treatment_group_count; i++) {
+      if (treatment_group_dup(&g_treatment_groups[i],
+                              &snap->treatment_groups[i]) != 0) {
+        treatment_groups_free(g_treatment_groups, g_treatment_group_count);
+        g_treatment_groups = NULL;
+        g_treatment_group_count = 0;
+        return -1;
+      }
+    }
+  }
+  if (snap->treatment_rule_count > 0 && snap->treatment_rules) {
+    g_treatment_rules = (WambleTreatmentRuleSpec *)calloc(
+        (size_t)snap->treatment_rule_count, sizeof(WambleTreatmentRuleSpec));
+    if (!g_treatment_rules)
+      return -1;
+    g_treatment_rule_count = snap->treatment_rule_count;
+    for (int i = 0; i < snap->treatment_rule_count; i++) {
+      if (treatment_rule_dup(&g_treatment_rules[i],
+                             &snap->treatment_rules[i]) != 0) {
+        treatment_rules_free(g_treatment_rules, g_treatment_rule_count);
+        g_treatment_rules = NULL;
+        g_treatment_rule_count = 0;
+        return -1;
+      }
+    }
+  }
+  if (snap->treatment_edge_count > 0 && snap->treatment_edges) {
+    g_treatment_edges = (WambleTreatmentEdgeSpec *)calloc(
+        (size_t)snap->treatment_edge_count, sizeof(WambleTreatmentEdgeSpec));
+    if (!g_treatment_edges)
+      return -1;
+    g_treatment_edge_count = snap->treatment_edge_count;
+    for (int i = 0; i < snap->treatment_edge_count; i++) {
+      if (treatment_edge_dup(&g_treatment_edges[i],
+                             &snap->treatment_edges[i]) != 0) {
+        treatment_edges_free(g_treatment_edges, g_treatment_edge_count);
+        g_treatment_edges = NULL;
+        g_treatment_edge_count = 0;
+        return -1;
+      }
+    }
+  }
+  if (snap->treatment_output_count > 0 && snap->treatment_outputs) {
+    g_treatment_outputs = (WambleTreatmentOutputSpec *)calloc(
+        (size_t)snap->treatment_output_count,
+        sizeof(WambleTreatmentOutputSpec));
+    if (!g_treatment_outputs)
+      return -1;
+    g_treatment_output_count = snap->treatment_output_count;
+    for (int i = 0; i < snap->treatment_output_count; i++) {
+      if (treatment_output_dup(&g_treatment_outputs[i],
+                               &snap->treatment_outputs[i]) != 0) {
+        treatment_outputs_free(g_treatment_outputs, g_treatment_output_count);
+        g_treatment_outputs = NULL;
+        g_treatment_output_count = 0;
+        return -1;
+      }
+    }
+  }
   return 0;
 }
 
@@ -3322,7 +3252,7 @@ int config_policy_eval(const char *identity_selector, const char *action,
       wamble_mutex_unlock(&g_policy_eval_mutex);
     return -1;
   }
-  callee->as.symbol = strdup("policy-eval");
+  callee->as.symbol = wamble_strdup("policy-eval");
   expr->as.pair.car = callee;
 
   LispValue *args = make_value(LISP_VALUE_NIL);
