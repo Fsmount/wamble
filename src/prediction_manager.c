@@ -1,5 +1,4 @@
 #include "../include/wamble/wamble.h"
-#include "../include/wamble/wamble_db.h"
 #include <ctype.h>
 #include <math.h>
 #include <stdlib.h>
@@ -82,7 +81,7 @@ static void prediction_rebuild_streaks_locked(void) {
 }
 
 static PredictionManagerStatus prediction_load_active_locked(void) {
-  DbPredictionsResult rows = db_get_pending_predictions();
+  DbPredictionsResult rows = wamble_query_get_pending_predictions();
   if (rows.status != DB_OK)
     return PREDICTION_MANAGER_ERR_DB_LOAD;
   if (!rows.rows || rows.count <= 0)
@@ -120,24 +119,21 @@ static int prediction_resolve_session_id(const uint8_t *player_token,
     return -1;
 
   uint64_t session_id = 0;
-  const WambleQueryService *qs = wamble_get_query_service();
-  if (qs && qs->get_session_by_token &&
-      qs->get_session_by_token(player_token, &session_id) == DB_OK &&
+  if (wamble_query_get_session_by_token(player_token, &session_id) == DB_OK &&
       session_id > 0) {
     if (out_session_id)
       *out_session_id = session_id;
     return 0;
   }
 
-  session_id = db_create_session(player_token, 0);
-  if (session_id > 0) {
+  if (wamble_query_create_session(player_token, 0, &session_id) == DB_OK &&
+      session_id > 0) {
     if (out_session_id)
       *out_session_id = session_id;
     return 0;
   }
 
-  if (qs && qs->get_session_by_token &&
-      qs->get_session_by_token(player_token, &session_id) == DB_OK &&
+  if (wamble_query_get_session_by_token(player_token, &session_id) == DB_OK &&
       session_id > 0) {
     if (out_session_id)
       *out_session_id = session_id;
@@ -155,9 +151,9 @@ static int prediction_persist_new_locked(uint64_t board_id,
   uint64_t session_id = 0;
   if (prediction_resolve_session_id(player_token, &session_id) == 0 &&
       session_id > 0 &&
-      db_create_prediction(board_id, session_id, parent_prediction_id,
-                           predicted_move_uci, target_ply, correct_streak,
-                           out_prediction_id) == DB_OK &&
+      wamble_query_create_prediction(
+          board_id, session_id, parent_prediction_id, predicted_move_uci,
+          target_ply, correct_streak, out_prediction_id) == DB_OK &&
       (!out_prediction_id || *out_prediction_id > 0)) {
     return 0;
   }
@@ -259,7 +255,7 @@ static int prediction_treatment_feature_bool(const uint8_t *token,
   }
   WambleTreatmentAction actions[8];
   int action_count = 0;
-  if (db_resolve_treatment_actions(
+  if (wamble_query_resolve_treatment_actions(
           token, "", "prediction.submit",
           board ? board->last_mover_treatment_group : NULL, facts, fact_count,
           actions, 8, &action_count) != DB_OK) {
@@ -283,25 +279,6 @@ static int prediction_treatment_feature_bool(const uint8_t *token,
 }
 
 static int prediction_pending_count_locked(uint64_t board_id);
-
-static double prediction_action_number(const WambleTreatmentAction *action,
-                                       int *ok) {
-  if (ok)
-    *ok = 0;
-  if (!action)
-    return 0.0;
-  if (action->value_type == WAMBLE_TREATMENT_VALUE_INT) {
-    if (ok)
-      *ok = 1;
-    return (double)action->int_value;
-  }
-  if (action->value_type == WAMBLE_TREATMENT_VALUE_DOUBLE) {
-    if (ok)
-      *ok = 1;
-    return action->double_value;
-  }
-  return 0.0;
-}
 
 static int prediction_failed_count_for_locked(uint64_t board_id,
                                               const uint8_t *token) {
@@ -356,7 +333,7 @@ static int prediction_collect_actions(const uint8_t *token,
       board ? prediction_pending_count_locked(board->id) : 0;
   fact_count++;
 
-  return (db_resolve_treatment_actions(
+  return (wamble_query_resolve_treatment_actions(
               token, "", hook_name,
               board ? board->last_mover_treatment_group : NULL, facts,
               fact_count, actions, max_actions, out_count) == DB_OK)
@@ -480,14 +457,11 @@ static int prediction_policy_allowed(const uint8_t *token, const char *action,
                                      const char *context_key,
                                      const char *context_value,
                                      WamblePolicyDecision *out) {
-  const WambleQueryService *qs = wamble_get_query_service();
-  if (!qs || !qs->resolve_policy_decision)
-    return 1;
   const char *profile = wamble_runtime_profile_key();
   WamblePolicyDecision decision = {0};
-  DbStatus st = qs->resolve_policy_decision(token, profile ? profile : "",
-                                            action, resource, context_key,
-                                            context_value, &decision);
+  DbStatus st = wamble_query_resolve_policy_decision(
+      token, profile ? profile : "", action, resource, context_key,
+      context_value, &decision);
   if (st != DB_OK)
     return 0;
   if (out)
@@ -559,7 +533,7 @@ prediction_apply_resolution_adjustments_locked(const uint8_t *token,
     if (strcmp(actions[i].output_kind, "behavior") != 0)
       continue;
     int ok = 0;
-    double value = prediction_action_number(&actions[i], &ok);
+    double value = wamble_treatment_action_number(&actions[i], &ok);
     if (!ok)
       continue;
     if (strcmp(actions[i].output_key, "prediction.points.multiplier") == 0) {
@@ -812,7 +786,7 @@ PredictionStatus prediction_collect_tree(uint64_t board_id,
   return PREDICTION_OK;
 }
 
-void prediction_clear_board(uint64_t board_id) {
+static void prediction_clear_board(uint64_t board_id) {
   if (!g_prediction_mutex_ready)
     return;
   wamble_mutex_lock(&g_prediction_mutex);
@@ -844,13 +818,4 @@ void prediction_expire_board(uint64_t board_id) {
   wamble_mutex_unlock(&g_prediction_mutex);
 
   prediction_clear_board(board_id);
-}
-
-int prediction_pending_count(uint64_t board_id) {
-  if (!g_prediction_mutex_ready)
-    return 0;
-  wamble_mutex_lock(&g_prediction_mutex);
-  int count = prediction_pending_count_locked(board_id);
-  wamble_mutex_unlock(&g_prediction_mutex);
-  return count;
 }

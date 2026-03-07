@@ -434,51 +434,48 @@ static void handle_sigusr2(int signo) {
 }
 #endif
 
-int main(int argc, char *argv[]) {
-  if (wamble_net_init() != 0) {
-    LOG_FATAL("Network initialization failed");
-    return 1;
-  }
-  const char *config_file = "wamble.conf";
-  const char *profile = NULL;
+typedef struct MainOptions {
+  const char *config_file;
+  const char *profile;
+} MainOptions;
+
+static int parse_main_options(int argc, char *argv[], MainOptions *opts) {
+  if (!opts)
+    return -1;
+
+  opts->config_file = "wamble.conf";
+  opts->profile = NULL;
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--config") == 0) {
-      if (i + 1 < argc) {
-        config_file = argv[++i];
-      } else {
+      if (i + 1 >= argc) {
         fprintf(stderr, "Option %s requires an argument.\n", argv[i]);
-        return 1;
+        return -1;
       }
-    } else if (strcmp(argv[i], "-p") == 0 ||
-               strcmp(argv[i], "--profile") == 0) {
-      if (i + 1 < argc) {
-        profile = argv[++i];
-      } else {
+      opts->config_file = argv[++i];
+      continue;
+    }
+
+    if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--profile") == 0) {
+      if (i + 1 >= argc) {
         fprintf(stderr, "Option %s requires an argument.\n", argv[i]);
-        return 1;
+        return -1;
       }
-    } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+      opts->profile = argv[++i];
+      continue;
+    }
+
+    if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
       printf("Usage: %s [-c|--config <config_file>] [-p|--profile <profile>]\n",
              argv[0]);
-      return 0;
+      return 1;
     }
   }
 
-  LOG_INFO("Wamble server starting up");
-  if (profile) {
-    LOG_INFO("Using profile: %s from config file: %s", profile, config_file);
-  } else {
-    LOG_INFO("Using default configuration from config file: %s", config_file);
-  }
+  return 0;
+}
 
-  char cfg_status[128];
-  ConfigLoadStatus cfg =
-      config_load(config_file, profile, cfg_status, sizeof(cfg_status));
-  if (cfg != CONFIG_LOAD_OK) {
-    LOG_WARN("Config load status=%d", (int)cfg);
-  }
-
+static void install_signal_handlers(void) {
 #ifdef WAMBLE_PLATFORM_POSIX
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
@@ -490,50 +487,62 @@ int main(int argc, char *argv[]) {
   sb.sa_handler = handle_sigterm;
   sigaction(SIGINT, &sb, NULL);
   sigaction(SIGTERM, &sb, NULL);
-#else
-  signal(SIGINT, handle_sigterm);
-  signal(SIGTERM, handle_sigterm);
-#endif
 
-#ifdef WAMBLE_PLATFORM_POSIX
   struct sigaction sc;
   memset(&sc, 0, sizeof(sc));
   sc.sa_handler = handle_sigusr2;
   sigaction(SIGUSR2, &sc, NULL);
+#else
+  signal(SIGINT, handle_sigterm);
+  signal(SIGTERM, handle_sigterm);
 #endif
+}
 
-  char global_conn_str[512];
-  char topology_err[256];
-  if (validate_db_topology(topology_err, sizeof(topology_err)) != 0) {
-    LOG_FATAL("Invalid DB topology: %s", topology_err);
-    return 1;
+static void persist_initial_config_snapshot(const char *config_file,
+                                            const char *profile) {
+  char *cfg_text = NULL;
+  if (read_text_file(config_file, &cfg_text) != 0 || !cfg_text)
+    return;
+
+  const char *profile_key = profile_key_for_runtime(profile);
+  if (db_store_config_snapshot(profile_key, cfg_text) != 0) {
+    LOG_WARN("Failed to persist initial config snapshot to global store");
   }
-  global_conn_str[0] = '\0';
+  free(cfg_text);
+}
+
+static int initialize_config_and_policy(
+    const char *config_file, const char *profile, char *cfg_status,
+    size_t cfg_status_size, char *topology_err, size_t topology_err_size,
+    char *global_conn_str, size_t global_conn_str_size) {
+  ConfigLoadStatus cfg =
+      config_load(config_file, profile, cfg_status, cfg_status_size);
+  if (cfg != CONFIG_LOAD_OK) {
+    LOG_WARN("Config load status=%d", (int)cfg);
+  }
+
+  if (validate_db_topology(topology_err, topology_err_size) != 0) {
+    LOG_FATAL("Invalid DB topology: %s", topology_err);
+    return -1;
+  }
+
   if (db_set_global_store_connection(NULL) != 0) {
     LOG_FATAL("Failed to configure shared global store connection");
-    return 1;
-  }
-  {
-    char *cfg_text = NULL;
-    if (read_text_file(config_file, &cfg_text) == 0) {
-      const char *profile_key = profile ? profile : "__default__";
-      if (db_store_config_snapshot(profile_key, cfg_text) != 0) {
-        LOG_WARN("Failed to persist initial config snapshot to global store");
-      }
-      free(cfg_text);
-    }
-  }
-  {
-    const char *profile_key = profile_key_for_runtime(profile);
-    if (db_apply_config_policy_rules(profile_key) != 0 ||
-        db_validate_global_policy() != 0 ||
-        db_apply_config_treatment_rules(profile_key) != 0 ||
-        db_validate_global_treatments() != 0) {
-      LOG_FATAL("Failed to load/validate trust policy");
-      return 1;
-    }
+    return -1;
   }
 
+  persist_initial_config_snapshot(config_file, profile);
+
+  if (bind_active_config_policy(profile_key_for_runtime(profile),
+                                global_conn_str, global_conn_str_size) != 0) {
+    LOG_FATAL("Failed to load/validate trust policy");
+    return -1;
+  }
+
+  return 0;
+}
+
+static int initialize_services(void) {
   if (db_init(NULL) != 0) {
     LOG_FATAL("Failed to initialize database");
     return 1;
@@ -550,32 +559,27 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  {
-    SpectatorInitStatus sst = spectator_manager_init();
-    if (sst != SPECTATOR_INIT_OK) {
-      LOG_WARN("Spectator manager init failed status=%d", (int)sst);
-    } else {
-      LOG_INFO("Spectator manager initialized");
-    }
+  SpectatorInitStatus sst = spectator_manager_init();
+  if (sst != SPECTATOR_INIT_OK) {
+    LOG_WARN("Spectator manager init failed status=%d", (int)sst);
+  } else {
+    LOG_INFO("Spectator manager initialized");
   }
 
   int started = 0;
   ProfileStartStatus pst = start_profile_listeners(&started);
-  if (pst == PROFILE_START_OK && started > 0) {
-    LOG_INFO("Started %d runtime listener(s)", started);
-  } else {
+  if (pst != PROFILE_START_OK || started <= 0) {
     LOG_FATAL("Listener startup failed (status=%d)", (int)pst);
     return 1;
   }
+  LOG_INFO("Started %d runtime listener(s)", started);
+  return 0;
+}
 
+static void restore_hot_reload_state(void) {
 #if defined(WAMBLE_PLATFORM_POSIX) || defined(WAMBLE_PLATFORM_WINDOWS)
   const char *env_reload = getenv("WAMBLE_HOT_RELOAD");
   const char *env_state = getenv("WAMBLE_STATE_FILE");
-#else
-  const char *env_state = NULL;
-#endif
-#if defined(WAMBLE_PLATFORM_POSIX) || defined(WAMBLE_PLATFORM_WINDOWS)
-
   if (env_reload && strcmp(env_reload, "1") == 0 && env_state && *env_state) {
     if (state_load_from_file(env_state) == 0) {
       LOG_INFO("Restored in-memory state from %s", env_state);
@@ -586,12 +590,47 @@ int main(int argc, char *argv[]) {
     }
   }
 #endif
+}
 
+static void drain_runtime_issue_queues(void) {
+  char profile_name[64];
+  WsGatewayStatus gateway_status = WS_GATEWAY_OK;
+  while (profile_runtime_take_ws_gateway_status(&gateway_status, profile_name,
+                                                sizeof(profile_name))) {
+    LOG_ERROR("WS gateway issue profile=%s status=%d",
+              profile_name[0] ? profile_name : "default", (int)gateway_status);
+  }
+
+  ProfileTrustDecisionStatus trust_status = PROFILE_TRUST_DECISION_DENIED;
+  while (profile_runtime_take_trust_decision_status(&trust_status, profile_name,
+                                                    sizeof(profile_name))) {
+    LOG_DEBUG("trust decision profile=%s status=%d",
+              profile_name[0] ? profile_name : "default", (int)trust_status);
+  }
+
+  PredictionManagerStatus prediction_status = PREDICTION_MANAGER_OK;
+  while (profile_runtime_take_prediction_manager_status(
+      &prediction_status, profile_name, sizeof(profile_name))) {
+    if (prediction_status < 0) {
+      LOG_ERROR("prediction manager issue profile=%s status=%d",
+                profile_name[0] ? profile_name : "default",
+                (int)prediction_status);
+    } else {
+      LOG_WARN("prediction manager issue profile=%s status=%d",
+               profile_name[0] ? profile_name : "default",
+               (int)prediction_status);
+    }
+  }
+}
+
+static void run_main_loop(const char *config_file, const char *profile,
+                          char *cfg_status, size_t cfg_status_size,
+                          char *topology_err, size_t topology_err_size,
+                          char *global_conn_str, size_t global_conn_str_size,
+                          char *argv[]) {
   time_t last_cleanup = wamble_now_wall();
-
   LOG_INFO("Server main loop starting");
   while (!g_shutdown_requested) {
-    LOG_DEBUG("Main loop iteration start");
     int inline_runtime = profile_runtime_pump_inline();
 
     time_t now = wamble_now_wall();
@@ -604,8 +643,8 @@ int main(int argc, char *argv[]) {
     }
     if (g_reload_requested) {
       process_config_reload_request(
-          config_file, profile, cfg_status, sizeof(cfg_status), topology_err,
-          sizeof(topology_err), global_conn_str, sizeof(global_conn_str));
+          config_file, profile, cfg_status, cfg_status_size, topology_err,
+          topology_err_size, global_conn_str, global_conn_str_size);
       g_reload_requested = 0;
     }
 
@@ -615,45 +654,59 @@ int main(int argc, char *argv[]) {
         g_exec_reload_requested = 0;
     }
 
-    {
-      char profile_name[64];
-      WsGatewayStatus rst = WS_GATEWAY_OK;
-      while (profile_runtime_take_ws_gateway_status(&rst, profile_name,
-                                                    sizeof(profile_name))) {
-        LOG_ERROR("WS gateway issue profile=%s status=%d",
-                  profile_name[0] ? profile_name : "default", (int)rst);
-      }
-    }
-    {
-      char profile_name[64];
-      ProfileTrustDecisionStatus tdst = PROFILE_TRUST_DECISION_DENIED;
-      while (profile_runtime_take_trust_decision_status(&tdst, profile_name,
-                                                        sizeof(profile_name))) {
-        LOG_DEBUG("trust decision profile=%s status=%d",
-                  profile_name[0] ? profile_name : "default", (int)tdst);
-      }
-    }
-    {
-      char profile_name[64];
-      PredictionManagerStatus pmst = PREDICTION_MANAGER_OK;
-      while (profile_runtime_take_prediction_manager_status(
-          &pmst, profile_name, sizeof(profile_name))) {
-        if (pmst < 0) {
-          LOG_ERROR("prediction manager issue profile=%s status=%d",
-                    profile_name[0] ? profile_name : "default", (int)pmst);
-        } else {
-          LOG_WARN("prediction manager issue profile=%s status=%d",
-                   profile_name[0] ? profile_name : "default", (int)pmst);
-        }
-      }
-    }
-
-    LOG_DEBUG("Main loop iteration end");
+    drain_runtime_issue_queues();
   }
   LOG_INFO("Server main loop ending");
+}
+
+static void shutdown_services(void) {
   stop_profile_listeners();
   spectator_manager_shutdown();
   db_cleanup();
   wamble_net_cleanup();
+}
+
+int main(int argc, char *argv[]) {
+  MainOptions opts;
+  int parse_rc = parse_main_options(argc, argv, &opts);
+  if (parse_rc < 0)
+    return 1;
+  if (parse_rc > 0)
+    return 0;
+
+  if (wamble_net_init() != 0) {
+    LOG_FATAL("Network initialization failed");
+    return 1;
+  }
+
+  LOG_INFO("Wamble server starting up");
+  if (opts.profile) {
+    LOG_INFO("Using profile: %s from config file: %s", opts.profile,
+             opts.config_file);
+  } else {
+    LOG_INFO("Using default configuration from config file: %s",
+             opts.config_file);
+  }
+
+  char cfg_status[128];
+  char global_conn_str[512];
+  char topology_err[256];
+  install_signal_handlers();
+  if (initialize_config_and_policy(opts.config_file, opts.profile, cfg_status,
+                                   sizeof(cfg_status), topology_err,
+                                   sizeof(topology_err), global_conn_str,
+                                   sizeof(global_conn_str)) != 0) {
+    wamble_net_cleanup();
+    return 1;
+  }
+  if (initialize_services() != 0) {
+    wamble_net_cleanup();
+    return 1;
+  }
+  restore_hot_reload_state();
+  run_main_loop(opts.config_file, opts.profile, cfg_status, sizeof(cfg_status),
+                topology_err, sizeof(topology_err), global_conn_str,
+                sizeof(global_conn_str), argv);
+  shutdown_services();
   return 0;
 }

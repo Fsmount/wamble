@@ -398,6 +398,9 @@ static void runtime_cfg_free_owned(WambleConfig *cfg) {
   free(cfg->global_db_user);
   free(cfg->global_db_pass);
   free(cfg->global_db_name);
+  free(cfg->prediction_match_policy);
+  free(cfg->spectator_summary_mode);
+  free(cfg->state_dir);
   free(cfg->websocket_path);
   cfg->db_host = NULL;
   cfg->db_user = NULL;
@@ -407,6 +410,9 @@ static void runtime_cfg_free_owned(WambleConfig *cfg) {
   cfg->global_db_user = NULL;
   cfg->global_db_pass = NULL;
   cfg->global_db_name = NULL;
+  cfg->prediction_match_policy = NULL;
+  cfg->spectator_summary_mode = NULL;
+  cfg->state_dir = NULL;
   cfg->websocket_path = NULL;
 }
 
@@ -423,10 +429,18 @@ static int runtime_cfg_dup_from(WambleConfig *dst, const WambleConfig *src) {
   dst->global_db_user = wamble_strdup_local(src->global_db_user);
   dst->global_db_pass = wamble_strdup_local(src->global_db_pass);
   dst->global_db_name = wamble_strdup_local(src->global_db_name);
+  dst->prediction_match_policy =
+      wamble_strdup_local(src->prediction_match_policy);
+  dst->spectator_summary_mode =
+      wamble_strdup_local(src->spectator_summary_mode);
+  dst->state_dir = wamble_strdup_local(src->state_dir);
   dst->websocket_path = wamble_strdup_local(src->websocket_path);
   if (!dst->db_host || !dst->db_user || !dst->db_pass || !dst->db_name ||
       !dst->global_db_host || !dst->global_db_user || !dst->global_db_pass ||
-      !dst->global_db_name || !dst->websocket_path) {
+      !dst->global_db_name ||
+      (src->prediction_match_policy && !dst->prediction_match_policy) ||
+      (src->spectator_summary_mode && !dst->spectator_summary_mode) ||
+      (src->state_dir && !dst->state_dir) || !dst->websocket_path) {
     runtime_cfg_free_owned(dst);
     return -1;
   }
@@ -593,7 +607,7 @@ static int copy_named_config_for_runtime(RunningProfile *rp, const char *name,
     return -1;
   memset(rp, 0, sizeof(*rp));
   if (name) {
-    rp->name = strdup(name);
+    rp->name = wamble_strdup(name);
     if (!rp->name)
       return -1;
   }
@@ -641,7 +655,7 @@ static int snapshot_restart_specs_from_running(const RunningProfile *running,
     return -1;
   for (int i = 0; i < count; i++) {
     if (running[i].name) {
-      specs[i].name = strdup(running[i].name);
+      specs[i].name = wamble_strdup(running[i].name);
       if (!specs[i].name) {
         free_restart_specs(specs, count);
         return -1;
@@ -701,6 +715,10 @@ static wamble_socket_t create_prebound_socket(const WambleConfig *cfg,
   return sockfd;
 }
 
+static ProfileStartStatus start_running_slot(RunningProfile *rp, Prebound *pb,
+                                             int i, int count,
+                                             int inline_single_ok);
+
 static ProfileStartStatus start_running_from_prebound(Prebound *pb, int count,
                                                       RunningProfile **out_run,
                                                       int *out_count,
@@ -730,31 +748,14 @@ static ProfileStartStatus start_running_from_prebound(Prebound *pb, int count,
       return PROFILE_START_THREAD_ERROR;
     }
 
-    rp->sockfd = pb[i].sockfd;
-    pb[i].sockfd = WAMBLE_INVALID_SOCKET;
-    rp->should_stop = 0;
-    rp->needs_update = 0;
-    rp->state_path = NULL;
-    rp->ready_for_exec = 0;
-
-    if (rp->sockfd == WAMBLE_INVALID_SOCKET) {
+    ProfileStartStatus slot_st =
+        start_running_slot(rp, pb, i, count, inline_single_ok);
+    if (slot_st != PROFILE_START_OK) {
       close_prebound_entries(pb, i + 1, count);
+      if (slot_st == PROFILE_START_THREAD_ERROR)
+        mark_profiles_stop(running, i);
       join_and_cleanup_profiles(running, count, 1);
-      return PROFILE_START_NO_SOCKET;
-    }
-    if (consume_fail_next_restart_start()) {
-      close_prebound_entries(pb, i + 1, count);
-      join_and_cleanup_profiles(running, count, 1);
-      return PROFILE_START_THREAD_ERROR;
-    }
-    rp->run_inline = (inline_single_ok && count == 1) ? 1 : 0;
-    rp->thread = 0;
-    if (!rp->run_inline &&
-        wamble_thread_create(&rp->thread, profile_thread_main, rp) != 0) {
-      close_prebound_entries(pb, i + 1, count);
-      mark_profiles_stop(running, i);
-      join_and_cleanup_profiles(running, count, 1);
-      return PROFILE_START_THREAD_ERROR;
+      return slot_st;
     }
   }
 
@@ -762,6 +763,33 @@ static ProfileStartStatus start_running_from_prebound(Prebound *pb, int count,
     *out_run = running;
   if (out_count)
     *out_count = count;
+  return PROFILE_START_OK;
+}
+
+static ProfileStartStatus start_running_slot(RunningProfile *rp, Prebound *pb,
+                                             int i, int count,
+                                             int inline_single_ok) {
+  if (!rp || !pb || i < 0 || count <= 0)
+    return PROFILE_START_THREAD_ERROR;
+
+  rp->sockfd = pb[i].sockfd;
+  pb[i].sockfd = WAMBLE_INVALID_SOCKET;
+  rp->should_stop = 0;
+  rp->needs_update = 0;
+  rp->state_path = NULL;
+  rp->ready_for_exec = 0;
+
+  if (rp->sockfd == WAMBLE_INVALID_SOCKET)
+    return PROFILE_START_NO_SOCKET;
+  if (consume_fail_next_restart_start())
+    return PROFILE_START_THREAD_ERROR;
+
+  rp->run_inline = (inline_single_ok && count == 1) ? 1 : 0;
+  rp->thread = 0;
+  if (!rp->run_inline &&
+      wamble_thread_create(&rp->thread, profile_thread_main, rp) != 0) {
+    return PROFILE_START_THREAD_ERROR;
+  }
   return PROFILE_START_OK;
 }
 
@@ -793,31 +821,14 @@ start_running_from_restart_specs(Prebound *pb, const RestartSpec *specs,
       return PROFILE_START_THREAD_ERROR;
     }
 
-    rp->sockfd = pb[i].sockfd;
-    pb[i].sockfd = WAMBLE_INVALID_SOCKET;
-    rp->should_stop = 0;
-    rp->needs_update = 0;
-    rp->state_path = NULL;
-    rp->ready_for_exec = 0;
-
-    if (rp->sockfd == WAMBLE_INVALID_SOCKET) {
+    ProfileStartStatus slot_st =
+        start_running_slot(rp, pb, i, count, inline_single_ok);
+    if (slot_st != PROFILE_START_OK) {
       close_prebound_entries(pb, i + 1, count);
+      if (slot_st == PROFILE_START_THREAD_ERROR)
+        mark_profiles_stop(running, i);
       join_and_cleanup_profiles(running, count, 1);
-      return PROFILE_START_NO_SOCKET;
-    }
-    if (consume_fail_next_restart_start()) {
-      close_prebound_entries(pb, i + 1, count);
-      join_and_cleanup_profiles(running, count, 1);
-      return PROFILE_START_THREAD_ERROR;
-    }
-    rp->run_inline = (inline_single_ok && count == 1) ? 1 : 0;
-    rp->thread = 0;
-    if (!rp->run_inline &&
-        wamble_thread_create(&rp->thread, profile_thread_main, rp) != 0) {
-      close_prebound_entries(pb, i + 1, count);
-      mark_profiles_stop(running, i);
-      join_and_cleanup_profiles(running, count, 1);
-      return PROFILE_START_THREAD_ERROR;
+      return slot_st;
     }
   }
 
@@ -1124,7 +1135,7 @@ static void profile_runtime_prepare_exec_snapshot(RunningProfile *rp) {
     wamble_mutex_lock(&g_mutex);
     if (rp->state_path)
       free(rp->state_path);
-    rp->state_path = strdup(tmpl);
+    rp->state_path = wamble_strdup(tmpl);
     int flags = fcntl(rp->sockfd, F_GETFD);
     if (flags >= 0)
       (void)fcntl(rp->sockfd, F_SETFD, flags & ~FD_CLOEXEC);
@@ -1153,7 +1164,7 @@ static void profile_runtime_prepare_exec_snapshot(RunningProfile *rp) {
     wamble_mutex_lock(&g_mutex);
     if (rp->state_path)
       free(rp->state_path);
-    rp->state_path = strdup(tmpl);
+    rp->state_path = wamble_strdup(tmpl);
     HANDLE handle = (HANDLE)rp->sockfd;
     SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
     rp->ready_for_exec = 1;
@@ -1953,28 +1964,6 @@ ProfileExportStatus profile_export_inherited_sockets(char *out_buf,
   (void)out_buf_size;
   (void)out_count;
   return PROFILE_EXPORT_NOT_READY;
-#endif
-}
-
-void profile_mark_sockets_inheritable(void) {
-#if defined(WAMBLE_PLATFORM_POSIX)
-  ensure_mutex_init();
-  for (int i = 0; i < g_running_count; i++) {
-    if (g_running[i].sockfd != WAMBLE_INVALID_SOCKET) {
-      int flags = fcntl(g_running[i].sockfd, F_GETFD);
-      if (flags >= 0) {
-        (void)fcntl(g_running[i].sockfd, F_SETFD, flags & ~FD_CLOEXEC);
-      }
-    }
-  }
-#elif defined(WAMBLE_PLATFORM_WINDOWS)
-  ensure_mutex_init();
-  for (int i = 0; i < g_running_count; i++) {
-    if (g_running[i].sockfd != WAMBLE_INVALID_SOCKET) {
-      HANDLE h = (HANDLE)g_running[i].sockfd;
-      SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-    }
-  }
 #endif
 }
 

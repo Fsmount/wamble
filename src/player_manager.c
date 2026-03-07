@@ -4,6 +4,8 @@
 #include <sys/random.h>
 #endif
 
+#define PUBLIC_KEY_LENGTH 32
+
 static WAMBLE_THREAD_LOCAL WamblePlayer *player_pool;
 static WAMBLE_THREAD_LOCAL int num_players = 0;
 static WAMBLE_THREAD_LOCAL wamble_mutex_t player_mutex;
@@ -75,7 +77,7 @@ void rng_init(void) {
   wamble_mutex_unlock(&rng_mutex);
 }
 
-uint64_t rng_u64(void) {
+static uint64_t rng_u64(void) {
   wamble_mutex_lock(&rng_mutex);
   uint64_t hi = (uint64_t)pcg32_random_r();
   uint64_t lo = (uint64_t)pcg32_random_r();
@@ -89,7 +91,7 @@ double rng_double(void) {
   return (double)r * (1.0 / 9007199254740992.0);
 }
 
-void rng_bytes(uint8_t *out, size_t len) {
+static void rng_bytes(uint8_t *out, size_t len) {
   size_t i = 0;
   while (i < len) {
     uint64_t r = rng_u64();
@@ -98,15 +100,6 @@ void rng_bytes(uint8_t *out, size_t len) {
       r >>= 8;
     }
   }
-}
-
-void rng_seed(uint64_t hi, uint64_t lo) {
-  wamble_mutex_lock(&rng_mutex);
-  pcg_state = (hi << 32) ^ lo ^ 0x853c49e6748fea9bULL;
-  pcg_inc = ((lo << 1) | 1ULL) ^ 0xda3e39cb94b95bdbULL;
-  (void)pcg32_random_r();
-  rng_initialized = 1;
-  wamble_mutex_unlock(&rng_mutex);
 }
 
 #define PLAYER_MAP_SIZE (get_config()->max_players * 2)
@@ -155,7 +148,9 @@ apply_persistent_player_stats(WamblePlayer *player,
 
 static uint64_t token_hash(const uint8_t *token) {
   uint64_t h = 1469598103934665603ULL;
-  for (int i = 0; i < 16; i++) {
+  if (!token)
+    return h;
+  for (int i = 0; i < TOKEN_LENGTH; i++) {
     h ^= token[i];
     h *= 1099511628211ULL;
   }
@@ -165,6 +160,16 @@ static uint64_t token_hash(const uint8_t *token) {
   h *= 0xc4ceb9fe1a85ec53ULL;
   h ^= h >> 33;
   return h;
+}
+
+static int player_slot_is_empty(const WamblePlayer *player) {
+  if (!player)
+    return 1;
+  for (int i = 0; i < TOKEN_LENGTH; i++) {
+    if (player->token[i] != 0)
+      return 0;
+  }
+  return 1;
 }
 
 static int player_map_capacity(void) {
@@ -240,14 +245,7 @@ static void player_map_delete(const uint8_t *token) {
 
 static WamblePlayer *find_empty_player_slot(void) {
   for (int i = 0; i < get_config()->max_players; i++) {
-    int is_empty = 1;
-    for (int j = 0; j < TOKEN_LENGTH; j++) {
-      if (player_pool[i].token[j] != 0) {
-        is_empty = 0;
-        break;
-      }
-    }
-    if (is_empty) {
+    if (player_slot_is_empty(&player_pool[i])) {
       if (i >= num_players) {
         num_players = i + 1;
       }
@@ -309,7 +307,7 @@ WamblePlayer *get_player_by_token(const uint8_t *token) {
     WamblePlayer *player = find_empty_player_slot();
     if (player) {
       memcpy(player->token, token, TOKEN_LENGTH);
-      memset(player->public_key, 0, 32);
+      memset(player->public_key, 0, PUBLIC_KEY_LENGTH);
       player->has_persistent_identity = true;
       player->last_seen_time = wamble_now_wall();
       hydrate_player_from_session(player, session_id);
@@ -365,7 +363,7 @@ WamblePlayer *create_new_player(void) {
     }
 
     memcpy(player->token, candidate_token, TOKEN_LENGTH);
-    memset(player->public_key, 0, 32);
+    memset(player->public_key, 0, PUBLIC_KEY_LENGTH);
     player->has_persistent_identity = 0;
     player->last_seen_time = wamble_now_wall();
     player->score = 0.0;
@@ -397,7 +395,7 @@ WamblePlayer *attach_persistent_identity(const uint8_t *token,
     return NULL;
   }
   WamblePlayer *player = &player_pool[idx];
-  memcpy(player->public_key, public_key, 32);
+  memcpy(player->public_key, public_key, PUBLIC_KEY_LENGTH);
   player->has_persistent_identity = true;
   if (stats_status == DB_OK)
     apply_persistent_player_stats(player, &stats);
@@ -416,12 +414,10 @@ int detach_persistent_identity(const uint8_t *token) {
     return -1;
   }
   WamblePlayer *player = &player_pool[idx];
+  memset(player->public_key, 0, PUBLIC_KEY_LENGTH);
   if (player->has_persistent_identity) {
-    memset(player->public_key, 0, 32);
     player->has_persistent_identity = false;
     wamble_emit_unlink_session_identity(player->token);
-  } else {
-    memset(player->public_key, 0, 32);
   }
   wamble_mutex_unlock(&player_mutex);
   return 0;
@@ -435,25 +431,17 @@ void player_manager_tick(void) {
   wamble_mutex_lock(&player_mutex);
 
   for (int i = 0; i < num_players; i++) {
-    int is_empty = 1;
-    for (int j = 0; j < TOKEN_LENGTH; j++) {
-      if (player_pool[i].token[j] != 0) {
-        is_empty = 0;
-        break;
-      }
-    }
-
-    if (!is_empty && (now - player_pool[i].last_seen_time) >
-                         get_config()->token_expiration) {
+    if (!player_slot_is_empty(&player_pool[i]) &&
+        (now - player_pool[i].last_seen_time) >
+            get_config()->token_expiration) {
       uint8_t old_token[TOKEN_LENGTH];
       memcpy(old_token, player_pool[i].token, TOKEN_LENGTH);
       player_map_delete(old_token);
-      memset(&player_pool[i], 0, sizeof(WamblePlayer));
-      if (i == num_players - 1) {
-        num_players--;
-      }
+      memset(&player_pool[i], 0, sizeof(player_pool[i]));
     }
   }
+  while (num_players > 0 && player_slot_is_empty(&player_pool[num_players - 1]))
+    num_players--;
 
   wamble_mutex_unlock(&player_mutex);
 }
@@ -467,8 +455,9 @@ void discard_player_by_token(const uint8_t *token) {
     uint8_t old_token[TOKEN_LENGTH];
     memcpy(old_token, player_pool[idx].token, TOKEN_LENGTH);
     player_map_delete(old_token);
-    memset(&player_pool[idx], 0, sizeof(WamblePlayer));
-    if (idx == num_players - 1) {
+    memset(&player_pool[idx], 0, sizeof(player_pool[idx]));
+    while (num_players > 0 &&
+           player_slot_is_empty(&player_pool[num_players - 1])) {
       num_players--;
     }
   }

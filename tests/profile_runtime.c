@@ -102,8 +102,6 @@ WAMBLE_TEST(profile_start_export_and_state_files) {
   T_ASSERT(strstr(socket_map, "alpha=") != NULL);
   T_ASSERT(strstr(socket_map, "beta=") != NULL);
 
-  profile_mark_sockets_inheritable();
-
   char state_map[512];
   int state_count = 0;
   T_ASSERT_EQ_INT(profile_prepare_state_save_and_inherit(
@@ -256,8 +254,6 @@ WAMBLE_TEST(profile_hot_reload_state_roundtrip) {
   T_ASSERT(strstr(socket_map, "alpha=") != NULL);
   T_ASSERT(strstr(socket_map, "beta=") != NULL);
 
-  profile_mark_sockets_inheritable();
-
   char state_map[512];
   int state_count = 0;
   T_ASSERT_EQ_INT(profile_prepare_state_save_and_inherit(
@@ -323,8 +319,6 @@ WAMBLE_TEST(default_runtime_hot_reload_exports_socket_and_state) {
                   PROFILE_EXPORT_OK);
   T_ASSERT_EQ_INT(exported, 1);
   T_ASSERT(strstr(socket_map, "__wamble_default_runtime__=") != NULL);
-
-  profile_mark_sockets_inheritable();
 
   char state_map[512];
   int state_count = 0;

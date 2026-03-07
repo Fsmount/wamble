@@ -54,12 +54,9 @@
 #define WAMBLE_WEAK __attribute__((weak))
 #endif
 
-int gmtime_w(struct tm *out_tm, const time_t *timer);
-
 #ifdef WAMBLE_PLATFORM_WINDOWS
 #define wamble_getpid() GetCurrentProcessId()
 #else
-#include <unistd.h>
 #define wamble_getpid() getpid()
 #endif
 
@@ -93,6 +90,16 @@ static inline size_t wamble_strnlen(const char *s, size_t max) {
 }
 #define strnlen wamble_strnlen
 #endif
+
+static inline char *wamble_strdup(const char *s) {
+  const char *src = s ? s : "";
+  size_t n = strlen(src);
+  char *out = (char *)malloc(n + 1);
+  if (!out)
+    return NULL;
+  memcpy(out, src, n + 1);
+  return out;
+}
 
 #if __STDC_VERSION__ >= 201112L
 #define WAMBLE_THREAD_LOCAL _Thread_local
@@ -799,15 +806,101 @@ int state_load_from_file(const char *path);
 ProfileExportStatus profile_export_inherited_sockets(char *out_buf,
                                                      size_t out_buf_size,
                                                      int *out_count);
-void profile_mark_sockets_inheritable(void);
 ProfileExportStatus profile_prepare_state_save_and_inherit(
     char *out_state_map, size_t out_state_map_size, int *out_count);
 
-uint64_t wamble_now_mono_millis(void);
-time_t wamble_now_wall(void);
+static inline uint64_t timespec_to_millis(const struct timespec *ts) {
+  if (!ts)
+    return 0;
+  return ((uint64_t)ts->tv_sec * 1000ULL) +
+         ((uint64_t)ts->tv_nsec / 1000000ULL);
+}
 
-uint64_t wamble_now_nanos(void);
-void wamble_sleep_ms(int ms);
+static inline uint64_t timespec_to_nanos(const struct timespec *ts) {
+  if (!ts)
+    return 0;
+  return ((uint64_t)ts->tv_sec * 1000000000ULL) + (uint64_t)ts->tv_nsec;
+}
+
+static inline uint64_t wamble_now_mono_millis(void) {
+#if defined(WAMBLE_PLATFORM_WINDOWS)
+  LARGE_INTEGER freq, counter;
+  if (QueryPerformanceFrequency(&freq) && QueryPerformanceCounter(&counter)) {
+    return (uint64_t)((counter.QuadPart * 1000ULL) / (uint64_t)freq.QuadPart);
+  }
+  return (uint64_t)GetTickCount64();
+#else
+  struct timespec ts;
+#ifdef CLOCK_MONOTONIC
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+    return timespec_to_millis(&ts);
+#endif
+  if (clock_gettime(CLOCK_REALTIME, &ts) == 0)
+    return timespec_to_millis(&ts);
+  return (uint64_t)time(NULL) * 1000ULL;
+#endif
+}
+
+static inline time_t wamble_now_wall(void) { return time(NULL); }
+
+static inline uint64_t wamble_now_nanos(void) {
+#if defined(WAMBLE_PLATFORM_WINDOWS)
+  LARGE_INTEGER freq, counter;
+  if (QueryPerformanceFrequency(&freq) && QueryPerformanceCounter(&counter)) {
+    uint64_t f = (uint64_t)freq.QuadPart;
+    uint64_t c = (uint64_t)counter.QuadPart;
+    uint64_t sec = c / f;
+    uint64_t rem = c % f;
+    uint64_t nanos = sec * 1000000000ULL + (rem * 1000000000ULL) / f;
+    return nanos;
+  }
+  return (uint64_t)GetTickCount64() * 1000000ULL;
+#elif defined(WAMBLE_PLATFORM_POSIX)
+  struct timespec ts;
+#ifdef CLOCK_MONOTONIC
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+    return timespec_to_nanos(&ts);
+#endif
+  if (clock_gettime(CLOCK_REALTIME, &ts) == 0)
+    return timespec_to_nanos(&ts);
+  return (uint64_t)time(NULL) * 1000000000ULL;
+#else
+  return (uint64_t)time(NULL) * 1000000000ULL;
+#endif
+}
+
+static inline void wamble_sleep_ms(int ms) {
+  if (ms <= 0)
+    return;
+#if defined(WAMBLE_PLATFORM_WINDOWS)
+  Sleep((DWORD)ms);
+#else
+  struct timeval tv;
+  tv.tv_sec = ms / 1000;
+  tv.tv_usec = (ms % 1000) * 1000;
+  select(0, NULL, NULL, NULL, &tv);
+#endif
+}
+
+static inline int gmtime_w(struct tm *out_tm, const time_t *timer) {
+#if defined(WAMBLE_PLATFORM_WINDOWS)
+  return (gmtime_s(out_tm, timer) == 0) ? 1 : 0;
+#elif defined(WAMBLE_PLATFORM_POSIX)
+#if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
+  return (gmtime_r(timer, out_tm) != NULL) ? 1 : 0;
+#else
+  struct tm *tmp = gmtime(timer);
+  if (!tmp)
+    return 0;
+  *out_tm = *tmp;
+  return 1;
+#endif
+#else
+  (void)out_tm;
+  (void)timer;
+  return 0;
+#endif
+}
 
 static inline void wamble_log(int level, const char *file, int line,
                               const char *func, const char *level_str,
@@ -1131,14 +1224,55 @@ typedef struct WambleBoard {
   time_t reservation_time;
 } WambleBoard;
 
-typedef struct WambleClientSession {
-  struct sockaddr_in addr;
-  uint8_t token[TOKEN_LENGTH];
-  uint32_t last_seq_num;
-  time_t last_seen;
-  uint32_t next_seq_num;
-  char treatment_group_key[128];
-} WambleClientSession;
+static inline double
+wamble_treatment_action_number(const WambleTreatmentAction *action, int *ok) {
+  if (ok)
+    *ok = 0;
+  if (!action)
+    return 0.0;
+  if (action->value_type == WAMBLE_TREATMENT_VALUE_INT) {
+    if (ok)
+      *ok = 1;
+    return (double)action->int_value;
+  }
+  if (action->value_type == WAMBLE_TREATMENT_VALUE_DOUBLE) {
+    if (ok)
+      *ok = 1;
+    return action->double_value;
+  }
+  return 0.0;
+}
+
+static inline int wamble_collect_board_treatment_facts(const WambleBoard *board,
+                                                       WambleFact *facts,
+                                                       int max_facts) {
+  int fact_count = 0;
+  if (!board || !facts || max_facts <= 0)
+    return 0;
+  if (fact_count < max_facts) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "board.id");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+    facts[fact_count].int_value = (int64_t)board->id;
+    fact_count++;
+  }
+  if (fact_count < max_facts) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "board.fen");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+    snprintf(facts[fact_count].string_value,
+             sizeof(facts[fact_count].string_value), "%s", board->fen);
+    fact_count++;
+  }
+  if (fact_count < max_facts) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "board.move_count");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+    facts[fact_count].int_value = board->board.fullmove_number;
+    fact_count++;
+  }
+  return fact_count;
+}
 
 int validate_and_apply_move_status(WambleBoard *wamble_board,
                                    WamblePlayer *player, const char *uci_move,
@@ -1148,7 +1282,6 @@ int get_legal_moves_for_square(const Board *board, int square, Move *moves,
                                int max_moves);
 
 int parse_fen_to_bitboard(const char *fen, Board *board);
-void bitboard_to_fen(const Board *board, char *fen);
 
 static inline int square_to_index(int file, int rank) {
   return rank * 8 + file;
@@ -1210,10 +1343,8 @@ void board_game_completed(uint64_t board_id, GameResult result);
 bool board_is_reserved_for_player(uint64_t board_id,
                                   const uint8_t *player_token);
 void board_release_reservation(uint64_t board_id);
-void board_archive(uint64_t board_id);
 void update_player_ratings(WambleBoard *board);
 WambleBoard *get_board_by_id(uint64_t board_id);
-int get_total_board_count_public(void);
 int board_manager_export(WambleBoard *out, int max, int *out_count,
                          uint64_t *out_next_id);
 int board_manager_import(const WambleBoard *in, int count, uint64_t next_id);
@@ -1239,10 +1370,7 @@ int network_get_session_treatment_group(const uint8_t *token, char *out_group,
 void cleanup_expired_sessions(void);
 
 void rng_init(void);
-uint64_t rng_u64(void);
 double rng_double(void);
-void rng_bytes(uint8_t *out, size_t len);
-void rng_seed(uint64_t hi, uint64_t lo);
 
 PredictionManagerStatus prediction_manager_init(void);
 PredictionStatus prediction_submit(WambleBoard *board,
@@ -1262,9 +1390,7 @@ PredictionStatus prediction_collect_tree(uint64_t board_id,
                                          int trust_tier, int max_depth,
                                          WamblePredictionView *out, int max_out,
                                          int *out_count);
-void prediction_clear_board(uint64_t board_id);
 void prediction_expire_board(uint64_t board_id);
-int prediction_pending_count(uint64_t board_id);
 
 typedef enum {
   PERSISTENCE_STATUS_OK = 0,
@@ -1297,10 +1423,6 @@ void wamble_emit_unlink_session_identity(const uint8_t *token);
 void wamble_emit_record_payout(uint64_t board_id, const uint8_t *token,
                                double points);
 void wamble_emit_update_player_rating(const uint8_t *token, double rating);
-void wamble_emit_record_prediction(uint64_t board_id, const uint8_t *token,
-                                   uint64_t parent_id,
-                                   const char *predicted_move_uci,
-                                   int move_number);
 void wamble_emit_resolve_prediction(uint64_t board_id, const uint8_t *token,
                                     int move_number, const char *status,
                                     double points_awarded);
@@ -1312,11 +1434,19 @@ void wamble_emit_record_move(uint64_t board_id, const uint8_t *token,
 DbBoardIdList wamble_query_list_boards_by_status(const char *status);
 DbBoardResult wamble_query_get_board(uint64_t board_id);
 DbMovesResult wamble_query_get_moves_for_board(uint64_t board_id);
+DbPredictionsResult wamble_query_get_pending_predictions(void);
 DbStatus wamble_query_get_longest_game_moves(int *out_max_moves);
 DbStatus wamble_query_get_active_session_count(int *out_count);
 DbStatus wamble_query_get_max_board_id(uint64_t *out_max_id);
 DbStatus wamble_query_get_session_by_token(const uint8_t *token,
                                            uint64_t *out_session);
+DbStatus wamble_query_create_session(const uint8_t *token, uint64_t player_id,
+                                     uint64_t *out_session);
+DbStatus wamble_query_create_prediction(uint64_t board_id, uint64_t session_id,
+                                        uint64_t parent_prediction_id,
+                                        const char *predicted_move_uci,
+                                        int move_number, int correct_streak,
+                                        uint64_t *out_prediction_id);
 DbStatus wamble_query_get_persistent_session_by_token(const uint8_t *token,
                                                       uint64_t *out_session);
 DbStatus wamble_query_get_player_total_score(uint64_t session_id,
@@ -1357,10 +1487,6 @@ int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
                           int max_retries);
 int send_unreliable_packet(wamble_socket_t sockfd, const struct WambleMsg *msg,
                            const struct sockaddr_in *cliaddr);
-int receive_message_timeout(wamble_socket_t sockfd, struct WambleMsg *msg,
-                            struct sockaddr_in *cliaddr, int timeout_ms);
-int receive_and_ack(wamble_socket_t sockfd, struct WambleMsg *msg,
-                    struct sockaddr_in *cliaddr, int timeout_ms);
 int wamble_socket_bound_port(wamble_socket_t sock);
 ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
                             const struct sockaddr_in *cliaddr, int trust_tier,
@@ -1412,12 +1538,25 @@ int spectator_collect_updates(struct SpectatorUpdate *out, int max);
 int spectator_collect_notifications(struct SpectatorUpdate *out, int max);
 
 static inline int tokens_equal(const uint8_t *token1, const uint8_t *token2) {
+  if (!token1 || !token2)
+    return token1 == token2;
   for (int i = 0; i < TOKEN_LENGTH; i++) {
     if (token1[i] != token2[i]) {
       return 0;
     }
   }
   return 1;
+}
+
+static inline uint32_t wamble_token_hash32(const uint8_t *token) {
+  uint32_t h = 2166136261u;
+  if (!token)
+    return h;
+  for (int i = 0; i < TOKEN_LENGTH; i++) {
+    h ^= token[i];
+    h *= 16777619u;
+  }
+  return h;
 }
 
 #endif

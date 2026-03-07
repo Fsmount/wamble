@@ -40,7 +40,7 @@ const WambleQueryService *wamble_get_query_service(void) {
 void wamble_set_intent_buffer(struct WambleIntentBuffer *buf) {
   g_intents_tls = buf;
 }
-struct WambleIntentBuffer *wamble_get_intent_buffer(void) {
+static struct WambleIntentBuffer *wamble_get_intent_buffer(void) {
   return g_intents_tls;
 }
 
@@ -105,25 +105,26 @@ static void intents_push(struct WamblePersistenceIntent in) {
   }
 }
 
+static void intent_copy_str(char *dst, size_t dst_cap, const char *src) {
+  if (!dst || dst_cap == 0)
+    return;
+  if (!src) {
+    dst[0] = '\0';
+    return;
+  }
+  size_t n = strnlen(src, dst_cap - 1);
+  memcpy(dst, src, n);
+  dst[n] = '\0';
+}
+
 void wamble_emit_update_board(uint64_t board_id, const char *fen,
                               const char *status) {
   struct WamblePersistenceIntent it = {0};
   it.type = WAMBLE_INTENT_UPDATE_BOARD;
   it.as.update_board.board_id = board_id;
-  if (fen) {
-    size_t n = strnlen(fen, FEN_MAX_LENGTH - 1);
-    memcpy(it.as.update_board.fen, fen, n);
-    it.as.update_board.fen[n] = '\0';
-  } else {
-    it.as.update_board.fen[0] = '\0';
-  }
-  if (status) {
-    size_t m = strnlen(status, STATUS_MAX_LENGTH - 1);
-    memcpy(it.as.update_board.status, status, m);
-    it.as.update_board.status[m] = '\0';
-  } else {
-    it.as.update_board.status[0] = '\0';
-  }
+  intent_copy_str(it.as.update_board.fen, sizeof(it.as.update_board.fen), fen);
+  intent_copy_str(it.as.update_board.status, sizeof(it.as.update_board.status),
+                  status);
   intents_push(it);
 }
 
@@ -164,12 +165,9 @@ void wamble_emit_record_game_result(uint64_t board_id, char winning_side,
   it.as.record_game_result.winning_side = winning_side;
   it.as.record_game_result.move_count = move_count;
   it.as.record_game_result.duration_seconds = duration_seconds;
-  if (termination_reason) {
-    size_t n = strnlen(termination_reason,
-                       sizeof(it.as.record_game_result.termination_reason) - 1);
-    memcpy(it.as.record_game_result.termination_reason, termination_reason, n);
-    it.as.record_game_result.termination_reason[n] = '\0';
-  }
+  intent_copy_str(it.as.record_game_result.termination_reason,
+                  sizeof(it.as.record_game_result.termination_reason),
+                  termination_reason);
   intents_push(it);
 }
 
@@ -182,9 +180,8 @@ void wamble_emit_record_move(uint64_t board_id, const uint8_t *token,
   it.as.record_move.board_id = board_id;
   memcpy(it.as.record_move.token, token, TOKEN_LENGTH);
   it.as.record_move.move_number = move_number;
-  size_t len = strnlen(move_uci, MAX_UCI_LENGTH - 1);
-  memcpy(it.as.record_move.move_uci, move_uci, len);
-  it.as.record_move.move_uci[len] = '\0';
+  intent_copy_str(it.as.record_move.move_uci,
+                  sizeof(it.as.record_move.move_uci), move_uci);
   intents_push(it);
 }
 
@@ -215,14 +212,10 @@ void wamble_emit_update_board_move_meta(uint64_t board_id,
   struct WamblePersistenceIntent it = {0};
   it.type = WAMBLE_INTENT_UPDATE_BOARD_MOVE_META;
   it.as.update_board_move_meta.board_id = board_id;
-  if (group_key) {
-    size_t n = strnlen(
-        group_key,
-        sizeof(it.as.update_board_move_meta.last_mover_treatment_group) - 1);
-    memcpy(it.as.update_board_move_meta.last_mover_treatment_group, group_key,
-           n);
-    it.as.update_board_move_meta.last_mover_treatment_group[n] = '\0';
-  }
+  intent_copy_str(
+      it.as.update_board_move_meta.last_mover_treatment_group,
+      sizeof(it.as.update_board_move_meta.last_mover_treatment_group),
+      group_key);
   intents_push(it);
 }
 
@@ -279,24 +272,6 @@ void wamble_emit_update_player_rating(const uint8_t *token, double rating) {
   it.type = WAMBLE_INTENT_UPDATE_PLAYER_RATING;
   memcpy(it.as.update_player_rating.token, token, TOKEN_LENGTH);
   it.as.update_player_rating.rating = rating;
-  intents_push(it);
-}
-
-void wamble_emit_record_prediction(uint64_t board_id, const uint8_t *token,
-                                   uint64_t parent_id,
-                                   const char *predicted_move_uci,
-                                   int move_number) {
-  if (board_id == 0 || !token || !predicted_move_uci || move_number <= 0)
-    return;
-  struct WamblePersistenceIntent it = {0};
-  it.type = WAMBLE_INTENT_RECORD_PREDICTION;
-  it.as.record_prediction.board_id = board_id;
-  it.as.record_prediction.parent_id = parent_id;
-  memcpy(it.as.record_prediction.token, token, TOKEN_LENGTH);
-  it.as.record_prediction.move_number = move_number;
-  size_t len = strnlen(predicted_move_uci, MAX_UCI_LENGTH - 1);
-  memcpy(it.as.record_prediction.predicted_move_uci, predicted_move_uci, len);
-  it.as.record_prediction.predicted_move_uci[len] = '\0';
   intents_push(it);
 }
 

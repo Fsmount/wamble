@@ -33,7 +33,18 @@ typedef struct {
 
 static void *recv_one_thread(void *arg) {
   RecvOneCtx *c = arg;
-  int rc = receive_message_timeout(c->sock, &c->msg, &c->from, 600);
+  fd_set rfds;
+  struct timeval tv;
+  FD_ZERO(&rfds);
+  FD_SET(c->sock, &rfds);
+  tv.tv_sec = 0;
+  tv.tv_usec = 600 * 1000;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+  int ready = select(0, &rfds, NULL, NULL, &tv);
+#else
+  int ready = select(c->sock + 1, &rfds, NULL, NULL, &tv);
+#endif
+  int rc = (ready > 0) ? receive_message(c->sock, &c->msg, &c->from) : 0;
   c->received = (rc > 0) ? 1 : 0;
   return NULL;
 }
@@ -175,7 +186,18 @@ WAMBLE_TEST(submit_prediction_roundtrip) {
 
   struct WambleMsg in;
   struct sockaddr_in from;
-  int got = receive_message_timeout(srv, &in, &from, 400);
+  fd_set rfds;
+  struct timeval tv;
+  FD_ZERO(&rfds);
+  FD_SET(srv, &rfds);
+  tv.tv_sec = 0;
+  tv.tv_usec = 400 * 1000;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+  int ready = select(0, &rfds, NULL, NULL, &tv);
+#else
+  int ready = select(srv + 1, &rfds, NULL, NULL, &tv);
+#endif
+  int got = (ready > 0) ? receive_message(srv, &in, &from) : 0;
   T_ASSERT(got > 0);
   T_ASSERT_EQ_INT(in.ctrl, WAMBLE_CTRL_SUBMIT_PREDICTION);
   T_ASSERT_EQ_INT((int)in.board_id, 77);
@@ -256,15 +278,33 @@ WAMBLE_TEST(prediction_data_roundtrip) {
   return 0;
 }
 
-static void *ack_peer_thread(void *arg) {
+static void *handle_msg_peer_thread(void *arg) {
+  wamble_socket_t sock = *(wamble_socket_t *)arg;
   struct WambleMsg in;
   struct sockaddr_in src;
-  (void)receive_and_ack(*(wamble_socket_t *)arg, &in, &src, 600);
+  int rc = receive_message(sock, &in, &src);
+  if (rc > 0)
+    handle_message(sock, &in, &src, 0, NULL);
   return NULL;
 }
 
 WAMBLE_TEST(reliable_ack_success) {
-  config_load(NULL, NULL, NULL, 0);
+  const char *cfg_path = "build/test_network_reliable_ack.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19420) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, "
+          "'test_trust', 'test'), "
+          "(0, 'protocol.ctrl', 'board_update', '*', 'allow', 0, "
+          "'test_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+  player_manager_init();
+  board_manager_init();
 
   wamble_socket_t srv = create_and_bind_socket(0);
   T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
@@ -283,7 +323,7 @@ WAMBLE_TEST(reliable_ack_success) {
   T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
 
   wamble_thread_t th;
-  T_ASSERT(wamble_thread_create(&th, ack_peer_thread, &cli) == 0);
+  T_ASSERT(wamble_thread_create(&th, handle_msg_peer_thread, &cli) == 0);
 
   struct WambleMsg msg;
   memset(&msg, 0, sizeof(msg));
@@ -292,6 +332,7 @@ WAMBLE_TEST(reliable_ack_success) {
     msg.token[i] = (uint8_t)(0x10 + i);
   msg.board_id = 77;
   strncpy(msg.fen, "fen-data", FEN_MAX_LENGTH);
+  T_ASSERT(db_create_session(msg.token, 0) > 0);
 
   int rc = send_reliable_message(srv, &msg, &cliaddr, get_config()->timeout_ms,
                                  get_config()->max_retries);
@@ -318,7 +359,22 @@ static void *delayed_send_thread(void *arg) {
 }
 
 WAMBLE_TEST(reliable_ack_rejects_wrong_source_and_preserves_packets) {
-  config_load(NULL, NULL, NULL, 0);
+  const char *cfg_path = "build/test_network_reliable_ack_wrong_source.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19422) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, "
+          "'test_trust', 'test'), "
+          "(0, 'protocol.ctrl', 'board_update', '*', 'allow', 0, "
+          "'test_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+  player_manager_init();
+  board_manager_init();
 
   wamble_socket_t srv = create_and_bind_socket(0);
   T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
@@ -347,7 +403,7 @@ WAMBLE_TEST(reliable_ack_rejects_wrong_source_and_preserves_packets) {
   srvaddr.sin_port = htons((uint16_t)wamble_socket_bound_port(srv));
 
   wamble_thread_t ack_th;
-  T_ASSERT(wamble_thread_create(&ack_th, ack_peer_thread, &cli) == 0);
+  T_ASSERT(wamble_thread_create(&ack_th, handle_msg_peer_thread, &cli) == 0);
 
   DelayedSendCtx fake_ack = {.sock = other, .dst = srvaddr, .delay_ms = 5};
   fake_ack.msg.ctrl = WAMBLE_CTRL_ACK;
@@ -374,8 +430,9 @@ WAMBLE_TEST(reliable_ack_rejects_wrong_source_and_preserves_packets) {
     msg.token[i] = (uint8_t)(0x10 + i);
   msg.board_id = 77;
   strncpy(msg.fen, "fen-data", FEN_MAX_LENGTH);
+  T_ASSERT(db_create_session(msg.token, 0) > 0);
 
-  int rc = send_reliable_message(srv, &msg, &cliaddr, 20, 2);
+  int rc = send_reliable_message(srv, &msg, &cliaddr, 500, 5);
   T_ASSERT_STATUS_OK(wamble_thread_join(other_msg_th, NULL));
   T_ASSERT_STATUS_OK(wamble_thread_join(fake_ack_th, NULL));
   T_ASSERT_STATUS_OK(wamble_thread_join(ack_th, NULL));
@@ -487,17 +544,45 @@ static void *ack_peer_many_thread(void *arg) {
   while (p->count < p->target) {
     struct WambleMsg in;
     struct sockaddr_in src;
-    int rc = receive_and_ack(p->sock, &in, &src, 100);
-    if (rc > 0)
+    fd_set rfds;
+    struct timeval tv;
+    FD_ZERO(&rfds);
+    FD_SET(p->sock, &rfds);
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+    int ready = select(0, &rfds, NULL, NULL, &tv);
+#else
+    int ready = select(p->sock + 1, &rfds, NULL, NULL, &tv);
+#endif
+    if (ready <= 0)
+      break;
+    int rc = receive_message(p->sock, &in, &src);
+    if (rc > 0) {
+      handle_message(p->sock, &in, &src, 0, NULL);
       p->count++;
-    else
-      wamble_sleep_ms(1);
+    }
   }
   return NULL;
 }
 
 WAMBLE_TEST(perf_reliable_ack_latency) {
-  config_load(NULL, NULL, NULL, 0);
+  const char *cfg_path = "build/test_network_perf_reliable_ack.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 1000)\n"
+                    "(defprofile p1 ((def port 19423) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, "
+          "'test_trust', 'test'), "
+          "(0, 'protocol.ctrl', 'board_update', '*', 'allow', 0, "
+          "'test_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+  player_manager_init();
+  board_manager_init();
 
   wamble_socket_t srv = create_and_bind_socket(0);
   T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
@@ -528,6 +613,7 @@ WAMBLE_TEST(perf_reliable_ack_latency) {
     msg.token[i] = (uint8_t)(0x10 + i);
   msg.board_id = 77;
   strncpy(msg.fen, "fen-data", FEN_MAX_LENGTH);
+  T_ASSERT(db_create_session(msg.token, 0) > 0);
 
   uint64_t start_ns = wamble_now_nanos();
   for (int i = 0; i < iters; i++) {
@@ -547,7 +633,7 @@ WAMBLE_TEST(perf_reliable_ack_latency) {
                 "iters=%d elapsed_ns=%llu avg_ns=%.0f throughput=%.2f msg/s",
                 iters, (unsigned long long)elapsed_ns, avg_ns, tput);
 
-  T_ASSERT(elapsed_ns < (uint64_t)3000 * 1000000ULL);
+  T_ASSERT(elapsed_ns < (uint64_t)9000 * 1000000ULL);
 
   wamble_close_socket(cli);
   wamble_close_socket(srv);
@@ -957,7 +1043,18 @@ WAMBLE_TEST(player_move_valid_uci_accept) {
 
   struct WambleMsg in;
   struct sockaddr_in from;
-  int got = receive_message_timeout(srv, &in, &from, 400);
+  fd_set rfds;
+  struct timeval tv;
+  FD_ZERO(&rfds);
+  FD_SET(srv, &rfds);
+  tv.tv_sec = 0;
+  tv.tv_usec = 400 * 1000;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+  int ready = select(0, &rfds, NULL, NULL, &tv);
+#else
+  int ready = select(srv + 1, &rfds, NULL, NULL, &tv);
+#endif
+  int got = (ready > 0) ? receive_message(srv, &in, &from) : 0;
   T_ASSERT(got > 0);
   T_ASSERT_EQ_INT(in.ctrl, WAMBLE_CTRL_PLAYER_MOVE);
   T_ASSERT_EQ_INT(in.uci_len, (int)strlen(uci));
@@ -1106,9 +1203,10 @@ WAMBLE_TESTS_ADD_SM(submit_prediction_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
 WAMBLE_TESTS_ADD_SM(prediction_data_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
-WAMBLE_TESTS_ADD_SM(reliable_ack_success, WAMBLE_SUITE_FUNCTIONAL, "network");
-WAMBLE_TESTS_ADD_SM(reliable_ack_rejects_wrong_source_and_preserves_packets,
-                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(reliable_ack_success, WAMBLE_SUITE_FUNCTIONAL,
+                       "network");
+WAMBLE_TESTS_ADD_DB_SM(reliable_ack_rejects_wrong_source_and_preserves_packets,
+                       WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(malformed_tiny_packet_rejected, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
 WAMBLE_TESTS_ADD_SM(unknown_ctrl_rejected, WAMBLE_SUITE_FUNCTIONAL, "network");
@@ -1130,8 +1228,8 @@ WAMBLE_TESTS_ADD_SM(legal_moves_count_guard, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
 WAMBLE_TESTS_ADD_EX_SM(perf_unreliable_throughput_local,
                        WAMBLE_SUITE_PERFORMANCE, "network", NULL, NULL, 10000);
-WAMBLE_TESTS_ADD_EX_SM(perf_reliable_ack_latency, WAMBLE_SUITE_PERFORMANCE,
-                       "network", NULL, NULL, 10000);
+WAMBLE_TESTS_ADD_DB_EX_SM(perf_reliable_ack_latency, WAMBLE_SUITE_PERFORMANCE,
+                          "network", NULL, NULL, 10000);
 WAMBLE_TESTS_ADD_EX_SM(stress_unreliable_burst, WAMBLE_SUITE_STRESS, "network",
                        NULL, NULL, 60000);
 WAMBLE_TESTS_ADD_SM(speed_token_encode_decode, WAMBLE_SUITE_SPEED, "network");
