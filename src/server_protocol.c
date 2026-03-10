@@ -53,9 +53,18 @@ static int resolve_profile_trust_tier(const uint8_t *token,
   WamblePolicyDecision trust_decision;
   DbStatus st = wamble_query_resolve_policy_decision(
       token, profile_name, "trust.tier", "tier", NULL, NULL, &trust_decision);
-  int trust_tier = (st == DB_OK && trust_decision.allowed)
-                       ? trust_decision.permission_level
-                       : 0;
+  int trust_event = PROFILE_TRUST_DECISION_UNRESOLVED;
+  int trust_tier = 0;
+  if (st == DB_OK) {
+    if (trust_decision.allowed) {
+      trust_tier = trust_decision.permission_level;
+      trust_event = PROFILE_TRUST_DECISION_ALLOWED;
+    } else {
+      trust_event = PROFILE_TRUST_DECISION_DENIED;
+    }
+  }
+  wamble_runtime_event_publish(WAMBLE_RUNTIME_EVENT_TRUST_DECISION, trust_event,
+                               profile_name);
 
   WambleFact facts[2];
   int fact_count = 0;
@@ -297,23 +306,20 @@ static int profile_discovery_allowed(const uint8_t *token,
                                      const WambleProfile *p, int trust_tier) {
   if (!token || !p)
     return 0;
-  (void)trust_tier;
   DiscoverPolicyDecision override = resolve_discovery_policy_for_action(
       token, p, "profile.discover.override");
   if (override == DISCOVER_POLICY_DENY)
     return 0;
-  if (override == DISCOVER_POLICY_ALLOW)
+  if (override == DISCOVER_POLICY_ALLOW) {
+    if (!p->advertise || trust_tier < p->visibility) {
+      wamble_runtime_event_publish(
+          WAMBLE_RUNTIME_EVENT_PROFILE_ADMIN,
+          PROFILE_ADMIN_STATUS_DISCOVERY_OVERRIDE_EXPOSED, p->name);
+    }
     return 1;
+  }
   int effective_trust = resolve_profile_trust_tier(token, p->name);
-  int default_visible =
-      (p->advertise && effective_trust >= p->visibility) ? 1 : 0;
-  DiscoverPolicyDecision policy =
-      resolve_discovery_policy_for_action(token, p, "profile.discover");
-  if (policy == DISCOVER_POLICY_DENY)
-    return 0;
-  if (policy == DISCOVER_POLICY_ALLOW)
-    return 1;
-  return default_visible;
+  return (p->advertise && effective_trust >= p->visibility) ? 1 : 0;
 }
 
 static ServerStatus send_policy_denied(wamble_socket_t sockfd,
@@ -501,7 +507,7 @@ static ServerStatus handle_client_hello(wamble_socket_t sockfd,
   memcpy(response.token, player->token, TOKEN_LENGTH);
   response.board_id = board->id;
   response.seq_num = WAMBLE_PROTO_VERSION;
-  write_visible_board_fen(msg->token, profile_name, board, response.fen,
+  write_visible_board_fen(player->token, profile_name, board, response.fen,
                           sizeof(response.fen));
 
   if (send_reliable_default(sockfd, &response, cliaddr) != 0) {
@@ -698,12 +704,13 @@ static ServerStatus handle_list_profiles(wamble_socket_t sockfd,
     if (written + need + (written ? 1 : 0) >= FEN_MAX_LENGTH)
       break;
     if (written)
-      resp.fen[written++] = ',';
-    memcpy(&resp.fen[written], name, (size_t)need);
+      resp.profiles_list[written++] = ',';
+    memcpy(&resp.profiles_list[written], name, (size_t)need);
     written += need;
   }
   if (written < FEN_MAX_LENGTH)
-    resp.fen[written] = '\0';
+    resp.profiles_list[written] = '\0';
+  resp.profiles_list_len = (uint16_t)written;
   if (send_reliable_default(sockfd, &resp, cliaddr) != 0) {
     return SERVER_ERR_SEND_FAILED;
   }
@@ -716,15 +723,11 @@ static ServerStatus handle_get_profile_info(wamble_socket_t sockfd,
                                             int effective_trust_tier) {
   char name[PROFILE_NAME_MAX_LENGTH];
   int nlen = 0;
-  if (msg->profile_name[0] || msg->profile_name_len > 0) {
-    nlen = msg->profile_name_len < (PROFILE_NAME_MAX_LENGTH - 1)
-               ? msg->profile_name_len
-               : (PROFILE_NAME_MAX_LENGTH - 1);
+  nlen = msg->profile_name_len < (PROFILE_NAME_MAX_LENGTH - 1)
+             ? msg->profile_name_len
+             : (PROFILE_NAME_MAX_LENGTH - 1);
+  if (nlen > 0)
     memcpy(name, msg->profile_name, (size_t)nlen);
-  } else {
-    nlen = msg->uci_len < MAX_UCI_LENGTH ? msg->uci_len : MAX_UCI_LENGTH;
-    memcpy(name, msg->uci, (size_t)nlen);
-  }
   name[nlen] = '\0';
 
   const WambleProfile *p = config_find_profile(name);
@@ -732,10 +735,26 @@ static ServerStatus handle_get_profile_info(wamble_socket_t sockfd,
   resp.ctrl = WAMBLE_CTRL_PROFILE_INFO;
   memcpy(resp.token, msg->token, TOKEN_LENGTH);
   if (p && profile_discovery_allowed(msg->token, p, effective_trust_tier)) {
-    snprintf(resp.fen, FEN_MAX_LENGTH, "%s;%d;%d;%d", p->name, p->config.port,
-             p->advertise, p->visibility);
+    int wrote = snprintf(resp.profile_info, FEN_MAX_LENGTH, "%s;%d;%d;%d",
+                         p->name, p->config.port, p->advertise, p->visibility);
+    if (wrote < 0)
+      wrote = 0;
+    if (wrote >= FEN_MAX_LENGTH)
+      wrote = FEN_MAX_LENGTH - 1;
+    resp.profile_info_len = (uint16_t)wrote;
   } else {
-    snprintf(resp.fen, FEN_MAX_LENGTH, "NOTFOUND;%.80s", name);
+    wamble_runtime_event_publish(
+        WAMBLE_RUNTIME_EVENT_PROFILE_ADMIN,
+        p ? PROFILE_ADMIN_STATUS_PROFILE_INFO_HIDDEN
+          : PROFILE_ADMIN_STATUS_PROFILE_INFO_NOT_FOUND,
+        name);
+    int wrote =
+        snprintf(resp.profile_info, FEN_MAX_LENGTH, "NOTFOUND;%.80s", name);
+    if (wrote < 0)
+      wrote = 0;
+    if (wrote >= FEN_MAX_LENGTH)
+      wrote = FEN_MAX_LENGTH - 1;
+    resp.profile_info_len = (uint16_t)wrote;
   }
   if (send_reliable_default(sockfd, &resp, cliaddr) != 0) {
     return SERVER_ERR_SEND_FAILED;
@@ -809,7 +828,7 @@ static ServerStatus enforce_message_access_policies(
     }
   }
 
-  if (msg->ctrl != WAMBLE_CTRL_ACK && msg->ctrl != WAMBLE_CTRL_LOGIN_REQUEST) {
+  if (msg->ctrl != WAMBLE_CTRL_ACK) {
     WamblePolicyDecision decision;
     memset(&decision, 0, sizeof(decision));
     const char *ctrl_res = ctrl_policy_resource(msg->ctrl);
@@ -920,6 +939,9 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
       memset(&response, 0, sizeof(response));
       response.ctrl = WAMBLE_CTRL_PLAYER_STATS_DATA;
       memcpy(response.token, player->token, TOKEN_LENGTH);
+      response.player_stats_score = player->score;
+      response.player_stats_games_played =
+          (player->games_played > 0) ? (uint32_t)player->games_played : 0;
       if (send_reliable_default(sockfd, &response, cliaddr) != 0) {
         return SERVER_ERR_SEND_FAILED;
       }

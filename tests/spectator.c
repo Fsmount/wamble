@@ -100,6 +100,12 @@ WAMBLE_TEST(spectator_visibility_and_capacity) {
   T_ASSERT_EQ_INT(
       spectator_handle_request(&denied, &addr, 0, 0, &state, &focus),
       SPECTATOR_ERR_VISIBILITY);
+  denied.ctrl = WAMBLE_CTRL_SPECTATE_STOP;
+  T_ASSERT_EQ_INT(
+      spectator_handle_request(&denied, &addr, 0, 0, &state, &focus),
+      SPECTATOR_OK_STOP);
+  T_ASSERT_EQ_INT(state, SPECTATOR_STATE_IDLE);
+  T_ASSERT_EQ_INT((int)focus, 0);
 
   wamble_config_pop();
 
@@ -110,14 +116,18 @@ WAMBLE_TEST(spectator_visibility_and_capacity) {
 
   uint8_t first_token[TOKEN_LENGTH] = {4};
   uint8_t second_token[TOKEN_LENGTH] = {5};
+  uint8_t third_token[TOKEN_LENGTH] = {6};
   struct WambleMsg first = {0};
   struct WambleMsg second = {0};
+  struct WambleMsg third = {0};
   first.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
   first.board_id = active_id;
   memcpy(first.token, first_token, TOKEN_LENGTH);
   second.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
   second.board_id = active_id;
   memcpy(second.token, second_token, TOKEN_LENGTH);
+  third.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  memcpy(third.token, third_token, TOKEN_LENGTH);
 
   state = SPECTATOR_STATE_IDLE;
   focus = 0;
@@ -126,12 +136,13 @@ WAMBLE_TEST(spectator_visibility_and_capacity) {
 
   state = SPECTATOR_STATE_IDLE;
   focus = 0;
-  T_ASSERT_EQ_INT(
-      spectator_handle_request(&second, &addr, 0, 0, &state, &focus),
-      SPECTATOR_ERR_FULL);
+  T_ASSERT_EQ_INT(spectator_handle_request(&third, &addr, 0, 0, &state, &focus),
+                  SPECTATOR_ERR_FULL);
   T_ASSERT_EQ_INT(
       spectator_handle_request(&second, &addr, 0, 1, &state, &focus),
       SPECTATOR_OK_FOCUS);
+  T_ASSERT_EQ_INT(spectator_handle_request(&third, &addr, 0, 0, &state, &focus),
+                  SPECTATOR_ERR_FULL);
 
   struct WambleMsg stop = {0};
   stop.ctrl = WAMBLE_CTRL_SPECTATE_STOP;

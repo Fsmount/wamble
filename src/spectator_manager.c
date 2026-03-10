@@ -34,7 +34,7 @@ static int is_board_eligible(const WambleBoard *b);
 static int cmp_boards(const void *a, const void *b);
 static int spectator_current_port(void);
 static int spectator_count_for_port_locked(int owner_port);
-static int spectator_focus_count_for_port_locked(int owner_port);
+static int spectator_active_count_for_port_locked(int owner_port);
 
 static void rebuild_summary_cache_locked(int max_to_scan) {
   if (max_to_scan <= 0) {
@@ -198,12 +198,12 @@ static int spectator_count_for_port_locked(int owner_port) {
   return count;
 }
 
-static int spectator_focus_count_for_port_locked(int owner_port) {
+static int spectator_active_count_for_port_locked(int owner_port) {
   int count = 0;
   for (int i = 0; i < spectators_count; i++) {
     if (spectators[i].owner_port != owner_port)
       continue;
-    if (spectators[i].state == SPECTATOR_STATE_FOCUS &&
+    if (spectators[i].state != SPECTATOR_STATE_IDLE &&
         !spectators[i].capacity_bypass) {
       count++;
     }
@@ -358,8 +358,12 @@ void spectator_manager_tick(void) {
           e->has_pending_notice = 1;
           e->pending_notice_board_id = e->focus_board_id;
           snprintf(e->pending_notice, sizeof(e->pending_notice),
-                   "focus ended (disabled) on board %" PRIu64,
+                   "focus ended; switched to summary mode (board %" PRIu64 ")",
                    e->focus_board_id);
+          wamble_runtime_event_publish(
+              WAMBLE_RUNTIME_EVENT_PROFILE_ADMIN,
+              PROFILE_ADMIN_STATUS_SPECTATOR_FOCUS_DISABLED_FALLBACK,
+              wamble_runtime_profile_key());
         }
         e->state = SPECTATOR_STATE_SUMMARY;
         e->focus_board_id = 0;
@@ -373,8 +377,13 @@ void spectator_manager_tick(void) {
             e->has_pending_notice = 1;
             e->pending_notice_board_id = e->focus_board_id;
             snprintf(e->pending_notice, sizeof(e->pending_notice),
-                     "focused game finished (board %" PRIu64 ")",
+                     "focused game finished; switched to summary mode "
+                     "(board %" PRIu64 ")",
                      e->focus_board_id);
+            wamble_runtime_event_publish(
+                WAMBLE_RUNTIME_EVENT_PROFILE_ADMIN,
+                PROFILE_ADMIN_STATUS_SPECTATOR_BOARD_FINISHED_FALLBACK,
+                wamble_runtime_profile_key());
           }
           e->state = SPECTATOR_STATE_SUMMARY;
           e->focus_board_id = 0;
@@ -395,8 +404,19 @@ void spectator_manager_tick(void) {
         e->last_focus_sent = now;
     }
 
-    if (max_focus == 0 && e->state == SPECTATOR_STATE_FOCUS) {
-      e->state = SPECTATOR_STATE_SUMMARY;
+    if (max_focus == 0 && e->state != SPECTATOR_STATE_IDLE &&
+        !e->capacity_bypass) {
+      if (!e->has_pending_notice) {
+        e->has_pending_notice = 1;
+        e->pending_notice_board_id = e->focus_board_id;
+        snprintf(e->pending_notice, sizeof(e->pending_notice),
+                 "spectating stopped; max-spectators is 0");
+        wamble_runtime_event_publish(
+            WAMBLE_RUNTIME_EVENT_PROFILE_ADMIN,
+            PROFILE_ADMIN_STATUS_SPECTATOR_STOPPED_BY_ZERO_CAP,
+            wamble_runtime_profile_key());
+      }
+      e->state = SPECTATOR_STATE_IDLE;
       e->focus_board_id = 0;
       e->last_focus_sent = 0.0;
       e->capacity_bypass = 0;
@@ -445,6 +465,31 @@ spectator_handle_request(const struct WambleMsg *msg,
                          int capacity_bypass, SpectatorState *out_state,
                          uint64_t *out_focus_board_id) {
   wamble_mutex_lock(&spectators_mutex);
+  if (msg->ctrl == WAMBLE_CTRL_SPECTATE_STOP) {
+    int owner_port = spectator_current_port();
+    for (int i = 0; i < spectators_count; i++) {
+      SpectatorEntry *e = &spectators[i];
+      if (memcmp(e->token, msg->token, TOKEN_LENGTH) != 0 ||
+          e->addr.sin_addr.s_addr != cliaddr->sin_addr.s_addr ||
+          e->addr.sin_port != cliaddr->sin_port ||
+          e->owner_port != owner_port) {
+        continue;
+      }
+      e->state = SPECTATOR_STATE_IDLE;
+      e->focus_board_id = 0;
+      e->last_focus_sent = 0.0;
+      e->capacity_bypass = 0;
+      e->last_summary_wall = 0;
+      break;
+    }
+    if (out_state)
+      *out_state = SPECTATOR_STATE_IDLE;
+    if (out_focus_board_id)
+      *out_focus_board_id = 0;
+    wamble_mutex_unlock(&spectators_mutex);
+    return SPECTATOR_OK_STOP;
+  }
+
   if (trust_tier < get_config()->spectator_visibility) {
     wamble_mutex_unlock(&spectators_mutex);
     return SPECTATOR_ERR_VISIBILITY;
@@ -457,31 +502,18 @@ spectator_handle_request(const struct WambleMsg *msg,
   }
   e->last_activity = monotonic_seconds();
 
-  if (msg->ctrl == WAMBLE_CTRL_SPECTATE_STOP) {
-    e->state = SPECTATOR_STATE_IDLE;
-    e->capacity_bypass = 0;
-    if (out_state)
-      *out_state = e->state;
-    if (out_focus_board_id)
-      *out_focus_board_id = 0;
-    wamble_mutex_unlock(&spectators_mutex);
-    return SPECTATOR_OK_STOP;
-  }
-
   if (msg->ctrl == WAMBLE_CTRL_SPECTATE_GAME) {
-    if (msg->board_id != 0) {
-      int cap = get_config()->max_spectators;
-      int active_focus_non_bypass =
-          (cap >= 0) ? spectator_focus_count_for_port_locked(e->owner_port) : 0;
-      int current_contrib =
-          (e->state == SPECTATOR_STATE_FOCUS && !e->capacity_bypass) ? 1 : 0;
-      int desired_contrib = capacity_bypass ? 0 : 1;
-      int projected_non_bypass =
-          active_focus_non_bypass - current_contrib + desired_contrib;
-      if (cap >= 0 && projected_non_bypass > cap) {
-        wamble_mutex_unlock(&spectators_mutex);
-        return SPECTATOR_ERR_FULL;
-      }
+    int cap = get_config()->max_spectators;
+    int active_non_bypass =
+        (cap >= 0) ? spectator_active_count_for_port_locked(e->owner_port) : 0;
+    int current_contrib =
+        (e->state != SPECTATOR_STATE_IDLE && !e->capacity_bypass) ? 1 : 0;
+    int desired_contrib = (msg->board_id == 0 || !capacity_bypass) ? 1 : 0;
+    int projected_non_bypass =
+        active_non_bypass - current_contrib + desired_contrib;
+    if (cap >= 0 && projected_non_bypass > cap) {
+      wamble_mutex_unlock(&spectators_mutex);
+      return SPECTATOR_ERR_FULL;
     }
 
     if (msg->board_id == 0) {

@@ -86,7 +86,7 @@ Database Connections
 - `prediction-max-pending` (int, 64): Maximum in-flight predictions tracked per
   board.
 Spectator Settings
-- `max-spectators` (int, 1024; -1 for no cap): Capacity limit for focused spectators at the server.
+- `max-spectators` (int, 1024; -1 for no cap): Capacity limit for total active spectators at the server (summary + focus).
    Bypass is policy-controlled via `spectate.capacity_bypass` / `focus`. Bypass-focused sessions are counted outside the `max-spectators` pool.
 - `spectator-visibility` (int, 0): Minimum trust tier required to spectate (summary or focus). Requests below this threshold are rejected.
 - `spectator-summary-hz` (int, 2): Target max update rate (per second) for summary mode. Best-effort; updates are sent over UDP and may be batched by the main loop cadence.
@@ -199,15 +199,13 @@ Policy Rule Builtins
 - Runtime action/resource registry:
   - `trust.tier`: query resource `tier`; rules should use resource
     `*`, `profile:<name>`, or `profile_group:<group>`.
-  - `profile.discover`: query resources `profile:<name>`,
-    `profile_selector:<group>`, `*`.
   - `profile.discover.override`: query resources `profile:<name>`,
     `profile_selector:<group>`, `*`.
   - `protocol.ctrl`: query resources
     `player_move`, `board_update`, `list_profiles`, `profile_info`, `error`,
     `server_notification`, `client_goodbye`, `spectate_game`,
-    `spectate_update`, `logout`, `login_success`, `login_failed`,
-    `get_player_stats`, `player_stats_data`, `get_profile_info`,
+    `spectate_update`, `login_request`, `logout`, `login_success`,
+    `login_failed`, `get_player_stats`, `player_stats_data`, `get_profile_info`,
     `profiles_list`, `spectate_stop`, `get_legal_moves`, `legal_moves`,
     `get_leaderboard`, `leaderboard_data`, `submit_prediction`,
     `get_predictions`, `prediction_data`, `unknown`.
@@ -224,7 +222,7 @@ Policy Rule Builtins
     The rule permission level is treated as the maximum readable depth cap.
 - Example:
   `(policy-allow "identity:42" "trust.tier" "profile:private" 5 "manual grant")`
-  `(policy-deny "tag:contractors" "profile.discover" "profile_selector:internal" "hide internal profiles")`
+  `(policy-deny "tag:contractors" "profile.discover.override" "profile_selector:internal" "hide internal profiles")`
 
 Custom Policy Evaluator (optional)
 - You may define `(defn policy-eval ...)` for dynamic policy decisions.
@@ -359,6 +357,11 @@ Config Reload and Exec Handoff
 - `SIGUSR2` (POSIX only): triggers an exec-based hot reload. The server exports
   active listener sockets (`WAMBLE_PROFILES_INHERITED`) and optional state file
   paths (`WAMBLE_STATE_FILE`/`WAMBLE_STATE_FILES`) before re-execing itself.
+- Friendlier admin controls:
+  - The server always writes a PID file to `wamble.pid` under `state-dir` (or
+    `/tmp` on POSIX when `state-dir` is unset).
+  - `build/wamble --reload` sends `SIGHUP` to the PID found in that file.
+  - `build/wamble --hot-reload` sends `SIGUSR2` to the PID found in that file.
 - Hot reload sets `WAMBLE_HOT_RELOAD=1` in the environment to instruct the new
   process to adopt inherited sockets and reload persisted state via
   `state_load_from_file`.
@@ -382,8 +385,11 @@ Profile Runtime Notes
 Visibility and Discovery
 - LIST_PROFILES returns only advertised profiles whose `visibility` is less
   than or equal to the requesting client's resolved trust tier (see
-  docs/database.txt), plus unadvertised profiles explicitly allowed by
-  `profile.discover` policy.
+  docs/database.txt), unless overridden by `profile.discover.override`
+  policy. `profile.discover.override` can explicitly allow or deny discovery,
+  including for unadvertised profiles.
+- To activate a non-advertised profile listener, add an explicit
+  `profile.discover.override` allow rule for that profile or selector.
 - GET_PROFILE_INFO applies the same discovery authorization and returns
   `NOTFOUND;<name>` when not discoverable.
 

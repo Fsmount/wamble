@@ -160,10 +160,9 @@ Unreliable Messages
 Spectator Policy
 - Visibility: spectating requires resolved trust >= `spectate-visibility`
   from global policy rules.
-- Capacity: the server may cap the number of focused spectators via
-  `max-spectators`. Bypass-focused sessions are counted outside 
-  the `max-spectators` pool. Summary mode is designed as a scrollable
-  feed and is not restricted to a fixed top-N.
+- Capacity: the server may cap the total number of active spectators via
+  `max-spectators`. Bypass-focused sessions are counted outside
+  the `max-spectators` pool.
 - Summary modes:
   - `full`: send all ACTIVE+RESERVED boards.
   - `changes`: send only boards changed since the last summary tick.
@@ -184,7 +183,7 @@ Profiles
 - The server runs one UDP listener thread per advertised profile.
 - `LIST_PROFILES` returns:
   - advertised profiles where `profile.visibility <= resolved_trust`;
-  - unadvertised profiles explicitly allowed by `profile.discover` policy.
+  - profiles explicitly allowed by `profile.discover.override` policy.
 - `GET_PROFILE_INFO` requests details for a named profile and uses the same discovery authorization as `LIST_PROFILES`.
 
 References

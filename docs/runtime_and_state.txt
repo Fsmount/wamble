@@ -48,6 +48,10 @@ Exec Handoff
   - `WAMBLE_PROFILES_INHERITED=name=fd,...`
   - `WAMBLE_STATE_FILES=name=/tmp/file,...`
 - Adoption: new process starts threads with the inherited sockets and loads state files once, then unlinks them.
+- Operators can trigger reload without sending raw signals by using the default
+  PID file written to `wamble.pid` under `state-dir` (or `/tmp` on POSIX):
+  - `build/wamble --reload`
+  - `build/wamble --hot-reload`
 
 State Files
 - Written by `state_save_to_file()` and read by `state_load_from_file()`.

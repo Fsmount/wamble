@@ -16,6 +16,7 @@
 static volatile sig_atomic_t g_reload_requested = 0;
 static volatile sig_atomic_t g_shutdown_requested = 0;
 static volatile sig_atomic_t g_exec_reload_requested = 0;
+static char g_pid_file_path[512];
 
 static void wamble_set_env(const char *key, const char *value) {
 #ifdef WAMBLE_PLATFORM_WINDOWS
@@ -247,6 +248,27 @@ static int restore_previous_config_and_policy(void *cfg_snapshot,
                                    global_conn_str_size);
 }
 
+static int recover_config_from_db_snapshot(
+    const char *profile_key, const char *profile, const char *attempt_cfg_text,
+    ConfigLoadStatus rcfg, char *cfg_status, size_t cfg_status_size) {
+  if (db_set_global_store_connection(NULL) != 0)
+    return -1;
+
+  char errbuf[128];
+  snprintf(errbuf, sizeof(errbuf), "config_load_status=%d", (int)rcfg);
+  (void)db_record_config_event(profile_key, attempt_cfg_text, "file",
+                               "rejected", errbuf);
+
+  char *db_cfg = NULL;
+  if (db_load_config_snapshot(profile_key, &db_cfg) != 0 || !db_cfg)
+    return -1;
+
+  int loaded =
+      load_config_from_text_blob(db_cfg, profile, cfg_status, cfg_status_size);
+  free(db_cfg);
+  return loaded;
+}
+
 static void process_config_reload_request(
     const char *config_file, const char *profile, char *cfg_status,
     size_t cfg_status_size, char *topology_err, size_t topology_err_size,
@@ -284,6 +306,9 @@ static void process_config_reload_request(
         LOG_INFO("Recovered config from DB snapshot for profile key %s",
                  profile_key);
         loaded_from_db_snapshot = 1;
+        LOG_WARN("Config reload recovered from last valid DB snapshot for "
+                 "profile key %s",
+                 profile_key);
       } else {
         LOG_WARN("DB snapshot restore failed; keeping in-memory previous "
                  "config");
@@ -359,6 +384,12 @@ static void process_config_reload_request(
   }
 
   LOG_INFO("Config reload applied");
+  if (loaded_from_db_snapshot) {
+    LOG_WARN("Config reload applied using last valid DB snapshot instead of "
+             "the current config file");
+  } else {
+    LOG_INFO("Config reload applied from the current config file");
+  }
   if (!loaded_from_db_snapshot && attempt_cfg_text && attempt_cfg_text[0]) {
     LOG_INFO("Config reload: persisting active snapshot");
     if (db_store_config_snapshot(profile_key, attempt_cfg_text) != 0) {
@@ -434,10 +465,116 @@ static void handle_sigusr2(int signo) {
 }
 #endif
 
+typedef enum {
+  MAIN_CONTROL_NONE = 0,
+  MAIN_CONTROL_RELOAD = 1,
+  MAIN_CONTROL_HOT_RELOAD = 2,
+} MainControl;
+
 typedef struct MainOptions {
   const char *config_file;
   const char *profile;
+  MainControl control_signal;
 } MainOptions;
+
+static int default_pid_path(char *out, size_t out_size) {
+  return wamble_runtime_state_path(out, out_size, "wamble.pid");
+}
+
+static int read_pid_from_file(const char *path, long *out_pid) {
+  if (!path || !out_pid)
+    return -1;
+  FILE *f = fopen(path, "rb");
+  if (!f)
+    return -1;
+  char buf[64];
+  size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+  fclose(f);
+  if (n == 0)
+    return -1;
+  buf[n] = '\0';
+  char *end = NULL;
+  long pid = strtol(buf, &end, 10);
+  if (end == buf || pid <= 0)
+    return -1;
+  *out_pid = pid;
+  return 0;
+}
+
+static int write_pid_file(void) {
+  char path[512];
+  if (default_pid_path(path, sizeof(path)) != 0)
+    return -1;
+  FILE *f = fopen(path, "wb");
+  if (!f)
+    return -1;
+  int rc = fprintf(f, "%ld\n", (long)wamble_getpid());
+  fclose(f);
+  if (rc <= 0)
+    return -1;
+  snprintf(g_pid_file_path, sizeof(g_pid_file_path), "%s", path);
+  return 0;
+}
+
+static void cleanup_pid_file(void) {
+  if (g_pid_file_path[0]) {
+    (void)wamble_unlink(g_pid_file_path);
+    g_pid_file_path[0] = '\0';
+  }
+}
+
+static int load_control_command_config(const MainOptions *opts) {
+  if (!opts)
+    return -1;
+  char cfg_status[128];
+  ConfigLoadStatus st = config_load(opts->config_file, opts->profile,
+                                    cfg_status, sizeof(cfg_status));
+  if (st == CONFIG_LOAD_OK)
+    return 0;
+  if (opts->profile && opts->profile[0]) {
+    fprintf(stderr,
+            "Warning: failed to load config '%s' profile '%s' "
+            "(status=%d: %s); falling back to default PID path\n",
+            opts->config_file ? opts->config_file : "(null)", opts->profile,
+            (int)st, (cfg_status[0] ? cfg_status : "no detail"));
+  } else {
+    fprintf(stderr,
+            "Warning: failed to load config '%s' "
+            "(status=%d: %s); falling back to default PID path\n",
+            opts->config_file ? opts->config_file : "(null)", (int)st,
+            (cfg_status[0] ? cfg_status : "no detail"));
+  }
+  return -1;
+}
+
+static int run_control_command(const MainOptions *opts) {
+  if (!opts || opts->control_signal == MAIN_CONTROL_NONE)
+    return 0;
+#ifdef WAMBLE_PLATFORM_POSIX
+  (void)load_control_command_config(opts);
+  char path[512];
+  long pid = 0;
+  if (default_pid_path(path, sizeof(path)) != 0 ||
+      read_pid_from_file(path, &pid) != 0) {
+    fprintf(stderr, "Could not read PID from %s\n", path);
+    return 1;
+  }
+  int signo =
+      (opts->control_signal == MAIN_CONTROL_HOT_RELOAD) ? SIGUSR2 : SIGHUP;
+  if (kill((pid_t)pid, signo) != 0) {
+    fprintf(stderr, "Failed to signal PID %ld: %s\n", pid, strerror(errno));
+    return 1;
+  }
+  printf("%s sent to PID %ld\n",
+         (opts->control_signal == MAIN_CONTROL_HOT_RELOAD) ? "Hot reload"
+                                                           : "Reload",
+         pid);
+  return 0;
+#else
+  fprintf(stderr, "Reload control commands are only supported on POSIX.\n");
+  return 1;
+#endif
+}
 
 static int parse_main_options(int argc, char *argv[], MainOptions *opts) {
   if (!opts)
@@ -445,6 +582,7 @@ static int parse_main_options(int argc, char *argv[], MainOptions *opts) {
 
   opts->config_file = "wamble.conf";
   opts->profile = NULL;
+  opts->control_signal = MAIN_CONTROL_NONE;
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--config") == 0) {
@@ -465,11 +603,31 @@ static int parse_main_options(int argc, char *argv[], MainOptions *opts) {
       continue;
     }
 
+    if (strcmp(argv[i], "--reload") == 0 ||
+        strcmp(argv[i], "--hot-reload") == 0) {
+      if (opts->control_signal != MAIN_CONTROL_NONE) {
+        fprintf(stderr, "Only one control command may be used at a time.\n");
+        return -1;
+      }
+      opts->control_signal = (strcmp(argv[i], "--hot-reload") == 0)
+                                 ? MAIN_CONTROL_HOT_RELOAD
+                                 : MAIN_CONTROL_RELOAD;
+      continue;
+    }
+
     if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
       printf("Usage: %s [-c|--config <config_file>] [-p|--profile <profile>]\n",
              argv[0]);
+      printf("  Reload config on POSIX with SIGHUP.\n");
+      printf("  Exec-based hot reload on POSIX uses SIGUSR2.\n");
+      printf("  Friendlier controls:\n");
+      printf("    %s --reload\n", argv[0]);
+      printf("    %s --hot-reload\n", argv[0]);
       return 1;
     }
+
+    fprintf(stderr, "Unknown option: %s\n", argv[i]);
+    return -1;
   }
 
   return 0;
@@ -498,47 +656,73 @@ static void install_signal_handlers(void) {
 #endif
 }
 
-static void persist_initial_config_snapshot(const char *config_file,
-                                            const char *profile) {
-  char *cfg_text = NULL;
-  if (read_text_file(config_file, &cfg_text) != 0 || !cfg_text)
+static void persist_initial_config_snapshot(const char *profile,
+                                            const char *config_text) {
+  if (!config_text || !config_text[0])
     return;
 
   const char *profile_key = profile_key_for_runtime(profile);
-  if (db_store_config_snapshot(profile_key, cfg_text) != 0) {
+  if (db_store_config_snapshot(profile_key, config_text) != 0) {
     LOG_WARN("Failed to persist initial config snapshot to global store");
   }
-  free(cfg_text);
 }
 
 static int initialize_config_and_policy(
     const char *config_file, const char *profile, char *cfg_status,
     size_t cfg_status_size, char *topology_err, size_t topology_err_size,
     char *global_conn_str, size_t global_conn_str_size) {
+  const char *profile_key = profile_key_for_runtime(profile);
+  char *attempt_cfg_text = NULL;
+  int loaded_from_db_snapshot = 0;
+  (void)read_text_file(config_file, &attempt_cfg_text);
+
   ConfigLoadStatus cfg =
       config_load(config_file, profile, cfg_status, cfg_status_size);
   if (cfg != CONFIG_LOAD_OK) {
-    LOG_WARN("Config load status=%d", (int)cfg);
+    LOG_WARN("Config load failed status=%d (%s); attempting DB snapshot "
+             "recovery",
+             (int)cfg,
+             (cfg_status && cfg_status[0]) ? cfg_status : "no detail");
+    if (recover_config_from_db_snapshot(profile_key, profile, attempt_cfg_text,
+                                        cfg, cfg_status,
+                                        cfg_status_size) != 0) {
+      LOG_FATAL("Config load failed status=%d (%s)", (int)cfg,
+                (cfg_status && cfg_status[0]) ? cfg_status : "no detail");
+      free(attempt_cfg_text);
+      return -1;
+    }
+    loaded_from_db_snapshot = 1;
+    LOG_INFO("Recovered startup config from latest DB snapshot for profile "
+             "key %s",
+             profile_key);
+    LOG_WARN("Startup recovered config from last valid DB snapshot for "
+             "profile key %s",
+             profile_key);
   }
 
   if (validate_db_topology(topology_err, topology_err_size) != 0) {
     LOG_FATAL("Invalid DB topology: %s", topology_err);
+    free(attempt_cfg_text);
     return -1;
   }
 
   if (db_set_global_store_connection(NULL) != 0) {
     LOG_FATAL("Failed to configure shared global store connection");
+    free(attempt_cfg_text);
     return -1;
   }
 
-  persist_initial_config_snapshot(config_file, profile);
+  if (!loaded_from_db_snapshot)
+    persist_initial_config_snapshot(profile, attempt_cfg_text);
 
-  if (bind_active_config_policy(profile_key_for_runtime(profile),
-                                global_conn_str, global_conn_str_size) != 0) {
+  if (bind_active_config_policy(profile_key, global_conn_str,
+                                global_conn_str_size) != 0) {
     LOG_FATAL("Failed to load/validate trust policy");
+    free(attempt_cfg_text);
     return -1;
   }
 
+  free(attempt_cfg_text);
   return 0;
 }
 
@@ -593,32 +777,74 @@ static void restore_hot_reload_state(void) {
 }
 
 static void drain_runtime_issue_queues(void) {
-  char profile_name[64];
-  WsGatewayStatus gateway_status = WS_GATEWAY_OK;
-  while (profile_runtime_take_ws_gateway_status(&gateway_status, profile_name,
-                                                sizeof(profile_name))) {
-    LOG_ERROR("WS gateway issue profile=%s status=%d",
-              profile_name[0] ? profile_name : "default", (int)gateway_status);
-  }
-
-  ProfileTrustDecisionStatus trust_status = PROFILE_TRUST_DECISION_DENIED;
-  while (profile_runtime_take_trust_decision_status(&trust_status, profile_name,
-                                                    sizeof(profile_name))) {
-    LOG_DEBUG("trust decision profile=%s status=%d",
-              profile_name[0] ? profile_name : "default", (int)trust_status);
-  }
-
-  PredictionManagerStatus prediction_status = PREDICTION_MANAGER_OK;
-  while (profile_runtime_take_prediction_manager_status(
-      &prediction_status, profile_name, sizeof(profile_name))) {
-    if (prediction_status < 0) {
-      LOG_ERROR("prediction manager issue profile=%s status=%d",
-                profile_name[0] ? profile_name : "default",
-                (int)prediction_status);
-    } else {
-      LOG_WARN("prediction manager issue profile=%s status=%d",
-               profile_name[0] ? profile_name : "default",
-               (int)prediction_status);
+  WambleRuntimeEvent ev;
+  while (wamble_runtime_event_take(&ev)) {
+    const char *profile_name = ev.profile[0] ? ev.profile : "default";
+    switch (ev.kind) {
+    case WAMBLE_RUNTIME_EVENT_WS_GATEWAY:
+      LOG_ERROR("WS gateway issue profile=%s status=%d", profile_name, ev.code);
+      break;
+    case WAMBLE_RUNTIME_EVENT_PREDICTION_MANAGER:
+      if (ev.code < 0) {
+        LOG_ERROR("prediction manager issue profile=%s status=%d", profile_name,
+                  ev.code);
+      } else {
+        LOG_WARN("prediction manager issue profile=%s status=%d", profile_name,
+                 ev.code);
+      }
+      break;
+    case WAMBLE_RUNTIME_EVENT_TRUST_DECISION:
+      switch ((ProfileTrustDecisionStatus)ev.code) {
+      case PROFILE_TRUST_DECISION_ALLOWED:
+        LOG_DEBUG("trust decision profile=%s status=allowed", profile_name);
+        break;
+      case PROFILE_TRUST_DECISION_DENIED:
+        LOG_DEBUG("trust decision profile=%s status=denied", profile_name);
+        break;
+      case PROFILE_TRUST_DECISION_UNRESOLVED:
+      default:
+        LOG_WARN("trust decision profile=%s status=unresolved", profile_name);
+        break;
+      }
+      break;
+    case WAMBLE_RUNTIME_EVENT_PROFILE_ADMIN:
+      switch ((ProfileAdminStatus)ev.code) {
+      case PROFILE_ADMIN_STATUS_DISCOVERY_OVERRIDE_EXPOSED:
+        LOG_INFO("runtime status profile=%s hidden profile was exposed by "
+                 "profile.discover.override",
+                 profile_name);
+        break;
+      case PROFILE_ADMIN_STATUS_SPECTATOR_FOCUS_DISABLED_FALLBACK:
+        LOG_INFO("runtime status profile=%s spectator focus fell back to "
+                 "summary because focus was disabled",
+                 profile_name);
+        break;
+      case PROFILE_ADMIN_STATUS_SPECTATOR_BOARD_FINISHED_FALLBACK:
+        LOG_INFO("runtime status profile=%s spectator focus fell back to "
+                 "summary because the focused board finished",
+                 profile_name);
+        break;
+      case PROFILE_ADMIN_STATUS_SPECTATOR_STOPPED_BY_ZERO_CAP:
+        LOG_WARN("runtime status profile=%s all non-bypass spectators were "
+                 "stopped because max-spectators is 0",
+                 profile_name);
+        break;
+      case PROFILE_ADMIN_STATUS_PROFILE_INFO_NOT_FOUND:
+        LOG_INFO("runtime status requested profile info for missing profile=%s",
+                 profile_name);
+        break;
+      case PROFILE_ADMIN_STATUS_PROFILE_INFO_HIDDEN:
+        LOG_INFO("runtime status requested profile info denied by discovery "
+                 "policy profile=%s",
+                 profile_name);
+        break;
+      case PROFILE_ADMIN_STATUS_NONE:
+      default:
+        break;
+      }
+      break;
+    default:
+      break;
     }
   }
 }
@@ -673,6 +899,8 @@ int main(int argc, char *argv[]) {
     return 1;
   if (parse_rc > 0)
     return 0;
+  if (opts.control_signal != MAIN_CONTROL_NONE)
+    return run_control_command(&opts);
 
   if (wamble_net_init() != 0) {
     LOG_FATAL("Network initialization failed");
@@ -703,10 +931,19 @@ int main(int argc, char *argv[]) {
     wamble_net_cleanup();
     return 1;
   }
+  if (write_pid_file() != 0) {
+    char path[512];
+    if (default_pid_path(path, sizeof(path)) != 0)
+      snprintf(path, sizeof(path), "%s", "(unavailable)");
+    LOG_FATAL("Failed to write PID file: %s", path);
+    shutdown_services();
+    return 1;
+  }
   restore_hot_reload_state();
   run_main_loop(opts.config_file, opts.profile, cfg_status, sizeof(cfg_status),
                 topology_err, sizeof(topology_err), global_conn_str,
                 sizeof(global_conn_str), argv);
+  cleanup_pid_file();
   shutdown_services();
   return 0;
 }

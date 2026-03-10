@@ -350,26 +350,23 @@ static NetworkStatus serialize_wamble_msg(const struct WambleMsg *msg,
     break;
   }
   case WAMBLE_CTRL_PROFILE_INFO: {
-
-    size_t len = strnlen(msg->fen, FEN_MAX_LENGTH);
+    size_t len = msg->profile_info_len
+                     ? (size_t)msg->profile_info_len
+                     : strnlen(msg->profile_info, FEN_MAX_LENGTH);
+    if (len > FEN_MAX_LENGTH - 1)
+      return NET_ERR_INVALID;
     if (len > WAMBLE_MAX_PAYLOAD)
       return NET_ERR_TRUNCATED;
-    memcpy(payload, msg->fen, len);
+    memcpy(payload, msg->profile_info, len);
     payload_len = len;
     break;
   }
   case WAMBLE_CTRL_GET_PROFILE_INFO: {
-    const char *name = NULL;
-    size_t name_len = 0;
-    if (msg->profile_name_len > 0 || msg->profile_name[0]) {
-      name = msg->profile_name;
-      name_len = msg->profile_name_len
-                     ? (size_t)msg->profile_name_len
-                     : strnlen(msg->profile_name, PROFILE_NAME_MAX_LENGTH - 1);
-    } else {
-      name = msg->uci;
-      name_len = (size_t)msg->uci_len;
-    }
+    const char *name = msg->profile_name;
+    size_t name_len =
+        msg->profile_name_len
+            ? (size_t)msg->profile_name_len
+            : strnlen(msg->profile_name, PROFILE_NAME_MAX_LENGTH - 1);
     if (name_len > 255)
       return NET_ERR_INVALID;
     size_t need = 1 + name_len;
@@ -390,11 +387,14 @@ static NetworkStatus serialize_wamble_msg(const struct WambleMsg *msg,
     break;
   }
   case WAMBLE_CTRL_PROFILES_LIST: {
-
-    size_t len = strnlen(msg->fen, FEN_MAX_LENGTH);
+    size_t len = msg->profiles_list_len
+                     ? (size_t)msg->profiles_list_len
+                     : strnlen(msg->profiles_list, FEN_MAX_LENGTH);
+    if (len > FEN_MAX_LENGTH - 1)
+      return NET_ERR_INVALID;
     if (len > WAMBLE_MAX_PAYLOAD)
       return NET_ERR_TRUNCATED;
-    memcpy(payload, msg->fen, len);
+    memcpy(payload, msg->profiles_list, len);
     payload_len = len;
     break;
   }
@@ -442,20 +442,15 @@ static NetworkStatus serialize_wamble_msg(const struct WambleMsg *msg,
     break;
   }
   case WAMBLE_CTRL_PLAYER_STATS_DATA: {
-    WamblePlayer *player = get_player_by_token(msg->token);
-    if (player) {
-
-      uint64_t bits = 0;
-      memcpy(&bits, &player->score, sizeof(double));
-      uint64_t be = host_to_net64(bits);
-      for (int i = 0; i < 8; i++) {
-        payload[i] = (uint8_t)((be >> (8 * (7 - i))) & 0xFF);
-      }
-      uint32_t gp = (uint32_t)player->games_played;
-      uint32_t gp_be = htonl(gp);
-      memcpy(payload + 8, &gp_be, 4);
-      payload_len = 12;
+    uint64_t bits = 0;
+    memcpy(&bits, &msg->player_stats_score, sizeof(double));
+    uint64_t be = host_to_net64(bits);
+    for (int i = 0; i < 8; i++) {
+      payload[i] = (uint8_t)((be >> (8 * (7 - i))) & 0xFF);
     }
+    uint32_t gp_be = htonl(msg->player_stats_games_played);
+    memcpy(payload + 8, &gp_be, 4);
+    payload_len = 12;
     break;
   }
   case WAMBLE_CTRL_LOGIN_FAILED: {
@@ -652,8 +647,7 @@ static NetworkStatus deserialize_wamble_msg(const uint8_t *buffer,
   case WAMBLE_CTRL_BOARD_UPDATE:
   case WAMBLE_CTRL_SERVER_NOTIFICATION:
   case WAMBLE_CTRL_SPECTATE_UPDATE:
-  case WAMBLE_CTRL_ERROR:
-  case WAMBLE_CTRL_PROFILES_LIST: {
+  case WAMBLE_CTRL_ERROR: {
 
     if (hdr.ctrl == WAMBLE_CTRL_ERROR) {
       if (payload_len < 3)
@@ -690,11 +684,19 @@ static NetworkStatus deserialize_wamble_msg(const uint8_t *buffer,
     break;
   }
   case WAMBLE_CTRL_PROFILE_INFO: {
-
     size_t copy =
         payload_len < FEN_MAX_LENGTH - 1 ? payload_len : (FEN_MAX_LENGTH - 1);
-    memcpy(msg->fen, payload, copy);
-    msg->fen[copy] = '\0';
+    memcpy(msg->profile_info, payload, copy);
+    msg->profile_info[copy] = '\0';
+    msg->profile_info_len = (uint16_t)copy;
+    break;
+  }
+  case WAMBLE_CTRL_PROFILES_LIST: {
+    size_t copy =
+        payload_len < FEN_MAX_LENGTH - 1 ? payload_len : (FEN_MAX_LENGTH - 1);
+    memcpy(msg->profiles_list, payload, copy);
+    msg->profiles_list[copy] = '\0';
+    msg->profiles_list_len = (uint16_t)copy;
     break;
   }
   case WAMBLE_CTRL_GET_PROFILE_INFO: {
@@ -708,11 +710,6 @@ static NetworkStatus deserialize_wamble_msg(const uint8_t *buffer,
       memcpy(msg->profile_name, &payload[1], msg->profile_name_len);
     }
     msg->profile_name[msg->profile_name_len] = '\0';
-    if (msg->profile_name_len <= MAX_UCI_LENGTH) {
-      msg->uci_len = msg->profile_name_len;
-      if (msg->uci_len)
-        memcpy(msg->uci, msg->profile_name, msg->uci_len);
-    }
     break;
   }
   case WAMBLE_CTRL_GET_LEGAL_MOVES: {
@@ -731,13 +728,12 @@ static NetworkStatus deserialize_wamble_msg(const uint8_t *buffer,
     uint64_t host = net_to_host64(be);
     double score = 0.0;
     memcpy(&score, &host, sizeof(double));
-
-    (void)score;
+    msg->player_stats_score = score;
 
     if (payload_len >= 12) {
       uint32_t gp_be = 0;
       memcpy(&gp_be, payload + 8, 4);
-      (void)gp_be;
+      msg->player_stats_games_played = ntohl(gp_be);
     }
     break;
   }

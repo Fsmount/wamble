@@ -27,7 +27,10 @@ Requests
 Updates
 - Collected by `spectator_collect_updates()` at the configured rate per mode.
 - Ordering favors recent boards, then a simple attractiveness score.
-- If a focused game ends, we queue a small text notice and switch back to summary.
+- If a focused game ends or focus gets disabled, we queue an explicit notice and
+  switch back to summary.
+- If `max-spectators` is reduced to `0`, non-bypass spectators are explicitly
+  stopped rather than silently left active.
 
 Port Affinity
 - Entries are tied to the listener port that created them; only that thread emits updates for that entry.
