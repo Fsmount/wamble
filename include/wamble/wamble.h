@@ -781,27 +781,45 @@ typedef enum {
   SERVER_ERR_FORBIDDEN = -11,
 } ServerStatus;
 
+typedef enum {
+  WAMBLE_RUNTIME_EVENT_WS_GATEWAY = 1,
+  WAMBLE_RUNTIME_EVENT_PREDICTION_MANAGER = 2,
+  WAMBLE_RUNTIME_EVENT_TRUST_DECISION = 3,
+  WAMBLE_RUNTIME_EVENT_PROFILE_ADMIN = 4,
+} WambleRuntimeEventKind;
+
+typedef struct WambleRuntimeEvent {
+  WambleRuntimeEventKind kind;
+  int code;
+  char profile[64];
+} WambleRuntimeEvent;
+
 ProfileStartStatus start_profile_listeners(int *out_started);
 void stop_profile_listeners(void);
 ProfileStartStatus reconcile_profile_listeners(void);
 int profile_runtime_pump_inline(void);
-int profile_runtime_take_ws_gateway_status(WsGatewayStatus *out_status,
-                                           char *out_profile,
-                                           size_t out_profile_size);
-int profile_runtime_take_prediction_manager_status(
-    PredictionManagerStatus *out_status, char *out_profile,
-    size_t out_profile_size);
+void wamble_runtime_event_publish(WambleRuntimeEventKind kind, int code,
+                                  const char *profile_name);
+int wamble_runtime_event_take(WambleRuntimeEvent *out_event);
 const char *wamble_runtime_profile_key(void);
+typedef enum {
+  PROFILE_ADMIN_STATUS_NONE = 0,
+  PROFILE_ADMIN_STATUS_DISCOVERY_OVERRIDE_EXPOSED = 1,
+  PROFILE_ADMIN_STATUS_SPECTATOR_FOCUS_DISABLED_FALLBACK = 2,
+  PROFILE_ADMIN_STATUS_SPECTATOR_BOARD_FINISHED_FALLBACK = 3,
+  PROFILE_ADMIN_STATUS_SPECTATOR_STOPPED_BY_ZERO_CAP = 4,
+  PROFILE_ADMIN_STATUS_PROFILE_INFO_NOT_FOUND = 5,
+  PROFILE_ADMIN_STATUS_PROFILE_INFO_HIDDEN = 6,
+} ProfileAdminStatus;
 typedef enum {
   PROFILE_TRUST_DECISION_DENIED = 0,
   PROFILE_TRUST_DECISION_ALLOWED = 1,
+  PROFILE_TRUST_DECISION_UNRESOLVED = 2,
 } ProfileTrustDecisionStatus;
-int profile_runtime_take_trust_decision_status(
-    ProfileTrustDecisionStatus *out_status, char *out_profile,
-    size_t out_profile_size);
 
 int state_save_to_file(const char *path);
 int state_load_from_file(const char *path);
+int wamble_runtime_state_path(char *out, size_t out_size, const char *name);
 
 ProfileExportStatus profile_export_inherited_sockets(char *out_buf,
                                                      size_t out_buf_size,
@@ -1168,10 +1186,16 @@ struct WambleMsg {
   char uci[MAX_UCI_LENGTH];
   uint8_t profile_name_len;
   char profile_name[PROFILE_NAME_MAX_LENGTH];
+  uint16_t profile_info_len;
+  char profile_info[FEN_MAX_LENGTH];
+  uint16_t profiles_list_len;
+  char profiles_list[FEN_MAX_LENGTH];
   char fen[FEN_MAX_LENGTH];
   uint16_t error_code;
   char error_reason[FEN_MAX_LENGTH];
   uint8_t login_pubkey[32];
+  double player_stats_score;
+  uint32_t player_stats_games_played;
   uint8_t move_square;
   uint8_t move_count;
   WambleNetMove moves[WAMBLE_MAX_LEGAL_MOVES];

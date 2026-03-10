@@ -11,6 +11,36 @@ typedef struct StateHeader {
   uint64_t next_id;
 } StateHeader;
 
+int wamble_runtime_state_path(char *out, size_t out_size, const char *name) {
+  if (!out || out_size == 0)
+    return -1;
+  out[0] = '\0';
+  const char *base = ".";
+  const WambleConfig *cfg = get_config();
+  if (cfg && cfg->state_dir && cfg->state_dir[0]) {
+    base = cfg->state_dir;
+#ifdef WAMBLE_PLATFORM_POSIX
+  } else {
+    base = "/tmp";
+#else
+  } else {
+    const char *tmp = getenv("TEMP");
+    if (tmp && tmp[0])
+      base = tmp;
+#endif
+  }
+  char sep = '/';
+#ifdef WAMBLE_PLATFORM_WINDOWS
+  sep = '\\';
+#endif
+  size_t base_len = strlen(base);
+  int need_sep =
+      (base_len > 0 && base[base_len - 1] != '/' && base[base_len - 1] != '\\');
+  snprintf(out, out_size, "%s%s%s", base, need_sep ? (char[2]){sep, '\0'} : "",
+           name ? name : "");
+  return 0;
+}
+
 static int state_write_all(FILE *f, const void *data, size_t len) {
   if (!f || !data)
     return -1;

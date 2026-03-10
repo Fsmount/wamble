@@ -9,6 +9,7 @@ Wamble is a multiplayer chess variant where after every move you're switched to 
 - Single config file with a small Lisp inspired syntax.
 - Config reload on POSIX is triggered with `SIGHUP`.
 - Exec-based hot reload without dropping sockets or cached boards is triggered with `SIGUSR2`.
+- Automatic PID file plus `--reload` / `--hot-reload` CLI controls for easier reload.
 - Run multiple profiles in one process. Each profile has its own port, game DB connection, visibility tier, and optional profile-group selector; advertised profiles get their own UDP listener thread.
 - Split PostgreSQL topology: profile DBs hold game/session state, while one shared global DB holds identities, tags, policy rules, config snapshots, and treatment configuration.
 - Lisp-configured policy rules for trust tiers, profile discovery, and protocol/resource authorization.

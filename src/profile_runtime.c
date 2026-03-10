@@ -44,34 +44,11 @@ static wamble_mutex_t g_mutex;
 static int g_mutex_initialized = 0;
 static int g_prepare_exec = 0;
 static WAMBLE_THREAD_LOCAL char g_runtime_profile_key[128];
-typedef struct WsGatewayStatusEvent {
-  WsGatewayStatus status;
-  char profile[64];
-} WsGatewayStatusEvent;
-typedef struct TrustDecisionStatusEvent {
-  ProfileTrustDecisionStatus status;
-  char profile[64];
-} TrustDecisionStatusEvent;
-typedef struct PredictionManagerStatusEvent {
-  PredictionManagerStatus status;
-  char profile[64];
-} PredictionManagerStatusEvent;
-enum { WS_STATUS_QUEUE_CAP = 64 };
-static WsGatewayStatusEvent g_ws_status_queue[WS_STATUS_QUEUE_CAP];
-static int g_ws_status_head = 0;
-static int g_ws_status_tail = 0;
-static int g_ws_status_count = 0;
-enum { TRUST_STATUS_QUEUE_CAP = 256 };
-static TrustDecisionStatusEvent g_trust_status_queue[TRUST_STATUS_QUEUE_CAP];
-static int g_trust_status_head = 0;
-static int g_trust_status_tail = 0;
-static int g_trust_status_count = 0;
-enum { PREDICTION_MANAGER_STATUS_QUEUE_CAP = 64 };
-static PredictionManagerStatusEvent
-    g_prediction_manager_status_queue[PREDICTION_MANAGER_STATUS_QUEUE_CAP];
-static int g_prediction_manager_status_head = 0;
-static int g_prediction_manager_status_tail = 0;
-static int g_prediction_manager_status_count = 0;
+enum { RUNTIME_EVENT_QUEUE_CAP = 256 };
+static WambleRuntimeEvent g_runtime_event_queue[RUNTIME_EVENT_QUEUE_CAP];
+static int g_runtime_event_head = 0;
+static int g_runtime_event_tail = 0;
+static int g_runtime_event_count = 0;
 
 static void free_running(RunningProfile *rp);
 static void profile_runtime_shutdown(RunningProfile *rp);
@@ -87,15 +64,9 @@ static void ensure_mutex_init(void) {
   if (!g_mutex_initialized) {
     wamble_mutex_init(&g_mutex);
     g_mutex_initialized = 1;
-    g_ws_status_head = 0;
-    g_ws_status_tail = 0;
-    g_ws_status_count = 0;
-    g_trust_status_head = 0;
-    g_trust_status_tail = 0;
-    g_trust_status_count = 0;
-    g_prediction_manager_status_head = 0;
-    g_prediction_manager_status_tail = 0;
-    g_prediction_manager_status_count = 0;
+    g_runtime_event_head = 0;
+    g_runtime_event_tail = 0;
+    g_runtime_event_count = 0;
   }
 }
 
@@ -108,85 +79,36 @@ static void profile_runtime_set_profile_key(const char *profile_name) {
            (profile_name && profile_name[0]) ? profile_name : "__default__");
 }
 
-static void publish_ws_gateway_status(WsGatewayStatus status,
-                                      const char *profile_name) {
+void wamble_runtime_event_publish(WambleRuntimeEventKind kind, int code,
+                                  const char *profile_name) {
   ensure_mutex_init();
   wamble_mutex_lock(&g_mutex);
-  if (g_ws_status_count >= WS_STATUS_QUEUE_CAP) {
-    g_ws_status_head = (g_ws_status_head + 1) % WS_STATUS_QUEUE_CAP;
-    g_ws_status_count--;
+  if (g_runtime_event_count >= RUNTIME_EVENT_QUEUE_CAP) {
+    g_runtime_event_head = (g_runtime_event_head + 1) % RUNTIME_EVENT_QUEUE_CAP;
+    g_runtime_event_count--;
   }
-  WsGatewayStatusEvent *ev = &g_ws_status_queue[g_ws_status_tail];
-  ev->status = status;
+  WambleRuntimeEvent *ev = &g_runtime_event_queue[g_runtime_event_tail];
+  ev->kind = kind;
+  ev->code = code;
   snprintf(ev->profile, sizeof(ev->profile), "%s",
            (profile_name && profile_name[0]) ? profile_name : "default");
-  g_ws_status_tail = (g_ws_status_tail + 1) % WS_STATUS_QUEUE_CAP;
-  g_ws_status_count++;
+  g_runtime_event_tail = (g_runtime_event_tail + 1) % RUNTIME_EVENT_QUEUE_CAP;
+  g_runtime_event_count++;
   wamble_mutex_unlock(&g_mutex);
 }
 
-int profile_runtime_take_ws_gateway_status(WsGatewayStatus *out_status,
-                                           char *out_profile,
-                                           size_t out_profile_size) {
+int wamble_runtime_event_take(WambleRuntimeEvent *out_event) {
   ensure_mutex_init();
-  if (out_status)
-    *out_status = WS_GATEWAY_OK;
-  if (out_profile && out_profile_size > 0)
-    out_profile[0] = '\0';
+  if (out_event)
+    memset(out_event, 0, sizeof(*out_event));
 
   wamble_mutex_lock(&g_mutex);
-  if (g_ws_status_count > 0) {
-    WsGatewayStatusEvent ev = g_ws_status_queue[g_ws_status_head];
-    g_ws_status_head = (g_ws_status_head + 1) % WS_STATUS_QUEUE_CAP;
-    g_ws_status_count--;
-    if (out_profile && out_profile_size > 0) {
-      snprintf(out_profile, out_profile_size, "%s", ev.profile);
-    }
-    if (out_status)
-      *out_status = ev.status;
-    wamble_mutex_unlock(&g_mutex);
-    return 1;
-  }
-  wamble_mutex_unlock(&g_mutex);
-  return 0;
-}
-
-static void publish_trust_decision_status(ProfileTrustDecisionStatus status,
-                                          const char *profile_name) {
-  ensure_mutex_init();
-  wamble_mutex_lock(&g_mutex);
-  if (g_trust_status_count >= TRUST_STATUS_QUEUE_CAP) {
-    g_trust_status_head = (g_trust_status_head + 1) % TRUST_STATUS_QUEUE_CAP;
-    g_trust_status_count--;
-  }
-  TrustDecisionStatusEvent *ev = &g_trust_status_queue[g_trust_status_tail];
-  ev->status = status;
-  snprintf(ev->profile, sizeof(ev->profile), "%s",
-           (profile_name && profile_name[0]) ? profile_name : "default");
-  g_trust_status_tail = (g_trust_status_tail + 1) % TRUST_STATUS_QUEUE_CAP;
-  g_trust_status_count++;
-  wamble_mutex_unlock(&g_mutex);
-}
-
-int profile_runtime_take_trust_decision_status(
-    ProfileTrustDecisionStatus *out_status, char *out_profile,
-    size_t out_profile_size) {
-  ensure_mutex_init();
-  if (out_status)
-    *out_status = PROFILE_TRUST_DECISION_DENIED;
-  if (out_profile && out_profile_size > 0)
-    out_profile[0] = '\0';
-
-  wamble_mutex_lock(&g_mutex);
-  if (g_trust_status_count > 0) {
-    TrustDecisionStatusEvent ev = g_trust_status_queue[g_trust_status_head];
-    g_trust_status_head = (g_trust_status_head + 1) % TRUST_STATUS_QUEUE_CAP;
-    g_trust_status_count--;
-    if (out_profile && out_profile_size > 0) {
-      snprintf(out_profile, out_profile_size, "%s", ev.profile);
-    }
-    if (out_status)
-      *out_status = ev.status;
+  if (g_runtime_event_count > 0) {
+    WambleRuntimeEvent ev = g_runtime_event_queue[g_runtime_event_head];
+    g_runtime_event_head = (g_runtime_event_head + 1) % RUNTIME_EVENT_QUEUE_CAP;
+    g_runtime_event_count--;
+    if (out_event)
+      *out_event = ev;
     wamble_mutex_unlock(&g_mutex);
     return 1;
   }
@@ -196,51 +118,14 @@ int profile_runtime_take_trust_decision_status(
 
 static void publish_prediction_manager_status(PredictionManagerStatus status,
                                               const char *profile_name) {
-  ensure_mutex_init();
-  wamble_mutex_lock(&g_mutex);
-  if (g_prediction_manager_status_count >=
-      PREDICTION_MANAGER_STATUS_QUEUE_CAP) {
-    g_prediction_manager_status_head = (g_prediction_manager_status_head + 1) %
-                                       PREDICTION_MANAGER_STATUS_QUEUE_CAP;
-    g_prediction_manager_status_count--;
-  }
-  PredictionManagerStatusEvent *ev =
-      &g_prediction_manager_status_queue[g_prediction_manager_status_tail];
-  ev->status = status;
-  snprintf(ev->profile, sizeof(ev->profile), "%s",
-           (profile_name && profile_name[0]) ? profile_name : "default");
-  g_prediction_manager_status_tail = (g_prediction_manager_status_tail + 1) %
-                                     PREDICTION_MANAGER_STATUS_QUEUE_CAP;
-  g_prediction_manager_status_count++;
-  wamble_mutex_unlock(&g_mutex);
+  wamble_runtime_event_publish(WAMBLE_RUNTIME_EVENT_PREDICTION_MANAGER,
+                               (int)status, profile_name);
 }
 
-int profile_runtime_take_prediction_manager_status(
-    PredictionManagerStatus *out_status, char *out_profile,
-    size_t out_profile_size) {
-  ensure_mutex_init();
-  if (out_status)
-    *out_status = PREDICTION_MANAGER_OK;
-  if (out_profile && out_profile_size > 0)
-    out_profile[0] = '\0';
-
-  wamble_mutex_lock(&g_mutex);
-  if (g_prediction_manager_status_count > 0) {
-    PredictionManagerStatusEvent ev =
-        g_prediction_manager_status_queue[g_prediction_manager_status_head];
-    g_prediction_manager_status_head = (g_prediction_manager_status_head + 1) %
-                                       PREDICTION_MANAGER_STATUS_QUEUE_CAP;
-    g_prediction_manager_status_count--;
-    if (out_profile && out_profile_size > 0) {
-      snprintf(out_profile, out_profile_size, "%s", ev.profile);
-    }
-    if (out_status)
-      *out_status = ev.status;
-    wamble_mutex_unlock(&g_mutex);
-    return 1;
-  }
-  wamble_mutex_unlock(&g_mutex);
-  return 0;
+static void publish_ws_gateway_status(WsGatewayStatus status,
+                                      const char *profile_name) {
+  wamble_runtime_event_publish(WAMBLE_RUNTIME_EVENT_WS_GATEWAY, (int)status,
+                               profile_name);
 }
 
 enum {
@@ -1072,8 +957,7 @@ static int profile_runtime_enabled(const WambleProfile *p) {
     const WamblePolicyRuleSpec *r = config_policy_rule_get(i);
     if (!r || !r->action || !r->resource || !r->effect)
       continue;
-    if (strcmp(r->action, "profile.discover") != 0 &&
-        strcmp(r->action, "profile.discover.override") != 0)
+    if (strcmp(r->action, "profile.discover.override") != 0)
       continue;
     if (strcmp(r->effect, "allow") != 0)
       continue;
@@ -1176,8 +1060,7 @@ static void profile_runtime_prepare_exec_snapshot(RunningProfile *rp) {
 #endif
 }
 
-static void profile_runtime_poll_messages(RunningProfile *rp,
-                                          const WambleQueryService *qs) {
+static void profile_runtime_poll_messages(RunningProfile *rp) {
   fd_set rfds;
   struct timeval tv;
   FD_ZERO(&rfds);
@@ -1200,21 +1083,7 @@ static void profile_runtime_poll_messages(RunningProfile *rp,
     int n = receive_message(rp->sockfd, &msg, &cliaddr);
     if (n <= 0)
       break;
-    int trust_tier = 0;
-    if (qs && qs->resolve_policy_decision) {
-      WamblePolicyDecision decision;
-      DbStatus st = qs->resolve_policy_decision(
-          msg.token, rp->name, "trust.tier", "tier", NULL, NULL, &decision);
-      if (st == DB_OK && decision.allowed)
-        trust_tier = decision.permission_level;
-      if (st == DB_OK) {
-        publish_trust_decision_status(decision.allowed
-                                          ? PROFILE_TRUST_DECISION_ALLOWED
-                                          : PROFILE_TRUST_DECISION_DENIED,
-                                      rp->name);
-      }
-    }
-    (void)handle_message(rp->sockfd, &msg, &cliaddr, trust_tier, rp->name);
+    (void)handle_message(rp->sockfd, &msg, &cliaddr, 0, rp->name);
   }
 }
 
@@ -1413,7 +1282,7 @@ static void profile_runtime_step(RunningProfile *rp) {
       (void)profile_ws_reconcile(rp);
     }
   }
-  profile_runtime_poll_messages(rp, rp->qs);
+  profile_runtime_poll_messages(rp);
   time_t now = wamble_now_wall();
   if (now - rp->last_cleanup > get_config()->cleanup_interval_sec) {
     cleanup_expired_sessions();
