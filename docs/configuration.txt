@@ -46,14 +46,16 @@ Core Options (common defaults)
 - `experienced-player-end-phase-mult` (double, 2.0): Payout multiplier for experienced players in the late game.
 - `db-host`, `db-user`, `db-pass`, `db-name` (string, defaults
   localhost/wamble/wamble/wamble): Database connection.
+- `db-port` (int, 5432): Profile game DB port.
 - `global-db-host`, `global-db-user`, `global-db-pass`, `global-db-name`
   (string, defaults localhost/wamble/wamble/wamble_global): Process-wide
   global store used for identities, policy rules, and config snapshots/events.
+- `global-db-port` (int, 5432): Shared global DB port.
   All profiles in the process must use the same `global-db-*` endpoint, and it
   must be different from every profile's game DB endpoint (`db-host/user/name`).
 Database Connections
 - Each profile listener runs in its own thread and opens its own DB connection
-  using that profile's `db-host`, `db-user`, `db-pass`, `db-name`.
+  using that profile's `db-host`, `db-port`, `db-user`, `db-pass`, `db-name`.
 - `select-timeout-usec` (int, 100000): Main loop select timeout (usec).
 - `cleanup-interval-sec` (int, 60): Session cleanup cadence.
 - `max-token-attempts` / `max-token-local-attempts` (int, 1000 / 100): Token
@@ -91,7 +93,7 @@ Spectator Settings
 - `spectator-visibility` (int, 0): Minimum trust tier required to spectate (summary or focus). Requests below this threshold are rejected.
 - `spectator-summary-hz` (int, 2): Target max update rate (per second) for summary mode. Best-effort; updates are sent over UDP and may be batched by the main loop cadence.
 - `spectator-focus-hz` (int, 20): Target max update rate (per second) for focused board updates. Best-effort over UDP.
-- `spectator-max-focus-per-session` (int, 1): Focus enable switch. Current implementation supports 0 (disabled) or 1 (single focus). Values >1 behave as 1.
+- `spectator-max-focus-per-session` (int, 1): Focus enable switch. Supported values are 0 (disabled) and 1 (single focus). Values >1 are treated as 1.
 - `spectator-summary-mode` (string, "changes"): Summary filtering mode:
   - `full`: send all ACTIVE+RESERVED boards.
   - `changes`: send only boards whose state changed since the last summary tick.
@@ -99,7 +101,7 @@ Spectator Settings
 Logging Verbosity
 - `log-level` (int, 0..4; default 3=INFO): Global verbosity
   (0=FATAL, 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG).
-  Per-module log levels are not supported at this time.
+  Logging uses a single global level.
 
 Builtins for Computed and Conditional Values
 - Arithmetic: `(+ a b ...)`, `(- a [b ...])`, `(* a b ...)`, `(/ a b ...)`.
@@ -217,7 +219,7 @@ Policy Rule Builtins
   - `stats.read`: query resource `player`.
   - `leaderboard.read`: query resource `global`.
   - `prediction.submit`: query resources `self`, `streak`, `gated`.
-    Context currently includes `board=<board-id>` when available.
+    Context includes `board=<board-id>` when available.
   - `prediction.read`: query resource `tree`; context `depth=<n>`.
     The rule permission level is treated as the maximum readable depth cap.
 - Example:
@@ -235,7 +237,7 @@ Custom Policy Evaluator (optional)
   - list form `(deny [reason] [policy-version])`
 - If missing or malformed, `config_policy_eval(...)` reports no decision/error;
   final allow/deny behavior then follows the caller's own default path.
-- Current runtime authorization paths use DB policy resolution
+- Runtime authorization paths use DB policy resolution
   (`resolve_policy_decision`) as the source of truth.
 
 Treatment Groups

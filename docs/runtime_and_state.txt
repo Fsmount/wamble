@@ -40,8 +40,9 @@ Thread Loop
 
 Exec Handoff
 - Export phase:
-  - `profile_mark_sockets_inheritable()` clears close-on-exec.
-  - `profile_prepare_state_save_and_inherit()` asks threads to save a small per-profile state file and reports a `name=path` CSV.
+  - `profile_prepare_state_save_and_inherit()` asks threads to save a small
+    per-profile state file, marks listener sockets inheritable, and reports a
+    `name=path` CSV.
   - `profile_export_inherited_sockets()` reports `name=socket_handle` CSV.
 - Environment used by the new process:
   - `WAMBLE_HOT_RELOAD=1`

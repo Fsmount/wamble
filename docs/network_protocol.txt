@@ -70,9 +70,8 @@ Control Codes
   - Header: `board_id` identifies the board for this update (authoritative).
   - Payload: `char fen[]`.
   - Typically sent as unreliable (`flags` high bit set). One packet per board.
-  - Richer payloads may be introduced later (e.g., player info, predictions),
-    but `board_id` will always be present in the header and must be used by
-    clients to associate updates with boards.
+  - Payload carries FEN data; `board_id` is always present in the header and
+    clients use it to associate updates with boards.
 - `0x0D` LOGIN_REQUEST (client to server): Attach persistent identity to an
   existing anonymous session.
   - Payload: `uint8 public_key[32]`.
@@ -87,7 +86,7 @@ Control Codes
   - Payload: empty.
 - `0x12` PLAYER_STATS_DATA (server to client): Player statistics.
   - Payload: `double score_be; int32 games_played_be`.
-  - Note: Rating is tracked separately from score and is not currently included in this payload.
+  - Note: Rating is tracked separately from score; this payload carries score and games played.
 - `0x13` GET_PROFILE_INFO (client to server): Request info for a specific profile.
   - Payload: `uint8 name_len; char name[name_len]`.
 - `0x14` PROFILES_LIST (server to client): Response to LIST_PROFILES.

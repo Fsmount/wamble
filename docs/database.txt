@@ -51,11 +51,18 @@ Tables
   - `token BYTEA UNIQUE NOT NULL` (16 bytes)
   - `player_id BIGINT NULL REFERENCES players(id)`
   - `global_identity_id BIGINT NOT NULL` (identity id allocated in shared identity DB)
+  - `config_revision_id BIGINT`
+  - `policy_snapshot_revision_id BIGINT`
   - `total_score DECIMAL(10,4) NOT NULL DEFAULT 0`
+  - `total_prediction_score DECIMAL(10,4) NOT NULL DEFAULT 0`
   - `games_played INTEGER NOT NULL DEFAULT 0`
+  - `treatment_group_key VARCHAR(128)`
+  - `treatment_rule_id BIGINT`
+  - `treatment_snapshot_revision_id BIGINT`
+  - `treatment_assigned_at TIMESTAMPTZ`
   - `created_at TIMESTAMPTZ DEFAULT NOW()`
   - `last_seen_at TIMESTAMPTZ DEFAULT NOW()`
-  - Indexes: `idx_sessions_token` on `(token)`, `idx_sessions_identity_id` on `(global_identity_id)`
+  - Indexes: `idx_sessions_token` on `(token)`, `idx_sessions_identity_id` on `(global_identity_id)`, `idx_sessions_treatment_group` on `(treatment_group_key)`
 
 - global_identities (shared global DB)
   - `id BIGSERIAL PRIMARY KEY`
@@ -67,13 +74,21 @@ Tables
   - `global_identity_id BIGINT NOT NULL`
   - `action VARCHAR(128) NOT NULL`
   - `resource VARCHAR(256) NOT NULL`
+  - `scope VARCHAR(256) NOT NULL DEFAULT '*'`
   - `effect VARCHAR(8) NOT NULL` in {'allow','deny'}
   - `permission_level INTEGER NOT NULL DEFAULT 0`
   - `policy_version VARCHAR(64) NOT NULL DEFAULT 'v1'`
+  - `source VARCHAR(32) NOT NULL DEFAULT 'manual'`
+  - `snapshot_revision_id BIGINT`
+  - `not_before_at TIMESTAMPTZ`
+  - `not_after_at TIMESTAMPTZ`
+  - `context_key VARCHAR(128)`
+  - `context_value VARCHAR(256)`
   - `reason TEXT`
   - `created_at TIMESTAMPTZ DEFAULT NOW()`
   - `updated_at TIMESTAMPTZ DEFAULT NOW()`
-  - Indexes: `(global_identity_id)`, `(action, resource)`
+  - Indexes: `(global_identity_id)`, `(action, resource)`,
+    `(global_identity_id, action, scope, resource)`, `(source, snapshot_revision_id)`
 
 - global_identity_tags (shared global DB)
   - `global_identity_id BIGINT NOT NULL`
@@ -145,6 +160,8 @@ Tables
   - `id BIGSERIAL PRIMARY KEY`
   - `fen VARCHAR(90) NOT NULL`
   - `status VARCHAR(16) NOT NULL` in {'ACTIVE','RESERVED','DORMANT','ARCHIVED'}
+  - `last_assignment_time TIMESTAMPTZ`
+  - `last_mover_treatment_group VARCHAR(128)`
   - `created_at TIMESTAMPTZ DEFAULT NOW()`
   - `updated_at TIMESTAMPTZ DEFAULT NOW()`
   - Indexes: `idx_boards_status` on `(status)`
@@ -185,8 +202,14 @@ Tables
   - `board_id BIGINT NOT NULL REFERENCES boards(id)`
   - `session_id BIGINT NOT NULL REFERENCES sessions(id)`
   - `predicted_move_uci VARCHAR(6) NOT NULL`
+  - `move_number INTEGER NOT NULL DEFAULT 0`
+  - `parent_prediction_id BIGINT REFERENCES predictions(id)`
+  - `correct_streak INTEGER NOT NULL DEFAULT 0`
+  - `points_awarded DECIMAL(10,4) NOT NULL DEFAULT 0`
+  - `resolved_at TIMESTAMPTZ`
   - `status VARCHAR(16) NOT NULL DEFAULT 'PENDING'` in {'PENDING','CORRECT','INCORRECT','EXPIRED'}
   - `created_at TIMESTAMPTZ DEFAULT NOW()`
+  - Indexes: `idx_predictions_board_status_move` on `(board_id, status, move_number)`, `idx_predictions_session_status` on `(session_id, status, created_at DESC)`
 
 Migrations
 - 001_profile_initial_schema.sql: creates profile DB tables, indexes, triggers.
@@ -206,9 +229,12 @@ Migrations
 - 008_profile_identity_sessions.sql: profile DB migration for session identity
   linkage (`sessions.global_identity_id`).
 - 009_global_identity_tags.sql: adds identity tags for bulk policy targeting.
-- 011_treatment_groups.sql: adds persisted treatment groups, assignment rules,
-  outputs, directed edges, session assignment columns, and board last-mover
-  treatment metadata.
+- 010_profile_prediction_resolution.sql: adds prediction resolution columns and
+  per-session prediction totals.
+- 011_global_treatment_groups.sql: adds persisted global treatment groups,
+  assignment rules, predicates, outputs, and directed edges.
+- 011_profile_treatment_groups.sql: adds per-session treatment assignment
+  columns and board last-mover treatment metadata.
 
 Trust and Visibility
 - Client trust resolves from identity-scoped policy only, in deterministic
