@@ -57,7 +57,7 @@ API
 - `prediction_submit()`, `prediction_submit_with_parent()`.
 - `prediction_resolve_move()`.
 - `prediction_collect_tree()`.
-- `prediction_clear_board()`, `prediction_pending_count()`.
+- `prediction_expire_board()`.
 
 References
 - Config (see docs/configuration.txt): `prediction-mode`,
