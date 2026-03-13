@@ -1312,8 +1312,8 @@ WAMBLE_TEST(server_protocol_client_hello_requires_policy) {
   T_ASSERT_STATUS_OK(wamble_thread_join(th1, NULL));
   if (rx1.received) {
     T_ASSERT_EQ_INT(rx1.msg.ctrl, WAMBLE_CTRL_ERROR);
-    T_ASSERT(strstr(rx1.msg.error_reason, "protocol.ctrl/client_hello") !=
-             NULL);
+    T_ASSERT_EQ_INT(rx1.msg.error_code, WAMBLE_ERR_ACCESS_DENIED);
+    T_ASSERT_EQ_INT(rx1.msg.error_reason[0], '\0');
   }
 
   wamble_close_socket(cli);

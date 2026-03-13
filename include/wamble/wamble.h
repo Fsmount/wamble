@@ -1307,6 +1307,27 @@ int get_legal_moves_for_square(const Board *board, int square, Move *moves,
 
 int parse_fen_to_bitboard(const char *fen, Board *board);
 
+static inline void wamble_strip_fen_history(const char *fen, char *out,
+                                            size_t out_size) {
+  if (!out || out_size == 0)
+    return;
+  out[0] = '\0';
+  if (!fen || !fen[0])
+    return;
+  int spaces = 0;
+  size_t i = 0;
+  while (fen[i] && i < out_size - 1) {
+    if (fen[i] == ' ') {
+      spaces++;
+      if (spaces == 2)
+        break;
+    }
+    out[i] = fen[i];
+    i++;
+  }
+  out[i] = '\0';
+}
+
 static inline int square_to_index(int file, int rank) {
   return rank * 8 + file;
 }

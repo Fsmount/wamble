@@ -118,7 +118,7 @@ static void write_visible_board_fen(const uint8_t *token,
   out_fen[0] = '\0';
   if (!board)
     return;
-  snprintf(out_fen, out_fen_size, "%s", board->fen);
+  wamble_strip_fen_history(board->fen, out_fen, out_fen_size);
   if (!token)
     return;
 
@@ -324,21 +324,11 @@ static int profile_discovery_allowed(const uint8_t *token,
 
 static ServerStatus send_policy_denied(wamble_socket_t sockfd,
                                        const struct sockaddr_in *cliaddr,
-                                       const uint8_t *token, const char *action,
-                                       const char *resource,
-                                       const WamblePolicyDecision *decision) {
+                                       const uint8_t *token) {
   struct WambleMsg err = {0};
   err.ctrl = WAMBLE_CTRL_ERROR;
   memcpy(err.token, token, TOKEN_LENGTH);
   err.error_code = WAMBLE_ERR_ACCESS_DENIED;
-  if (decision && decision->reason[0]) {
-    snprintf(err.error_reason, sizeof(err.error_reason),
-             "denied %.24s/%.24s: %.30s", action ? action : "",
-             resource ? resource : "", decision->reason);
-  } else {
-    snprintf(err.error_reason, sizeof(err.error_reason), "denied %.24s/%.24s",
-             action ? action : "", resource ? resource : "");
-  }
   if (send_reliable_default(sockfd, &err, cliaddr) != 0) {
     return SERVER_ERR_SEND_FAILED;
   }
@@ -539,12 +529,9 @@ static ServerStatus handle_player_move(wamble_socket_t sockfd,
                                        const struct WambleMsg *msg,
                                        const struct sockaddr_in *cliaddr,
                                        const char *profile_name) {
-  WamblePolicyDecision decision;
-  memset(&decision, 0, sizeof(decision));
   if (!policy_check(msg->token, profile_name, "game.move", "play", NULL, NULL,
-                    &decision)) {
-    return send_policy_denied(sockfd, cliaddr, msg->token, "game.move", "play",
-                              &decision);
+                    NULL)) {
+    return send_policy_denied(sockfd, cliaddr, msg->token);
   }
   WamblePlayer *player = get_player_by_token(msg->token);
   if (!player) {
@@ -622,9 +609,7 @@ handle_submit_prediction(wamble_socket_t sockfd, const struct WambleMsg *msg,
     struct WambleMsg out = {0};
     out.ctrl = WAMBLE_CTRL_ERROR;
     memcpy(out.token, msg->token, TOKEN_LENGTH);
-    out.error_code = (uint16_t)(2000 - st);
-    snprintf(out.error_reason, sizeof(out.error_reason),
-             "prediction_submit_failed");
+    out.error_code = WAMBLE_ERR_ACCESS_DENIED;
     if (send_reliable_default(sockfd, &out, cliaddr) != 0) {
       return SERVER_ERR_SEND_FAILED;
     }
@@ -671,9 +656,7 @@ static ServerStatus handle_get_predictions(wamble_socket_t sockfd,
     struct WambleMsg out = {0};
     out.ctrl = WAMBLE_CTRL_ERROR;
     memcpy(out.token, msg->token, TOKEN_LENGTH);
-    out.error_code = (uint16_t)(2100 - st);
-    snprintf(out.error_reason, sizeof(out.error_reason),
-             "prediction_read_failed");
+    out.error_code = WAMBLE_ERR_ACCESS_DENIED;
     if (send_reliable_default(sockfd, &out, cliaddr) != 0) {
       return SERVER_ERR_SEND_FAILED;
     }
@@ -786,14 +769,7 @@ static ServerStatus handle_login_request(wamble_socket_t sockfd,
     memcpy(response.token, player->token, TOKEN_LENGTH);
   } else {
     response.ctrl = WAMBLE_CTRL_LOGIN_FAILED;
-    response.error_code = 1;
-    if (!has_key) {
-      snprintf(response.error_reason, sizeof(response.error_reason),
-               "missing public key");
-    } else {
-      snprintf(response.error_reason, sizeof(response.error_reason),
-               "unknown session token; call CLIENT_HELLO first");
-    }
+    response.error_code = WAMBLE_ERR_ACCESS_DENIED;
   }
   if (send_reliable_default(sockfd, &response, cliaddr) != 0) {
     return SERVER_ERR_SEND_FAILED;
@@ -819,8 +795,6 @@ static ServerStatus enforce_message_access_policies(
       out.ctrl = WAMBLE_CTRL_ERROR;
       memcpy(out.token, msg->token, TOKEN_LENGTH);
       out.error_code = WAMBLE_ERR_ACCESS_DENIED;
-      snprintf(out.error_reason, sizeof(out.error_reason), "%s",
-               "rate_limited");
       if (send_reliable_default(sockfd, &out, cliaddr) != 0) {
         return SERVER_ERR_SEND_FAILED;
       }
@@ -829,13 +803,10 @@ static ServerStatus enforce_message_access_policies(
   }
 
   if (msg->ctrl != WAMBLE_CTRL_ACK) {
-    WamblePolicyDecision decision;
-    memset(&decision, 0, sizeof(decision));
     const char *ctrl_res = ctrl_policy_resource(msg->ctrl);
     if (!policy_check(msg->token, profile_name, "protocol.ctrl", ctrl_res, NULL,
-                      NULL, &decision)) {
-      return send_policy_denied(sockfd, cliaddr, msg->token, "protocol.ctrl",
-                                ctrl_res, &decision);
+                      NULL, NULL)) {
+      return send_policy_denied(sockfd, cliaddr, msg->token);
     }
   }
 
@@ -886,9 +857,6 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
       out.ctrl = WAMBLE_CTRL_ERROR;
       memcpy(out.token, msg->token, TOKEN_LENGTH);
       out.error_code = WAMBLE_ERR_ACCESS_DENIED;
-      snprintf(out.error_reason, sizeof(out.error_reason),
-               "denied spectate: %.48s",
-               decision.reason[0] ? decision.reason : "policy");
       if (send_reliable_default(sockfd, &out, cliaddr) != 0) {
         return SERVER_ERR_SEND_FAILED;
       }
@@ -907,8 +875,7 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
       struct WambleMsg out = {0};
       out.ctrl = WAMBLE_CTRL_ERROR;
       memcpy(out.token, msg->token, TOKEN_LENGTH);
-      out.error_code = (uint16_t)(-res);
-      out.error_reason[0] = '\0';
+      out.error_code = WAMBLE_ERR_ACCESS_DENIED;
       if (send_reliable_default(sockfd, &out, cliaddr) != 0) {
         return SERVER_ERR_SEND_FAILED;
       }
@@ -926,12 +893,9 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     return SERVER_OK;
   }
   case WAMBLE_CTRL_GET_PLAYER_STATS: {
-    WamblePolicyDecision decision;
-    memset(&decision, 0, sizeof(decision));
     if (!policy_check(msg->token, profile_name, "stats.read", "player", NULL,
-                      NULL, &decision)) {
-      return send_policy_denied(sockfd, cliaddr, msg->token, "stats.read",
-                                "player", &decision);
+                      NULL, NULL)) {
+      return send_policy_denied(sockfd, cliaddr, msg->token);
     }
     WamblePlayer *player = get_player_by_token(msg->token);
     if (player) {
@@ -950,12 +914,9 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     return SERVER_ERR_UNKNOWN_PLAYER;
   }
   case WAMBLE_CTRL_GET_LEADERBOARD: {
-    WamblePolicyDecision decision;
-    memset(&decision, 0, sizeof(decision));
     if (!policy_check(msg->token, profile_name, "leaderboard.read", "global",
-                      NULL, NULL, &decision)) {
-      return send_policy_denied(sockfd, cliaddr, msg->token, "leaderboard.read",
-                                "global", &decision);
+                      NULL, NULL, NULL)) {
+      return send_policy_denied(sockfd, cliaddr, msg->token);
     }
     uint8_t lb_type = msg->leaderboard_type;
     if (lb_type != WAMBLE_LEADERBOARD_RATING)
@@ -999,12 +960,9 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
   case WAMBLE_CTRL_GET_PREDICTIONS:
     return handle_get_predictions(sockfd, cliaddr, msg, profile_name);
   case WAMBLE_CTRL_GET_LEGAL_MOVES: {
-    WamblePolicyDecision decision;
-    memset(&decision, 0, sizeof(decision));
     if (!policy_check(msg->token, profile_name, "game.move", "legal", NULL,
-                      NULL, &decision)) {
-      return send_policy_denied(sockfd, cliaddr, msg->token, "game.move",
-                                "legal", &decision);
+                      NULL, NULL)) {
+      return send_policy_denied(sockfd, cliaddr, msg->token);
     }
     WamblePlayer *player = get_player_by_token(msg->token);
     if (!player) {

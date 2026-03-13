@@ -107,7 +107,7 @@ static void spectator_write_visible_fen(const uint8_t *token,
   out_fen[0] = '\0';
   if (!board)
     return;
-  snprintf(out_fen, out_fen_size, "%s", board->fen);
+  wamble_strip_fen_history(board->fen, out_fen, out_fen_size);
   if (!token)
     return;
   WambleFact facts[3];
