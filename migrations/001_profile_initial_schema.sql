@@ -66,11 +66,11 @@ CREATE TABLE predictions (
 CREATE INDEX idx_sessions_token ON sessions(token);
 CREATE INDEX idx_sessions_identity_id ON sessions(global_identity_id);
 CREATE INDEX idx_boards_status ON boards(status);
-CREATE INDEX idx_moves_board_id ON moves(board_id);
-CREATE INDEX idx_moves_session_id ON moves(session_id);
-CREATE INDEX idx_moves_board_session ON moves(board_id, session_id);
+CREATE INDEX idx_moves_board_id_all ON moves(board_id);
+CREATE INDEX idx_moves_session_id_all ON moves(session_id);
+CREATE INDEX idx_moves_board_session_all ON moves(board_id, session_id);
 CREATE INDEX idx_reservations_expires_at ON reservations(expires_at);
-CREATE INDEX idx_payouts_session_id ON payouts(session_id);
+CREATE INDEX idx_payouts_session_id_all ON payouts(session_id);
 
 CREATE OR REPLACE FUNCTION update_timestamp()
 RETURNS TRIGGER AS $$

@@ -521,6 +521,7 @@ typedef struct WambleConfig {
 
   char *state_dir;
   char *websocket_path;
+  int chess960_interval;
 } WambleConfig;
 
 typedef enum {
@@ -972,6 +973,7 @@ typedef struct {
   time_t reservation_time;
   char last_mover_treatment_group[128];
   bool reserved_for_white;
+  int mode_variant_id;
 } DbBoardResult;
 
 typedef struct {
@@ -1089,20 +1091,40 @@ typedef struct {
   int captured_piece_type;
   int captured_square;
   char prev_en_passant[3];
-  char prev_castling[5];
+  char prev_castling[9];
   int prev_halfmove_clock;
   int prev_fullmove_number;
   int moving_piece_color;
+  int is_castling;
+  int castle_rook_from;
+  int castle_rook_to;
+  int castle_king_to;
 } MoveInfo;
+
+typedef enum {
+  GAME_MODE_STANDARD = 0,
+  GAME_MODE_CHESS960,
+} GameMode;
+
+static inline const char *game_mode_to_str(GameMode mode) {
+  return (mode == GAME_MODE_CHESS960) ? "chess960" : "standard";
+}
+
+static inline GameMode game_mode_from_str(const char *s) {
+  if (s && s[0] == 'c')
+    return GAME_MODE_CHESS960;
+  return GAME_MODE_STANDARD;
+}
 
 typedef struct {
   Bitboard pieces[12];
   Bitboard occupied[2];
   char turn;
-  char castling[5];
+  char castling[9];
   char en_passant[3];
   int halfmove_clock;
   int fullmove_number;
+  GameMode game_mode;
 } Board;
 
 typedef enum {
@@ -1137,6 +1159,9 @@ typedef enum {
 #define WAMBLE_ERR_ACCESS_DENIED 1001
 
 #define WAMBLE_FLAG_UNRELIABLE 0x80
+#define WAMBLE_FLAG_BOARD_IS_960 0x01
+#define WAMBLE_FLAG_MODE_FILTER_CHESS960 0x02
+#define WAMBLE_FLAG_MODE_FILTER_STANDARD 0x04
 
 #define WAMBLE_MAX_LEGAL_MOVES 218
 #define WAMBLE_MAX_LEADERBOARD_ENTRIES 16
@@ -1196,6 +1221,7 @@ struct WambleMsg {
   uint8_t login_pubkey[32];
   double player_stats_score;
   uint32_t player_stats_games_played;
+  uint32_t player_stats_chess960_games_played;
   uint8_t move_square;
   uint8_t move_count;
   WambleNetMove moves[WAMBLE_MAX_LEGAL_MOVES];
@@ -1224,6 +1250,7 @@ typedef struct WamblePlayer {
   double prediction_score;
   double rating;
   int games_played;
+  int chess960_games_played;
 } WamblePlayer;
 
 typedef struct WamblePersistentPlayerStats {
@@ -1231,7 +1258,12 @@ typedef struct WamblePersistentPlayerStats {
   double prediction_score;
   double rating;
   int games_played;
+  int chess960_games_played;
 } WamblePersistentPlayerStats;
+
+typedef union {
+  int chess960_position_id;
+} WambleModeParams;
 
 typedef struct WambleBoard {
   char fen[FEN_MAX_LENGTH];
@@ -1246,6 +1278,7 @@ typedef struct WambleBoard {
   uint8_t reservation_player_token[TOKEN_LENGTH];
   bool reserved_for_white;
   time_t reservation_time;
+  WambleModeParams mode_params;
 } WambleBoard;
 
 static inline double
@@ -1295,6 +1328,22 @@ static inline int wamble_collect_board_treatment_facts(const WambleBoard *board,
     facts[fact_count].int_value = board->board.fullmove_number;
     fact_count++;
   }
+  if (fact_count < max_facts) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "board.is_chess960");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_BOOL;
+    facts[fact_count].bool_value =
+        (board->board.game_mode == GAME_MODE_CHESS960) ? 1 : 0;
+    fact_count++;
+  }
+  if (fact_count < max_facts) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "board.chess960_position_id");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+    facts[fact_count].int_value =
+        (int64_t)board->mode_params.chess960_position_id;
+    fact_count++;
+  }
   return fact_count;
 }
 
@@ -1306,6 +1355,7 @@ int get_legal_moves_for_square(const Board *board, int square, Move *moves,
                                int max_moves);
 
 int parse_fen_to_bitboard(const char *fen, Board *board);
+int chess960_gen_fen(int pos, char *buf, size_t buf_size);
 
 static inline void wamble_strip_fen_history(const char *fen, char *out,
                                             size_t out_size) {
@@ -1472,7 +1522,7 @@ void wamble_emit_resolve_prediction(uint64_t board_id, const uint8_t *token,
                                     int move_number, const char *status,
                                     double points_awarded);
 void wamble_emit_create_board(uint64_t board_id, const char *fen,
-                              const char *status);
+                              const char *status, int mode_variant_id);
 void wamble_emit_record_move(uint64_t board_id, const uint8_t *token,
                              const char *move_uci, int move_number);
 
@@ -1502,6 +1552,8 @@ DbStatus wamble_query_get_player_rating(uint64_t session_id,
                                         double *out_rating);
 DbStatus wamble_query_get_session_games_played(uint64_t session_id,
                                                int *out_games);
+DbStatus wamble_query_get_session_chess960_games_played(uint64_t session_id,
+                                                        int *out_games);
 DbStatus wamble_query_get_persistent_player_stats(
     const uint8_t *public_key, WamblePersistentPlayerStats *out_stats);
 DbLeaderboardResult wamble_query_get_leaderboard(uint64_t requester_session_id,
@@ -1570,6 +1622,7 @@ typedef struct SpectatorUpdate {
   uint64_t board_id;
   char fen[FEN_MAX_LENGTH];
   struct sockaddr_in addr;
+  uint8_t flags;
 } SpectatorUpdate;
 
 SpectatorRequestStatus

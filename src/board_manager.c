@@ -19,6 +19,20 @@ static WAMBLE_THREAD_LOCAL int *board_index_map;
 #define INITIAL_BOARD_FEN                                                      \
   "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 #define INITIAL_BOARD_STATUS "DORMANT"
+#define NO_CHESS960_POSITION (-1)
+
+static int board_should_be_chess960(uint64_t board_id) {
+  int interval = get_config()->chess960_interval;
+  if (interval < 0)
+    return 0;
+  if (interval == 0)
+    return 1;
+  return (board_id % (uint64_t)interval) == 0;
+}
+
+static int board_get_chess960_position(uint64_t board_id) {
+  return (int)(board_id % 960);
+}
 
 static inline uint64_t mix64_hash(uint64_t x) {
   x ^= x >> 33;
@@ -192,8 +206,16 @@ void board_manager_tick() {
     if (observed_total_boards + created_count >= get_config()->max_boards)
       break;
     uint64_t new_board_id = alloc_board_id();
-    wamble_emit_create_board(new_board_id, INITIAL_BOARD_FEN,
-                             INITIAL_BOARD_STATUS);
+    int c960_pos = NO_CHESS960_POSITION;
+    const char *fen_to_use = INITIAL_BOARD_FEN;
+    char c960_fen[FEN_MAX_LENGTH];
+    if (board_should_be_chess960(new_board_id)) {
+      c960_pos = board_get_chess960_position(new_board_id);
+      chess960_gen_fen(c960_pos, c960_fen, sizeof(c960_fen));
+      fen_to_use = c960_fen;
+    }
+    wamble_emit_create_board(new_board_id, fen_to_use, INITIAL_BOARD_STATUS,
+                             c960_pos);
     created_count++;
   }
 
@@ -267,7 +289,17 @@ void board_manager_init(void) {
         WambleBoard *b = &board_cached[slot];
         memset(b, 0, sizeof(*b));
         b->id = new_board_id;
-        strcpy(b->fen, INITIAL_BOARD_FEN);
+        b->mode_params.chess960_position_id = NO_CHESS960_POSITION;
+        int c960_pos_init = NO_CHESS960_POSITION;
+        if (board_should_be_chess960(new_board_id)) {
+          c960_pos_init = board_get_chess960_position(new_board_id);
+          char c960_fen[FEN_MAX_LENGTH];
+          chess960_gen_fen(c960_pos_init, c960_fen, sizeof(c960_fen));
+          strcpy(b->fen, c960_fen);
+          b->mode_params.chess960_position_id = c960_pos_init;
+        } else {
+          strcpy(b->fen, INITIAL_BOARD_FEN);
+        }
         parse_fen_to_bitboard(b->fen, &b->board);
         b->state = BOARD_STATE_DORMANT;
         b->result = GAME_RESULT_IN_PROGRESS;
@@ -277,8 +309,8 @@ void board_manager_init(void) {
         board_map_put(b->id, slot);
         if (slot >= num_cached_boards)
           num_cached_boards = slot + 1;
-        wamble_emit_create_board(new_board_id, INITIAL_BOARD_FEN,
-                                 INITIAL_BOARD_STATUS);
+        wamble_emit_create_board(new_board_id, b->fen, INITIAL_BOARD_STATUS,
+                                 b->mode_params.chess960_position_id);
         total_boards++;
       }
     }
@@ -353,7 +385,7 @@ static int board_assignment_apply_treatment(const WambleBoard *board,
                                             double *score) {
   if (!board || !player || !score)
     return 0;
-  WambleFact facts[4];
+  WambleFact facts[7];
   int fact_count = 0;
   memset(facts, 0, sizeof(facts));
 
@@ -381,6 +413,26 @@ static int board_assignment_apply_treatment(const WambleBoard *board,
   facts[fact_count].double_value = player->rating;
   fact_count++;
 
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "board.is_chess960");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_BOOL;
+  facts[fact_count].bool_value =
+      (board->board.game_mode == GAME_MODE_CHESS960) ? 1 : 0;
+  fact_count++;
+
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "board.chess960_position_id");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+  facts[fact_count].int_value =
+      (int64_t)board->mode_params.chess960_position_id;
+  fact_count++;
+
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "player.chess960_games_played");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+  facts[fact_count].int_value = player->chess960_games_played;
+  fact_count++;
+
   WambleTreatmentAction actions[16];
   int action_count = 0;
   if (wamble_query_resolve_treatment_actions(
@@ -390,14 +442,26 @@ static int board_assignment_apply_treatment(const WambleBoard *board,
     return 0;
   }
 
+  int board_is_960 = (board->board.game_mode == GAME_MODE_CHESS960);
   for (int i = 0; i < action_count; i++) {
     const WambleTreatmentAction *action = &actions[i];
     if (strcmp(action->output_kind, "feature") == 0 &&
-        strcmp(action->output_key, "board.assignment.disable") == 0 &&
         action->value_type == WAMBLE_TREATMENT_VALUE_BOOL &&
         action->bool_value) {
-      *score = 0.0;
-      return -1;
+      if (strcmp(action->output_key, "board.assignment.disable") == 0) {
+        *score = 0.0;
+        return -1;
+      }
+      if (strcmp(action->output_key, "board.chess960.disable") == 0 &&
+          board_is_960) {
+        *score = 0.0;
+        return -1;
+      }
+      if (strcmp(action->output_key, "board.chess960.only") == 0 &&
+          !board_is_960) {
+        *score = 0.0;
+        return -1;
+      }
     }
     if (strcmp(action->output_kind, "behavior") != 0)
       continue;
@@ -431,7 +495,10 @@ static double calculate_board_attractiveness(const WambleBoard *board,
     phase = GAME_PHASE_END;
   }
 
-  bool is_new_player = (player->games_played < NEW_PLAYER_GAMES_THRESHOLD);
+  int relevant_games = (board->board.game_mode == GAME_MODE_CHESS960)
+                           ? player->chess960_games_played
+                           : player->games_played;
+  bool is_new_player = (relevant_games < NEW_PLAYER_GAMES_THRESHOLD);
 
   double multiplier;
   switch (phase) {
@@ -520,6 +587,9 @@ static WambleBoard *load_board_into_cache(uint64_t board_id) {
   memset(board->reservation_player_token, 0, TOKEN_LENGTH);
   board->reservation_time = br.reservation_time;
   board->reserved_for_white = br.reserved_for_white;
+  board->board.game_mode =
+      (br.mode_variant_id >= 0) ? GAME_MODE_CHESS960 : GAME_MODE_STANDARD;
+  board->mode_params.chess960_position_id = br.mode_variant_id;
 
   board_map_put(board_id, cache_slot);
   if (cache_slot >= num_cached_boards) {
@@ -832,6 +902,9 @@ static int append_dormant_eligible_boards(WamblePlayer *player,
     temp_board.state = BOARD_STATE_DORMANT;
     temp_board.result = GAME_RESULT_IN_PROGRESS;
     temp_board.last_assignment_time = br.last_assignment_time;
+    temp_board.board.game_mode =
+        (br.mode_variant_id >= 0) ? GAME_MODE_CHESS960 : GAME_MODE_STANDARD;
+    temp_board.mode_params.chess960_position_id = br.mode_variant_id;
     snprintf(temp_board.last_mover_treatment_group,
              sizeof(temp_board.last_mover_treatment_group), "%s",
              br.last_mover_treatment_group);
@@ -939,10 +1012,20 @@ static int create_new_board_for_player(WamblePlayer *player) {
   }
 
   WambleBoard *board = &board_cached[cache_slot];
-  strcpy(board->fen, INITIAL_BOARD_FEN);
-
   board->id = alloc_board_id();
-  wamble_emit_create_board(board->id, board->fen, INITIAL_BOARD_STATUS);
+  board->mode_params.chess960_position_id = NO_CHESS960_POSITION;
+  if (board_should_be_chess960(board->id)) {
+    board->mode_params.chess960_position_id =
+        board_get_chess960_position(board->id);
+    char c960_fen[FEN_MAX_LENGTH];
+    chess960_gen_fen(board->mode_params.chess960_position_id, c960_fen,
+                     sizeof(c960_fen));
+    strcpy(board->fen, c960_fen);
+  } else {
+    strcpy(board->fen, INITIAL_BOARD_FEN);
+  }
+  wamble_emit_create_board(board->id, board->fen, INITIAL_BOARD_STATUS,
+                           board->mode_params.chess960_position_id);
 
   board->result = GAME_RESULT_IN_PROGRESS;
   parse_fen_to_bitboard(board->fen, &board->board);

@@ -27,6 +27,8 @@ static DbStatus db_get_player_prediction_score(uint64_t session_id,
 static DbStatus db_get_player_rating(uint64_t session_id, double *out_rating);
 static DbStatus db_get_session_games_played(uint64_t session_id,
                                             int *out_games);
+static DbStatus db_get_session_chess960_games_played(uint64_t session_id,
+                                                     int *out_games);
 static DbStatus
 db_get_persistent_player_stats(const uint8_t *public_key,
                                WamblePersistentPlayerStats *out_stats);
@@ -2199,6 +2201,8 @@ const WambleQueryService *wamble_get_db_query_service(void) {
     svc.get_player_prediction_score = db_get_player_prediction_score;
     svc.get_player_rating = db_get_player_rating;
     svc.get_session_games_played = db_get_session_games_played;
+    svc.get_session_chess960_games_played =
+        db_get_session_chess960_games_played;
     svc.get_persistent_player_stats = db_get_persistent_player_stats;
     svc.get_leaderboard = db_get_leaderboard;
     svc.get_moves_for_board = db_get_moves_for_board;
@@ -2391,6 +2395,14 @@ DbStatus wamble_query_get_session_games_played(uint64_t session_id,
   if (!qs || !qs->get_session_games_played)
     return DB_ERR_EXEC;
   return qs->get_session_games_played(session_id, out_games);
+}
+
+DbStatus wamble_query_get_session_chess960_games_played(uint64_t session_id,
+                                                        int *out_games) {
+  const WambleQueryService *qs = get_query_service();
+  if (!qs || !qs->get_session_chess960_games_played)
+    return DB_ERR_EXEC;
+  return qs->get_session_chess960_games_played(session_id, out_games);
 }
 
 DbStatus wamble_query_get_persistent_player_stats(
@@ -2727,9 +2739,10 @@ int db_insert_board(uint64_t board_id, const char *fen, const char *status) {
   char board_id_str[32];
   snprintf(board_id_str, sizeof(board_id_str), "%" PRIu64, (uint64_t)board_id);
   const char *paramValues[] = {board_id_str, fen, status};
-  const char *query = "INSERT INTO boards (id, fen, status) VALUES ($1, $2, $3)"
-                      " ON CONFLICT (id) DO UPDATE SET fen = EXCLUDED.fen, "
-                      "status = EXCLUDED.status";
+  const char *query =
+      "INSERT INTO boards (id, fen, status) "
+      "VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET fen = "
+      "EXCLUDED.fen, status = EXCLUDED.status";
 
   PGresult *res =
       pq_exec_params_locked(query, 3, NULL, paramValues, NULL, NULL, 0);
@@ -2749,6 +2762,32 @@ int db_insert_board(uint64_t board_id, const char *fen, const char *status) {
       pq_exec_params_locked(seq_query, 1, NULL, seq_params, NULL, NULL, 0);
   if (seq_res)
     PQclear(seq_res);
+  return 0;
+}
+
+int db_insert_board_mode_variant(uint64_t board_id, int mode_variant_id) {
+  if (board_id == 0)
+    return -1;
+  char board_id_str[32];
+  char mode_variant_id_str[16];
+  snprintf(board_id_str, sizeof(board_id_str), "%" PRIu64, board_id);
+  snprintf(mode_variant_id_str, sizeof(mode_variant_id_str), "%d",
+           mode_variant_id);
+  const char *paramValues[] = {board_id_str, mode_variant_id_str};
+  const char *query =
+      "INSERT INTO board_mode_variants (board_id, game_mode, mode_variant_id) "
+      "VALUES ($1, 'chess960', $2) ON CONFLICT (board_id) DO UPDATE SET "
+      "game_mode = EXCLUDED.game_mode, mode_variant_id = "
+      "EXCLUDED.mode_variant_id";
+  PGresult *res =
+      pq_exec_params_locked(query, 2, NULL, paramValues, NULL, NULL, 0);
+  if (!res)
+    return -1;
+  if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+    PQclear(res);
+    return -1;
+  }
+  PQclear(res);
   return 0;
 }
 
@@ -2870,9 +2909,11 @@ static DbBoardResult db_get_board(uint64_t board_id) {
       "COALESCE(b.last_mover_treatment_group, ''), "
       "COALESCE(EXTRACT(EPOCH FROM r.started_at)::bigint, "
       "COALESCE(EXTRACT(EPOCH FROM b.reservation_started_at)::bigint, 0)), "
-      "COALESCE(r.reserved_for_white, COALESCE(b.reserved_for_white, FALSE)) "
+      "COALESCE(r.reserved_for_white, COALESCE(b.reserved_for_white, FALSE)), "
+      "COALESCE(bmv.mode_variant_id, -1) "
       "FROM boards b "
       "LEFT JOIN reservations r ON r.board_id = b.id "
+      "LEFT JOIN board_mode_variants bmv ON bmv.board_id = b.id "
       "WHERE b.id = $1";
 
   char board_id_str[32];
@@ -2908,6 +2949,7 @@ static DbBoardResult db_get_board(uint64_t board_id) {
   out.reservation_time = (time_t)strtoull(PQgetvalue(res, 0, 6), NULL, 10);
   out.reserved_for_white =
       (PQgetvalue(res, 0, 7)[0] == 't' || PQgetvalue(res, 0, 7)[0] == '1');
+  out.mode_variant_id = (int)strtol(PQgetvalue(res, 0, 8), NULL, 10);
   out.status = DB_OK;
   PQclear(res);
   return out;
@@ -3633,20 +3675,62 @@ static DbStatus db_get_session_games_played(uint64_t session_id,
   return DB_OK;
 }
 
+static DbStatus db_get_session_chess960_games_played(uint64_t session_id,
+                                                     int *out_games) {
+  if (!out_games)
+    return DB_ERR_BAD_DATA;
+  const char *query =
+      "SELECT COUNT(DISTINCT m.board_id) "
+      "FROM moves m "
+      "JOIN board_mode_variants bmv ON bmv.board_id = m.board_id "
+      "WHERE m.session_id = $1";
+
+  char session_id_str[32];
+  snprintf(session_id_str, sizeof(session_id_str), "%" PRIu64, session_id);
+
+  const char *paramValues[] = {session_id_str};
+
+  PGresult *res =
+      pq_exec_params_locked(query, 1, NULL, paramValues, NULL, NULL, 0);
+
+  if (!res)
+    return DB_ERR_CONN;
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    PQclear(res);
+    return DB_ERR_EXEC;
+  }
+
+  char *endptr;
+  long chess960_games_played = strtol(PQgetvalue(res, 0, 0), &endptr, 10);
+  if (*endptr != '\0' || chess960_games_played < 0) {
+    PQclear(res);
+    return DB_ERR_BAD_DATA;
+  }
+  PQclear(res);
+  *out_games = (int)chess960_games_played;
+  return DB_OK;
+}
+
 static DbStatus
 db_get_persistent_player_stats(const uint8_t *public_key,
                                WamblePersistentPlayerStats *out_stats) {
   if (!public_key || !out_stats)
     return DB_ERR_BAD_DATA;
 
-  const char *query = "SELECT COALESCE(SUM(s.total_score), 0), "
-                      "COALESCE(SUM(s.total_prediction_score), 0), "
-                      "COALESCE(p.rating, 0), "
-                      "COALESCE(SUM(s.games_played), 0) "
-                      "FROM players p "
-                      "LEFT JOIN sessions s ON s.player_id = p.id "
-                      "WHERE p.public_key = decode($1, 'hex') "
-                      "GROUP BY p.id, p.rating";
+  const char *query =
+      "SELECT COALESCE(SUM(s.total_score), 0), "
+      "COALESCE(SUM(s.total_prediction_score), 0), "
+      "COALESCE(p.rating, 0), "
+      "COALESCE(SUM(s.games_played), 0), "
+      "(SELECT COUNT(DISTINCT m.board_id) "
+      " FROM sessions s2 "
+      " JOIN moves m ON m.session_id = s2.id "
+      " JOIN board_mode_variants bmv ON bmv.board_id = m.board_id "
+      " WHERE s2.player_id = p.id) "
+      "FROM players p "
+      "LEFT JOIN sessions s ON s.player_id = p.id "
+      "WHERE p.public_key = decode($1, 'hex') "
+      "GROUP BY p.id, p.rating";
 
   char public_key_hex[65];
   bytes_to_hex(public_key, 32, public_key_hex);
@@ -3686,9 +3770,15 @@ db_get_persistent_player_stats(const uint8_t *public_key,
     PQclear(res);
     return DB_ERR_BAD_DATA;
   }
+  long chess960_games_played = strtol(PQgetvalue(res, 0, 4), &endptr, 10);
+  if (!endptr || *endptr != '\0' || chess960_games_played < 0) {
+    PQclear(res);
+    return DB_ERR_BAD_DATA;
+  }
   PQclear(res);
 
   out_stats->games_played = (int)games_played;
+  out_stats->chess960_games_played = (int)chess960_games_played;
   return DB_OK;
 }
 

@@ -60,6 +60,32 @@ static const Case cases[] = {
      "k7/8/1Q6/8/8/8/8/K7 b - - 1 1", 1, GAME_RESULT_DRAW},
     {"50 move rule draw", "k7/8/8/8/8/8/8/K7 w - - 99 50", "a1b1",
      "k7/8/8/8/8/8/8/1K6 b - - 100 50", 1, GAME_RESULT_DRAW},
+    {"chess960 d1 kingside castling d1h1", "4k3/8/8/8/8/8/8/R2K3R w AH - 0 1",
+     "d1h1", "4k3/8/8/8/8/8/8/R4RK1 b - -", 1, GAME_RESULT_IN_PROGRESS},
+    {"chess960 d1 queenside castling d1a1", "4k3/8/8/8/8/8/8/R2K3R w AH - 0 1",
+     "d1a1", "4k3/8/8/8/8/8/8/2KR3R b - -", 1, GAME_RESULT_IN_PROGRESS},
+    {"chess960 g1 kingside castling g1h1 (adjacent rook)",
+     "4k3/8/8/8/8/8/8/6KR w H - 0 1", "g1h1", "4k3/8/8/8/8/8/8/5RK1 b - -", 1,
+     GAME_RESULT_IN_PROGRESS},
+    {"chess960 adjacent rook castling blocked by piece at rook_to",
+     "4k3/8/8/8/8/8/8/5NKR w H - 0 1", "g1h1", "", 0, GAME_RESULT_IN_PROGRESS},
+    {"chess960 g1 queenside castling g1f1 (non-corner rook)",
+     "4k3/8/8/8/8/8/8/5RKR w HF - 0 1", "g1f1", "4k3/8/8/8/8/8/8/2KR3R b - -",
+     1, GAME_RESULT_IN_PROGRESS},
+    {"chess960 b1 kingside castling b1h1", "4k3/8/8/8/8/8/8/1K5R w H - 0 1",
+     "b1h1", "4k3/8/8/8/8/8/8/5RK1 b - -", 1, GAME_RESULT_IN_PROGRESS},
+    {"chess960 rook capture revokes castling right",
+     "r3k3/8/8/8/8/8/8/R2K3R w AHa - 0 1", "a1a8",
+     "R3k3/8/8/8/8/8/8/3K3R b H -", 1, GAME_RESULT_IN_PROGRESS},
+    {"castling through attacked square illegal",
+     "6r1/8/8/8/8/8/8/4K2R w K - 0 1", "e1g1", "", 0, GAME_RESULT_IN_PROGRESS},
+    {"castling while in check illegal", "4r3/8/8/8/8/8/8/4K2R w K - 0 1",
+     "e1g1", "", 0, GAME_RESULT_IN_PROGRESS},
+    {"chess960 castling path blocked illegal",
+     "4k3/8/8/8/8/8/8/3K2NR w H - 0 1", "d1h1", "", 0, GAME_RESULT_IN_PROGRESS},
+    {"chess960 castling through attacked square illegal",
+     "4k3/8/8/8/8/8/5r2/3K3R w H - 0 1", "d1h1", "", 0,
+     GAME_RESULT_IN_PROGRESS},
 };
 
 static int move_engine_apply_not_reserved(void);
@@ -74,10 +100,9 @@ static int move_engine_stress_concurrent_movegen(void);
 static int move_engine_promotion_missing_letter_illegal(void);
 static int move_engine_promotion_invalid_letter_illegal(void);
 static int move_engine_generator_promotions_listed(void);
-static int move_engine_castling_through_attacked_square_illegal(void);
-static int move_engine_castling_while_in_check_illegal(void);
 static int move_engine_status_move_ok_on_success(void);
 static int move_engine_clocks_increment_and_reset(void);
+static int move_engine_chess960_gen_fen_structural(void);
 
 WAMBLE_PARAM_TEST(Case, apply_move_case) {
   const Case *c = tc;
@@ -177,9 +202,7 @@ WAMBLE_TESTS_ADD_SM(move_engine_promotion_invalid_letter_illegal,
                     WAMBLE_SUITE_FUNCTIONAL, "move_engine");
 WAMBLE_TESTS_ADD_SM(move_engine_generator_promotions_listed,
                     WAMBLE_SUITE_FUNCTIONAL, "move_engine");
-WAMBLE_TESTS_ADD_SM(move_engine_castling_through_attacked_square_illegal,
-                    WAMBLE_SUITE_FUNCTIONAL, "move_engine");
-WAMBLE_TESTS_ADD_SM(move_engine_castling_while_in_check_illegal,
+WAMBLE_TESTS_ADD_SM(move_engine_chess960_gen_fen_structural,
                     WAMBLE_SUITE_FUNCTIONAL, "move_engine");
 WAMBLE_TESTS_ADD_SM(move_engine_status_move_ok_on_success,
                     WAMBLE_SUITE_FUNCTIONAL, "move_engine");
@@ -275,42 +298,6 @@ WAMBLE_TEST(move_engine_generator_promotions_listed) {
     }
   }
   T_ASSERT(has_q && has_r && has_b && has_n);
-  return 0;
-}
-
-WAMBLE_TEST(move_engine_castling_through_attacked_square_illegal) {
-  WambleBoard wb;
-  memset(&wb, 0, sizeof(wb));
-  wb.id = 1;
-  wb.state = BOARD_STATE_RESERVED;
-  T_ASSERT_STATUS_OK(
-      parse_fen_to_bitboard("6r1/8/8/8/8/8/8/4K2R w K - 0 1", &wb.board));
-  wb.reserved_for_white = true;
-  WamblePlayer player;
-  memset(&player, 0, sizeof(player));
-  memcpy(wb.reservation_player_token, player.token, TOKEN_LENGTH);
-  MoveApplyStatus st = MOVE_OK;
-  int rc = validate_and_apply_move_status(&wb, &player, "e1g1", &st);
-  T_ASSERT(rc != 0);
-  T_ASSERT_STATUS(st, MOVE_ERR_ILLEGAL);
-  return 0;
-}
-
-WAMBLE_TEST(move_engine_castling_while_in_check_illegal) {
-  WambleBoard wb;
-  memset(&wb, 0, sizeof(wb));
-  wb.id = 1;
-  wb.state = BOARD_STATE_RESERVED;
-  T_ASSERT_STATUS_OK(
-      parse_fen_to_bitboard("4r3/8/8/8/8/8/8/4K2R w K - 0 1", &wb.board));
-  wb.reserved_for_white = true;
-  WamblePlayer player;
-  memset(&player, 0, sizeof(player));
-  memcpy(wb.reservation_player_token, player.token, TOKEN_LENGTH);
-  MoveApplyStatus st = MOVE_OK;
-  int rc = validate_and_apply_move_status(&wb, &player, "e1g1", &st);
-  T_ASSERT(rc != 0);
-  T_ASSERT_STATUS(st, MOVE_ERR_ILLEGAL);
   return 0;
 }
 
@@ -591,5 +578,70 @@ WAMBLE_TEST(move_engine_stress_concurrent_movegen) {
                 (unsigned long long)elapsed_ns, iters_per_sec);
   T_ASSERT(all_done);
   T_ASSERT(elapsed_ns < (uint64_t)5e9);
+  return 0;
+}
+
+WAMBLE_TEST(move_engine_chess960_gen_fen_structural) {
+  for (int sp = 0; sp < 960; sp++) {
+    char buf[128];
+    T_ASSERT_STATUS_OK(chess960_gen_fen(sp, buf, sizeof(buf)));
+
+    int bishops = 0, knights = 0, queens = 0, kings = 0, rooks = 0;
+    int king_file = -1, rook_lo = -1, rook_hi = -1;
+    int bishop_files[2];
+    int bf = 0;
+    const char *slash = buf;
+    for (const char *q = buf; *q && *q != ' '; q++)
+      if (*q == '/')
+        slash = q + 1;
+    for (int f = 0; f < 8; f++) {
+      char ch = slash[f];
+      switch (ch) {
+      case 'R':
+        rooks++;
+        if (rook_lo == -1)
+          rook_lo = f;
+        else
+          rook_hi = f;
+        break;
+      case 'N':
+        knights++;
+        break;
+      case 'B':
+        if (bf < 2)
+          bishop_files[bf++] = f;
+        bishops++;
+        break;
+      case 'Q':
+        queens++;
+        break;
+      case 'K':
+        kings++;
+        king_file = f;
+        break;
+      default:
+        break;
+      }
+    }
+    T_ASSERT_EQ_INT(rooks, 2);
+    T_ASSERT_EQ_INT(knights, 2);
+    T_ASSERT_EQ_INT(bishops, 2);
+    T_ASSERT_EQ_INT(queens, 1);
+    T_ASSERT_EQ_INT(kings, 1);
+    T_ASSERT(rook_lo < king_file && king_file < rook_hi);
+    T_ASSERT((bishop_files[0] % 2) != (bishop_files[1] % 2));
+
+    int spaces = 0;
+    const char *p = buf;
+    while (*p && spaces < 2) {
+      if (*p++ == ' ')
+        spaces++;
+    }
+    for (const char *c = p; *c && *c != ' '; c++) {
+      T_ASSERT(*c == '-' || (*c >= 'A' && *c <= 'H') ||
+               (*c >= 'a' && *c <= 'h'));
+      T_ASSERT(*c != 'K' && *c != 'Q' && *c != 'k' && *c != 'q');
+    }
+  }
   return 0;
 }

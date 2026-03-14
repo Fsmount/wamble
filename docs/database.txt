@@ -167,6 +167,13 @@ Tables
   - Indexes: `idx_boards_status` on `(status)`
   - Trigger: `trigger_boards_updated_at` updates `updated_at` on update.
 
+- board_mode_variants
+  - `board_id BIGINT PRIMARY KEY REFERENCES boards(id)`
+  - `game_mode board_game_mode NOT NULL` (`chess960`)
+  - `mode_variant_id INTEGER NOT NULL` (Chess960 position id, `0..959`)
+  - Index: `idx_board_mode_variants_mode_variant_id` on
+    `(game_mode, mode_variant_id)`
+
 - moves
   - `id BIGSERIAL PRIMARY KEY`
   - `board_id BIGINT NOT NULL REFERENCES boards(id)`
@@ -235,6 +242,8 @@ Migrations
   assignment rules, predicates, outputs, and directed edges.
 - 011_profile_treatment_groups.sql: adds per-session treatment assignment
   columns and board last-mover treatment metadata.
+- 012_profile_board_mode_variants.sql: adds board mode metadata for variants
+  (Chess960) via `board_mode_variants`.
 
 Trust and Visibility
 - Client trust resolves from identity-scoped policy only, in deterministic

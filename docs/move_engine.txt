@@ -4,6 +4,7 @@ Wamble Move Engine
 Overview
 - Bitboard move generator and validator for standard chess rules.
 - Maintains a `Board` and a FEN string on the `WambleBoard` wrapper.
+- Supports Chess960 in addition to standard chess.
 
 Types
 - `Board`: piece bitboards, side occupancy, turn, castling, en-passant, clocks.

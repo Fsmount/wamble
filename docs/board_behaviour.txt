@@ -5,6 +5,15 @@ Overview
 Manages a dynamic pool of game boards, assigning them to players based on an attractiveness score. Board lifecycle is handled by a state machine where `RESERVED`, `ACTIVE`, and `DORMANT` states count toward the configured board limit.
 The manager maintains a target number of boards `max-boards`, computed from `longest_game_moves * active_players` with a floor of `min-boards`, and will create new boards when the pool drops below this target.
 
+Board Game Modes
+- Boards can be either `standard` or `chess960`.
+- Mode selection is automatic for newly created boards using `chess960-interval`:
+  - `-1`: newly created boards use the standard start position.
+  - `0`: newly created boards use Chess960 positions.
+  - `N > 0`: newly created boards use Chess960 when `board_id % N == 0`.
+- Chess960 boards use a deterministic start position id `board_id % 960`.
+- The generated Chess960 FEN and the `mode_variant_id` are persisted with the board.
+
 Board States
 - `RESERVED`: A board temporarily assigned to a player who is actively playing. This state prevents other players from being assigned to the board.
 - `ACTIVE`: A board that is currently in-play and held in the server's cache for quick access. Players can be assigned to active games.

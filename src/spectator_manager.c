@@ -17,6 +17,7 @@ typedef struct SpectatorEntry {
   char pending_notice[FEN_MAX_LENGTH];
   int capacity_bypass;
   int owner_port;
+  unsigned int game_mode_filter;
 } SpectatorEntry;
 
 static SpectatorEntry *spectators;
@@ -110,9 +111,9 @@ static void spectator_write_visible_fen(const uint8_t *token,
   wamble_strip_fen_history(board->fen, out_fen, out_fen_size);
   if (!token)
     return;
-  WambleFact facts[3];
+  WambleFact facts[5];
   memset(facts, 0, sizeof(facts));
-  int fact_count = wamble_collect_board_treatment_facts(board, facts, 3);
+  int fact_count = wamble_collect_board_treatment_facts(board, facts, 5);
   WambleTreatmentAction actions[8];
   int action_count = 0;
   if (wamble_query_resolve_treatment_actions(
@@ -522,6 +523,11 @@ spectator_handle_request(const struct WambleMsg *msg,
       e->last_summary_sent = 0.0;
       e->capacity_bypass = 0;
       e->last_summary_wall = 0;
+      e->game_mode_filter = 0;
+      if (msg->flags & WAMBLE_FLAG_MODE_FILTER_CHESS960)
+        e->game_mode_filter |= (1u << GAME_MODE_CHESS960);
+      if (msg->flags & WAMBLE_FLAG_MODE_FILTER_STANDARD)
+        e->game_mode_filter |= (1u << GAME_MODE_STANDARD);
       if (out_state)
         *out_state = e->state;
       if (out_focus_board_id)
@@ -596,16 +602,23 @@ static void fill_summary_now(SpectatorEntry *e, SpectatorUpdate *out,
   for (int i = 0; i < summary_cache_count; i++) {
     if (*out_count >= out_cap)
       break;
-    SpectatorUpdate *u = &out[*out_count];
-    memcpy(u->token, e->token, TOKEN_LENGTH);
     WambleBoard *b = summary_cache[i];
     if (use_changes) {
       if (since != 0 && b->last_move_time <= since)
         continue;
     }
+    GameMode board_game_mode = b->board.game_mode;
+    if (e->game_mode_filter != 0 &&
+        !(e->game_mode_filter & (1u << board_game_mode)))
+      continue;
+    SpectatorUpdate *u = &out[*out_count];
+    memcpy(u->token, e->token, TOKEN_LENGTH);
     u->board_id = b->id;
     spectator_write_visible_fen(e->token, b, u->fen, sizeof(u->fen));
     u->addr = e->addr;
+    u->flags = WAMBLE_FLAG_UNRELIABLE;
+    if (board_game_mode == GAME_MODE_CHESS960)
+      u->flags |= WAMBLE_FLAG_BOARD_IS_960;
     (*out_count)++;
   }
 }
@@ -659,6 +672,9 @@ int spectator_collect_updates(struct SpectatorUpdate *out, int max) {
             u->board_id = b->id;
             spectator_write_visible_fen(e->token, b, u->fen, sizeof(u->fen));
             u->addr = e->addr;
+            u->flags = WAMBLE_FLAG_UNRELIABLE;
+            if (b->board.game_mode == GAME_MODE_CHESS960)
+              u->flags |= WAMBLE_FLAG_BOARD_IS_960;
             out_count++;
           }
         }

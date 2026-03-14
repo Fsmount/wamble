@@ -1096,7 +1096,7 @@ static void send_spectator_batch(wamble_socket_t sockfd,
     memcpy(out.token, events[i].token, TOKEN_LENGTH);
     out.board_id = events[i].board_id;
     out.seq_num = 0;
-    out.flags = WAMBLE_FLAG_UNRELIABLE;
+    out.flags = events[i].flags ? events[i].flags : WAMBLE_FLAG_UNRELIABLE;
     {
       size_t __len = strnlen(events[i].fen, FEN_MAX_LENGTH - 1);
       memcpy(out.fen, events[i].fen, __len);

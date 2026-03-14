@@ -579,6 +579,8 @@ static ServerStatus handle_player_move(wamble_socket_t sockfd,
   response.board_id = next_board->id;
   response.seq_num = 0;
   response.uci_len = 0;
+  if (next_board->board.game_mode == GAME_MODE_CHESS960)
+    response.flags |= WAMBLE_FLAG_BOARD_IS_960;
   write_visible_board_fen(msg->token, profile_name, next_board, response.fen,
                           sizeof(response.fen));
 
@@ -906,6 +908,10 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
       response.player_stats_score = player->score;
       response.player_stats_games_played =
           (player->games_played > 0) ? (uint32_t)player->games_played : 0;
+      response.player_stats_chess960_games_played =
+          (player->chess960_games_played > 0)
+              ? (uint32_t)player->chess960_games_played
+              : 0;
       if (send_reliable_default(sockfd, &response, cliaddr) != 0) {
         return SERVER_ERR_SEND_FAILED;
       }

@@ -1901,7 +1901,8 @@ static const ConfigVarMap config_map[] = {
     CONF_ITEM("prediction-max-pending", CONF_INT, prediction_max_pending),
     CONF_ITEM("spectator-summary-mode", CONF_STRING, spectator_summary_mode),
     CONF_ITEM("state-dir", CONF_STRING, state_dir),
-    CONF_ITEM("websocket-path", CONF_STRING, websocket_path)};
+    CONF_ITEM("websocket-path", CONF_STRING, websocket_path),
+    CONF_ITEM("chess960-interval", CONF_INT, chess960_interval)};
 
 static void populate_config_from_env(LispEnv *env) {
   for (size_t i = 0; i < sizeof(config_map) / sizeof(config_map[0]); i++) {
@@ -2006,6 +2007,7 @@ static void config_set_defaults(void) {
   g_config.spectator_summary_mode = wamble_strdup("changes");
   g_config.state_dir = NULL;
   g_config.websocket_path = wamble_strdup("/ws");
+  g_config.chess960_interval = -1;
 }
 
 static void free_profiles(void) {

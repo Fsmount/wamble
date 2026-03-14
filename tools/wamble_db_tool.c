@@ -139,6 +139,7 @@ int main(int argc, char **argv) {
     exec_file(c, "migrations/008_profile_identity_sessions.sql");
     exec_file(c, "migrations/010_profile_prediction_resolution.sql");
     exec_file(c, "migrations/011_profile_treatment_groups.sql");
+    exec_file(c, "migrations/012_profile_chess960.sql");
   }
   if (do_migrate_global) {
     exec_file(c, "migrations/005_global_identity_trust.sql");
