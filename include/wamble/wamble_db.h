@@ -28,6 +28,7 @@ void db_async_update_session_last_seen(uint64_t session_id);
 
 uint64_t db_create_board(const char *fen);
 int db_insert_board(uint64_t board_id, const char *fen, const char *status);
+int db_insert_board_mode_variant(uint64_t board_id, int mode_variant_id);
 int db_async_update_board(uint64_t board_id, const char *fen,
                           const char *status);
 int db_async_update_board_assignment_time(uint64_t board_id);
@@ -104,6 +105,8 @@ typedef struct WambleQueryService {
                                           double *out_total);
   DbStatus (*get_player_rating)(uint64_t session_id, double *out_rating);
   DbStatus (*get_session_games_played)(uint64_t session_id, int *out_games);
+  DbStatus (*get_session_chess960_games_played)(uint64_t session_id,
+                                                int *out_games);
   DbStatus (*get_persistent_player_stats)(
       const uint8_t *public_key, WamblePersistentPlayerStats *out_stats);
   DbLeaderboardResult (*get_leaderboard)(uint64_t requester_session_id,
@@ -167,6 +170,7 @@ typedef struct WamblePersistenceIntent {
       uint64_t board_id;
       char fen[FEN_MAX_LENGTH];
       char status[STATUS_MAX_LENGTH];
+      int mode_variant_id;
     } create_board;
     struct {
       uint64_t board_id;

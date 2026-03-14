@@ -18,7 +18,13 @@ Creating Players
   without changing the session token.
 
 Lookups
-- `get_player_by_token(token)` returns a known player. If only the DB knows about the token, we rehydrate a minimal player (score, rating, games) and update last-seen.
+- `get_player_by_token(token)` returns a known player. If only the DB knows about the token, we rehydrate a minimal player (score, rating, games, chess960 games) and update last-seen.
+
+Stats
+- Player stats track both:
+  - total games played.
+  - games played on Chess960 boards.
+- `GET_PLAYER_STATS` / `PLAYER_STATS_DATA` includes the Chess960 game counter in the payload.
 
 Expiration
 - `player_manager_tick()` drops idle entries after `token-expiration` seconds and removes the token from the index.

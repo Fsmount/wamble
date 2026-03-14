@@ -192,6 +192,7 @@ WAMBLE_TEST(player_stats_data_roundtrip) {
     out.token[i] = (uint8_t)(0x10 + i);
   out.player_stats_score = 42.5;
   out.player_stats_games_played = 18;
+  out.player_stats_chess960_games_played = 7;
 
   T_ASSERT_STATUS_OK(send_unreliable_packet(srv, &out, &cliaddr));
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
@@ -200,6 +201,7 @@ WAMBLE_TEST(player_stats_data_roundtrip) {
   T_ASSERT_EQ_INT(ctx.msg.ctrl, WAMBLE_CTRL_PLAYER_STATS_DATA);
   T_ASSERT(fabs(ctx.msg.player_stats_score - 42.5) < 1e-9);
   T_ASSERT_EQ_INT((int)ctx.msg.player_stats_games_played, 18);
+  T_ASSERT_EQ_INT((int)ctx.msg.player_stats_chess960_games_played, 7);
 
   wamble_close_socket(cli);
   wamble_close_socket(srv);
@@ -1327,6 +1329,8 @@ WAMBLE_TESTS_ADD_SM(token_base64url_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
 WAMBLE_TESTS_ADD_SM(spectate_update_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
 WAMBLE_TESTS_ADD_SM(leaderboard_data_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
+                    "network");
+WAMBLE_TESTS_ADD_SM(player_stats_data_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
 WAMBLE_TESTS_ADD_SM(submit_prediction_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");

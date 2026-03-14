@@ -528,7 +528,10 @@ int test_db_apply_migrations(const char *schema_name) {
   if (test_db_apply_sql_file("migrations/011_profile_treatment_groups.sql") !=
       0)
     return -1;
-  return test_db_apply_sql_file("migrations/011_global_treatment_groups.sql");
+  if (test_db_apply_sql_file("migrations/011_global_treatment_groups.sql") != 0)
+    return -1;
+  return test_db_apply_sql_file(
+      "migrations/012_profile_board_mode_variants.sql");
 #else
   (void)schema_name;
   return -1;

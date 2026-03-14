@@ -19,7 +19,7 @@ Message Layout
   message's control code (`ctrl`).
 - Common header (all packets):
   - `ctrl` (uint8): Control code for packet type.
-  - `flags` (uint8): `0x80` bit indicates unreliable packet.
+  - `flags` (uint8): packet/mode flags (bitmask).
   - `version` (uint8): Protocol version (currently 1).
   - `reserved` (uint8): Must be 0.
   - `token` (uint8[16]): Session token.
@@ -30,6 +30,11 @@ Message Layout
   - `board_id`: Big-endian (8 bytes).
   - `seq_num`, `payload_len`: Network byte order (big-endian).
 - Token URL form: 22-char base64url string (no padding).
+- `flags` bits:
+  - `0x80` (`WAMBLE_FLAG_UNRELIABLE`): packet is unreliable.
+  - `0x01` (`WAMBLE_FLAG_BOARD_IS_960`): board in this packet is Chess960.
+  - `0x02` (`WAMBLE_FLAG_MODE_FILTER_CHESS960`): spectator summary filter includes Chess960 boards.
+  - `0x04` (`WAMBLE_FLAG_MODE_FILTER_STANDARD`): spectator summary filter includes standard boards.
 
 Control Codes
 - `0x01` CLIENT_HELLO (client to server): Initial connection request.
@@ -40,6 +45,7 @@ Control Codes
   - Payload: `uint8 uci_len; char uci[uci_len]` (max 6 bytes).
 - `0x04` BOARD_UPDATE (server to client): Board state has changed.
   - Payload: `char fen[]`.
+  - `flags`: server sets `0x01` when the assigned board is Chess960.
 - `0x05` ACK (bidirectional): Acknowledges a reliable packet.
   - Payload: empty. Header `seq_num` matches the packet being ACKed.
 - `0x06` LIST_PROFILES (client to server): Request available profiles.
@@ -55,6 +61,10 @@ Control Codes
   - Payload: empty.
 - `0x0B` SPECTATE_GAME (client to server): Request to watch a game.
   - Payload: empty.
+  - `flags` (summary mode only, `board_id=0`):
+    - `0x02`: include Chess960 boards.
+    - `0x04`: include standard boards.
+    - Omitting both bits requests an unfiltered summary stream.
   - Header semantics:
     - `board_id=0` enters summary mode. The server will push per-board
       `SPECTATE_UPDATE` packets for eligible boards (ACTIVE+RESERVED), sorted
@@ -72,6 +82,7 @@ Control Codes
   - Typically sent as unreliable (`flags` high bit set). One packet per board.
   - Payload carries FEN data; `board_id` is always present in the header and
     clients use it to associate updates with boards.
+  - `flags`: server sets `0x01` when the update is for a Chess960 board.
 - `0x0D` LOGIN_REQUEST (client to server): Attach persistent identity to an
   existing anonymous session.
   - Payload: `uint8 public_key[32]`.
@@ -85,8 +96,8 @@ Control Codes
 - `0x11` GET_PLAYER_STATS (client to server): Request player statistics.
   - Payload: empty.
 - `0x12` PLAYER_STATS_DATA (server to client): Player statistics.
-  - Payload: `double score_be; int32 games_played_be`.
-  - Note: Rating is tracked separately from score; this payload carries score and games played.
+  - Payload: `double score_be; uint32 games_played_be; uint32 chess960_games_played_be`.
+  - Note: Rating is tracked separately from score; this payload carries score and game counters.
 - `0x13` GET_PROFILE_INFO (client to server): Request info for a specific profile.
   - Payload: `uint8 name_len; char name[name_len]`.
 - `0x14` PROFILES_LIST (server to client): Response to LIST_PROFILES.

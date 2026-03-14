@@ -63,6 +63,82 @@ static const Bitboard KING_ATTACKS[64] = {
 
 enum { WHITE_KING_START = 4, BLACK_KING_START = 60 };
 
+int chess960_gen_fen(int pos, char *buf, size_t buf_size) {
+  if (pos < 0 || pos > 959 || !buf || buf_size < 90)
+    return -1;
+
+  static const int DARK_BISHOP_FILES[4] = {1, 3, 5, 7};
+  static const int LIGHT_BISHOP_FILES[4] = {0, 2, 4, 6};
+
+  int n = pos;
+  int b1 = n % 4;
+  n /= 4;
+  int b2 = n % 4;
+  n /= 4;
+  int q = n % 6;
+  n /= 6;
+
+  static const int KNIGHT_PLACEMENTS[10][2] = {{0, 1}, {0, 2}, {0, 3}, {0, 4},
+                                               {1, 2}, {1, 3}, {1, 4}, {2, 3},
+                                               {2, 4}, {3, 4}};
+  int kn1 = KNIGHT_PLACEMENTS[n][0];
+  int kn2 = KNIGHT_PLACEMENTS[n][1];
+
+  char rank[8];
+  memset(rank, 0, sizeof(rank));
+
+  rank[DARK_BISHOP_FILES[b1]] = 'B';
+  rank[LIGHT_BISHOP_FILES[b2]] = 'B';
+
+  int free_idx = 0;
+  for (int f = 0; f < 8; f++) {
+    if (!rank[f]) {
+      if (free_idx == q) {
+        rank[f] = 'Q';
+        break;
+      }
+      free_idx++;
+    }
+  }
+
+  int knight_count = 0;
+  for (int f = 0; f < 8; f++) {
+    if (!rank[f]) {
+      if (knight_count == kn1 || knight_count == kn2)
+        rank[f] = 'N';
+      knight_count++;
+    }
+  }
+
+  int rook1 = -1, rook2 = -1, king = -1;
+  for (int f = 0; f < 8; f++) {
+    if (!rank[f]) {
+      if (rook1 == -1)
+        rook1 = f;
+      else if (king == -1)
+        king = f;
+      else
+        rook2 = f;
+    }
+  }
+  rank[rook1] = 'R';
+  rank[king] = 'K';
+  rank[rook2] = 'R';
+
+  char castling[5];
+  snprintf(castling, sizeof(castling), "%c%c%c%c", (char)('A' + rook2),
+           (char)('A' + rook1), (char)('a' + rook2), (char)('a' + rook1));
+
+  snprintf(
+      buf, buf_size,
+      "%c%c%c%c%c%c%c%c/pppppppp/8/8/8/8/PPPPPPPP/%c%c%c%c%c%c%c%c w %s - 0 1",
+      (char)(rank[0] + 32), (char)(rank[1] + 32), (char)(rank[2] + 32),
+      (char)(rank[3] + 32), (char)(rank[4] + 32), (char)(rank[5] + 32),
+      (char)(rank[6] + 32), (char)(rank[7] + 32), rank[0], rank[1], rank[2],
+      rank[3], rank[4], rank[5], rank[6], rank[7], castling);
+  return 0;
+}
+
 static inline int ctz64_u64(Bitboard bb) {
 #if defined(_MSC_VER)
   unsigned long idx;
@@ -248,10 +324,14 @@ static MoveInfo make_move_bitboard(Board *board, const Move *move) {
   MoveInfo info = {.captured_square = -1,
                    .captured_piece_type = -1,
                    .prev_en_passant = "--",
-                   .prev_castling = "----",
+                   .prev_castling = "--------",
                    .prev_halfmove_clock = 0,
                    .prev_fullmove_number = 0,
-                   .moving_piece_color = 0};
+                   .moving_piece_color = 0,
+                   .is_castling = 0,
+                   .castle_rook_from = -1,
+                   .castle_rook_to = -1,
+                   .castle_king_to = -1};
 
   info.prev_halfmove_clock = board->halfmove_clock;
   info.prev_fullmove_number = board->fullmove_number;
@@ -280,8 +360,13 @@ static MoveInfo make_move_bitboard(Board *board, const Move *move) {
   board->occupied[color] &= ~get_bit(from);
 
   int captured_piece = 0;
+  int king_piece_moving = color == 0 ? WHITE_KING : BLACK_KING;
+  int own_rook_piece = color == 0 ? WHITE_ROOK : BLACK_ROOK;
+  int is_960_castling_move = (piece_type == king_piece_moving &&
+                              board->game_mode == GAME_MODE_CHESS960 &&
+                              (board->pieces[own_rook_piece] & get_bit(to)));
   for (int i = 0; i < 12; i++) {
-    if (board->pieces[i] & get_bit(to)) {
+    if ((board->pieces[i] & get_bit(to)) && !is_960_castling_move) {
       info.captured_piece_type = i;
       info.captured_square = to;
       board->pieces[i] &= ~get_bit(to);
@@ -292,14 +377,24 @@ static MoveInfo make_move_bitboard(Board *board, const Move *move) {
       int captured_rook_white = (i == WHITE_ROOK);
       int captured_rook_black = (i == BLACK_ROOK);
 
-      if (captured_rook_white && to == 0) {
-        remove_castling_right(board, 'Q');
-      } else if (captured_rook_white && to == 7) {
-        remove_castling_right(board, 'K');
-      } else if (captured_rook_black && to == 56) {
-        remove_castling_right(board, 'q');
-      } else if (captured_rook_black && to == 63) {
-        remove_castling_right(board, 'k');
+      if (board->game_mode == GAME_MODE_CHESS960) {
+        if (captured_rook_white) {
+          int file = to % 8;
+          remove_castling_right(board, (char)('A' + file));
+        } else if (captured_rook_black) {
+          int file = to % 8;
+          remove_castling_right(board, (char)('a' + file));
+        }
+      } else {
+        if (captured_rook_white && to == 0) {
+          remove_castling_right(board, 'Q');
+        } else if (captured_rook_white && to == 7) {
+          remove_castling_right(board, 'K');
+        } else if (captured_rook_black && to == 56) {
+          remove_castling_right(board, 'q');
+        } else if (captured_rook_black && to == 63) {
+          remove_castling_right(board, 'k');
+        }
       }
       break;
     }
@@ -332,22 +427,77 @@ static MoveInfo make_move_bitboard(Board *board, const Move *move) {
   board->occupied[color] |= get_bit(to);
 
   int king_piece = color == 0 ? WHITE_KING : BLACK_KING;
-  if (piece_type == king_piece && abs(from - to) == 2) {
+  if (piece_type == king_piece) {
     int rook_piece = color == 0 ? WHITE_ROOK : BLACK_ROOK;
-    if (to == from + 2) {
-      int rook_from = from + 3;
-      int rook_to = from + 1;
-      board->pieces[rook_piece] &= ~get_bit(rook_from);
-      board->pieces[rook_piece] |= get_bit(rook_to);
-      board->occupied[color] &= ~get_bit(rook_from);
-      board->occupied[color] |= get_bit(rook_to);
+    int is_960 = (board->game_mode == GAME_MODE_CHESS960);
+    int rank_base = color == 0 ? 0 : 56;
+    int king_side = 0, queen_side = 0;
+
+    if (is_960) {
+      int ks_rook_sq = -1, qs_rook_sq = -1;
+      for (int i = 0; board->castling[i]; i++) {
+        char c = board->castling[i];
+        int file = -1;
+        if (color == 0 && c >= 'A' && c <= 'H')
+          file = c - 'A';
+        else if (color == 1 && c >= 'a' && c <= 'h')
+          file = c - 'a';
+        if (file >= 0) {
+          int sq = rank_base + file;
+          if (sq > from && ks_rook_sq == -1)
+            ks_rook_sq = sq;
+          else if (sq < from && qs_rook_sq == -1)
+            qs_rook_sq = sq;
+        }
+      }
+      if (to == ks_rook_sq && ks_rook_sq != -1)
+        king_side = 1;
+      else if (to == qs_rook_sq && qs_rook_sq != -1)
+        queen_side = 1;
     } else {
-      int rook_from = from - 4;
-      int rook_to = from - 1;
+      if (abs(from - to) == 2) {
+        if (to == from + 2)
+          king_side = 1;
+        else
+          queen_side = 1;
+      }
+    }
+
+    if (king_side || queen_side) {
+      int rook_from, rook_to, king_to;
+      if (is_960) {
+        rook_from = to;
+        if (king_side) {
+          king_to = rank_base + 6;
+          rook_to = rank_base + 5;
+        } else {
+          king_to = rank_base + 2;
+          rook_to = rank_base + 3;
+        }
+        board->pieces[piece_type] &= ~get_bit(to);
+        board->occupied[color] &= ~get_bit(to);
+      } else {
+        if (king_side) {
+          rook_from = from + 3;
+          rook_to = from + 1;
+        } else {
+          rook_from = from - 4;
+          rook_to = from - 1;
+        }
+        king_to = to;
+      }
       board->pieces[rook_piece] &= ~get_bit(rook_from);
       board->pieces[rook_piece] |= get_bit(rook_to);
       board->occupied[color] &= ~get_bit(rook_from);
       board->occupied[color] |= get_bit(rook_to);
+      if (is_960) {
+        board->pieces[piece_type] |= get_bit(king_to);
+        board->occupied[color] |= get_bit(king_to);
+      }
+      info.is_castling = 1;
+      info.castle_rook_from = rook_from;
+      info.castle_rook_to = rook_to;
+      info.castle_king_to = king_to;
     }
   }
 
@@ -369,26 +519,47 @@ static MoveInfo make_move_bitboard(Board *board, const Move *move) {
   }
 
   if (piece_type == king_piece) {
-
-    if (color == 0) {
-      remove_castling_right(board, 'K');
-      remove_castling_right(board, 'Q');
+    if (board->game_mode == GAME_MODE_CHESS960) {
+      char new_castling[9] = {0};
+      int idx = 0;
+      for (int i = 0; board->castling[i]; i++) {
+        char c = board->castling[i];
+        int is_own =
+            (color == 0) ? (c >= 'A' && c <= 'H') : (c >= 'a' && c <= 'h');
+        if (!is_own)
+          new_castling[idx++] = c;
+      }
+      strcpy(board->castling, new_castling);
+      if (strlen(board->castling) == 0)
+        strcpy(board->castling, "-");
     } else {
-      remove_castling_right(board, 'k');
-      remove_castling_right(board, 'q');
+      if (color == 0) {
+        remove_castling_right(board, 'K');
+        remove_castling_right(board, 'Q');
+      } else {
+        remove_castling_right(board, 'k');
+        remove_castling_right(board, 'q');
+      }
     }
   } else if (piece_type == (color == 0 ? WHITE_ROOK : BLACK_ROOK)) {
-
-    if (color == 0) {
-      if (from == 0)
-        remove_castling_right(board, 'Q');
-      else if (from == 7)
-        remove_castling_right(board, 'K');
+    if (board->game_mode == GAME_MODE_CHESS960) {
+      int file = from % 8;
+      if (color == 0)
+        remove_castling_right(board, (char)('A' + file));
+      else
+        remove_castling_right(board, (char)('a' + file));
     } else {
-      if (from == 56)
-        remove_castling_right(board, 'q');
-      else if (from == 63)
-        remove_castling_right(board, 'k');
+      if (color == 0) {
+        if (from == 0)
+          remove_castling_right(board, 'Q');
+        else if (from == 7)
+          remove_castling_right(board, 'K');
+      } else {
+        if (from == 56)
+          remove_castling_right(board, 'q');
+        else if (from == 63)
+          remove_castling_right(board, 'k');
+      }
     }
   }
 
@@ -425,69 +596,56 @@ static void unmake_move_bitboard(Board *board, const Move *move,
   int moving_piece_color = info->moving_piece_color;
 
   board->turn = (moving_piece_color == 0) ? 'w' : 'b';
-
   board->halfmove_clock = info->prev_halfmove_clock;
   board->fullmove_number = info->prev_fullmove_number;
-
   copy_str_trunc(board->en_passant, sizeof(board->en_passant),
                  info->prev_en_passant);
   copy_str_trunc(board->castling, sizeof(board->castling), info->prev_castling);
 
-  int piece_type_at_to = -1;
-  for (int i = 0; i < 12; i++) {
-    if (board->pieces[i] & get_bit(to)) {
-      piece_type_at_to = i;
-      break;
-    }
-  }
+  int king_piece = (moving_piece_color == 0) ? WHITE_KING : BLACK_KING;
+  int rook_piece = (moving_piece_color == 0) ? WHITE_ROOK : BLACK_ROOK;
 
-  if (move->promotion) {
-
-    board->pieces[piece_type_at_to] &= ~get_bit(to);
-    board->occupied[moving_piece_color] &= ~get_bit(to);
-
-    int pawn_type = (moving_piece_color == 0) ? WHITE_PAWN : BLACK_PAWN;
-    board->pieces[pawn_type] |= get_bit(from);
+  if (info->is_castling && board->game_mode == GAME_MODE_CHESS960) {
+    board->pieces[king_piece] &= ~get_bit(info->castle_king_to);
+    board->occupied[moving_piece_color] &= ~get_bit(info->castle_king_to);
+    board->pieces[king_piece] |= get_bit(from);
     board->occupied[moving_piece_color] |= get_bit(from);
+    board->pieces[rook_piece] &= ~get_bit(info->castle_rook_to);
+    board->occupied[moving_piece_color] &= ~get_bit(info->castle_rook_to);
+    board->pieces[rook_piece] |= get_bit(info->castle_rook_from);
+    board->occupied[moving_piece_color] |= get_bit(info->castle_rook_from);
   } else {
+    int piece_type_at_to = -1;
+    for (int i = 0; i < 12; i++) {
+      if (board->pieces[i] & get_bit(to)) {
+        piece_type_at_to = i;
+        break;
+      }
+    }
 
-    board->pieces[piece_type_at_to] &= ~get_bit(to);
-    board->occupied[moving_piece_color] &= ~get_bit(to);
-    board->pieces[piece_type_at_to] |= get_bit(from);
-    board->occupied[moving_piece_color] |= get_bit(from);
+    if (move->promotion) {
+      board->pieces[piece_type_at_to] &= ~get_bit(to);
+      board->occupied[moving_piece_color] &= ~get_bit(to);
+      int pawn_type = (moving_piece_color == 0) ? WHITE_PAWN : BLACK_PAWN;
+      board->pieces[pawn_type] |= get_bit(from);
+      board->occupied[moving_piece_color] |= get_bit(from);
+    } else {
+      board->pieces[piece_type_at_to] &= ~get_bit(to);
+      board->occupied[moving_piece_color] &= ~get_bit(to);
+      board->pieces[piece_type_at_to] |= get_bit(from);
+      board->occupied[moving_piece_color] |= get_bit(from);
+    }
+
+    if (info->is_castling) {
+      board->pieces[rook_piece] &= ~get_bit(info->castle_rook_to);
+      board->occupied[moving_piece_color] &= ~get_bit(info->castle_rook_to);
+      board->pieces[rook_piece] |= get_bit(info->castle_rook_from);
+      board->occupied[moving_piece_color] |= get_bit(info->castle_rook_from);
+    }
   }
 
   if (info->captured_piece_type != -1) {
     board->pieces[info->captured_piece_type] |= get_bit(info->captured_square);
-    int captured_color = (info->captured_piece_type < 6) ? 0 : 1;
-    board->occupied[captured_color] |= get_bit(info->captured_square);
-  }
-
-  int king_piece = (moving_piece_color == 0) ? WHITE_KING : BLACK_KING;
-  if (piece_type_at_to == king_piece && abs(from - to) == 2) {
-    int rook_piece = (moving_piece_color == 0) ? WHITE_ROOK : BLACK_ROOK;
-    if (to == from + 2) {
-
-      board->pieces[rook_piece] &= ~get_bit(from + 1);
-      board->occupied[moving_piece_color] &= ~get_bit(from + 1);
-      board->pieces[rook_piece] |= get_bit(from + 3);
-      board->occupied[moving_piece_color] |= get_bit(from + 3);
-    } else {
-
-      board->pieces[rook_piece] &= ~get_bit(from - 1);
-      board->occupied[moving_piece_color] &= ~get_bit(from - 1);
-      board->pieces[rook_piece] |= get_bit(from - 4);
-      board->occupied[moving_piece_color] |= get_bit(from - 4);
-    }
-  }
-
-  if (move->promotion == 0 &&
-      (piece_type_at_to == WHITE_PAWN || piece_type_at_to == BLACK_PAWN) &&
-      info->captured_piece_type != -1 &&
-      (info->captured_piece_type == WHITE_PAWN ||
-       info->captured_piece_type == BLACK_PAWN) &&
-      info->captured_square != to) {
-
     int captured_color = (info->captured_piece_type < 6) ? 0 : 1;
     board->occupied[captured_color] |= get_bit(info->captured_square);
   }
@@ -559,23 +717,67 @@ static int generate_legal_moves_bitboard(Board *board, Move *moves) {
 
       case 5: {
         attacks = KING_ATTACKS[from] & ~own;
-        const int king_start =
-            (color == 0) ? WHITE_KING_START : BLACK_KING_START;
 
-        if (from == king_start && !is_square_attacked(board, from, 1 - color)) {
+        if (!is_square_attacked(board, from, 1 - color)) {
+          if (board->game_mode == GAME_MODE_CHESS960) {
+            int rank_base = color == 0 ? 0 : 56;
+            for (int ci = 0; board->castling[ci]; ci++) {
+              char c = board->castling[ci];
+              int rook_sq = -1;
+              int king_side = 0;
+              if (color == 0 && c >= 'A' && c <= 'H') {
+                rook_sq = rank_base + (c - 'A');
+                king_side = (rook_sq > from) ? 1 : 0;
+              } else if (color == 1 && c >= 'a' && c <= 'h') {
+                rook_sq = rank_base + (c - 'a');
+                king_side = (rook_sq > from) ? 1 : 0;
+              } else {
+                continue;
+              }
+              int king_to = king_side ? rank_base + 6 : rank_base + 2;
+              int rook_to = king_side ? rank_base + 5 : rank_base + 3;
+              Bitboard must_empty = 0ULL;
+              int klo = from < king_to ? from + 1 : king_to;
+              int khi = from < king_to ? king_to : from - 1;
+              for (int s = klo; s <= khi; s++)
+                must_empty |= get_bit(s);
+              int rlo = rook_sq < rook_to ? rook_sq + 1 : rook_to;
+              int rhi = rook_sq < rook_to ? rook_to : rook_sq - 1;
+              for (int s = rlo; s <= rhi; s++)
+                must_empty |= get_bit(s);
+              Bitboard occ_excl = occ & ~get_bit(from) & ~get_bit(rook_sq);
+              if (occ_excl & must_empty)
+                continue;
+              int path_lo = from < king_to ? from : king_to;
+              int path_hi = from > king_to ? from : king_to;
+              int attacked = 0;
+              for (int s = path_lo; s <= path_hi; s++) {
+                if (is_square_attacked(board, s, 1 - color)) {
+                  attacked = 1;
+                  break;
+                }
+              }
+              if (!attacked)
+                attacks |= get_bit(rook_sq);
+            }
+          } else {
+            const int king_start =
+                (color == 0) ? WHITE_KING_START : BLACK_KING_START;
+            if (from == king_start) {
+              if (strchr(board->castling, color ? 'k' : 'K') &&
+                  !(occ & (get_bit(from + 1) | get_bit(from + 2))) &&
+                  !is_square_attacked(board, from + 1, 1 - color) &&
+                  !is_square_attacked(board, from + 2, 1 - color))
+                attacks |= get_bit(from + 2);
 
-          if (strchr(board->castling, color ? 'k' : 'K') &&
-              !(occ & (get_bit(from + 1) | get_bit(from + 2))) &&
-              !is_square_attacked(board, from + 1, 1 - color) &&
-              !is_square_attacked(board, from + 2, 1 - color))
-            attacks |= get_bit(from + 2);
-
-          if (strchr(board->castling, color ? 'q' : 'Q') &&
-              !(occ &
-                (get_bit(from - 1) | get_bit(from - 2) | get_bit(from - 3))) &&
-              !is_square_attacked(board, from - 1, 1 - color) &&
-              !is_square_attacked(board, from - 2, 1 - color))
-            attacks |= get_bit(from - 2);
+              if (strchr(board->castling, color ? 'q' : 'Q') &&
+                  !(occ & (get_bit(from - 1) | get_bit(from - 2) |
+                           get_bit(from - 3))) &&
+                  !is_square_attacked(board, from - 1, 1 - color) &&
+                  !is_square_attacked(board, from - 2, 1 - color))
+                attacks |= get_bit(from - 2);
+            }
+          }
         }
         break;
       }
@@ -683,6 +885,14 @@ int parse_fen_to_bitboard(const char *fen, Board *board) {
     board->castling[i++] = *p++;
   }
   board->castling[i] = '\0';
+  board->game_mode = GAME_MODE_STANDARD;
+  for (int j = 0; board->castling[j]; j++) {
+    char c = board->castling[j];
+    if (c != '-' && c != 'K' && c != 'Q' && c != 'k' && c != 'q') {
+      board->game_mode = GAME_MODE_CHESS960;
+      break;
+    }
+  }
   p++;
 
   i = 0;

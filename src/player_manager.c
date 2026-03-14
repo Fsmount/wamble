@@ -132,6 +132,13 @@ static void hydrate_player_from_session(WamblePlayer *player,
     player->games_played = games_played;
   else
     player->games_played = 0;
+
+  int chess960_games_played = 0;
+  if (wamble_query_get_session_chess960_games_played(
+          session_id, &chess960_games_played) == DB_OK)
+    player->chess960_games_played = chess960_games_played;
+  else
+    player->chess960_games_played = 0;
 }
 
 static void
@@ -144,6 +151,7 @@ apply_persistent_player_stats(WamblePlayer *player,
   player->rating = (stats->rating > 0.0) ? stats->rating
                                          : (double)get_config()->default_rating;
   player->games_played = stats->games_played;
+  player->chess960_games_played = stats->chess960_games_played;
 }
 
 static uint64_t token_hash(const uint8_t *token) {
@@ -370,6 +378,7 @@ WamblePlayer *create_new_player(void) {
     player->prediction_score = 0.0;
     player->rating = (double)get_config()->default_rating;
     player->games_played = 0;
+    player->chess960_games_played = 0;
     wamble_emit_create_session(candidate_token, 0);
     player_map_put(player->token, (int)(player - player_pool));
     wamble_mutex_unlock(&player_mutex);

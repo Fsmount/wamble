@@ -450,7 +450,9 @@ static NetworkStatus serialize_wamble_msg(const struct WambleMsg *msg,
     }
     uint32_t gp_be = htonl(msg->player_stats_games_played);
     memcpy(payload + 8, &gp_be, 4);
-    payload_len = 12;
+    uint32_t c960_be = htonl(msg->player_stats_chess960_games_played);
+    memcpy(payload + 12, &c960_be, 4);
+    payload_len = 16;
     break;
   }
   case WAMBLE_CTRL_LOGIN_FAILED: {
@@ -734,6 +736,11 @@ static NetworkStatus deserialize_wamble_msg(const uint8_t *buffer,
       uint32_t gp_be = 0;
       memcpy(&gp_be, payload + 8, 4);
       msg->player_stats_games_played = ntohl(gp_be);
+    }
+    if (payload_len >= 16) {
+      uint32_t c960_be = 0;
+      memcpy(&c960_be, payload + 12, 4);
+      msg->player_stats_chess960_games_played = ntohl(c960_be);
     }
     break;
   }

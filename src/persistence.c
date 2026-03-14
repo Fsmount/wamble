@@ -293,7 +293,7 @@ void wamble_emit_resolve_prediction(uint64_t board_id, const uint8_t *token,
 }
 
 void wamble_emit_create_board(uint64_t board_id, const char *fen,
-                              const char *status) {
+                              const char *status, int mode_variant_id) {
   if (board_id == 0 || !fen || !status)
     return;
   struct WamblePersistenceIntent it = {0};
@@ -305,6 +305,7 @@ void wamble_emit_create_board(uint64_t board_id, const char *fen,
   size_t status_len = strnlen(status, STATUS_MAX_LENGTH - 1);
   memcpy(it.as.create_board.status, status, status_len);
   it.as.create_board.status[status_len] = '\0';
+  it.as.create_board.mode_variant_id = mode_variant_id;
   intents_push(it);
 }
 
@@ -449,9 +450,17 @@ static int apply_one_intent_db(const struct WamblePersistenceIntent *it,
     return db_async_update_player_rating(sid,
                                          it->as.update_player_rating.rating);
   }
-  case WAMBLE_INTENT_CREATE_BOARD:
-    return db_insert_board(it->as.create_board.board_id,
-                           it->as.create_board.fen, it->as.create_board.status);
+  case WAMBLE_INTENT_CREATE_BOARD: {
+    int rc =
+        db_insert_board(it->as.create_board.board_id, it->as.create_board.fen,
+                        it->as.create_board.status);
+    if (rc != 0)
+      return rc;
+    if (it->as.create_board.mode_variant_id >= 0)
+      return db_insert_board_mode_variant(it->as.create_board.board_id,
+                                          it->as.create_board.mode_variant_id);
+    return 0;
+  }
   case WAMBLE_INTENT_RECORD_MOVE: {
     uint64_t sid = 0;
     DbStatus st =

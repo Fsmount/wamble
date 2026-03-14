@@ -87,6 +87,10 @@ Database Connections
   - `from-to-only`: only the first four UCI characters must match.
 - `prediction-max-pending` (int, 64): Maximum in-flight predictions tracked per
   board.
+- `chess960-interval` (int, -1): Controls automatic Chess960 board creation.
+  - `-1`: disabled (all boards are another mode).
+  - `0`: enabled; all new boards use chess960.
+  - `N > 0`: enabled; new boards use Chess960 when `board_id % N == 0`.
 Spectator Settings
 - `max-spectators` (int, 1024; -1 for no cap): Capacity limit for total active spectators at the server (summary + focus).
    Bypass is policy-controlled via `spectate.capacity_bypass` / `focus`. Bypass-focused sessions are counted outside the `max-spectators` pool.
