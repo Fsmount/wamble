@@ -211,9 +211,9 @@ Policy Rule Builtins
     `player_move`, `board_update`, `list_profiles`, `profile_info`, `error`,
     `server_notification`, `client_goodbye`, `spectate_game`,
     `spectate_update`, `login_request`, `logout`, `login_success`,
-    `login_failed`, `get_player_stats`, `player_stats_data`, `get_profile_info`,
-    `profiles_list`, `spectate_stop`, `get_legal_moves`, `legal_moves`,
-    `get_leaderboard`, `leaderboard_data`, `submit_prediction`,
+    `login_failed`, `login_challenge`, `get_player_stats`, `player_stats_data`,
+    `get_profile_info`, `profiles_list`, `spectate_stop`, `get_legal_moves`,
+    `legal_moves`, `get_leaderboard`, `leaderboard_data`, `submit_prediction`,
     `get_predictions`, `prediction_data`, `unknown`.
   - `game.move`: query resources `play`, `legal`.
   - `spectate.access`: query resource `view`; context `mode=summary|focus`.

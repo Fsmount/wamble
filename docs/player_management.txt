@@ -16,6 +16,12 @@ Creating Players
 - Persistent attach: `attach_persistent_identity(token, pubkey)` links an existing
   anonymous session (created by `CLIENT_HELLO`) to a pubkey-backed identity
   without changing the session token.
+- Login authentication uses a challenge-response flow:
+  - client sends `LOGIN_REQUEST` with `public_key[32]`.
+  - server responds with `LOGIN_CHALLENGE` (`challenge[32]`).
+  - client signs protocol context + token + public key + challenge using Ed25519
+    and sends `LOGIN_REQUEST` with `public_key[32] + signature[64]`.
+  - server verifies the signature before linking identity.
 
 Lookups
 - `get_player_by_token(token)` returns a known player. If only the DB knows about the token, we rehydrate a minimal player (score, rating, games, chess960 games) and update last-seen.

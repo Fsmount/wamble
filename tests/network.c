@@ -4,6 +4,11 @@
 #include "wamble/wamble.h"
 #include "wamble/wamble_db.h"
 
+void crypto_eddsa_key_pair(uint8_t secret_key[64], uint8_t public_key[32],
+                           uint8_t seed[32]);
+void crypto_eddsa_sign(uint8_t signature[64], const uint8_t secret_key[64],
+                       const uint8_t *message, size_t message_size);
+
 WAMBLE_TEST(token_base64url_roundtrip) {
   uint8_t token[TOKEN_LENGTH];
   for (int i = 0; i < TOKEN_LENGTH; i++)
@@ -46,6 +51,28 @@ static void *recv_one_thread(void *arg) {
 #endif
   int rc = (ready > 0) ? receive_message(c->sock, &c->msg, &c->from) : 0;
   c->received = (rc > 0) ? 1 : 0;
+  return NULL;
+}
+
+static void *recv_one_and_ack_thread(void *arg) {
+  RecvOneCtx *c = arg;
+  fd_set rfds;
+  struct timeval tv;
+  FD_ZERO(&rfds);
+  FD_SET(c->sock, &rfds);
+  tv.tv_sec = 0;
+  tv.tv_usec = 600 * 1000;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+  int ready = select(0, &rfds, NULL, NULL, &tv);
+#else
+  int ready = select(c->sock + 1, &rfds, NULL, NULL, &tv);
+#endif
+  int rc = (ready > 0) ? receive_message(c->sock, &c->msg, &c->from) : 0;
+  c->received = (rc > 0) ? 1 : 0;
+  if (c->received && (c->msg.flags & WAMBLE_FLAG_UNRELIABLE) == 0 &&
+      c->msg.ctrl != WAMBLE_CTRL_ACK) {
+    send_ack(c->sock, &c->msg, &c->from);
+  }
   return NULL;
 }
 
@@ -202,6 +229,102 @@ WAMBLE_TEST(player_stats_data_roundtrip) {
   T_ASSERT(fabs(ctx.msg.player_stats_score - 42.5) < 1e-9);
   T_ASSERT_EQ_INT((int)ctx.msg.player_stats_games_played, 18);
   T_ASSERT_EQ_INT((int)ctx.msg.player_stats_chess960_games_played, 7);
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(login_challenge_roundtrip) {
+  config_load(NULL, NULL, NULL, 0);
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  RecvOneCtx ctx = {.sock = cli};
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, recv_one_thread, &ctx) == 0);
+
+  struct WambleMsg out = {0};
+  out.ctrl = WAMBLE_CTRL_LOGIN_CHALLENGE;
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    out.token[i] = (uint8_t)(0x41 + i);
+  for (int i = 0; i < WAMBLE_LOGIN_CHALLENGE_LENGTH; i++)
+    out.login_challenge[i] = (uint8_t)(0xa0 + i);
+
+  T_ASSERT_STATUS_OK(send_unreliable_packet(srv, &out, &cliaddr));
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+
+  T_ASSERT_EQ_INT(ctx.received, 1);
+  T_ASSERT_EQ_INT(ctx.msg.ctrl, WAMBLE_CTRL_LOGIN_CHALLENGE);
+  for (int i = 0; i < WAMBLE_LOGIN_CHALLENGE_LENGTH; i++) {
+    T_ASSERT_EQ_INT((int)ctx.msg.login_challenge[i], (int)(0xa0 + i));
+  }
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(login_request_with_signature_roundtrip) {
+  config_load(NULL, NULL, NULL, 0);
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+  struct sockaddr_in dst = {0};
+  dst.sin_family = AF_INET;
+  dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  dst.sin_port = htons((uint16_t)wamble_socket_bound_port(srv));
+
+  struct WambleMsg out = {0};
+  out.ctrl = WAMBLE_CTRL_LOGIN_REQUEST;
+  out.login_has_signature = 1;
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    out.token[i] = (uint8_t)(0x73 + i);
+  for (int i = 0; i < WAMBLE_PUBLIC_KEY_LENGTH; i++)
+    out.login_pubkey[i] = (uint8_t)(0x10 + i);
+  for (int i = 0; i < WAMBLE_LOGIN_SIGNATURE_LENGTH; i++)
+    out.login_signature[i] = (uint8_t)(0x80 + i);
+
+  T_ASSERT_STATUS_OK(send_unreliable_packet(cli, &out, &dst));
+
+  struct WambleMsg in = {0};
+  struct sockaddr_in from;
+  fd_set rfds;
+  struct timeval tv;
+  FD_ZERO(&rfds);
+  FD_SET(srv, &rfds);
+  tv.tv_sec = 0;
+  tv.tv_usec = 400 * 1000;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+  int ready = select(0, &rfds, NULL, NULL, &tv);
+#else
+  int ready = select(srv + 1, &rfds, NULL, NULL, &tv);
+#endif
+  int got = (ready > 0) ? receive_message(srv, &in, &from) : 0;
+  T_ASSERT(got > 0);
+  T_ASSERT_EQ_INT(in.ctrl, WAMBLE_CTRL_LOGIN_REQUEST);
+  T_ASSERT_EQ_INT((int)in.login_has_signature, 1);
+  for (int i = 0; i < WAMBLE_PUBLIC_KEY_LENGTH; i++) {
+    T_ASSERT_EQ_INT((int)in.login_pubkey[i], (int)(0x10 + i));
+  }
+  for (int i = 0; i < WAMBLE_LOGIN_SIGNATURE_LENGTH; i++) {
+    T_ASSERT_EQ_INT((int)in.login_signature[i], (int)(0x80 + i));
+  }
 
   wamble_close_socket(cli);
   wamble_close_socket(srv);
@@ -1323,6 +1446,136 @@ WAMBLE_TEST(server_protocol_client_hello_requires_policy) {
   return 0;
 }
 
+WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
+  const char *cfg_path = "build/test_network_login_ed25519.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19424) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'login_request', '*', 'allow', 0, "
+          "'login_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  WamblePlayer *player = create_new_player();
+  T_ASSERT(player != NULL);
+
+  uint8_t seed[32] = {0};
+  uint8_t secret_key[64] = {0};
+  uint8_t public_key[32] = {0};
+  for (int i = 0; i < 32; i++)
+    seed[i] = (uint8_t)(0x20 + i);
+  crypto_eddsa_key_pair(secret_key, public_key, seed);
+
+  struct WambleMsg challenge_req = {0};
+  challenge_req.ctrl = WAMBLE_CTRL_LOGIN_REQUEST;
+  memcpy(challenge_req.token, player->token, TOKEN_LENGTH);
+  memcpy(challenge_req.login_pubkey, public_key, WAMBLE_PUBLIC_KEY_LENGTH);
+
+  RecvOneCtx rx_challenge = {.sock = cli};
+  wamble_thread_t th_challenge;
+  T_ASSERT(wamble_thread_create(&th_challenge, recv_one_and_ack_thread,
+                                &rx_challenge) == 0);
+  ServerStatus st = handle_message(srv, &challenge_req, &cliaddr, 0, "p1");
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_challenge, NULL));
+  T_ASSERT_EQ_INT(st, SERVER_OK);
+  T_ASSERT_EQ_INT(rx_challenge.received, 1);
+  T_ASSERT_EQ_INT(rx_challenge.msg.ctrl, WAMBLE_CTRL_LOGIN_CHALLENGE);
+
+  uint8_t sign_message[128] = {0};
+  size_t sign_message_len = wamble_build_login_signature_message(
+      sign_message, sizeof(sign_message), player->token, public_key,
+      rx_challenge.msg.login_challenge);
+  T_ASSERT(sign_message_len > 0);
+
+  uint8_t bad_signature[WAMBLE_LOGIN_SIGNATURE_LENGTH] = {0};
+  crypto_eddsa_sign(bad_signature, secret_key, sign_message, sign_message_len);
+  bad_signature[0] ^= 0x80;
+
+  struct WambleMsg bad_req = {0};
+  bad_req.ctrl = WAMBLE_CTRL_LOGIN_REQUEST;
+  bad_req.login_has_signature = 1;
+  memcpy(bad_req.token, player->token, TOKEN_LENGTH);
+  memcpy(bad_req.login_pubkey, public_key, WAMBLE_PUBLIC_KEY_LENGTH);
+  memcpy(bad_req.login_signature, bad_signature, WAMBLE_LOGIN_SIGNATURE_LENGTH);
+
+  RecvOneCtx rx_bad = {.sock = cli};
+  wamble_thread_t th_bad;
+  T_ASSERT(wamble_thread_create(&th_bad, recv_one_and_ack_thread, &rx_bad) ==
+           0);
+  ServerStatus bad_st = handle_message(srv, &bad_req, &cliaddr, 0, "p1");
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_bad, NULL));
+  T_ASSERT_EQ_INT(bad_st, SERVER_ERR_LOGIN_FAILED);
+  T_ASSERT_EQ_INT(rx_bad.received, 1);
+  T_ASSERT_EQ_INT(rx_bad.msg.ctrl, WAMBLE_CTRL_LOGIN_FAILED);
+
+  RecvOneCtx rx_challenge_2 = {.sock = cli};
+  wamble_thread_t th_challenge_2;
+  T_ASSERT(wamble_thread_create(&th_challenge_2, recv_one_and_ack_thread,
+                                &rx_challenge_2) == 0);
+  st = handle_message(srv, &challenge_req, &cliaddr, 0, "p1");
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_challenge_2, NULL));
+  T_ASSERT_EQ_INT(st, SERVER_OK);
+  T_ASSERT_EQ_INT(rx_challenge_2.received, 1);
+  T_ASSERT_EQ_INT(rx_challenge_2.msg.ctrl, WAMBLE_CTRL_LOGIN_CHALLENGE);
+
+  uint8_t good_signature[WAMBLE_LOGIN_SIGNATURE_LENGTH] = {0};
+  sign_message_len = wamble_build_login_signature_message(
+      sign_message, sizeof(sign_message), player->token, public_key,
+      rx_challenge_2.msg.login_challenge);
+  T_ASSERT(sign_message_len > 0);
+  crypto_eddsa_sign(good_signature, secret_key, sign_message, sign_message_len);
+
+  struct WambleMsg good_req = {0};
+  good_req.ctrl = WAMBLE_CTRL_LOGIN_REQUEST;
+  good_req.login_has_signature = 1;
+  memcpy(good_req.token, player->token, TOKEN_LENGTH);
+  memcpy(good_req.login_pubkey, public_key, WAMBLE_PUBLIC_KEY_LENGTH);
+  memcpy(good_req.login_signature, good_signature,
+         WAMBLE_LOGIN_SIGNATURE_LENGTH);
+
+  RecvOneCtx rx_ok = {.sock = cli};
+  wamble_thread_t th_ok;
+  T_ASSERT(wamble_thread_create(&th_ok, recv_one_and_ack_thread, &rx_ok) == 0);
+  ServerStatus ok_st = handle_message(srv, &good_req, &cliaddr, 0, "p1");
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_ok, NULL));
+  T_ASSERT_EQ_INT(ok_st, SERVER_OK);
+  T_ASSERT_EQ_INT(rx_ok.received, 1);
+  T_ASSERT_EQ_INT(rx_ok.msg.ctrl, WAMBLE_CTRL_LOGIN_SUCCESS);
+
+  WamblePlayer *after = get_player_by_token(player->token);
+  T_ASSERT(after != NULL);
+  T_ASSERT(after->has_persistent_identity);
+  T_ASSERT(memcmp(after->public_key, public_key, WAMBLE_PUBLIC_KEY_LENGTH) ==
+           0);
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
 WAMBLE_TEST(get_profile_tos_roundtrip) {
   config_load(NULL, NULL, NULL, 0);
   wamble_socket_t srv = create_and_bind_socket(0);
@@ -1366,6 +1619,10 @@ WAMBLE_TESTS_ADD_SM(leaderboard_data_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
 WAMBLE_TESTS_ADD_SM(player_stats_data_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
+WAMBLE_TESTS_ADD_SM(login_challenge_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
+                    "network");
+WAMBLE_TESTS_ADD_SM(login_request_with_signature_roundtrip,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(submit_prediction_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
 WAMBLE_TESTS_ADD_SM(prediction_data_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
@@ -1390,6 +1647,8 @@ WAMBLE_TESTS_ADD_SM(profile_info_roundtrip, WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(profiles_list_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
 WAMBLE_TESTS_ADD_DB_SM(server_protocol_client_hello_requires_policy,
+                       WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(server_protocol_login_uses_ed25519_challenge_response,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(spectate_stop_accept, WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(reserved_nonzero_rejected, WAMBLE_SUITE_FUNCTIONAL,

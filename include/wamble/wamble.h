@@ -962,6 +962,9 @@ static inline void wamble_log(int level, const char *file, int line,
 #define PROFILE_NAME_MAX_LENGTH 256
 #define TOKEN_LENGTH 16
 #define STATUS_MAX_LENGTH 17
+#define WAMBLE_PUBLIC_KEY_LENGTH 32
+#define WAMBLE_LOGIN_SIGNATURE_LENGTH 64
+#define WAMBLE_LOGIN_CHALLENGE_LENGTH 32
 
 struct WambleMove;
 
@@ -1041,27 +1044,28 @@ typedef struct {
 #define WAMBLE_CTRL_SPECTATE_UPDATE 0x0C
 
 #define WAMBLE_CTRL_LOGIN_REQUEST 0x0D
-#define WAMBLE_CTRL_LOGOUT 0x0E
-#define WAMBLE_CTRL_LOGIN_SUCCESS 0x0F
-#define WAMBLE_CTRL_LOGIN_FAILED 0x10
-#define WAMBLE_CTRL_GET_PLAYER_STATS 0x11
-#define WAMBLE_CTRL_PLAYER_STATS_DATA 0x12
+#define WAMBLE_CTRL_LOGIN_CHALLENGE 0x0E
+#define WAMBLE_CTRL_LOGOUT 0x0F
+#define WAMBLE_CTRL_LOGIN_SUCCESS 0x10
+#define WAMBLE_CTRL_LOGIN_FAILED 0x11
+#define WAMBLE_CTRL_GET_PLAYER_STATS 0x12
+#define WAMBLE_CTRL_PLAYER_STATS_DATA 0x13
 
-#define WAMBLE_CTRL_GET_PROFILE_INFO 0x13
-#define WAMBLE_CTRL_PROFILES_LIST 0x14
+#define WAMBLE_CTRL_GET_PROFILE_INFO 0x14
+#define WAMBLE_CTRL_PROFILES_LIST 0x15
 
-#define WAMBLE_CTRL_SPECTATE_STOP 0x15
+#define WAMBLE_CTRL_SPECTATE_STOP 0x16
 
-#define WAMBLE_CTRL_GET_LEGAL_MOVES 0x16
-#define WAMBLE_CTRL_LEGAL_MOVES 0x17
-#define WAMBLE_CTRL_GET_LEADERBOARD 0x18
-#define WAMBLE_CTRL_LEADERBOARD_DATA 0x19
-#define WAMBLE_CTRL_SUBMIT_PREDICTION 0x1A
-#define WAMBLE_CTRL_GET_PREDICTIONS 0x1B
-#define WAMBLE_CTRL_PREDICTION_DATA 0x1C
+#define WAMBLE_CTRL_GET_LEGAL_MOVES 0x17
+#define WAMBLE_CTRL_LEGAL_MOVES 0x18
+#define WAMBLE_CTRL_GET_LEADERBOARD 0x19
+#define WAMBLE_CTRL_LEADERBOARD_DATA 0x1A
+#define WAMBLE_CTRL_SUBMIT_PREDICTION 0x1B
+#define WAMBLE_CTRL_GET_PREDICTIONS 0x1C
+#define WAMBLE_CTRL_PREDICTION_DATA 0x1D
 
-#define WAMBLE_CTRL_GET_PROFILE_TOS 0x1D
-#define WAMBLE_CTRL_PROFILE_TOS_DATA 0x1E
+#define WAMBLE_CTRL_GET_PROFILE_TOS 0x1E
+#define WAMBLE_CTRL_PROFILE_TOS_DATA 0x1F
 
 #define get_bit(square) (1ULL << (square))
 
@@ -1168,6 +1172,29 @@ typedef enum {
 #define WAMBLE_FLAG_MODE_FILTER_CHESS960 0x02
 #define WAMBLE_FLAG_MODE_FILTER_STANDARD 0x04
 
+static inline size_t wamble_build_login_signature_message(
+    uint8_t *out, size_t out_size, const uint8_t token[TOKEN_LENGTH],
+    const uint8_t public_key[WAMBLE_PUBLIC_KEY_LENGTH],
+    const uint8_t challenge[WAMBLE_LOGIN_CHALLENGE_LENGTH]) {
+  static const uint8_t context[] = "wamble.login.v1";
+  size_t context_len = sizeof(context) - 1;
+  size_t need = context_len + 1 + TOKEN_LENGTH + WAMBLE_PUBLIC_KEY_LENGTH +
+                WAMBLE_LOGIN_CHALLENGE_LENGTH;
+  if (!out || !token || !public_key || !challenge || out_size < need)
+    return 0;
+  size_t off = 0;
+  memcpy(out + off, context, context_len);
+  off += context_len;
+  out[off++] = (uint8_t)WAMBLE_PROTO_VERSION;
+  memcpy(out + off, token, TOKEN_LENGTH);
+  off += TOKEN_LENGTH;
+  memcpy(out + off, public_key, WAMBLE_PUBLIC_KEY_LENGTH);
+  off += WAMBLE_PUBLIC_KEY_LENGTH;
+  memcpy(out + off, challenge, WAMBLE_LOGIN_CHALLENGE_LENGTH);
+  off += WAMBLE_LOGIN_CHALLENGE_LENGTH;
+  return off;
+}
+
 #define WAMBLE_MAX_LEGAL_MOVES 218
 #define WAMBLE_MAX_LEADERBOARD_ENTRIES 16
 #define WAMBLE_MAX_PREDICTION_ENTRIES 16
@@ -1224,7 +1251,10 @@ struct WambleMsg {
   char fen[FEN_MAX_LENGTH];
   uint16_t error_code;
   char error_reason[FEN_MAX_LENGTH];
-  uint8_t login_pubkey[32];
+  uint8_t login_pubkey[WAMBLE_PUBLIC_KEY_LENGTH];
+  uint8_t login_signature[WAMBLE_LOGIN_SIGNATURE_LENGTH];
+  uint8_t login_challenge[WAMBLE_LOGIN_CHALLENGE_LENGTH];
+  uint8_t login_has_signature;
   double player_stats_score;
   uint32_t player_stats_games_played;
   uint32_t player_stats_chess960_games_played;
@@ -1248,7 +1278,7 @@ struct WambleMsg {
 
 typedef struct WamblePlayer {
   uint8_t token[TOKEN_LENGTH];
-  uint8_t public_key[32];
+  uint8_t public_key[WAMBLE_PUBLIC_KEY_LENGTH];
   bool has_persistent_identity;
   time_t last_seen_time;
   double score;
@@ -1470,7 +1500,10 @@ int network_get_session_treatment_group(const uint8_t *token, char *out_group,
 void cleanup_expired_sessions(void);
 
 void rng_init(void);
+void rng_bytes(uint8_t *out, size_t len);
 double rng_double(void);
+int wamble_ed25519_verify(const uint8_t *signature, const uint8_t *public_key,
+                          const uint8_t *message, size_t message_size);
 
 PredictionManagerStatus prediction_manager_init(void);
 PredictionStatus prediction_submit(WambleBoard *board,

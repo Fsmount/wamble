@@ -74,7 +74,7 @@ Control Codes
       `SPECTATE_UPDATE` packets for that board only. Immediate unreliable
       update is sent on entry, followed by periodic updates at
       `spectate-focus-hz`.
-- `0x15` SPECTATE_STOP (client to server): Stop spectating.
+- `0x16` SPECTATE_STOP (client to server): Stop spectating.
   - Payload: empty. Server acknowledges. Puts session in `IDLE` state.
 - `0x0C` SPECTATE_UPDATE (server to client): Board update for spectators.
   - Header: `board_id` identifies the board for this update (authoritative).
@@ -85,38 +85,54 @@ Control Codes
   - `flags`: server sets `0x01` when the update is for a Chess960 board.
 - `0x0D` LOGIN_REQUEST (client to server): Attach persistent identity to an
   existing anonymous session.
-  - Payload: `uint8 public_key[32]`.
+  - Two-step payload variants:
+    - Challenge request: `uint8 public_key[32]`.
+    - Signed proof: `uint8 public_key[32]; uint8 signature[64]`.
+  - Signature message format:
+    - ASCII context bytes: `"wamble.login.v1"`
+    - `uint8 protocol_version` (currently `1`)
+    - `uint8 token[16]`
+    - `uint8 public_key[32]`
+    - `uint8 challenge[32]` (from `LOGIN_CHALLENGE`)
+  - Signature algorithm: Ed25519.
+  - Server behaviour:
+    - Unsigned variant issues `LOGIN_CHALLENGE`.
+    - Signed variant verifies challenge freshness and signature, then links the
+      session token to the persistent identity.
   - Requires a valid session token from a prior `CLIENT_HELLO`.
-- `0x0E` LOGOUT (client to server): Disassociate persistent identity.
+- `0x0E` LOGIN_CHALLENGE (server to client): One-time challenge for login proof.
+  - Payload: `uint8 challenge[32]`.
+  - Sent reliably.
+- `0x0F` LOGOUT (client to server): Disassociate persistent identity.
   - Payload: empty.
-- `0x0F` LOGIN_SUCCESS (server to client): Successful login.
+- `0x10` LOGIN_SUCCESS (server to client): Successful login.
   - Payload: empty.
-- `0x10` LOGIN_FAILED (server to client): Failed login.
+- `0x11` LOGIN_FAILED (server to client): Failed login.
   - Payload: `uint16 code; uint8 reason_len; char reason[reason_len]`.
-- `0x11` GET_PLAYER_STATS (client to server): Request player statistics.
+- `0x12` GET_PLAYER_STATS (client to server): Request player statistics.
   - Payload: empty.
-- `0x12` PLAYER_STATS_DATA (server to client): Player statistics.
+- `0x13` PLAYER_STATS_DATA (server to client): Player statistics.
   - Payload: `double score_be; uint32 games_played_be; uint32 chess960_games_played_be`.
   - Note: Rating is tracked separately from score; this payload carries score and game counters.
-- `0x13` GET_PROFILE_INFO (client to server): Request info for a specific profile.
+- `0x14` GET_PROFILE_INFO (client to server): Request info for a specific profile.
   - Payload: `uint8 name_len; char name[name_len]`.
-- `0x14` PROFILES_LIST (server to client): Response to LIST_PROFILES.
+- `0x15` PROFILES_LIST (server to client): Response to LIST_PROFILES.
   - Payload: `char csv[]` (comma-separated profile names).
-- `0x16` GET_LEGAL_MOVES (client to server): Request legal moves for a square.
+- `0x17` GET_LEGAL_MOVES (client to server): Request legal moves for a square.
   - Payload: `uint8 square_index` (0-63, 0 = a1).
   - Header: `board_id` must reference the board assignment for the player.
   - Authorization: server validates the requesting token owns the reservation;
     otherwise the response is an empty `LEGAL_MOVES` packet.
-- `0x17` LEGAL_MOVES (server to client): Response to GET_LEGAL_MOVES.
+- `0x18` LEGAL_MOVES (server to client): Response to GET_LEGAL_MOVES.
   - Payload: `uint8 square_index; uint8 move_count; struct { uint8 from; uint8 to; int8 promotion; } moves[move_count]`.
   - `move_count` is capped at 218 and only includes moves originating from `square_index`.
   - Promotion is encoded as ASCII lowercase (`'q'`, `'r'`, `'b'`, `'n'`) or 0 for non-promotions.
   - Typically sent reliably so clients can pre-populate hover highlights.
-- `0x18` GET_LEADERBOARD (client to server): Request leaderboard snapshot.
+- `0x19` GET_LEADERBOARD (client to server): Request leaderboard snapshot.
   - Payload: `uint8 leaderboard_type; uint8 limit`.
   - `leaderboard_type`: `1=score`, `2=rating`.
   - `limit`: defaults to 10 if 0.
-- `0x19` LEADERBOARD_DATA (server to client): Leaderboard response.
+- `0x1A` LEADERBOARD_DATA (server to client): Leaderboard response.
   - Payload:
     - `uint8 leaderboard_type`
     - `uint8 count`
@@ -124,16 +140,16 @@ Control Codes
     - `count * struct { uint32 rank_be; uint64 session_id_be; uint64 score_bits_be; uint64 rating_bits_be; uint32 games_played_be; }`
   - `score_bits_be` and `rating_bits_be` are IEEE-754 double bit patterns in big-endian order.
   - Maximum entries per packet: 16.
-- `0x1A` SUBMIT_PREDICTION (client to server): Submit a prediction for the next
+- `0x1B` SUBMIT_PREDICTION (client to server): Submit a prediction for the next
   half-move on `board_id`.
   - Payload: `uint8 uci_len; char uci[uci_len]; uint64 parent_prediction_id_be`.
   - `parent_prediction_id_be = 0` means a root prediction.
-- `0x1B` GET_PREDICTIONS (client to server): Request prediction tree rows for a
+- `0x1C` GET_PREDICTIONS (client to server): Request prediction tree rows for a
   board.
   - Payload: `uint8 depth; uint8 limit`.
   - `depth = 0` lets the server use its configured default depth cap.
   - `limit` is capped by the implementation maximum entries per packet.
-- `0x1C` PREDICTION_DATA (server to client): Prediction tree response or submit
+- `0x1D` PREDICTION_DATA (server to client): Prediction tree response or submit
   confirmation.
   - Payload:
     - `uint8 count`
@@ -151,11 +167,11 @@ Control Codes
   - `status`: `0=pending`, `1=correct`, `2=incorrect`, `3=expired`.
   - `points_bits_be` is an IEEE-754 double bit pattern in big-endian order.
   - Maximum entries per packet: 16.
-- `0x1D` GET_PROFILE_TOS (client to server): Request ToS text for a profile.
+- `0x1E` GET_PROFILE_TOS (client to server): Request ToS text for a profile.
   - Payload: `uint8 name_len; char name[name_len]`.
   - Same authorization rules as GET_PROFILE_INFO: profile must be discoverable
     by the requesting session's trust tier.
-- `0x1E` PROFILE_TOS_DATA (server to client): Response to GET_PROFILE_TOS.
+- `0x1F` PROFILE_TOS_DATA (server to client): Response to GET_PROFILE_TOS.
   - Payload: `char tos_text[]` (UTF-8).
   - If the profile is not found or not accessible: `NOTFOUND;<name>`.
   - Sent reliably.
