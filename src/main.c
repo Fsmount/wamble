@@ -809,11 +809,6 @@ static void drain_runtime_issue_queues(void) {
       break;
     case WAMBLE_RUNTIME_EVENT_PROFILE_ADMIN:
       switch ((ProfileAdminStatus)ev.code) {
-      case PROFILE_ADMIN_STATUS_DISCOVERY_OVERRIDE_EXPOSED:
-        LOG_INFO("runtime status profile=%s hidden profile was exposed by "
-                 "profile.discover.override",
-                 profile_name);
-        break;
       case PROFILE_ADMIN_STATUS_SPECTATOR_FOCUS_DISABLED_FALLBACK:
         LOG_INFO("runtime status profile=%s spectator focus fell back to "
                  "summary because focus was disabled",
@@ -829,16 +824,107 @@ static void drain_runtime_issue_queues(void) {
                  "stopped because max-spectators is 0",
                  profile_name);
         break;
-      case PROFILE_ADMIN_STATUS_PROFILE_INFO_NOT_FOUND:
-        LOG_INFO("runtime status requested profile info for missing profile=%s",
-                 profile_name);
-        break;
-      case PROFILE_ADMIN_STATUS_PROFILE_INFO_HIDDEN:
-        LOG_INFO("runtime status requested profile info denied by discovery "
-                 "policy profile=%s",
-                 profile_name);
-        break;
       case PROFILE_ADMIN_STATUS_NONE:
+      default:
+        break;
+      }
+      break;
+    case WAMBLE_RUNTIME_EVENT_SERVER_PROTOCOL:
+      switch ((ServerProtocolStatus)ev.code) {
+      case SERVER_PROTOCOL_STATUS_FRAGMENTATION_SINGLE_PACKET:
+        LOG_DEBUG("runtime status profile=%s server protocol payload served in "
+                  "single packet",
+                  profile_name);
+        break;
+      case SERVER_PROTOCOL_STATUS_FRAGMENTATION_MULTI_PACKET:
+        LOG_DEBUG("runtime status profile=%s server protocol payload served "
+                  "using fragmentation",
+                  profile_name);
+        break;
+      case SERVER_PROTOCOL_STATUS_FRAGMENTATION_PREPARE_FAILED:
+        LOG_WARN("runtime status profile=%s server protocol payload "
+                 "fragmentation prepare failed",
+                 profile_name);
+        break;
+      case SERVER_PROTOCOL_STATUS_FRAGMENTATION_SEND_FAILED:
+        LOG_WARN("runtime status profile=%s server protocol payload "
+                 "fragmentation send failed",
+                 profile_name);
+        break;
+      case SERVER_PROTOCOL_STATUS_RATE_LIMIT_DENIED:
+        LOG_WARN("runtime status profile=%s server protocol request denied by "
+                 "rate limit",
+                 profile_name);
+        break;
+      case SERVER_PROTOCOL_STATUS_POLICY_DENIED:
+        LOG_WARN("runtime status profile=%s server protocol request denied by "
+                 "policy",
+                 profile_name);
+        break;
+      case SERVER_PROTOCOL_STATUS_PROFILE_DISCOVERY_OVERRIDE_EXPOSED:
+        LOG_INFO("runtime status profile=%s server protocol exposed hidden "
+                 "profile via profile.discover.override",
+                 profile_name);
+        break;
+      case SERVER_PROTOCOL_STATUS_PROFILE_INFO_NOT_FOUND:
+        LOG_INFO("runtime status profile=%s server protocol profile info not "
+                 "found",
+                 profile_name);
+        break;
+      case SERVER_PROTOCOL_STATUS_PROFILE_INFO_HIDDEN:
+        LOG_INFO("runtime status profile=%s server protocol profile info "
+                 "hidden by discovery policy",
+                 profile_name);
+        break;
+      case SERVER_PROTOCOL_STATUS_CLIENT_HELLO_UNSUPPORTED_VERSION:
+        LOG_INFO("runtime status profile=%s server protocol rejected "
+                 "client_hello with unsupported version",
+                 profile_name);
+        break;
+      case SERVER_PROTOCOL_STATUS_LOGIN_CHALLENGE_ISSUED:
+        LOG_DEBUG("runtime status profile=%s server protocol issued login "
+                  "challenge",
+                  profile_name);
+        break;
+      case SERVER_PROTOCOL_STATUS_LOGIN_SUCCESS:
+        LOG_INFO("runtime status profile=%s server protocol login success",
+                 profile_name);
+        break;
+      case SERVER_PROTOCOL_STATUS_LOGIN_FAILED:
+        LOG_WARN("runtime status profile=%s server protocol login failed",
+                 profile_name);
+        break;
+      case SERVER_PROTOCOL_STATUS_MOVE_REJECTED:
+        LOG_WARN("runtime status profile=%s server protocol move rejected",
+                 profile_name);
+        break;
+      case SERVER_PROTOCOL_STATUS_SPECTATE_DENIED:
+        LOG_WARN("runtime status profile=%s server protocol spectate denied",
+                 profile_name);
+        break;
+      case SERVER_PROTOCOL_STATUS_UNKNOWN_PLAYER:
+        LOG_WARN("runtime status profile=%s server protocol unknown player",
+                 profile_name);
+        break;
+      case SERVER_PROTOCOL_STATUS_UNKNOWN_BOARD:
+        LOG_WARN("runtime status profile=%s server protocol unknown board",
+                 profile_name);
+        break;
+      case SERVER_PROTOCOL_STATUS_UNKNOWN_CTRL:
+        LOG_WARN("runtime status profile=%s server protocol unknown ctrl",
+                 profile_name);
+        break;
+      case SERVER_PROTOCOL_STATUS_LEGAL_MOVES_INVALID_REQUEST:
+        LOG_WARN("runtime status profile=%s server protocol invalid legal "
+                 "moves request",
+                 profile_name);
+        break;
+      case SERVER_PROTOCOL_STATUS_PREDICTION_REJECTED:
+        LOG_WARN("runtime status profile=%s server protocol prediction "
+                 "request rejected",
+                 profile_name);
+        break;
+      case SERVER_PROTOCOL_STATUS_NONE:
       default:
         break;
       }
