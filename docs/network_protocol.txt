@@ -151,6 +151,14 @@ Control Codes
   - `status`: `0=pending`, `1=correct`, `2=incorrect`, `3=expired`.
   - `points_bits_be` is an IEEE-754 double bit pattern in big-endian order.
   - Maximum entries per packet: 16.
+- `0x1D` GET_PROFILE_TOS (client to server): Request ToS text for a profile.
+  - Payload: `uint8 name_len; char name[name_len]`.
+  - Same authorization rules as GET_PROFILE_INFO: profile must be discoverable
+    by the requesting session's trust tier.
+- `0x1E` PROFILE_TOS_DATA (server to client): Response to GET_PROFILE_TOS.
+  - Payload: `char tos_text[]` (UTF-8).
+  - If the profile is not found or not accessible: `NOTFOUND;<name>`.
+  - Sent reliably.
 
 Reliability
 - Reliable messages are sent with a sequence number (`seq_num`).

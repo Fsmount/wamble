@@ -941,6 +941,8 @@ restore_running_from_restart_specs(const RestartSpec *specs, int count,
 static int profile_runtime_enabled(const WambleProfile *p) {
   if (!p || !p->name)
     return 0;
+  if (p->abstract)
+    return 0;
   if (p->advertise)
     return 1;
 
