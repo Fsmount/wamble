@@ -4,7 +4,9 @@
 #include <sys/random.h>
 #endif
 
-#define PUBLIC_KEY_LENGTH 32
+int crypto_eddsa_check(const uint8_t signature[WAMBLE_LOGIN_SIGNATURE_LENGTH],
+                       const uint8_t public_key[WAMBLE_PUBLIC_KEY_LENGTH],
+                       const uint8_t *message, size_t message_size);
 
 static WAMBLE_THREAD_LOCAL WamblePlayer *player_pool;
 static WAMBLE_THREAD_LOCAL int num_players = 0;
@@ -91,7 +93,16 @@ double rng_double(void) {
   return (double)r * (1.0 / 9007199254740992.0);
 }
 
-static void rng_bytes(uint8_t *out, size_t len) {
+int wamble_ed25519_verify(const uint8_t *signature, const uint8_t *public_key,
+                          const uint8_t *message, size_t message_size) {
+  if (!signature || !public_key || (!message && message_size != 0))
+    return -1;
+  return crypto_eddsa_check(signature, public_key, message, message_size);
+}
+
+void rng_bytes(uint8_t *out, size_t len) {
+  if (!out || len == 0)
+    return;
   size_t i = 0;
   while (i < len) {
     uint64_t r = rng_u64();
@@ -315,7 +326,7 @@ WamblePlayer *get_player_by_token(const uint8_t *token) {
     WamblePlayer *player = find_empty_player_slot();
     if (player) {
       memcpy(player->token, token, TOKEN_LENGTH);
-      memset(player->public_key, 0, PUBLIC_KEY_LENGTH);
+      memset(player->public_key, 0, WAMBLE_PUBLIC_KEY_LENGTH);
       player->has_persistent_identity = true;
       player->last_seen_time = wamble_now_wall();
       hydrate_player_from_session(player, session_id);
@@ -371,7 +382,7 @@ WamblePlayer *create_new_player(void) {
     }
 
     memcpy(player->token, candidate_token, TOKEN_LENGTH);
-    memset(player->public_key, 0, PUBLIC_KEY_LENGTH);
+    memset(player->public_key, 0, WAMBLE_PUBLIC_KEY_LENGTH);
     player->has_persistent_identity = 0;
     player->last_seen_time = wamble_now_wall();
     player->score = 0.0;
@@ -404,7 +415,7 @@ WamblePlayer *attach_persistent_identity(const uint8_t *token,
     return NULL;
   }
   WamblePlayer *player = &player_pool[idx];
-  memcpy(player->public_key, public_key, PUBLIC_KEY_LENGTH);
+  memcpy(player->public_key, public_key, WAMBLE_PUBLIC_KEY_LENGTH);
   player->has_persistent_identity = true;
   if (stats_status == DB_OK)
     apply_persistent_player_stats(player, &stats);
@@ -423,7 +434,7 @@ int detach_persistent_identity(const uint8_t *token) {
     return -1;
   }
   WamblePlayer *player = &player_pool[idx];
-  memset(player->public_key, 0, PUBLIC_KEY_LENGTH);
+  memset(player->public_key, 0, WAMBLE_PUBLIC_KEY_LENGTH);
   if (player->has_persistent_identity) {
     player->has_persistent_identity = false;
     wamble_emit_unlink_session_identity(player->token);

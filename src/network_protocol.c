@@ -242,6 +242,7 @@ static int ctrl_is_supported(uint8_t ctrl) {
   case WAMBLE_CTRL_LOGOUT:
   case WAMBLE_CTRL_LOGIN_SUCCESS:
   case WAMBLE_CTRL_LOGIN_FAILED:
+  case WAMBLE_CTRL_LOGIN_CHALLENGE:
   case WAMBLE_CTRL_GET_PLAYER_STATS:
   case WAMBLE_CTRL_PLAYER_STATS_DATA:
   case WAMBLE_CTRL_GET_LEGAL_MOVES:
@@ -466,8 +467,22 @@ static NetworkStatus serialize_wamble_msg(const struct WambleMsg *msg,
     break;
   }
   case WAMBLE_CTRL_LOGIN_REQUEST: {
-    memcpy(payload, msg->login_pubkey, 32);
-    payload_len = 32;
+    size_t need = WAMBLE_PUBLIC_KEY_LENGTH;
+    if (msg->login_has_signature)
+      need += WAMBLE_LOGIN_SIGNATURE_LENGTH;
+    if (need > WAMBLE_MAX_PAYLOAD)
+      return NET_ERR_TRUNCATED;
+    memcpy(payload, msg->login_pubkey, WAMBLE_PUBLIC_KEY_LENGTH);
+    if (msg->login_has_signature) {
+      memcpy(payload + WAMBLE_PUBLIC_KEY_LENGTH, msg->login_signature,
+             WAMBLE_LOGIN_SIGNATURE_LENGTH);
+    }
+    payload_len = need;
+    break;
+  }
+  case WAMBLE_CTRL_LOGIN_CHALLENGE: {
+    memcpy(payload, msg->login_challenge, WAMBLE_LOGIN_CHALLENGE_LENGTH);
+    payload_len = WAMBLE_LOGIN_CHALLENGE_LENGTH;
     break;
   }
   case WAMBLE_CTRL_PLAYER_STATS_DATA: {
@@ -631,6 +646,12 @@ static NetworkStatus deserialize_wamble_msg(const uint8_t *buffer,
   case WAMBLE_CTRL_LOGOUT:
 
     break;
+  case WAMBLE_CTRL_LOGIN_CHALLENGE: {
+    if (payload_len != WAMBLE_LOGIN_CHALLENGE_LENGTH)
+      return NET_ERR_INVALID;
+    memcpy(msg->login_challenge, payload, WAMBLE_LOGIN_CHALLENGE_LENGTH);
+    break;
+  }
   case WAMBLE_CTRL_GET_LEADERBOARD: {
     if (payload_len > 2)
       return NET_ERR_INVALID;
@@ -786,8 +807,17 @@ static NetworkStatus deserialize_wamble_msg(const uint8_t *buffer,
     break;
   }
   case WAMBLE_CTRL_LOGIN_REQUEST: {
-    if (payload_len == 32) {
-      memcpy(msg->login_pubkey, payload, 32);
+    if (payload_len == WAMBLE_PUBLIC_KEY_LENGTH) {
+      memcpy(msg->login_pubkey, payload, WAMBLE_PUBLIC_KEY_LENGTH);
+      msg->login_has_signature = 0;
+    } else if (payload_len ==
+               WAMBLE_PUBLIC_KEY_LENGTH + WAMBLE_LOGIN_SIGNATURE_LENGTH) {
+      memcpy(msg->login_pubkey, payload, WAMBLE_PUBLIC_KEY_LENGTH);
+      memcpy(msg->login_signature, payload + WAMBLE_PUBLIC_KEY_LENGTH,
+             WAMBLE_LOGIN_SIGNATURE_LENGTH);
+      msg->login_has_signature = 1;
+    } else {
+      return NET_ERR_INVALID;
     }
     break;
   }

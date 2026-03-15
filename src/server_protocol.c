@@ -9,6 +9,20 @@ typedef struct {
 static WAMBLE_THREAD_LOCAL RequestRateLimitEntry *g_rate_limit_entries = NULL;
 static WAMBLE_THREAD_LOCAL int g_rate_limit_capacity = 0;
 
+#define LOGIN_CHALLENGE_TTL_MS 30000ULL
+
+typedef struct {
+  int used;
+  uint8_t token[TOKEN_LENGTH];
+  uint8_t public_key[WAMBLE_PUBLIC_KEY_LENGTH];
+  uint8_t challenge[WAMBLE_LOGIN_CHALLENGE_LENGTH];
+  uint64_t issued_at_ms;
+} LoginChallengeEntry;
+
+static WAMBLE_THREAD_LOCAL LoginChallengeEntry *g_login_challenge_entries =
+    NULL;
+static WAMBLE_THREAD_LOCAL int g_login_challenge_capacity = 0;
+
 static int ensure_rate_limit_entries(void) {
   int desired = get_config()->max_client_sessions;
   if (desired <= 0)
@@ -25,6 +39,121 @@ static int ensure_rate_limit_entries(void) {
   return 0;
 }
 
+static int ensure_login_challenge_entries(void) {
+  int desired = get_config()->max_client_sessions;
+  if (desired <= 0)
+    desired = 1;
+  if (g_login_challenge_entries && g_login_challenge_capacity == desired)
+    return 0;
+  LoginChallengeEntry *next = calloc((size_t)desired, sizeof(*next));
+  if (!next)
+    return -1;
+  free(g_login_challenge_entries);
+  g_login_challenge_entries = next;
+  g_login_challenge_capacity = desired;
+  return 0;
+}
+
+static LoginChallengeEntry *find_login_challenge_entry(const uint8_t *token,
+                                                       int *out_free_index) {
+  if (out_free_index)
+    *out_free_index = -1;
+  if (!token || !g_login_challenge_entries || g_login_challenge_capacity <= 0)
+    return NULL;
+  for (int i = 0; i < g_login_challenge_capacity; i++) {
+    LoginChallengeEntry *entry = &g_login_challenge_entries[i];
+    if (!entry->used) {
+      if (out_free_index && *out_free_index < 0)
+        *out_free_index = i;
+      continue;
+    }
+    if (tokens_equal(entry->token, token))
+      return entry;
+  }
+  return NULL;
+}
+
+static LoginChallengeEntry *
+acquire_login_challenge_entry(const uint8_t *token) {
+  int free_index = -1;
+  LoginChallengeEntry *entry = find_login_challenge_entry(token, &free_index);
+  if (entry)
+    return entry;
+  if (free_index >= 0)
+    return &g_login_challenge_entries[free_index];
+  if (g_login_challenge_capacity <= 0)
+    return NULL;
+  int evict =
+      (int)(wamble_token_hash32(token) % (uint32_t)g_login_challenge_capacity);
+  return &g_login_challenge_entries[evict];
+}
+
+static void clear_login_challenge(const uint8_t *token) {
+  if (!token)
+    return;
+  LoginChallengeEntry *entry = find_login_challenge_entry(token, NULL);
+  if (entry)
+    memset(entry, 0, sizeof(*entry));
+}
+
+static int
+issue_login_challenge(const uint8_t *token, const uint8_t *public_key,
+                      uint8_t out_challenge[WAMBLE_LOGIN_CHALLENGE_LENGTH]) {
+  if (!token || !public_key || !out_challenge)
+    return -1;
+  if (ensure_login_challenge_entries() != 0)
+    return -1;
+  LoginChallengeEntry *entry = acquire_login_challenge_entry(token);
+  if (!entry)
+    return -1;
+  memset(entry, 0, sizeof(*entry));
+  entry->used = 1;
+  memcpy(entry->token, token, TOKEN_LENGTH);
+  memcpy(entry->public_key, public_key, WAMBLE_PUBLIC_KEY_LENGTH);
+  rng_bytes(entry->challenge, WAMBLE_LOGIN_CHALLENGE_LENGTH);
+  entry->issued_at_ms = wamble_now_mono_millis();
+  memcpy(out_challenge, entry->challenge, WAMBLE_LOGIN_CHALLENGE_LENGTH);
+  return 0;
+}
+
+static int login_challenge_is_fresh(uint64_t issued_at_ms) {
+  uint64_t now = wamble_now_mono_millis();
+  if (now < issued_at_ms)
+    return 0;
+  return (now - issued_at_ms) <= LOGIN_CHALLENGE_TTL_MS;
+}
+
+static int verify_login_proof(const struct WambleMsg *msg) {
+  if (!msg)
+    return -1;
+  LoginChallengeEntry *entry = find_login_challenge_entry(msg->token, NULL);
+  if (!entry || !entry->used)
+    return -1;
+  int verified = 0;
+  if (memcmp(entry->public_key, msg->login_pubkey, WAMBLE_PUBLIC_KEY_LENGTH) !=
+      0) {
+    goto done;
+  }
+  if (!login_challenge_is_fresh(entry->issued_at_ms))
+    goto done;
+
+  uint8_t sign_message[128];
+  size_t sign_message_len = wamble_build_login_signature_message(
+      sign_message, sizeof(sign_message), msg->token, msg->login_pubkey,
+      entry->challenge);
+  if (sign_message_len == 0)
+    goto done;
+
+  verified = (wamble_ed25519_verify(msg->login_signature, msg->login_pubkey,
+                                    sign_message, sign_message_len) == 0)
+                 ? 1
+                 : 0;
+
+done:
+  memset(entry, 0, sizeof(*entry));
+  return verified ? 0 : -1;
+}
+
 static int send_reliable_default(wamble_socket_t sockfd,
                                  const struct WambleMsg *msg,
                                  const struct sockaddr_in *cliaddr) {
@@ -37,10 +166,23 @@ static int policy_check(const uint8_t *token, const char *profile_name,
                         const char *action, const char *resource,
                         const char *context_key, const char *context_value,
                         WamblePolicyDecision *out_decision) {
+  int token_nonzero = 0;
+  for (int i = 0; token && i < TOKEN_LENGTH; i++) {
+    if (token[i] != 0) {
+      token_nonzero = 1;
+      break;
+    }
+  }
   WamblePolicyDecision decision;
   DbStatus st = wamble_query_resolve_policy_decision(
       token, profile_name, action, resource, context_key, context_value,
       &decision);
+  if (st == DB_NOT_FOUND && token_nonzero) {
+    (void)wamble_query_create_session(token, 0, NULL);
+    st = wamble_query_resolve_policy_decision(token, profile_name, action,
+                                              resource, context_key,
+                                              context_value, &decision);
+  }
   if (st != DB_OK)
     return 0;
   if (out_decision)
@@ -371,6 +513,8 @@ static const char *ctrl_policy_resource(uint8_t ctrl) {
     return "login_success";
   case WAMBLE_CTRL_LOGIN_FAILED:
     return "login_failed";
+  case WAMBLE_CTRL_LOGIN_CHALLENGE:
+    return "login_challenge";
   case WAMBLE_CTRL_GET_PLAYER_STATS:
     return "get_player_stats";
   case WAMBLE_CTRL_PLAYER_STATS_DATA:
@@ -517,6 +661,7 @@ static ServerStatus handle_client_goodbye(const struct WambleMsg *msg) {
   WamblePlayer *player = get_player_by_token(msg->token);
   if (!player)
     return SERVER_ERR_UNKNOWN_PLAYER;
+  clear_login_challenge(msg->token);
   spectator_discard_by_token(msg->token);
   discard_player_by_token(msg->token);
   return SERVER_OK;
@@ -526,6 +671,7 @@ static ServerStatus handle_logout(const struct WambleMsg *msg) {
   WamblePlayer *player = get_player_by_token(msg->token);
   if (!player)
     return SERVER_ERR_UNKNOWN_PLAYER;
+  clear_login_challenge(msg->token);
   if (detach_persistent_identity(msg->token) != 0)
     return SERVER_ERR_INTERNAL;
   return SERVER_OK;
@@ -795,7 +941,7 @@ static ServerStatus handle_get_profile_tos(wamble_socket_t sockfd,
 static int login_has_pubkey(const struct WambleMsg *msg) {
   if (!msg)
     return 0;
-  for (int i = 0; i < 32; i++) {
+  for (int i = 0; i < WAMBLE_PUBLIC_KEY_LENGTH; i++) {
     if (msg->login_pubkey[i] != 0)
       return 1;
   }
@@ -805,12 +951,44 @@ static int login_has_pubkey(const struct WambleMsg *msg) {
 static ServerStatus handle_login_request(wamble_socket_t sockfd,
                                          const struct sockaddr_in *cliaddr,
                                          const struct WambleMsg *msg) {
-  int has_key = login_has_pubkey(msg);
-  WamblePlayer *player = NULL;
-  if (has_key)
-    player = attach_persistent_identity(msg->token, msg->login_pubkey);
-
   struct WambleMsg response = {0};
+  memcpy(response.token, msg->token, TOKEN_LENGTH);
+
+  WamblePlayer *existing = get_player_by_token(msg->token);
+  int has_key = login_has_pubkey(msg);
+  if (!existing || !has_key) {
+    response.ctrl = WAMBLE_CTRL_LOGIN_FAILED;
+    response.error_code = WAMBLE_ERR_ACCESS_DENIED;
+    if (send_reliable_default(sockfd, &response, cliaddr) != 0)
+      return SERVER_ERR_SEND_FAILED;
+    return SERVER_ERR_LOGIN_FAILED;
+  }
+
+  if (!msg->login_has_signature) {
+    response.ctrl = WAMBLE_CTRL_LOGIN_CHALLENGE;
+    if (issue_login_challenge(msg->token, msg->login_pubkey,
+                              response.login_challenge) != 0) {
+      response.ctrl = WAMBLE_CTRL_LOGIN_FAILED;
+      response.error_code = WAMBLE_ERR_ACCESS_DENIED;
+      if (send_reliable_default(sockfd, &response, cliaddr) != 0)
+        return SERVER_ERR_SEND_FAILED;
+      return SERVER_ERR_LOGIN_FAILED;
+    }
+    if (send_reliable_default(sockfd, &response, cliaddr) != 0)
+      return SERVER_ERR_SEND_FAILED;
+    return SERVER_OK;
+  }
+
+  if (verify_login_proof(msg) != 0) {
+    response.ctrl = WAMBLE_CTRL_LOGIN_FAILED;
+    response.error_code = WAMBLE_ERR_ACCESS_DENIED;
+    if (send_reliable_default(sockfd, &response, cliaddr) != 0)
+      return SERVER_ERR_SEND_FAILED;
+    return SERVER_ERR_LOGIN_FAILED;
+  }
+
+  WamblePlayer *player =
+      attach_persistent_identity(msg->token, msg->login_pubkey);
   if (player) {
     response.ctrl = WAMBLE_CTRL_LOGIN_SUCCESS;
     memcpy(response.token, player->token, TOKEN_LENGTH);
