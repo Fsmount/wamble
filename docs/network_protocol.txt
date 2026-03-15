@@ -172,7 +172,19 @@ Control Codes
   - Same authorization rules as GET_PROFILE_INFO: profile must be discoverable
     by the requesting session's trust tier.
 - `0x1F` PROFILE_TOS_DATA (server to client): Response to GET_PROFILE_TOS.
-  - Payload: `char tos_text[]` (UTF-8).
+  - Fragmented payload format (`fragment_version = 1`):
+    - `uint8 fragment_version` (`1`)
+    - `uint8 hash_algo` (`1` = BLAKE2b-256)
+    - `uint16 chunk_index_be`
+    - `uint16 chunk_count_be`
+    - `uint32 total_len_be`
+    - `uint32 transfer_id_be`
+    - `uint8 fragment_hash[32]` (BLAKE2b-256 over full payload bytes)
+    - `uint16 chunk_len_be`
+    - `uint8 chunk_bytes[chunk_len]`
+  - All fragments for a transfer share `hash_algo`, `total_len_be`,
+    `transfer_id_be`, and `fragment_hash`.
+  - Current chunk payload max is 1154 bytes (`WAMBLE_MAX_PAYLOAD - 46`).
   - If the profile is not found or not accessible: `NOTFOUND;<name>`.
   - Sent reliably.
 
@@ -240,15 +252,19 @@ WebSocket Bridge
   - Client -> server: masked binary frames (`opcode=0x2`) containing one
     Wamble packet each.
   - Server -> client: unmasked binary frames containing one Wamble packet each.
-  - Data transport is binary-only, text and continuation data frames are not
-    supported.
+  - Data transport is binary-only; text frames are not supported.
+  - Continuation data frames are supported for fragmented binary messages.
   - Ping/Pong and Close control frames are supported.
-  - Fragmentation is not supported (`FIN=1` required on all frames).
+  - Fragmentation is supported for binary messages (`opcode=0x2` then
+    `opcode=0x0` continuations until `FIN=1`).
+  - Control frames must remain unfragmented.
   - Frame payload limit is currently 4096 bytes.
 - Semantics:
   - Control codes and packet bytes are unchanged.
   - Reliability/ACK and sequence semantics are enforced by the application
     protocol, independent of websocket/TCP transport reliability.
+  - Gateway optimization: for reliable server->client packets, the bridge
+    emits protocol ACKs locally after successful websocket frame write.
   - The websocket layer is strictly a transport adapter over the existing
     protocol.
   - The adapter creates a loopback UDP socket per websocket client; server-side

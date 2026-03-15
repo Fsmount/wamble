@@ -965,6 +965,37 @@ static inline void wamble_log(int level, const char *file, int line,
 #define WAMBLE_PUBLIC_KEY_LENGTH 32
 #define WAMBLE_LOGIN_SIGNATURE_LENGTH 64
 #define WAMBLE_LOGIN_CHALLENGE_LENGTH 32
+#define WAMBLE_MAX_PAYLOAD 1200
+#define WAMBLE_HEADER_WIRE_SIZE (1 + 1 + 1 + 1 + TOKEN_LENGTH + 8 + 4 + 2)
+#define WAMBLE_MAX_PACKET_SIZE (WAMBLE_HEADER_WIRE_SIZE + WAMBLE_MAX_PAYLOAD)
+#define WAMBLE_FRAGMENT_HASH_LENGTH 32
+#define WAMBLE_FRAGMENT_VERSION 1
+#define WAMBLE_FRAGMENT_HASH_BLAKE2B_256 1
+#define WAMBLE_FRAGMENT_WIRE_HEADER_LENGTH                                     \
+  (1 + 1 + 2 + 2 + 4 + 4 + WAMBLE_FRAGMENT_HASH_LENGTH + 2)
+#define WAMBLE_FRAGMENT_DATA_MAX                                               \
+  (WAMBLE_MAX_PAYLOAD - WAMBLE_FRAGMENT_WIRE_HEADER_LENGTH)
+
+static inline NetworkStatus wamble_wire_packet_size(const uint8_t *packet,
+                                                    size_t packet_cap,
+                                                    size_t *out_packet_len) {
+  if (!packet || !out_packet_len)
+    return NET_ERR_INVALID;
+  if (packet_cap < WAMBLE_HEADER_WIRE_SIZE)
+    return NET_ERR_TRUNCATED;
+  if (packet[3] != 0)
+    return NET_ERR_INVALID;
+  uint16_t payload_len =
+      (uint16_t)(((uint16_t)packet[WAMBLE_HEADER_WIRE_SIZE - 2] << 8) |
+                 packet[WAMBLE_HEADER_WIRE_SIZE - 1]);
+  if (payload_len > WAMBLE_MAX_PAYLOAD)
+    return NET_ERR_INVALID;
+  size_t total = WAMBLE_HEADER_WIRE_SIZE + (size_t)payload_len;
+  if (total > packet_cap)
+    return NET_ERR_TRUNCATED;
+  *out_packet_len = total;
+  return NET_OK;
+}
 
 struct WambleMove;
 
@@ -1244,8 +1275,15 @@ struct WambleMsg {
   char profile_name[PROFILE_NAME_MAX_LENGTH];
   uint16_t profile_info_len;
   char profile_info[FEN_MAX_LENGTH];
-  const char *tos_ptr;
-  size_t tos_len;
+  uint8_t fragment_version;
+  uint8_t fragment_hash_algo;
+  uint16_t fragment_chunk_index;
+  uint16_t fragment_chunk_count;
+  uint32_t fragment_total_len;
+  uint32_t fragment_transfer_id;
+  uint8_t fragment_hash[WAMBLE_FRAGMENT_HASH_LENGTH];
+  uint16_t fragment_data_len;
+  uint8_t fragment_data[WAMBLE_FRAGMENT_DATA_MAX];
   uint16_t profiles_list_len;
   char profiles_list[FEN_MAX_LENGTH];
   char fen[FEN_MAX_LENGTH];
@@ -1273,8 +1311,38 @@ struct WambleMsg {
   WamblePredictionEntry predictions[WAMBLE_MAX_PREDICTION_ENTRIES];
 };
 
-#define WAMBLE_MAX_PAYLOAD 1200
 #define WAMBLE_DUP_WINDOW 1024
+
+typedef enum {
+  WAMBLE_FRAGMENT_INTEGRITY_UNKNOWN = 0,
+  WAMBLE_FRAGMENT_INTEGRITY_OK = 1,
+  WAMBLE_FRAGMENT_INTEGRITY_MISMATCH = 2,
+} WambleFragmentIntegrity;
+
+typedef enum {
+  WAMBLE_FRAGMENT_REASSEMBLY_ERR_INVALID = -2,
+  WAMBLE_FRAGMENT_REASSEMBLY_ERR_NOMEM = -1,
+  WAMBLE_FRAGMENT_REASSEMBLY_IGNORED = 0,
+  WAMBLE_FRAGMENT_REASSEMBLY_IN_PROGRESS = 1,
+  WAMBLE_FRAGMENT_REASSEMBLY_COMPLETE = 2,
+  WAMBLE_FRAGMENT_REASSEMBLY_COMPLETE_BAD_HASH = 3,
+} WambleFragmentReassemblyResult;
+
+typedef struct WambleFragmentReassembly {
+  uint8_t active;
+  uint8_t ctrl;
+  uint8_t hash_algo;
+  uint16_t chunk_count;
+  uint16_t received_chunks;
+  uint32_t total_len;
+  uint32_t transfer_id;
+  uint8_t expected_hash[WAMBLE_FRAGMENT_HASH_LENGTH];
+  WambleFragmentIntegrity integrity;
+  uint8_t *data;
+  size_t data_capacity;
+  uint8_t *chunk_seen;
+  size_t chunk_seen_capacity;
+} WambleFragmentReassembly;
 
 typedef struct WamblePlayer {
   uint8_t token[TOKEN_LENGTH];
@@ -1615,6 +1683,12 @@ int wamble_query_treatment_edge_allows(const char *profile,
 wamble_socket_t create_and_bind_socket(int port);
 int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
                     struct sockaddr_in *cliaddr);
+void wamble_fragment_reassembly_init(WambleFragmentReassembly *reassembly);
+void wamble_fragment_reassembly_reset(WambleFragmentReassembly *reassembly);
+void wamble_fragment_reassembly_free(WambleFragmentReassembly *reassembly);
+WambleFragmentReassemblyResult
+wamble_fragment_reassembly_push(WambleFragmentReassembly *reassembly,
+                                const struct WambleMsg *msg);
 void send_ack(wamble_socket_t sockfd, const struct WambleMsg *msg,
               const struct sockaddr_in *cliaddr);
 int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,

@@ -21,6 +21,9 @@ typedef ssize_t ws_test_io_count_t;
 wamble_socket_t wamble_test_ws_connect(int port);
 int wamble_test_ws_handshake(wamble_socket_t sock, const char *path,
                              const char *key, const char *version);
+int wamble_test_ws_send_frame_ex(wamble_socket_t sock, uint8_t fin,
+                                 uint8_t opcode, const uint8_t *payload,
+                                 size_t len, int force_ext126);
 int wamble_test_ws_send_frame(wamble_socket_t sock, uint8_t opcode,
                               const uint8_t *payload, size_t len,
                               int force_ext126);

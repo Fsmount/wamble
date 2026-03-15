@@ -1,4 +1,9 @@
 #include "../include/wamble/wamble.h"
+void crypto_blake2b(uint8_t *hash, size_t hash_size, const uint8_t *msg,
+                    size_t msg_size);
+int ws_gateway_queue_packet(const struct sockaddr_in *cliaddr,
+                            const uint8_t *packet, size_t packet_len);
+int ws_gateway_is_ws_client(const struct sockaddr_in *cliaddr);
 
 #if !defined(__STDC_VERSION__) || (__STDC_VERSION__ < 201112L)
 #ifndef HAVE_STRNLEN_DECL
@@ -29,7 +34,6 @@ typedef struct WambleHeader {
 #pragma pack(pop)
 
 #define WAMBLE_HEADER_SIZE (sizeof(WambleHeader))
-#define WAMBLE_MAX_PACKET_SIZE (WAMBLE_HEADER_SIZE + WAMBLE_MAX_PAYLOAD)
 #define WAMBLE_PREDICTION_ENTRY_WIRE_SIZE                                      \
   (8 + 8 + TOKEN_LENGTH + 8 + 2 + 1 + 1 + 1 + MAX_UCI_LENGTH)
 #define WAMBLE_PENDING_PACKET_CAP 64
@@ -275,10 +279,288 @@ static inline uint64_t net_to_host64(uint64_t x) {
 }
 #endif
 
-static NetworkStatus serialize_wamble_msg(const struct WambleMsg *msg,
-                                          uint8_t *buffer,
-                                          size_t buffer_capacity,
-                                          size_t *out_len, uint8_t flags) {
+static int ctrl_supports_fragment_payload(uint8_t ctrl) {
+  switch (ctrl) {
+  case WAMBLE_CTRL_PROFILE_TOS_DATA:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static int msg_uses_fragment_payload(const struct WambleMsg *msg) {
+  if (!msg)
+    return 0;
+  return (msg->fragment_version == WAMBLE_FRAGMENT_VERSION) ||
+         (msg->fragment_chunk_count > 0) || (msg->fragment_total_len > 0) ||
+         (msg->fragment_data_len > 0);
+}
+
+static NetworkStatus encode_fragment_payload(const struct WambleMsg *msg,
+                                             uint8_t *payload,
+                                             size_t payload_capacity,
+                                             size_t *payload_len) {
+  if (!msg || !payload || !payload_len)
+    return NET_ERR_INVALID;
+  if (msg->fragment_version != WAMBLE_FRAGMENT_VERSION)
+    return NET_ERR_INVALID;
+  if (msg->fragment_hash_algo != WAMBLE_FRAGMENT_HASH_BLAKE2B_256)
+    return NET_ERR_INVALID;
+  if (msg->fragment_chunk_count == 0 ||
+      msg->fragment_chunk_index >= msg->fragment_chunk_count)
+    return NET_ERR_INVALID;
+  if (msg->fragment_data_len > WAMBLE_FRAGMENT_DATA_MAX)
+    return NET_ERR_INVALID;
+  size_t chunk_len = (size_t)msg->fragment_data_len;
+  size_t need = WAMBLE_FRAGMENT_WIRE_HEADER_LENGTH + chunk_len;
+  if (need > payload_capacity)
+    return NET_ERR_TRUNCATED;
+
+  payload[0] = WAMBLE_FRAGMENT_VERSION;
+  payload[1] = WAMBLE_FRAGMENT_HASH_BLAKE2B_256;
+  uint16_t idx_be = htons(msg->fragment_chunk_index);
+  uint16_t count_be = htons(msg->fragment_chunk_count);
+  uint32_t total_be = htonl(msg->fragment_total_len);
+  uint32_t transfer_id_be = htonl(msg->fragment_transfer_id);
+  uint16_t len_be = htons(msg->fragment_data_len);
+  memcpy(payload + 2, &idx_be, 2);
+  memcpy(payload + 4, &count_be, 2);
+  memcpy(payload + 6, &total_be, 4);
+  memcpy(payload + 10, &transfer_id_be, 4);
+  memcpy(payload + 14, msg->fragment_hash, WAMBLE_FRAGMENT_HASH_LENGTH);
+  memcpy(payload + 14 + WAMBLE_FRAGMENT_HASH_LENGTH, &len_be, 2);
+  if (chunk_len)
+    memcpy(payload + WAMBLE_FRAGMENT_WIRE_HEADER_LENGTH, msg->fragment_data,
+           chunk_len);
+  *payload_len = need;
+  return NET_OK;
+}
+
+static NetworkStatus decode_fragment_payload(const uint8_t *payload,
+                                             size_t payload_len,
+                                             struct WambleMsg *msg,
+                                             int *is_fragmented) {
+  if (!payload || !msg || !is_fragmented)
+    return NET_ERR_INVALID;
+  *is_fragmented = 0;
+  if (payload_len < WAMBLE_FRAGMENT_WIRE_HEADER_LENGTH ||
+      payload[0] != WAMBLE_FRAGMENT_VERSION) {
+    return NET_OK;
+  }
+
+  uint8_t hash_algo = payload[1];
+  uint16_t chunk_index_be = 0;
+  uint16_t chunk_count_be = 0;
+  uint32_t total_be = 0;
+  uint32_t transfer_id_be = 0;
+  uint16_t chunk_len_be = 0;
+  memcpy(&chunk_index_be, payload + 2, 2);
+  memcpy(&chunk_count_be, payload + 4, 2);
+  memcpy(&total_be, payload + 6, 4);
+  memcpy(&transfer_id_be, payload + 10, 4);
+  memcpy(msg->fragment_hash, payload + 14, WAMBLE_FRAGMENT_HASH_LENGTH);
+  memcpy(&chunk_len_be, payload + 14 + WAMBLE_FRAGMENT_HASH_LENGTH, 2);
+  msg->fragment_version = WAMBLE_FRAGMENT_VERSION;
+  msg->fragment_hash_algo = hash_algo;
+  msg->fragment_chunk_index = ntohs(chunk_index_be);
+  msg->fragment_chunk_count = ntohs(chunk_count_be);
+  msg->fragment_total_len = ntohl(total_be);
+  msg->fragment_transfer_id = ntohl(transfer_id_be);
+  if (msg->fragment_hash_algo != WAMBLE_FRAGMENT_HASH_BLAKE2B_256)
+    return NET_ERR_INVALID;
+  size_t chunk_len = (size_t)ntohs(chunk_len_be);
+  if (msg->fragment_chunk_count == 0 ||
+      msg->fragment_chunk_index >= msg->fragment_chunk_count)
+    return NET_ERR_INVALID;
+  if (chunk_len > WAMBLE_FRAGMENT_DATA_MAX)
+    return NET_ERR_INVALID;
+  if (payload_len != WAMBLE_FRAGMENT_WIRE_HEADER_LENGTH + chunk_len)
+    return NET_ERR_INVALID;
+  if (chunk_len) {
+    memcpy(msg->fragment_data, payload + WAMBLE_FRAGMENT_WIRE_HEADER_LENGTH,
+           chunk_len);
+  }
+  msg->fragment_data_len = (uint16_t)chunk_len;
+  *is_fragmented = 1;
+  return NET_OK;
+}
+
+void wamble_fragment_reassembly_init(WambleFragmentReassembly *reassembly) {
+  if (!reassembly)
+    return;
+  memset(reassembly, 0, sizeof(*reassembly));
+  reassembly->integrity = WAMBLE_FRAGMENT_INTEGRITY_UNKNOWN;
+}
+
+void wamble_fragment_reassembly_reset(WambleFragmentReassembly *reassembly) {
+  if (!reassembly)
+    return;
+  reassembly->active = 0;
+  reassembly->ctrl = 0;
+  reassembly->hash_algo = 0;
+  reassembly->chunk_count = 0;
+  reassembly->received_chunks = 0;
+  reassembly->total_len = 0;
+  reassembly->transfer_id = 0;
+  memset(reassembly->expected_hash, 0, WAMBLE_FRAGMENT_HASH_LENGTH);
+  reassembly->integrity = WAMBLE_FRAGMENT_INTEGRITY_UNKNOWN;
+  if (reassembly->chunk_seen && reassembly->chunk_seen_capacity > 0)
+    memset(reassembly->chunk_seen, 0, reassembly->chunk_seen_capacity);
+}
+
+void wamble_fragment_reassembly_free(WambleFragmentReassembly *reassembly) {
+  if (!reassembly)
+    return;
+  free(reassembly->data);
+  free(reassembly->chunk_seen);
+  wamble_fragment_reassembly_init(reassembly);
+}
+
+static int reassembly_ensure_capacity(uint8_t **buf, size_t *capacity,
+                                      size_t needed, int zero_new_region) {
+  if (!buf || !capacity)
+    return -1;
+  if (needed <= *capacity)
+    return 0;
+  size_t next_capacity = (*capacity > 0) ? *capacity : 64;
+  while (next_capacity < needed) {
+    if (next_capacity > (SIZE_MAX / 2)) {
+      next_capacity = needed;
+      break;
+    }
+    next_capacity *= 2;
+  }
+  uint8_t *next = (uint8_t *)realloc(*buf, next_capacity);
+  if (!next)
+    return -1;
+  if (zero_new_region && next_capacity > *capacity)
+    memset(next + *capacity, 0, next_capacity - *capacity);
+  *buf = next;
+  *capacity = next_capacity;
+  return 0;
+}
+
+static int reassembly_fragment_shape_valid(const struct WambleMsg *msg,
+                                           size_t *out_offset,
+                                           size_t *out_len) {
+  if (!msg || !out_offset || !out_len)
+    return 0;
+  if (msg->fragment_chunk_count == 0 ||
+      msg->fragment_chunk_index >= msg->fragment_chunk_count)
+    return 0;
+  if (msg->fragment_data_len > WAMBLE_FRAGMENT_DATA_MAX)
+    return 0;
+  size_t total_len = (size_t)msg->fragment_total_len;
+  size_t offset =
+      (size_t)msg->fragment_chunk_index * (size_t)WAMBLE_FRAGMENT_DATA_MAX;
+  size_t len = (size_t)msg->fragment_data_len;
+  if (offset > total_len)
+    return 0;
+  if (len > total_len - offset)
+    return 0;
+  size_t expected_len = total_len - offset;
+  if (expected_len > (size_t)WAMBLE_FRAGMENT_DATA_MAX)
+    expected_len = (size_t)WAMBLE_FRAGMENT_DATA_MAX;
+  if (len != expected_len)
+    return 0;
+  *out_offset = offset;
+  *out_len = len;
+  return 1;
+}
+
+static int reassembly_begin_transfer(WambleFragmentReassembly *reassembly,
+                                     const struct WambleMsg *msg) {
+  if (!reassembly || !msg)
+    return -1;
+  size_t total_len = (size_t)msg->fragment_total_len;
+  size_t chunk_count = (size_t)msg->fragment_chunk_count;
+  if (reassembly_ensure_capacity(&reassembly->data, &reassembly->data_capacity,
+                                 total_len, 0) != 0) {
+    return -1;
+  }
+  if (reassembly_ensure_capacity(&reassembly->chunk_seen,
+                                 &reassembly->chunk_seen_capacity, chunk_count,
+                                 1) != 0) {
+    return -1;
+  }
+
+  memset(reassembly->chunk_seen, 0, chunk_count);
+  reassembly->active = 1;
+  reassembly->ctrl = msg->ctrl;
+  reassembly->hash_algo = msg->fragment_hash_algo;
+  reassembly->chunk_count = msg->fragment_chunk_count;
+  reassembly->received_chunks = 0;
+  reassembly->total_len = msg->fragment_total_len;
+  reassembly->transfer_id = msg->fragment_transfer_id;
+  memcpy(reassembly->expected_hash, msg->fragment_hash,
+         WAMBLE_FRAGMENT_HASH_LENGTH);
+  reassembly->integrity = WAMBLE_FRAGMENT_INTEGRITY_UNKNOWN;
+  return 0;
+}
+
+WambleFragmentReassemblyResult
+wamble_fragment_reassembly_push(WambleFragmentReassembly *reassembly,
+                                const struct WambleMsg *msg) {
+  if (!reassembly || !msg)
+    return WAMBLE_FRAGMENT_REASSEMBLY_ERR_INVALID;
+  if (!ctrl_supports_fragment_payload(msg->ctrl))
+    return WAMBLE_FRAGMENT_REASSEMBLY_IGNORED;
+  if (msg->fragment_version != WAMBLE_FRAGMENT_VERSION)
+    return WAMBLE_FRAGMENT_REASSEMBLY_IGNORED;
+  if (msg->fragment_hash_algo != WAMBLE_FRAGMENT_HASH_BLAKE2B_256)
+    return WAMBLE_FRAGMENT_REASSEMBLY_ERR_INVALID;
+
+  size_t offset = 0;
+  size_t len = 0;
+  if (!reassembly_fragment_shape_valid(msg, &offset, &len))
+    return WAMBLE_FRAGMENT_REASSEMBLY_ERR_INVALID;
+
+  int same_transfer = reassembly->active && reassembly->ctrl == msg->ctrl &&
+                      reassembly->hash_algo == msg->fragment_hash_algo &&
+                      reassembly->chunk_count == msg->fragment_chunk_count &&
+                      reassembly->total_len == msg->fragment_total_len &&
+                      reassembly->transfer_id == msg->fragment_transfer_id &&
+                      memcmp(reassembly->expected_hash, msg->fragment_hash,
+                             WAMBLE_FRAGMENT_HASH_LENGTH) == 0;
+  if (!same_transfer) {
+    if (reassembly_begin_transfer(reassembly, msg) != 0)
+      return WAMBLE_FRAGMENT_REASSEMBLY_ERR_NOMEM;
+  }
+
+  uint16_t idx = msg->fragment_chunk_index;
+  if (reassembly->chunk_seen[idx]) {
+    if (len &&
+        memcmp(reassembly->data + offset, msg->fragment_data, len) != 0) {
+      return WAMBLE_FRAGMENT_REASSEMBLY_ERR_INVALID;
+    }
+  } else {
+    if (len)
+      memcpy(reassembly->data + offset, msg->fragment_data, len);
+    reassembly->chunk_seen[idx] = 1;
+    reassembly->received_chunks++;
+  }
+
+  if (reassembly->received_chunks < reassembly->chunk_count)
+    return WAMBLE_FRAGMENT_REASSEMBLY_IN_PROGRESS;
+
+  uint8_t computed_hash[WAMBLE_FRAGMENT_HASH_LENGTH] = {0};
+  static const uint8_t empty_payload[1] = {0};
+  const uint8_t *hash_input =
+      reassembly->data ? reassembly->data : empty_payload;
+  crypto_blake2b(computed_hash, WAMBLE_FRAGMENT_HASH_LENGTH, hash_input,
+                 (size_t)reassembly->total_len);
+  if (memcmp(computed_hash, reassembly->expected_hash,
+             WAMBLE_FRAGMENT_HASH_LENGTH) == 0) {
+    reassembly->integrity = WAMBLE_FRAGMENT_INTEGRITY_OK;
+    return WAMBLE_FRAGMENT_REASSEMBLY_COMPLETE;
+  }
+  reassembly->integrity = WAMBLE_FRAGMENT_INTEGRITY_MISMATCH;
+  return WAMBLE_FRAGMENT_REASSEMBLY_COMPLETE_BAD_HASH;
+}
+
+NetworkStatus wamble_packet_serialize(const struct WambleMsg *msg,
+                                      uint8_t *buffer, size_t buffer_capacity,
+                                      size_t *out_len, uint8_t flags) {
   if (!buffer || buffer_capacity < WAMBLE_HEADER_SIZE)
     return NET_ERR_INVALID;
 
@@ -365,8 +647,19 @@ static NetworkStatus serialize_wamble_msg(const struct WambleMsg *msg,
     break;
   }
   case WAMBLE_CTRL_PROFILE_TOS_DATA: {
-    const char *src = msg->tos_ptr ? msg->tos_ptr : "";
-    size_t len = msg->tos_ptr ? msg->tos_len : 0;
+    int fragmented = ctrl_supports_fragment_payload(msg->ctrl) &&
+                     msg_uses_fragment_payload(msg);
+    if (fragmented) {
+      NetworkStatus frag_status = encode_fragment_payload(
+          msg, payload, WAMBLE_MAX_PAYLOAD, &payload_len);
+      if (frag_status != NET_OK)
+        return frag_status;
+      break;
+    }
+    const char *src = msg->profile_info;
+    size_t len = msg->profile_info_len
+                     ? (size_t)msg->profile_info_len
+                     : strnlen(msg->profile_info, FEN_MAX_LENGTH);
     if (len > WAMBLE_MAX_PAYLOAD)
       return NET_ERR_TRUNCATED;
     if (len)
@@ -609,10 +902,10 @@ static NetworkStatus serialize_wamble_msg(const struct WambleMsg *msg,
   return NET_OK;
 }
 
-static NetworkStatus deserialize_wamble_msg(const uint8_t *buffer,
-                                            size_t buffer_size,
-                                            struct WambleMsg *msg,
-                                            uint8_t *out_flags) {
+NetworkStatus wamble_packet_deserialize(const uint8_t *buffer,
+                                        size_t buffer_size,
+                                        struct WambleMsg *msg,
+                                        uint8_t *out_flags) {
   if (!buffer || buffer_size < WAMBLE_HEADER_SIZE || !msg)
     return NET_ERR_INVALID;
   WambleHeader hdr;
@@ -735,13 +1028,43 @@ static NetworkStatus deserialize_wamble_msg(const uint8_t *buffer,
     msg->error_reason[copy] = '\0';
     break;
   }
-  case WAMBLE_CTRL_PROFILE_INFO:
-  case WAMBLE_CTRL_PROFILE_TOS_DATA: {
+  case WAMBLE_CTRL_PROFILE_INFO: {
     size_t copy =
         payload_len < FEN_MAX_LENGTH - 1 ? payload_len : (FEN_MAX_LENGTH - 1);
     memcpy(msg->profile_info, payload, copy);
     msg->profile_info[copy] = '\0';
     msg->profile_info_len = (uint16_t)copy;
+    break;
+  }
+  case WAMBLE_CTRL_PROFILE_TOS_DATA: {
+    int is_fragmented = 0;
+    if (ctrl_supports_fragment_payload(hdr.ctrl)) {
+      NetworkStatus frag_status =
+          decode_fragment_payload(payload, payload_len, msg, &is_fragmented);
+      if (frag_status != NET_OK)
+        return frag_status;
+    }
+    if (is_fragmented) {
+      size_t info_copy = msg->fragment_data_len;
+      if (info_copy > FEN_MAX_LENGTH - 1)
+        info_copy = FEN_MAX_LENGTH - 1;
+      if (info_copy)
+        memcpy(msg->profile_info, msg->fragment_data, info_copy);
+      msg->profile_info[info_copy] = '\0';
+      msg->profile_info_len = (uint16_t)info_copy;
+      break;
+    }
+    if (payload_len > WAMBLE_FRAGMENT_DATA_MAX)
+      return NET_ERR_TRUNCATED;
+    if (payload_len)
+      memcpy(msg->fragment_data, payload, payload_len);
+    msg->fragment_data_len = (uint16_t)payload_len;
+    size_t copy =
+        payload_len < FEN_MAX_LENGTH - 1 ? payload_len : (FEN_MAX_LENGTH - 1);
+    memcpy(msg->profile_info, payload, copy);
+    msg->profile_info[copy] = '\0';
+    msg->profile_info_len = (uint16_t)copy;
+    msg->fragment_total_len = (uint32_t)payload_len;
     break;
   }
   case WAMBLE_CTRL_PROFILES_LIST: {
@@ -1101,43 +1424,25 @@ wamble_socket_t create_and_bind_socket(int port) {
   return sockfd;
 }
 
-int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
-                    struct sockaddr_in *cliaddr) {
-  network_ensure_thread_state_initialized();
-  wamble_socklen_t len = sizeof(*cliaddr);
-  uint8_t receive_buffer[WAMBLE_MAX_PACKET_SIZE];
-  size_t pending_len = 0;
-  int pending_rc = pending_packet_pop(receive_buffer, sizeof(receive_buffer),
-                                      &pending_len, cliaddr);
-  ssize_t bytes_received = 0;
-  if (pending_rc < 0) {
+static int receive_message_from_packet_impl(const uint8_t *packet,
+                                            size_t packet_len,
+                                            struct WambleMsg *msg,
+                                            const struct sockaddr_in *cliaddr) {
+  if (!packet || !msg || !cliaddr || packet_len == 0 ||
+      packet_len > WAMBLE_MAX_PACKET_SIZE) {
     return -1;
   }
-  if (pending_rc > 0) {
-    bytes_received = (ssize_t)pending_len;
-  } else {
-    bytes_received =
-        recvfrom(sockfd, (char *)receive_buffer, WAMBLE_MAX_PACKET_SIZE, 0,
-                 (struct sockaddr *)cliaddr, &len);
-  }
-
-  if (bytes_received <= 0) {
-    return (int)bytes_received;
-  }
+  network_ensure_thread_state_initialized();
 
   uint8_t flags = 0;
-  if (deserialize_wamble_msg(receive_buffer, (size_t)bytes_received, msg,
-                             &flags) != NET_OK) {
+  if (wamble_packet_deserialize(packet, packet_len, msg, &flags) != NET_OK)
+    return -1;
 
+  if (!ctrl_is_supported(msg->ctrl))
     return -1;
-  }
+  if (msg->uci_len > MAX_UCI_LENGTH)
+    return -1;
 
-  if (!ctrl_is_supported(msg->ctrl)) {
-    return -1;
-  }
-  if (msg->uci_len > MAX_UCI_LENGTH) {
-    return -1;
-  }
   int token_valid = 0;
   for (int i = 0; i < TOKEN_LENGTH; i++) {
     if (msg->token[i] != 0) {
@@ -1145,26 +1450,22 @@ int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
       break;
     }
   }
-  if (!token_valid && msg->ctrl != WAMBLE_CTRL_CLIENT_HELLO) {
+  if (!token_valid && msg->ctrl != WAMBLE_CTRL_CLIENT_HELLO)
     return -1;
-  }
 
   int is_dup = 0;
-  {
-    WambleClientSession *_session = find_client_session(cliaddr);
-    if (!_session) {
-      _session = find_client_session_by_token(msg->token);
-    }
-    if (_session) {
-      uint32_t _last = _session->last_seq_num;
-      uint32_t _d_forward = msg->seq_num - _last;
-      if (_d_forward == 0) {
+  WambleClientSession *session = find_client_session(cliaddr);
+  if (!session)
+    session = find_client_session_by_token(msg->token);
+  if (session) {
+    uint32_t last = session->last_seq_num;
+    uint32_t forward = msg->seq_num - last;
+    if (forward == 0) {
+      is_dup = 1;
+    } else if (!(forward <= (UINT32_MAX / 2u))) {
+      uint32_t back = last - msg->seq_num;
+      if (back <= WAMBLE_DUP_WINDOW)
         is_dup = 1;
-      } else if (!(_d_forward <= (UINT32_MAX / 2u))) {
-        uint32_t _d_back = _last - msg->seq_num;
-        if (_d_back <= WAMBLE_DUP_WINDOW)
-          is_dup = 1;
-      }
     }
   }
   if (msg->ctrl != WAMBLE_CTRL_ACK &&
@@ -1180,11 +1481,47 @@ int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
     update_client_session(cliaddr, msg->token, msg->seq_num);
   }
 
-  return (int)bytes_received;
+  return (int)packet_len;
+}
+
+int receive_message_packet(const uint8_t *packet, size_t packet_len,
+                           struct WambleMsg *msg,
+                           const struct sockaddr_in *cliaddr) {
+  return receive_message_from_packet_impl(packet, packet_len, msg, cliaddr);
+}
+
+int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
+                    struct sockaddr_in *cliaddr) {
+  network_ensure_thread_state_initialized();
+  wamble_socklen_t len = sizeof(*cliaddr);
+  uint8_t receive_buffer[WAMBLE_MAX_PACKET_SIZE];
+  size_t pending_len = 0;
+  int pending_rc = pending_packet_pop(receive_buffer, sizeof(receive_buffer),
+                                      &pending_len, cliaddr);
+  ssize_t bytes_received = 0;
+  if (pending_rc < 0)
+    return -1;
+  if (pending_rc > 0) {
+    bytes_received = (ssize_t)pending_len;
+  } else {
+    bytes_received =
+        recvfrom(sockfd, (char *)receive_buffer, WAMBLE_MAX_PACKET_SIZE, 0,
+                 (struct sockaddr *)cliaddr, &len);
+  }
+
+  if (bytes_received <= 0)
+    return (int)bytes_received;
+  return receive_message_from_packet_impl(receive_buffer,
+                                          (size_t)bytes_received, msg, cliaddr);
 }
 
 void send_ack(wamble_socket_t sockfd, const struct WambleMsg *msg,
               const struct sockaddr_in *cliaddr) {
+  if (!msg || !cliaddr)
+    return;
+  if (ws_gateway_is_ws_client(cliaddr))
+    return;
+
   struct WambleMsg ack_msg;
   memset(&ack_msg, 0, sizeof(ack_msg));
   ack_msg.ctrl = WAMBLE_CTRL_ACK;
@@ -1197,8 +1534,8 @@ void send_ack(wamble_socket_t sockfd, const struct WambleMsg *msg,
 
   uint8_t send_buffer[WAMBLE_MAX_PACKET_SIZE];
   size_t serialized_size = 0;
-  if (serialize_wamble_msg(&ack_msg, send_buffer, sizeof(send_buffer),
-                           &serialized_size, 0) != NET_OK) {
+  if (wamble_packet_serialize(&ack_msg, send_buffer, sizeof(send_buffer),
+                              &serialized_size, 0) != NET_OK) {
 
     return;
   }
@@ -1244,10 +1581,16 @@ int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
   uint8_t send_buffer[WAMBLE_MAX_PACKET_SIZE];
   size_t serialized_size = 0;
   uint8_t send_flags = reliable_msg.flags;
-  if (serialize_wamble_msg(&reliable_msg, send_buffer, sizeof(send_buffer),
-                           &serialized_size, send_flags) != NET_OK) {
+  if (wamble_packet_serialize(&reliable_msg, send_buffer, sizeof(send_buffer),
+                              &serialized_size, send_flags) != NET_OK) {
     return -1;
   }
+
+  int ws_rc = ws_gateway_queue_packet(cliaddr, send_buffer, serialized_size);
+  if (ws_rc > 0)
+    return 0;
+  if (ws_rc < 0)
+    return -1;
 
   int current_timeout = timeout_ms;
   for (int attempt = 0; attempt < max_retries; attempt++) {
@@ -1297,8 +1640,8 @@ int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
         if (rcv <= 0)
           break;
         uint8_t ack_flags = 0;
-        if (deserialize_wamble_msg(ack_buffer, (size_t)rcv, &ack_msg,
-                                   &ack_flags) == NET_OK &&
+        if (wamble_packet_deserialize(ack_buffer, (size_t)rcv, &ack_msg,
+                                      &ack_flags) == NET_OK &&
             ack_msg.ctrl == WAMBLE_CTRL_ACK &&
             ack_msg.seq_num == reliable_msg.seq_num &&
             sockaddr_in_equal(&ack_cliaddr, cliaddr) &&
@@ -1324,10 +1667,15 @@ int send_unreliable_packet(wamble_socket_t sockfd, const struct WambleMsg *msg,
     return -1;
   uint8_t buffer[WAMBLE_MAX_PACKET_SIZE];
   size_t serialized_size = 0;
-  if (serialize_wamble_msg(msg, buffer, sizeof(buffer), &serialized_size,
-                           WAMBLE_FLAG_UNRELIABLE) != NET_OK) {
+  if (wamble_packet_serialize(msg, buffer, sizeof(buffer), &serialized_size,
+                              WAMBLE_FLAG_UNRELIABLE) != NET_OK) {
     return -1;
   }
+  int ws_rc = ws_gateway_queue_packet(cliaddr, buffer, serialized_size);
+  if (ws_rc > 0)
+    return 0;
+  if (ws_rc < 0)
+    return -1;
 #ifdef WAMBLE_PLATFORM_WINDOWS
   int rc = sendto(sockfd, (const char *)buffer, (int)serialized_size, 0,
                   (const struct sockaddr *)cliaddr, (int)sizeof(*cliaddr));
