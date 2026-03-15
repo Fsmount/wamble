@@ -306,6 +306,8 @@ static int profile_discovery_allowed(const uint8_t *token,
                                      const WambleProfile *p, int trust_tier) {
   if (!token || !p)
     return 0;
+  if (p->abstract)
+    return 0;
   DiscoverPolicyDecision override = resolve_discovery_policy_for_action(
       token, p, "profile.discover.override");
   if (override == DISCOVER_POLICY_DENY)
@@ -393,6 +395,10 @@ static const char *ctrl_policy_resource(uint8_t ctrl) {
     return "get_predictions";
   case WAMBLE_CTRL_PREDICTION_DATA:
     return "prediction_data";
+  case WAMBLE_CTRL_GET_PROFILE_TOS:
+    return "get_profile_tos";
+  case WAMBLE_CTRL_PROFILE_TOS_DATA:
+    return "profile_tos_data";
   default:
     return "unknown";
   }
@@ -747,6 +753,45 @@ static ServerStatus handle_get_profile_info(wamble_socket_t sockfd,
   return SERVER_OK;
 }
 
+static ServerStatus handle_get_profile_tos(wamble_socket_t sockfd,
+                                           const struct sockaddr_in *cliaddr,
+                                           const struct WambleMsg *msg,
+                                           int effective_trust_tier) {
+  char name[PROFILE_NAME_MAX_LENGTH];
+  int nlen = msg->profile_name_len < (PROFILE_NAME_MAX_LENGTH - 1)
+                 ? msg->profile_name_len
+                 : (PROFILE_NAME_MAX_LENGTH - 1);
+  if (nlen > 0)
+    memcpy(name, msg->profile_name, (size_t)nlen);
+  name[nlen] = '\0';
+
+  const WambleProfile *p = config_find_profile(name);
+  struct WambleMsg resp = {0};
+  resp.ctrl = WAMBLE_CTRL_PROFILE_TOS_DATA;
+  memcpy(resp.token, msg->token, TOKEN_LENGTH);
+  if (p && profile_discovery_allowed(msg->token, p, effective_trust_tier)) {
+    resp.tos_ptr = p->tos_text ? p->tos_text : "";
+    resp.tos_len = p->tos_text ? strlen(p->tos_text) : 0;
+  } else {
+    wamble_runtime_event_publish(
+        WAMBLE_RUNTIME_EVENT_PROFILE_ADMIN,
+        p ? PROFILE_ADMIN_STATUS_PROFILE_INFO_HIDDEN
+          : PROFILE_ADMIN_STATUS_PROFILE_INFO_NOT_FOUND,
+        name);
+    int wrote =
+        snprintf(resp.profile_info, FEN_MAX_LENGTH, "NOTFOUND;%.80s", name);
+    if (wrote < 0)
+      wrote = 0;
+    if (wrote >= FEN_MAX_LENGTH)
+      wrote = FEN_MAX_LENGTH - 1;
+    resp.tos_ptr = resp.profile_info;
+    resp.tos_len = (size_t)wrote;
+  }
+  if (send_reliable_default(sockfd, &resp, cliaddr) != 0)
+    return SERVER_ERR_SEND_FAILED;
+  return SERVER_OK;
+}
+
 static int login_has_pubkey(const struct WambleMsg *msg) {
   if (!msg)
     return 0;
@@ -841,6 +886,8 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     return handle_list_profiles(sockfd, cliaddr, msg, effective_trust_tier);
   case WAMBLE_CTRL_GET_PROFILE_INFO:
     return handle_get_profile_info(sockfd, cliaddr, msg, effective_trust_tier);
+  case WAMBLE_CTRL_GET_PROFILE_TOS:
+    return handle_get_profile_tos(sockfd, cliaddr, msg, effective_trust_tier);
   case WAMBLE_CTRL_LOGIN_REQUEST:
     return handle_login_request(sockfd, cliaddr, msg);
   case WAMBLE_CTRL_LOGOUT:

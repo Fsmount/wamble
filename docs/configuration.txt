@@ -299,6 +299,12 @@ Profiles
 - Define a profile with grouped overrides:
   `(defprofile test ((def port 8890) (def db-name "wamble_test") (def log-level 4)))`
 - Metadata inside a profile:
+  - `abstract` (int 0/1, default 0): Marks the profile as a config template.
+    Abstract profiles are never instantiated (no listener is started) and are
+    invisible to all clients regardless of `advertise`, `visibility`, or any
+    `profile.discover.override` policy rule. Use for shared config base
+    profiles that exist only for inheritance. Not inherited by child profiles
+    (children default to `abstract=0`).
   - `advertise` (int 0/1, default 0): Whether to advertise/offer this profile
     to clients.
   - `visibility` (int, default 0): Minimum trust tier required to see this profile in

@@ -2016,6 +2016,7 @@ static void free_profiles(void) {
   for (int i = 0; i < g_profile_count; i++) {
     free(g_profiles[i].name);
     free(g_profiles[i].group);
+    free(g_profiles[i].tos_text);
 
     free(g_profiles[i].config.db_host);
     free(g_profiles[i].config.db_user);
@@ -2441,6 +2442,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
           int base_visibility = 0;
           int base_db_isolated = 0;
           const char *base_group = NULL;
+          const char *base_tos_text = NULL;
           if (base_name) {
             int found = 0;
             for (int j = 0; j < count; j++) {
@@ -2451,6 +2453,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
                 base_visibility = g_profiles[j].visibility;
                 base_db_isolated = g_profiles[j].db_isolated;
                 base_group = g_profiles[j].group;
+                base_tos_text = g_profiles[j].tos_text;
                 found = 1;
                 break;
               }
@@ -2490,17 +2493,26 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
           WambleConfig overlaid = g_config;
           g_config = saved;
 
+          int abstract = 0;
           int advertise = base_advertise;
           int visibility = base_visibility;
           int db_isolated = base_db_isolated;
           char *profile_group = NULL;
           if (base_group)
             profile_group = wamble_strdup(base_group);
+          char *profile_tos = NULL;
+          if (base_tos_text)
+            profile_tos = wamble_strdup(base_tos_text);
           {
             LispValue sym;
             sym.type = LISP_VALUE_SYMBOL;
-            sym.as.symbol = (char *)"advertise";
+            sym.as.symbol = (char *)"abstract";
             LispValue *val = lisp_env_get(profile_env, &sym);
+            if (val->type == LISP_VALUE_INTEGER)
+              abstract = (int)val->as.integer;
+            free_lisp_value(val);
+            sym.as.symbol = (char *)"advertise";
+            val = lisp_env_get(profile_env, &sym);
             if (val->type == LISP_VALUE_INTEGER)
               advertise = (int)val->as.integer;
             free_lisp_value(val);
@@ -2521,6 +2533,13 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
               profile_group = wamble_strdup(val->as.string);
             }
             free_lisp_value(val);
+            sym.as.symbol = (char *)"tos-text";
+            val = lisp_env_get(profile_env, &sym);
+            if (val->type == LISP_VALUE_STRING) {
+              free(profile_tos);
+              profile_tos = wamble_strdup(val->as.string);
+            }
+            free_lisp_value(val);
           }
 
           if (strcmp(pname, WAMBLE_DEFAULT_RUNTIME_EXPORT_NAME) == 0) {
@@ -2530,6 +2549,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
                        WAMBLE_DEFAULT_RUNTIME_EXPORT_NAME);
             }
             free(profile_group);
+            free(profile_tos);
             free(overlaid.db_host);
             free(overlaid.db_user);
             free(overlaid.db_pass);
@@ -2561,7 +2581,9 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
 
           g_profiles[i].name = wamble_strdup(pname);
           g_profiles[i].group = profile_group;
+          g_profiles[i].tos_text = profile_tos;
           g_profiles[i].config = overlaid;
+          g_profiles[i].abstract = abstract;
           g_profiles[i].advertise = advertise;
           g_profiles[i].visibility = visibility;
           g_profiles[i].db_isolated = db_isolated;
@@ -2586,6 +2608,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
 
             free(g_profiles[i].name);
             free(g_profiles[i].group);
+            free(g_profiles[i].tos_text);
             free(g_profiles[i].config.db_host);
             free(g_profiles[i].config.db_user);
             free(g_profiles[i].config.db_pass);

@@ -542,7 +542,9 @@ void config_free_snapshot(void *snapshot);
 struct WambleProfile {
   char *name;
   char *group;
+  char *tos_text;
   WambleConfig config;
+  int abstract;
   int advertise;
   int visibility;
   int db_isolated;
@@ -1058,6 +1060,9 @@ typedef struct {
 #define WAMBLE_CTRL_GET_PREDICTIONS 0x1B
 #define WAMBLE_CTRL_PREDICTION_DATA 0x1C
 
+#define WAMBLE_CTRL_GET_PROFILE_TOS 0x1D
+#define WAMBLE_CTRL_PROFILE_TOS_DATA 0x1E
+
 #define get_bit(square) (1ULL << (square))
 
 typedef enum {
@@ -1199,7 +1204,6 @@ typedef struct {
   char uci[MAX_UCI_LENGTH];
 } WamblePredictionEntry;
 
-#pragma pack(push, 1)
 struct WambleMsg {
   uint8_t ctrl;
   uint8_t flags;
@@ -1213,6 +1217,8 @@ struct WambleMsg {
   char profile_name[PROFILE_NAME_MAX_LENGTH];
   uint16_t profile_info_len;
   char profile_info[FEN_MAX_LENGTH];
+  const char *tos_ptr;
+  size_t tos_len;
   uint16_t profiles_list_len;
   char profiles_list[FEN_MAX_LENGTH];
   char fen[FEN_MAX_LENGTH];
@@ -1236,7 +1242,6 @@ struct WambleMsg {
   uint8_t prediction_count;
   WamblePredictionEntry predictions[WAMBLE_MAX_PREDICTION_ENTRIES];
 };
-#pragma pack(pop)
 
 #define WAMBLE_MAX_PAYLOAD 1200
 #define WAMBLE_DUP_WINDOW 1024

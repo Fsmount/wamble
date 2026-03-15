@@ -248,6 +248,8 @@ static int ctrl_is_supported(uint8_t ctrl) {
   case WAMBLE_CTRL_LEGAL_MOVES:
   case WAMBLE_CTRL_GET_LEADERBOARD:
   case WAMBLE_CTRL_LEADERBOARD_DATA:
+  case WAMBLE_CTRL_GET_PROFILE_TOS:
+  case WAMBLE_CTRL_PROFILE_TOS_DATA:
     return 1;
   default:
     return 0;
@@ -361,7 +363,34 @@ static NetworkStatus serialize_wamble_msg(const struct WambleMsg *msg,
     payload_len = len;
     break;
   }
+  case WAMBLE_CTRL_PROFILE_TOS_DATA: {
+    const char *src = msg->tos_ptr ? msg->tos_ptr : "";
+    size_t len = msg->tos_ptr ? msg->tos_len : 0;
+    if (len > WAMBLE_MAX_PAYLOAD)
+      return NET_ERR_TRUNCATED;
+    if (len)
+      memcpy(payload, src, len);
+    payload_len = len;
+    break;
+  }
   case WAMBLE_CTRL_GET_PROFILE_INFO: {
+    const char *name = msg->profile_name;
+    size_t name_len =
+        msg->profile_name_len
+            ? (size_t)msg->profile_name_len
+            : strnlen(msg->profile_name, PROFILE_NAME_MAX_LENGTH - 1);
+    if (name_len > 255)
+      return NET_ERR_INVALID;
+    size_t need = 1 + name_len;
+    if (need > WAMBLE_MAX_PAYLOAD)
+      return NET_ERR_TRUNCATED;
+    payload[0] = (uint8_t)name_len;
+    if (name_len)
+      memcpy(&payload[1], name, name_len);
+    payload_len = need;
+    break;
+  }
+  case WAMBLE_CTRL_GET_PROFILE_TOS: {
     const char *name = msg->profile_name;
     size_t name_len =
         msg->profile_name_len
@@ -685,7 +714,8 @@ static NetworkStatus deserialize_wamble_msg(const uint8_t *buffer,
     msg->error_reason[copy] = '\0';
     break;
   }
-  case WAMBLE_CTRL_PROFILE_INFO: {
+  case WAMBLE_CTRL_PROFILE_INFO:
+  case WAMBLE_CTRL_PROFILE_TOS_DATA: {
     size_t copy =
         payload_len < FEN_MAX_LENGTH - 1 ? payload_len : (FEN_MAX_LENGTH - 1);
     memcpy(msg->profile_info, payload, copy);
@@ -711,6 +741,17 @@ static NetworkStatus deserialize_wamble_msg(const uint8_t *buffer,
     if (msg->profile_name_len) {
       memcpy(msg->profile_name, &payload[1], msg->profile_name_len);
     }
+    msg->profile_name[msg->profile_name_len] = '\0';
+    break;
+  }
+  case WAMBLE_CTRL_GET_PROFILE_TOS: {
+    if (payload_len < 1)
+      return NET_ERR_TRUNCATED;
+    msg->profile_name_len = payload[0];
+    if ((size_t)msg->profile_name_len > payload_len - 1)
+      return NET_ERR_INVALID;
+    if (msg->profile_name_len)
+      memcpy(msg->profile_name, &payload[1], msg->profile_name_len);
     msg->profile_name[msg->profile_name_len] = '\0';
     break;
   }

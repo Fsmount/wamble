@@ -1323,6 +1323,40 @@ WAMBLE_TEST(server_protocol_client_hello_requires_policy) {
   return 0;
 }
 
+WAMBLE_TEST(get_profile_tos_roundtrip) {
+  config_load(NULL, NULL, NULL, 0);
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+  struct sockaddr_in dst = {0};
+  dst.sin_family = AF_INET;
+  dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  dst.sin_port = htons((uint16_t)wamble_socket_bound_port(srv));
+
+  struct WambleMsg out = {0};
+  const char *name = "canary";
+  out.ctrl = WAMBLE_CTRL_GET_PROFILE_TOS;
+  out.profile_name_len = (uint8_t)strlen(name);
+  memcpy(out.profile_name, name, strlen(name));
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    out.token[i] = (uint8_t)(i + 5);
+
+  T_ASSERT_STATUS_OK(send_unreliable_packet(cli, &out, &dst));
+
+  struct WambleMsg in = {0};
+  struct sockaddr_in from;
+  int rc = receive_message(srv, &in, &from);
+  T_ASSERT(rc > 0);
+  T_ASSERT_EQ_INT(in.ctrl, WAMBLE_CTRL_GET_PROFILE_TOS);
+  T_ASSERT_EQ_INT((int)in.profile_name_len, (int)strlen(name));
+  T_ASSERT_STREQ(in.profile_name, name);
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
 WAMBLE_TESTS_BEGIN_NAMED(wamble_register_tests_network)
 WAMBLE_TESTS_ADD_SM(token_base64url_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
@@ -1372,5 +1406,7 @@ WAMBLE_TESTS_ADD_SM(speed_token_encode_decode, WAMBLE_SUITE_SPEED, "network");
 WAMBLE_TESTS_ADD_SM(token_base64url_invalid, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
 WAMBLE_TESTS_ADD_SM(token_base64url_wrong_length, WAMBLE_SUITE_FUNCTIONAL,
+                    "network");
+WAMBLE_TESTS_ADD_SM(get_profile_tos_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
 WAMBLE_TESTS_END()

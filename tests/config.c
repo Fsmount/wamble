@@ -422,6 +422,28 @@ WAMBLE_TEST(config_profile_inheritance_variants) {
   return 0;
 }
 
+WAMBLE_TEST(config_profile_abstract_not_inherited) {
+  const char *p = "build/test_config_abstract.conf";
+  const char *cfg =
+      "(defprofile tmpl ((def abstract 1) (def advertise 0) (def port 9100)))\n"
+      "(defprofile real :inherits tmpl ((def port 9101)))\n"
+      "(defprofile alsoabstract :inherits tmpl ((def abstract 1) (def port "
+      "9102)))\n";
+  FILE *f = fopen(p, "w");
+  T_ASSERT(f != NULL);
+  fwrite(cfg, 1, strlen(cfg), f);
+  fclose(f);
+  T_ASSERT_STATUS(config_load(p, NULL, NULL, 0), CONFIG_LOAD_OK);
+  const WambleProfile *tmpl = config_find_profile("tmpl");
+  const WambleProfile *real = config_find_profile("real");
+  const WambleProfile *alsoabstract = config_find_profile("alsoabstract");
+  T_ASSERT(tmpl && real && alsoabstract);
+  T_ASSERT_EQ_INT(tmpl->abstract, 1);
+  T_ASSERT_EQ_INT(real->abstract, 0);
+  T_ASSERT_EQ_INT(alsoabstract->abstract, 1);
+  return 0;
+}
+
 WAMBLE_TEST(config_profile_missing_base_skipped) {
   const char *p = "build/test_config_missing_base.conf";
   const char *cfg = "(defprofile orphan :inherits nosuch ((def port 9900)))\n";
@@ -1217,6 +1239,7 @@ WAMBLE_TESTS_ADD_FM(config_profile_select_and_not_found, "config");
 WAMBLE_TESTS_ADD_FM(config_profile_reserved_default_runtime_name_rejected,
                     "config");
 WAMBLE_TESTS_ADD_FM(config_profile_inheritance_variants, "config");
+WAMBLE_TESTS_ADD_FM(config_profile_abstract_not_inherited, "config");
 WAMBLE_TESTS_ADD_FM(config_profile_missing_base_skipped, "config");
 WAMBLE_TESTS_ADD_FM(config_env_getenv_unset, "config");
 WAMBLE_TESTS_ADD_FM(config_snapshot_restore_rebuilds_policy_eval, "config");
