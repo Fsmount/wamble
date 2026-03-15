@@ -174,14 +174,14 @@ int wamble_test_ws_handshake(wamble_socket_t sock, const char *path,
   return (rc == n) ? 0 : -1;
 }
 
-int wamble_test_ws_send_frame(wamble_socket_t sock, uint8_t opcode,
-                              const uint8_t *payload, size_t len,
-                              int force_ext126) {
+int wamble_test_ws_send_frame_ex(wamble_socket_t sock, uint8_t fin,
+                                 uint8_t opcode, const uint8_t *payload,
+                                 size_t len, int force_ext126) {
   uint8_t frame[526];
   size_t frame_len = 0;
   uint8_t hdr[14];
   size_t hlen = 0;
-  hdr[hlen++] = (uint8_t)(0x80u | (opcode & 0x0Fu));
+  hdr[hlen++] = (uint8_t)(((fin ? 1u : 0u) << 7) | (opcode & 0x0Fu));
   if (!force_ext126 && len <= 125u) {
     hdr[hlen++] = (uint8_t)(0x80u | (uint8_t)len);
   } else {
@@ -208,6 +208,13 @@ int wamble_test_ws_send_frame(wamble_socket_t sock, uint8_t opcode,
     return -1;
   }
   return 0;
+}
+
+int wamble_test_ws_send_frame(wamble_socket_t sock, uint8_t opcode,
+                              const uint8_t *payload, size_t len,
+                              int force_ext126) {
+  return wamble_test_ws_send_frame_ex(sock, 1u, opcode, payload, len,
+                                      force_ext126);
 }
 
 int wamble_test_ws_recv_frame(wamble_socket_t sock, uint8_t *out_opcode,
@@ -332,23 +339,10 @@ WambleWsGateway *wamble_test_start_gateway(int *out_tcp_port,
                                            wamble_socket_t *out_udp_sock,
                                            WsGatewayStatus *out_status,
                                            int *out_last_port) {
-  wamble_socket_t udp = create_and_bind_socket(0);
-  if (udp == WAMBLE_INVALID_SOCKET) {
-    if (out_status)
-      *out_status = WS_GATEWAY_ERR_BIND;
-    if (out_last_port)
-      *out_last_port = -1;
+  if (!out_tcp_port)
     return NULL;
-  }
-  int udp_port = wamble_socket_bound_port(udp);
-  if (udp_port <= 0) {
-    if (out_status)
-      *out_status = WS_GATEWAY_ERR_BIND;
-    if (out_last_port)
-      *out_last_port = -2;
-    wamble_close_socket(udp);
-    return NULL;
-  }
+  if (out_udp_sock)
+    *out_udp_sock = WAMBLE_INVALID_SOCKET;
 
   WambleWsGateway *gw = NULL;
   int tcp_port = 0;
@@ -362,7 +356,7 @@ WambleWsGateway *wamble_test_start_gateway(int *out_tcp_port,
       break;
     }
     WsGatewayStatus st = WS_GATEWAY_OK;
-    gw = ws_gateway_start("test", cand, udp_port, "/ws", 8, &st);
+    gw = ws_gateway_start("test", cand, 1, "/ws", 8, &st);
     if (out_status)
       *out_status = st;
     if (out_last_port)
@@ -375,11 +369,9 @@ WambleWsGateway *wamble_test_start_gateway(int *out_tcp_port,
       break;
   }
   if (!gw || tcp_port <= 0) {
-    wamble_close_socket(udp);
     return NULL;
   }
 
   *out_tcp_port = tcp_port;
-  *out_udp_sock = udp;
   return gw;
 }

@@ -1,4 +1,7 @@
 #include "../include/wamble/wamble.h"
+void crypto_blake2b(uint8_t *hash, size_t hash_size, const uint8_t *msg,
+                    size_t msg_size);
+
 typedef struct {
   int used;
   uint8_t token[TOKEN_LENGTH];
@@ -8,6 +11,7 @@ typedef struct {
 
 static WAMBLE_THREAD_LOCAL RequestRateLimitEntry *g_rate_limit_entries = NULL;
 static WAMBLE_THREAD_LOCAL int g_rate_limit_capacity = 0;
+static WAMBLE_THREAD_LOCAL uint32_t g_fragment_transfer_id_seq = 1;
 
 #define LOGIN_CHALLENGE_TTL_MS 30000ULL
 
@@ -899,10 +903,73 @@ static ServerStatus handle_get_profile_info(wamble_socket_t sockfd,
   return SERVER_OK;
 }
 
+static uint32_t next_fragment_transfer_id(void) {
+  uint32_t id = g_fragment_transfer_id_seq++;
+  if (id == 0) {
+    g_fragment_transfer_id_seq = 2;
+    id = 1;
+  }
+  return id;
+}
+
+static ServerStatus send_fragmented_payload(wamble_socket_t sockfd,
+                                            const struct sockaddr_in *cliaddr,
+                                            uint8_t ctrl,
+                                            const uint8_t token[TOKEN_LENGTH],
+                                            const uint8_t *payload,
+                                            size_t payload_len) {
+  if (!cliaddr || !token || !payload || WAMBLE_FRAGMENT_DATA_MAX == 0)
+    return SERVER_ERR_INTERNAL;
+  if (payload_len > UINT32_MAX)
+    return SERVER_ERR_INTERNAL;
+
+  size_t max_fragment_size = (size_t)WAMBLE_FRAGMENT_DATA_MAX;
+  size_t needed_chunks =
+      (payload_len == 0)
+          ? 1
+          : ((payload_len + max_fragment_size - 1) / max_fragment_size);
+  if (needed_chunks == 0 || needed_chunks > UINT16_MAX)
+    return SERVER_ERR_INTERNAL;
+  uint16_t chunk_count = (uint16_t)needed_chunks;
+  uint32_t transfer_id = next_fragment_transfer_id();
+  uint8_t payload_hash[WAMBLE_FRAGMENT_HASH_LENGTH] = {0};
+  crypto_blake2b(payload_hash, WAMBLE_FRAGMENT_HASH_LENGTH, payload,
+                 payload_len);
+
+  for (uint16_t chunk_index = 0; chunk_index < chunk_count; chunk_index++) {
+    size_t offset = (size_t)chunk_index * max_fragment_size;
+    size_t chunk_len = 0;
+    if (offset < payload_len) {
+      chunk_len = payload_len - offset;
+      if (chunk_len > max_fragment_size)
+        chunk_len = max_fragment_size;
+    }
+
+    struct WambleMsg resp = {0};
+    resp.ctrl = ctrl;
+    memcpy(resp.token, token, TOKEN_LENGTH);
+    resp.fragment_version = WAMBLE_FRAGMENT_VERSION;
+    resp.fragment_hash_algo = WAMBLE_FRAGMENT_HASH_BLAKE2B_256;
+    resp.fragment_chunk_index = chunk_index;
+    resp.fragment_chunk_count = chunk_count;
+    resp.fragment_total_len = (uint32_t)payload_len;
+    resp.fragment_transfer_id = transfer_id;
+    memcpy(resp.fragment_hash, payload_hash, WAMBLE_FRAGMENT_HASH_LENGTH);
+    resp.fragment_data_len = (uint16_t)chunk_len;
+    if (chunk_len)
+      memcpy(resp.fragment_data, payload + offset, chunk_len);
+    if (send_reliable_default(sockfd, &resp, cliaddr) != 0)
+      return SERVER_ERR_SEND_FAILED;
+  }
+  return SERVER_OK;
+}
+
 static ServerStatus handle_get_profile_tos(wamble_socket_t sockfd,
                                            const struct sockaddr_in *cliaddr,
                                            const struct WambleMsg *msg,
                                            int effective_trust_tier) {
+  if (!msg || !cliaddr)
+    return SERVER_ERR_INTERNAL;
   char name[PROFILE_NAME_MAX_LENGTH];
   int nlen = msg->profile_name_len < (PROFILE_NAME_MAX_LENGTH - 1)
                  ? msg->profile_name_len
@@ -912,30 +979,28 @@ static ServerStatus handle_get_profile_tos(wamble_socket_t sockfd,
   name[nlen] = '\0';
 
   const WambleProfile *p = config_find_profile(name);
-  struct WambleMsg resp = {0};
-  resp.ctrl = WAMBLE_CTRL_PROFILE_TOS_DATA;
-  memcpy(resp.token, msg->token, TOKEN_LENGTH);
   if (p && profile_discovery_allowed(msg->token, p, effective_trust_tier)) {
-    resp.tos_ptr = p->tos_text ? p->tos_text : "";
-    resp.tos_len = p->tos_text ? strlen(p->tos_text) : 0;
+    const char *tos = p->tos_text ? p->tos_text : "";
+    size_t tos_len = p->tos_text ? strlen(p->tos_text) : 0;
+    return send_fragmented_payload(sockfd, cliaddr,
+                                   WAMBLE_CTRL_PROFILE_TOS_DATA, msg->token,
+                                   (const uint8_t *)tos, tos_len);
   } else {
     wamble_runtime_event_publish(
         WAMBLE_RUNTIME_EVENT_PROFILE_ADMIN,
         p ? PROFILE_ADMIN_STATUS_PROFILE_INFO_HIDDEN
           : PROFILE_ADMIN_STATUS_PROFILE_INFO_NOT_FOUND,
         name);
-    int wrote =
-        snprintf(resp.profile_info, FEN_MAX_LENGTH, "NOTFOUND;%.80s", name);
+    char fallback[FEN_MAX_LENGTH];
+    int wrote = snprintf(fallback, FEN_MAX_LENGTH, "NOTFOUND;%.80s", name);
     if (wrote < 0)
       wrote = 0;
     if (wrote >= FEN_MAX_LENGTH)
       wrote = FEN_MAX_LENGTH - 1;
-    resp.tos_ptr = resp.profile_info;
-    resp.tos_len = (size_t)wrote;
+    return send_fragmented_payload(sockfd, cliaddr,
+                                   WAMBLE_CTRL_PROFILE_TOS_DATA, msg->token,
+                                   (const uint8_t *)fallback, (size_t)wrote);
   }
-  if (send_reliable_default(sockfd, &resp, cliaddr) != 0)
-    return SERVER_ERR_SEND_FAILED;
-  return SERVER_OK;
 }
 
 static int login_has_pubkey(const struct WambleMsg *msg) {

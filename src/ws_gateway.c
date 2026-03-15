@@ -16,12 +16,15 @@
 #define WS_HANDSHAKE_MAX 8192
 #define WS_FRAME_MAX 4096
 #define WS_PREFETCH_MAX (WS_FRAME_MAX + 14u)
+#define WS_INBOUND_QUEUE_CAP_DEFAULT 1024
+#define WS_ROUTE_ID_MASK 0x0FFFFFFFu
 #define WS_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 #define WS_CLOSE_PROTOCOL_ERROR 1002
 #define WS_CLOSE_MESSAGE_TOO_BIG 1009
 #define WS_CONTROL_PAYLOAD_MAX 125u
 
 typedef enum WsOpcode {
+  WS_OPCODE_CONTINUATION = 0x0u,
   WS_OPCODE_BINARY = 0x2u,
   WS_OPCODE_CLOSE = 0x8u,
   WS_OPCODE_PING = 0x9u,
@@ -29,6 +32,7 @@ typedef enum WsOpcode {
 } WsOpcode;
 
 typedef struct WsClientSlot WsClientSlot;
+typedef struct WsInboundPacket WsInboundPacket;
 
 struct WambleWsGateway {
   char *profile_name;
@@ -46,6 +50,10 @@ struct WambleWsGateway {
   wamble_cond_t clients_done;
   int active_client_threads;
   WsClientSlot *clients;
+  WsInboundPacket *inbound_packets;
+  int inbound_cap;
+  int inbound_head;
+  int inbound_count;
 };
 
 #if defined(WAMBLE_PLATFORM_WINDOWS)
@@ -63,7 +71,166 @@ struct WsClientSlot {
   wamble_socket_t tcp_sock;
   int in_use;
   volatile int should_stop;
+  int upgraded;
+  uint32_t route_id;
+  struct sockaddr_in virtual_addr;
+  uint8_t tx_batch[WS_FRAME_MAX];
+  size_t tx_batch_len;
 };
+
+struct WsInboundPacket {
+  struct sockaddr_in addr;
+  size_t len;
+  uint8_t data[WAMBLE_MAX_PACKET_SIZE];
+};
+
+typedef struct WsRouteEntry {
+  struct sockaddr_in addr;
+  WambleWsGateway *gateway;
+  int slot_index;
+  uint32_t route_id;
+  int in_use;
+} WsRouteEntry;
+
+static WsRouteEntry *g_ws_routes = NULL;
+static size_t g_ws_routes_cap = 0;
+static uint32_t g_ws_route_seq = 1;
+static wamble_mutex_t g_ws_routes_mutex;
+static int g_ws_routes_mutex_ready = 0;
+
+static void ws_routes_ensure_mutex_ready(void) {
+  if (!g_ws_routes_mutex_ready) {
+    wamble_mutex_init(&g_ws_routes_mutex);
+    g_ws_routes_mutex_ready = 1;
+  }
+}
+
+static int ws_sockaddr_equal(const struct sockaddr_in *a,
+                             const struct sockaddr_in *b) {
+  if (!a || !b)
+    return 0;
+  return a->sin_family == b->sin_family && a->sin_port == b->sin_port &&
+         a->sin_addr.s_addr == b->sin_addr.s_addr;
+}
+
+static struct sockaddr_in ws_virtual_addr_for_id(uint32_t route_id) {
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  uint32_t ip_low = (route_id >> 16) & 0x0FFFu;
+  uint32_t host_ip = 0xF0000000u | ip_low;
+  uint16_t port = (uint16_t)(route_id & 0xFFFFu);
+  if (port == 0)
+    port = 1;
+  addr.sin_addr.s_addr = htonl(host_ip);
+  addr.sin_port = htons(port);
+  return addr;
+}
+
+static int ws_routes_ensure_capacity(size_t need) {
+  if (need <= g_ws_routes_cap)
+    return 0;
+  size_t next_cap = (g_ws_routes_cap > 0) ? g_ws_routes_cap : 64u;
+  while (next_cap < need) {
+    if (next_cap > (SIZE_MAX / 2u)) {
+      next_cap = need;
+      break;
+    }
+    next_cap *= 2u;
+  }
+  WsRouteEntry *next =
+      (WsRouteEntry *)realloc(g_ws_routes, next_cap * sizeof(*next));
+  if (!next)
+    return -1;
+  memset(next + g_ws_routes_cap, 0,
+         (next_cap - g_ws_routes_cap) * sizeof(*next));
+  g_ws_routes = next;
+  g_ws_routes_cap = next_cap;
+  return 0;
+}
+
+static int ws_route_register(WambleWsGateway *gw, int slot_index,
+                             struct sockaddr_in *out_addr,
+                             uint32_t *out_route_id) {
+  if (!gw || slot_index < 0 || !out_addr || !out_route_id)
+    return -1;
+  ws_routes_ensure_mutex_ready();
+  wamble_mutex_lock(&g_ws_routes_mutex);
+  if (ws_routes_ensure_capacity(g_ws_routes_cap + 1u) != 0) {
+    wamble_mutex_unlock(&g_ws_routes_mutex);
+    return -1;
+  }
+  size_t idx = 0;
+  while (idx < g_ws_routes_cap && g_ws_routes[idx].in_use)
+    idx++;
+  if (idx >= g_ws_routes_cap) {
+    wamble_mutex_unlock(&g_ws_routes_mutex);
+    return -1;
+  }
+  uint32_t route_id = (g_ws_route_seq++ & WS_ROUTE_ID_MASK);
+  if (route_id == 0)
+    route_id = (g_ws_route_seq++ & WS_ROUTE_ID_MASK);
+  struct sockaddr_in vaddr = ws_virtual_addr_for_id(route_id);
+  g_ws_routes[idx].in_use = 1;
+  g_ws_routes[idx].gateway = gw;
+  g_ws_routes[idx].slot_index = slot_index;
+  g_ws_routes[idx].route_id = route_id;
+  g_ws_routes[idx].addr = vaddr;
+  *out_addr = vaddr;
+  *out_route_id = route_id;
+  wamble_mutex_unlock(&g_ws_routes_mutex);
+  return 0;
+}
+
+static void ws_route_unregister(uint32_t route_id) {
+  if (route_id == 0)
+    return;
+  ws_routes_ensure_mutex_ready();
+  wamble_mutex_lock(&g_ws_routes_mutex);
+  for (size_t i = 0; i < g_ws_routes_cap; i++) {
+    if (g_ws_routes[i].in_use && g_ws_routes[i].route_id == route_id) {
+      memset(&g_ws_routes[i], 0, sizeof(g_ws_routes[i]));
+      break;
+    }
+  }
+  wamble_mutex_unlock(&g_ws_routes_mutex);
+}
+
+static void ws_route_unregister_gateway(WambleWsGateway *gw) {
+  if (!gw)
+    return;
+  ws_routes_ensure_mutex_ready();
+  wamble_mutex_lock(&g_ws_routes_mutex);
+  for (size_t i = 0; i < g_ws_routes_cap; i++) {
+    if (g_ws_routes[i].in_use && g_ws_routes[i].gateway == gw)
+      memset(&g_ws_routes[i], 0, sizeof(g_ws_routes[i]));
+  }
+  wamble_mutex_unlock(&g_ws_routes_mutex);
+}
+
+static int ws_route_lookup(const struct sockaddr_in *addr, WambleWsGateway **gw,
+                           int *slot_index, uint32_t *route_id) {
+  if (!addr || !gw || !slot_index || !route_id)
+    return 0;
+  *gw = NULL;
+  *slot_index = -1;
+  *route_id = 0;
+  ws_routes_ensure_mutex_ready();
+  wamble_mutex_lock(&g_ws_routes_mutex);
+  for (size_t i = 0; i < g_ws_routes_cap; i++) {
+    if (!g_ws_routes[i].in_use)
+      continue;
+    if (ws_sockaddr_equal(&g_ws_routes[i].addr, addr)) {
+      *gw = g_ws_routes[i].gateway;
+      *slot_index = g_ws_routes[i].slot_index;
+      *route_id = g_ws_routes[i].route_id;
+      wamble_mutex_unlock(&g_ws_routes_mutex);
+      return 1;
+    }
+  }
+  wamble_mutex_unlock(&g_ws_routes_mutex);
+  return 0;
+}
 
 static int ws_send_all(wamble_socket_t sock, const uint8_t *data, size_t len) {
   size_t sent = 0;
@@ -503,71 +670,97 @@ ws_read_frame_prefetch(wamble_socket_t sock, uint8_t *prefetch,
                        uint8_t *payload, size_t payload_cap, size_t *out_len) {
   if (!prefetch || !prefetch_len || !out_opcode || !payload || !out_len)
     return WS_READ_ERR_PROTOCOL;
+  size_t total_len = 0;
+  int fragmented_binary = 0;
+  uint8_t message_opcode = 0;
 
-  uint8_t h2[2];
-  if (ws_read_frame_prefetch_copy(sock, prefetch, prefetch_len, h2,
-                                  sizeof(h2)) != WS_READ_OK) {
-    return WS_READ_ERR_IO;
-  }
-
-  uint8_t rsv = (uint8_t)((h2[0] >> 4) & 0x07u);
-  uint8_t fin = (uint8_t)((h2[0] >> 7) & 1u);
-  uint8_t opcode = (uint8_t)(h2[0] & 0x0Fu);
-  uint8_t is_control = (uint8_t)((opcode & 0x08u) != 0u);
-  uint8_t masked = (uint8_t)((h2[1] >> 7) & 1u);
-  uint64_t len = (uint64_t)(h2[1] & 0x7Fu);
-
-  if (rsv != 0u || fin == 0u)
-    return WS_READ_ERR_PROTOCOL;
-
-  if (len == 126u) {
-    if (is_control)
-      return WS_READ_ERR_PROTOCOL;
-    uint8_t ext[2];
-    if (ws_read_frame_prefetch_copy(sock, prefetch, prefetch_len, ext,
-                                    sizeof(ext)) != WS_READ_OK) {
+  for (;;) {
+    uint8_t h2[2];
+    if (ws_read_frame_prefetch_copy(sock, prefetch, prefetch_len, h2,
+                                    sizeof(h2)) != WS_READ_OK) {
       return WS_READ_ERR_IO;
     }
-    len = ((uint64_t)ext[0] << 8) | (uint64_t)ext[1];
-  } else if (len == 127u) {
-    if (is_control)
+
+    uint8_t rsv = (uint8_t)((h2[0] >> 4) & 0x07u);
+    uint8_t fin = (uint8_t)((h2[0] >> 7) & 1u);
+    uint8_t opcode = (uint8_t)(h2[0] & 0x0Fu);
+    uint8_t is_control = (uint8_t)((opcode & 0x08u) != 0u);
+    uint8_t masked = (uint8_t)((h2[1] >> 7) & 1u);
+    uint64_t len = (uint64_t)(h2[1] & 0x7Fu);
+
+    if (rsv != 0u)
       return WS_READ_ERR_PROTOCOL;
-    uint8_t ext[8];
-    if (ws_read_frame_prefetch_copy(sock, prefetch, prefetch_len, ext,
-                                    sizeof(ext)) != WS_READ_OK) {
-      return WS_READ_ERR_IO;
+    if (is_control && fin == 0u)
+      return WS_READ_ERR_PROTOCOL;
+
+    if (len == 126u) {
+      if (is_control)
+        return WS_READ_ERR_PROTOCOL;
+      uint8_t ext[2];
+      if (ws_read_frame_prefetch_copy(sock, prefetch, prefetch_len, ext,
+                                      sizeof(ext)) != WS_READ_OK) {
+        return WS_READ_ERR_IO;
+      }
+      len = ((uint64_t)ext[0] << 8) | (uint64_t)ext[1];
+    } else if (len == 127u) {
+      if (is_control)
+        return WS_READ_ERR_PROTOCOL;
+      uint8_t ext[8];
+      if (ws_read_frame_prefetch_copy(sock, prefetch, prefetch_len, ext,
+                                      sizeof(ext)) != WS_READ_OK) {
+        return WS_READ_ERR_IO;
+      }
+      len = 0;
+      for (int i = 0; i < 8; i++) {
+        len = (len << 8) | (uint64_t)ext[i];
+      }
     }
-    len = 0;
-    for (int i = 0; i < 8; i++) {
-      len = (len << 8) | (uint64_t)ext[i];
-    }
-    if (len > WS_FRAME_MAX)
+
+    if (!masked || (is_control && len > WS_CONTROL_PAYLOAD_MAX))
+      return WS_READ_ERR_PROTOCOL;
+    if (len > (uint64_t)(payload_cap - total_len))
       return WS_READ_ERR_TOO_BIG;
-  }
 
-  if (!masked || (is_control && len > WS_CONTROL_PAYLOAD_MAX))
-    return WS_READ_ERR_PROTOCOL;
-  if (len > payload_cap)
-    return WS_READ_ERR_TOO_BIG;
+    uint8_t mask[4];
+    if (ws_read_frame_prefetch_copy(sock, prefetch, prefetch_len, mask,
+                                    sizeof(mask)) != WS_READ_OK) {
+      return WS_READ_ERR_IO;
+    }
+    if (len > 0 && ws_read_frame_prefetch_copy(sock, prefetch, prefetch_len,
+                                               payload + total_len,
+                                               (size_t)len) != WS_READ_OK) {
+      return WS_READ_ERR_IO;
+    }
 
-  uint8_t mask[4];
-  if (ws_read_frame_prefetch_copy(sock, prefetch, prefetch_len, mask,
-                                  sizeof(mask)) != WS_READ_OK) {
-    return WS_READ_ERR_IO;
-  }
-  if (len > 0 &&
-      ws_read_frame_prefetch_copy(sock, prefetch, prefetch_len, payload,
-                                  (size_t)len) != WS_READ_OK) {
-    return WS_READ_ERR_IO;
-  }
+    for (uint64_t i = 0; i < len; i++) {
+      payload[total_len + (size_t)i] ^= mask[i % 4u];
+    }
 
-  for (uint64_t i = 0; i < len; i++) {
-    payload[i] ^= mask[i % 4u];
-  }
+    if (!fragmented_binary) {
+      if (opcode == WS_OPCODE_CONTINUATION)
+        return WS_READ_ERR_PROTOCOL;
+      if (fin == 1u) {
+        *out_opcode = opcode;
+        *out_len = (size_t)len;
+        return WS_READ_OK;
+      }
+      if (opcode != WS_OPCODE_BINARY)
+        return WS_READ_ERR_PROTOCOL;
+      fragmented_binary = 1;
+      message_opcode = opcode;
+      total_len += (size_t)len;
+      continue;
+    }
 
-  *out_opcode = opcode;
-  *out_len = (size_t)len;
-  return WS_READ_OK;
+    if (is_control || opcode != WS_OPCODE_CONTINUATION)
+      return WS_READ_ERR_PROTOCOL;
+    total_len += (size_t)len;
+    if (fin == 1u) {
+      *out_opcode = message_opcode;
+      *out_len = total_len;
+      return WS_READ_OK;
+    }
+  }
 }
 
 static WsReadStatus ws_read_frame_prefetch_copy(wamble_socket_t sock,
@@ -596,42 +789,24 @@ static WsReadStatus ws_read_frame_prefetch_copy(wamble_socket_t sock,
   return WS_READ_OK;
 }
 
-static int ws_bridge_poll_ready(wamble_socket_t tcp_sock,
-                                wamble_socket_t udp_sock, size_t prefetch_len,
-                                int *tcp_ready, int *udp_ready) {
-  if (!tcp_ready || !udp_ready)
-    return -1;
-  *tcp_ready = 0;
-  *udp_ready = 0;
-
-  if (prefetch_len > 0) {
-    *tcp_ready = 1;
+static int ws_wait_tcp_ready(wamble_socket_t tcp_sock, size_t prefetch_len) {
+  if (prefetch_len > 0)
     return 1;
-  }
-
   fd_set rfds;
   FD_ZERO(&rfds);
   FD_SET(tcp_sock, &rfds);
-  FD_SET(udp_sock, &rfds);
-  wamble_socket_t maxfd = (tcp_sock > udp_sock) ? tcp_sock : udp_sock;
   struct timeval tv;
-  tv.tv_sec = 1;
-  tv.tv_usec = 0;
-
+  tv.tv_sec = 0;
+  tv.tv_usec = 20000;
   int sel =
 #ifdef WAMBLE_PLATFORM_WINDOWS
       select(0, &rfds, NULL, NULL, &tv);
 #else
-      select(maxfd + 1, &rfds, NULL, NULL, &tv);
+      select(tcp_sock + 1, &rfds, NULL, NULL, &tv);
 #endif
-  if (sel < 0)
-    return -1;
-  if (sel == 0)
-    return 0;
-
-  *tcp_ready = FD_ISSET(tcp_sock, &rfds) ? 1 : 0;
-  *udp_ready = FD_ISSET(udp_sock, &rfds) ? 1 : 0;
-  return 1;
+  if (sel <= 0)
+    return sel;
+  return FD_ISSET(tcp_sock, &rfds) ? 1 : 0;
 }
 
 static void ws_drain_peer_after_close(wamble_socket_t tcp_sock) {
@@ -681,89 +856,126 @@ static void ws_handle_bad_incoming_frame(wamble_socket_t tcp_sock,
     ws_drain_peer_after_close(tcp_sock);
 }
 
-static int ws_handle_tcp_frame(wamble_socket_t tcp_sock,
-                               wamble_socket_t udp_sock, uint8_t opcode,
-                               const uint8_t *payload, size_t len) {
-  if (opcode == WS_OPCODE_CLOSE) {
-    if (len > WS_CONTROL_PAYLOAD_MAX) {
+static int ws_enqueue_inbound_packet(WambleWsGateway *gw,
+                                     const struct sockaddr_in *addr,
+                                     const uint8_t *packet, size_t packet_len) {
+  if (!gw || !addr || !packet || packet_len == 0 ||
+      packet_len > WAMBLE_MAX_PACKET_SIZE) {
+    return -1;
+  }
+  wamble_mutex_lock(&gw->mutex);
+  if (gw->inbound_count >= gw->inbound_cap) {
+    wamble_mutex_unlock(&gw->mutex);
+    return -1;
+  }
+  int slot = (gw->inbound_head + gw->inbound_count) % gw->inbound_cap;
+  WsInboundPacket *dst = &gw->inbound_packets[slot];
+  dst->addr = *addr;
+  dst->len = packet_len;
+  memcpy(dst->data, packet, packet_len);
+  gw->inbound_count++;
+  wamble_mutex_unlock(&gw->mutex);
+  return 0;
+}
+
+static int ws_slot_flush_locked(WsClientSlot *slot) {
+  if (!slot || slot->tcp_sock == WAMBLE_INVALID_SOCKET)
+    return -1;
+  if (slot->tx_batch_len == 0)
+    return 0;
+  uint8_t frame[WS_FRAME_MAX];
+  size_t frame_len = slot->tx_batch_len;
+  memcpy(frame, slot->tx_batch, frame_len);
+  slot->tx_batch_len = 0;
+  if (ws_send_frame(slot->tcp_sock, WS_OPCODE_BINARY, frame, frame_len) != 0)
+    return -1;
+  return 0;
+}
+
+static int ws_handle_binary_payload(WambleWsGateway *gw, WsClientSlot *slot,
+                                    const uint8_t *payload, size_t len) {
+  if (!gw || !slot || !payload)
+    return -1;
+  size_t offset = 0;
+  while (offset < len) {
+    size_t packet_len = 0;
+    if (wamble_wire_packet_size(payload + offset, len - offset, &packet_len) !=
+        NET_OK) {
+      return -1;
+    }
+    if (packet_len == 0 || packet_len > WAMBLE_MAX_PACKET_SIZE)
+      return -1;
+    if (ws_enqueue_inbound_packet(gw, &slot->virtual_addr, payload + offset,
+                                  packet_len) != 0) {
+      return -1;
+    }
+    offset += packet_len;
+  }
+  return 0;
+}
+
+static int ws_process_client_stream(WambleWsGateway *gw, WsClientSlot *slot,
+                                    wamble_socket_t tcp_sock, uint8_t *prefetch,
+                                    size_t prefetch_len) {
+  if (!gw || !slot || !prefetch)
+    return -1;
+  uint8_t ws_payload[WS_FRAME_MAX];
+  while (!slot->should_stop && !gw->should_stop) {
+    int ready = ws_wait_tcp_ready(tcp_sock, prefetch_len);
+    if (ready < 0)
+      return -1;
+    if (ready == 0) {
+      int flush_rc = 0;
+      wamble_mutex_lock(&gw->mutex);
+      if (slot->tx_batch_len > 0)
+        flush_rc = ws_slot_flush_locked(slot);
+      wamble_mutex_unlock(&gw->mutex);
+      if (flush_rc != 0)
+        return -1;
+      continue;
+    }
+
+    uint8_t opcode = 0;
+    size_t len = 0;
+    WsReadStatus rst =
+        ws_read_frame_prefetch(tcp_sock, prefetch, &prefetch_len, &opcode,
+                               ws_payload, sizeof(ws_payload), &len);
+    if (rst != WS_READ_OK) {
+      ws_handle_bad_incoming_frame(tcp_sock, rst);
+      return -1;
+    }
+    if (opcode == WS_OPCODE_CLOSE) {
+      if (len > WS_CONTROL_PAYLOAD_MAX) {
+        (void)ws_send_close_code(tcp_sock, WS_CLOSE_PROTOCOL_ERROR);
+        return -1;
+      }
+      (void)ws_send_frame(tcp_sock, WS_OPCODE_CLOSE, ws_payload, len);
+      return 0;
+    }
+    if (opcode == WS_OPCODE_PING) {
+      if (ws_send_frame(tcp_sock, WS_OPCODE_PONG, ws_payload, len) != 0)
+        return -1;
+      continue;
+    }
+    if (opcode == WS_OPCODE_PONG)
+      continue;
+    if (opcode != WS_OPCODE_BINARY) {
       (void)ws_send_close_code(tcp_sock, WS_CLOSE_PROTOCOL_ERROR);
       return -1;
     }
-    (void)ws_send_frame(tcp_sock, WS_OPCODE_CLOSE, payload, len);
-    return 1;
-  }
-  if (opcode == WS_OPCODE_PING)
-    return ws_send_frame(tcp_sock, WS_OPCODE_PONG, payload, len);
-  if (opcode == WS_OPCODE_PONG)
-    return 0;
-  if (opcode == WS_OPCODE_BINARY) {
-    wamble_io_count_t rc = send(udp_sock, (const char *)payload,
-#ifdef WAMBLE_PLATFORM_WINDOWS
-                                (int)len,
-#else
-                                len,
-#endif
-                                0);
-    return (rc < 0) ? -1 : 0;
-  }
-
-  (void)ws_send_close_code(tcp_sock, WS_CLOSE_PROTOCOL_ERROR);
-  return -1;
-}
-
-static int ws_tcp_to_udp_bridge(wamble_socket_t tcp_sock,
-                                wamble_socket_t udp_sock,
-                                volatile int *stop_ptr,
-                                volatile int *gw_stop_ptr, uint8_t *prefetch,
-                                size_t prefetch_len) {
-  uint8_t ws_payload[WS_FRAME_MAX];
-  uint8_t udp_buf[WS_FRAME_MAX];
-
-  while (!*stop_ptr && !*gw_stop_ptr) {
-    int tcp_ready = 0;
-    int udp_ready = 0;
-    int poll_rc = ws_bridge_poll_ready(tcp_sock, udp_sock, prefetch_len,
-                                       &tcp_ready, &udp_ready);
-    if (poll_rc < 0)
+    if (ws_handle_binary_payload(gw, slot, ws_payload, len) != 0) {
+      (void)ws_send_close_code(tcp_sock, WS_CLOSE_PROTOCOL_ERROR);
       return -1;
-    if (poll_rc == 0)
-      continue;
-
-    if (tcp_ready) {
-      uint8_t opcode = 0;
-      size_t len = 0;
-      WsReadStatus rst =
-          ws_read_frame_prefetch(tcp_sock, prefetch, &prefetch_len, &opcode,
-                                 ws_payload, sizeof(ws_payload), &len);
-      if (rst != WS_READ_OK) {
-        ws_handle_bad_incoming_frame(tcp_sock, rst);
-        return -1;
-      }
-
-      int frame_rc =
-          ws_handle_tcp_frame(tcp_sock, udp_sock, opcode, ws_payload, len);
-      if (frame_rc > 0)
-        return 0;
-      if (frame_rc < 0)
-        return -1;
     }
-
-    if (udp_ready) {
-      wamble_io_count_t n = recv(udp_sock, (char *)udp_buf,
-#ifdef WAMBLE_PLATFORM_WINDOWS
-                                 (int)sizeof(udp_buf),
-#else
-                                 sizeof(udp_buf),
-#endif
-                                 0);
-      if (n <= 0)
-        return -1;
-      if (ws_send_frame(tcp_sock, WS_OPCODE_BINARY, udp_buf, (size_t)n) != 0)
-        return -1;
-    }
+    int flush_rc = 0;
+    wamble_mutex_lock(&gw->mutex);
+    if (slot->tx_batch_len > 0)
+      flush_rc = ws_slot_flush_locked(slot);
+    wamble_mutex_unlock(&gw->mutex);
+    if (flush_rc != 0)
+      return -1;
   }
-
-  return 0;
+  return -1;
 }
 
 static int ws_read_http_handshake(wamble_socket_t tcp_sock, uint8_t *req,
@@ -893,26 +1105,8 @@ static int ws_send_upgrade_switching_protocols(wamble_socket_t tcp_sock,
   return ws_send_all(tcp_sock, (const uint8_t *)response, (size_t)n);
 }
 
-static wamble_socket_t ws_open_udp_loopback_socket(int udp_port) {
-  wamble_socket_t udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
-  if (udp_sock == WAMBLE_INVALID_SOCKET)
-    return WAMBLE_INVALID_SOCKET;
-
-  struct sockaddr_in up;
-  memset(&up, 0, sizeof(up));
-  up.sin_family = AF_INET;
-  up.sin_port = htons((uint16_t)udp_port);
-  up.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  if (connect(udp_sock, (struct sockaddr *)&up, sizeof(up)) != 0) {
-    wamble_close_socket(udp_sock);
-    return WAMBLE_INVALID_SOCKET;
-  }
-
-  return udp_sock;
-}
-
-static int ws_upgrade_and_bridge(WambleWsGateway *gw, WsClientSlot *slot,
-                                 wamble_socket_t tcp_sock) {
+static int ws_upgrade_and_serve(WambleWsGateway *gw, WsClientSlot *slot,
+                                int slot_index, wamble_socket_t tcp_sock) {
   uint8_t req[WS_HANDSHAKE_MAX + 1];
   uint8_t prefetch[WS_PREFETCH_MAX];
   size_t prefetch_len = 0;
@@ -950,29 +1144,37 @@ static int ws_upgrade_and_bridge(WambleWsGateway *gw, WsClientSlot *slot,
   if (ws_send_upgrade_switching_protocols(tcp_sock, accept_key) != 0)
     return -1;
 
-  wamble_socket_t udp_sock = ws_open_udp_loopback_socket(gw->udp_port);
-  if (udp_sock == WAMBLE_INVALID_SOCKET)
+  if (ws_route_register(gw, slot_index, &slot->virtual_addr, &slot->route_id) !=
+      0) {
     return -1;
+  }
+  slot->upgraded = 1;
 
-  int rc = ws_tcp_to_udp_bridge(tcp_sock, udp_sock, &slot->should_stop,
-                                &gw->should_stop, prefetch, prefetch_len);
-  wamble_close_socket(udp_sock);
+  int rc = ws_process_client_stream(gw, slot, tcp_sock, prefetch, prefetch_len);
   return rc;
 }
 
 static void ws_mark_client_slot_closed(WambleWsGateway *gw, int slot_index) {
   if (!gw || slot_index < 0)
     return;
+  uint32_t route_id = 0;
   wamble_mutex_lock(&gw->mutex);
   if (slot_index < gw->max_clients) {
+    route_id = gw->clients[slot_index].route_id;
     gw->clients[slot_index].in_use = 0;
     gw->clients[slot_index].should_stop = 0;
+    gw->clients[slot_index].upgraded = 0;
+    gw->clients[slot_index].route_id = 0;
+    gw->clients[slot_index].tx_batch_len = 0;
+    memset(&gw->clients[slot_index].virtual_addr, 0,
+           sizeof(gw->clients[slot_index].virtual_addr));
     gw->clients[slot_index].tcp_sock = WAMBLE_INVALID_SOCKET;
   }
   if (gw->active_client_threads > 0)
     gw->active_client_threads--;
   wamble_cond_broadcast(&gw->clients_done);
   wamble_mutex_unlock(&gw->mutex);
+  ws_route_unregister(route_id);
 }
 
 static void *ws_client_main(void *arg) {
@@ -999,7 +1201,7 @@ static void *ws_client_main(void *arg) {
     return NULL;
   }
 
-  (void)ws_upgrade_and_bridge(gw, slot, tcp_sock);
+  (void)ws_upgrade_and_serve(gw, slot, slot_index, tcp_sock);
   wamble_close_socket(tcp_sock);
   ws_mark_client_slot_closed(gw, slot_index);
   return NULL;
@@ -1015,6 +1217,11 @@ static int ws_allocate_client_slot(WambleWsGateway *gw, wamble_socket_t sock,
     if (!gw->clients[i].in_use) {
       gw->clients[i].in_use = 1;
       gw->clients[i].should_stop = 0;
+      gw->clients[i].upgraded = 0;
+      gw->clients[i].route_id = 0;
+      gw->clients[i].tx_batch_len = 0;
+      memset(&gw->clients[i].virtual_addr, 0,
+             sizeof(gw->clients[i].virtual_addr));
       gw->clients[i].tcp_sock = sock;
       *out_slot = i;
       break;
@@ -1176,6 +1383,10 @@ WambleWsGateway *ws_gateway_start(const char *profile_name, int ws_port,
   gw->running = 0;
   gw->should_stop = 0;
   gw->active_client_threads = 0;
+  gw->inbound_packets = NULL;
+  gw->inbound_cap = 0;
+  gw->inbound_head = 0;
+  gw->inbound_count = 0;
 
   if (!gw->profile_name || !gw->ws_path)
     goto fail_alloc;
@@ -1183,6 +1394,13 @@ WambleWsGateway *ws_gateway_start(const char *profile_name, int ws_port,
   gw->clients =
       (WsClientSlot *)calloc((size_t)gw->max_clients, sizeof(WsClientSlot));
   if (!gw->clients)
+    goto fail_alloc;
+  gw->inbound_cap = gw->max_clients * 32;
+  if (gw->inbound_cap < WS_INBOUND_QUEUE_CAP_DEFAULT)
+    gw->inbound_cap = WS_INBOUND_QUEUE_CAP_DEFAULT;
+  gw->inbound_packets = (WsInboundPacket *)calloc((size_t)gw->inbound_cap,
+                                                  sizeof(WsInboundPacket));
+  if (!gw->inbound_packets)
     goto fail_alloc;
 
   for (int i = 0; i < gw->max_clients; i++) {
@@ -1222,6 +1440,7 @@ fail:
     wamble_mutex_destroy(&gw->mutex);
   }
   free(gw->clients);
+  free(gw->inbound_packets);
   free(gw->profile_name);
   free(gw->ws_path);
   free(gw);
@@ -1253,10 +1472,12 @@ void ws_gateway_stop(WambleWsGateway *gateway) {
     wamble_cond_wait(&gateway->clients_done, &gateway->mutex);
   }
   wamble_mutex_unlock(&gateway->mutex);
+  ws_route_unregister_gateway(gateway);
 
   wamble_cond_destroy(&gateway->clients_done);
   wamble_mutex_destroy(&gateway->mutex);
   free(gateway->clients);
+  free(gateway->inbound_packets);
   free(gateway->profile_name);
   free(gateway->ws_path);
   free(gateway);
@@ -1264,15 +1485,110 @@ void ws_gateway_stop(WambleWsGateway *gateway) {
 
 int ws_gateway_matches(const WambleWsGateway *gateway, int ws_port,
                        int udp_port, const char *ws_path) {
+  (void)udp_port;
   if (!gateway || !ws_path)
     return 0;
   if (gateway->ws_port != ws_port)
-    return 0;
-  if (gateway->udp_port != udp_port)
     return 0;
   if (!gateway->ws_path)
     return 0;
   if (strcmp(gateway->ws_path, ws_path) != 0)
     return 0;
   return 1;
+}
+
+int ws_gateway_pop_packet(WambleWsGateway *gateway, uint8_t *packet,
+                          size_t packet_cap, size_t *out_packet_len,
+                          struct sockaddr_in *out_cliaddr) {
+  if (!gateway || !packet || !out_packet_len || !out_cliaddr)
+    return -1;
+  wamble_mutex_lock(&gateway->mutex);
+  if (gateway->inbound_count <= 0) {
+    wamble_mutex_unlock(&gateway->mutex);
+    return 0;
+  }
+  WsInboundPacket *src = &gateway->inbound_packets[gateway->inbound_head];
+  if (src->len > packet_cap) {
+    wamble_mutex_unlock(&gateway->mutex);
+    return -1;
+  }
+  memcpy(packet, src->data, src->len);
+  *out_packet_len = src->len;
+  *out_cliaddr = src->addr;
+  gateway->inbound_head = (gateway->inbound_head + 1) % gateway->inbound_cap;
+  gateway->inbound_count--;
+  wamble_mutex_unlock(&gateway->mutex);
+  return 1;
+}
+
+int ws_gateway_is_ws_client(const struct sockaddr_in *cliaddr) {
+  WambleWsGateway *gw = NULL;
+  int slot_index = -1;
+  uint32_t route_id = 0;
+  return ws_route_lookup(cliaddr, &gw, &slot_index, &route_id);
+}
+
+int ws_gateway_queue_packet(const struct sockaddr_in *cliaddr,
+                            const uint8_t *packet, size_t packet_len) {
+  if (!cliaddr || !packet || packet_len == 0 ||
+      packet_len > WAMBLE_MAX_PACKET_SIZE) {
+    return -1;
+  }
+  WambleWsGateway *gw = NULL;
+  int slot_index = -1;
+  uint32_t route_id = 0;
+  if (!ws_route_lookup(cliaddr, &gw, &slot_index, &route_id))
+    return 0;
+  if (!gw || slot_index < 0)
+    return -1;
+
+  int result = -1;
+  wamble_mutex_lock(&gw->mutex);
+  if (gw->should_stop || slot_index >= gw->max_clients)
+    goto done;
+  WsClientSlot *slot = &gw->clients[slot_index];
+  if (!slot->in_use || !slot->upgraded || slot->route_id != route_id ||
+      !ws_sockaddr_equal(&slot->virtual_addr, cliaddr) ||
+      slot->tcp_sock == WAMBLE_INVALID_SOCKET) {
+    goto done;
+  }
+  if (packet_len > WS_FRAME_MAX)
+    goto done;
+  if (slot->tx_batch_len > 0 &&
+      slot->tx_batch_len + packet_len > sizeof(slot->tx_batch)) {
+    if (ws_slot_flush_locked(slot) != 0) {
+      slot->should_stop = 1;
+      goto done;
+    }
+  }
+  if (slot->tx_batch_len + packet_len > sizeof(slot->tx_batch))
+    goto done;
+  memcpy(slot->tx_batch + slot->tx_batch_len, packet, packet_len);
+  slot->tx_batch_len += packet_len;
+  if (slot->tx_batch_len == sizeof(slot->tx_batch)) {
+    if (ws_slot_flush_locked(slot) != 0) {
+      slot->should_stop = 1;
+      goto done;
+    }
+  }
+  result = 1;
+done:
+  wamble_mutex_unlock(&gw->mutex);
+  return result;
+}
+
+void ws_gateway_flush_outbound(WambleWsGateway *gateway) {
+  if (!gateway)
+    return;
+  wamble_mutex_lock(&gateway->mutex);
+  for (int i = 0; i < gateway->max_clients; i++) {
+    WsClientSlot *slot = &gateway->clients[i];
+    if (!slot->in_use || !slot->upgraded || slot->should_stop ||
+        slot->tcp_sock == WAMBLE_INVALID_SOCKET || slot->tx_batch_len == 0) {
+      continue;
+    }
+    if (ws_slot_flush_locked(slot) != 0)
+      slot->should_stop = 1;
+  }
+  wamble_mutex_unlock(&gateway->mutex);
 }

@@ -2,6 +2,13 @@
 #include "../include/wamble/wamble_db.h"
 #include <stdlib.h>
 #include <string.h>
+int receive_message_packet(const uint8_t *packet, size_t packet_len,
+                           struct WambleMsg *msg,
+                           const struct sockaddr_in *cliaddr);
+int ws_gateway_pop_packet(WambleWsGateway *gateway, uint8_t *packet,
+                          size_t packet_cap, size_t *out_packet_len,
+                          struct sockaddr_in *out_cliaddr);
+void ws_gateway_flush_outbound(WambleWsGateway *gateway);
 #if defined(_MSC_VER) && !defined(strtoull)
 #define strtoull _strtoui64
 #endif
@@ -1063,6 +1070,23 @@ static void profile_runtime_prepare_exec_snapshot(RunningProfile *rp) {
 }
 
 static void profile_runtime_poll_messages(RunningProfile *rp) {
+  if (rp->ws_gateway) {
+    uint8_t packet[WAMBLE_MAX_PACKET_SIZE];
+    size_t packet_len = 0;
+    struct sockaddr_in ws_cliaddr;
+    for (int drained_ws = 0; drained_ws < 256; drained_ws++) {
+      int ws_rc = ws_gateway_pop_packet(rp->ws_gateway, packet, sizeof(packet),
+                                        &packet_len, &ws_cliaddr);
+      if (ws_rc <= 0)
+        break;
+      struct WambleMsg msg;
+      int n = receive_message_packet(packet, packet_len, &msg, &ws_cliaddr);
+      if (n <= 0)
+        continue;
+      (void)handle_message(rp->sockfd, &msg, &ws_cliaddr, 0, rp->name);
+    }
+  }
+
   fd_set rfds;
   struct timeval tv;
   FD_ZERO(&rfds);
@@ -1087,6 +1111,9 @@ static void profile_runtime_poll_messages(RunningProfile *rp) {
       break;
     (void)handle_message(rp->sockfd, &msg, &cliaddr, 0, rp->name);
   }
+
+  if (rp->ws_gateway)
+    ws_gateway_flush_outbound(rp->ws_gateway);
 }
 
 static void send_spectator_batch(wamble_socket_t sockfd,
@@ -1306,6 +1333,8 @@ static void profile_runtime_step(RunningProfile *rp) {
     }
   }
   profile_runtime_send_spectator_updates(rp);
+  if (rp->ws_gateway)
+    ws_gateway_flush_outbound(rp->ws_gateway);
 }
 
 static void profile_runtime_run(RunningProfile *rp) {
