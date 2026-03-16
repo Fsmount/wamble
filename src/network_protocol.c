@@ -37,6 +37,9 @@ typedef struct WambleHeader {
 #define WAMBLE_PREDICTION_ENTRY_WIRE_SIZE                                      \
   (8 + 8 + TOKEN_LENGTH + 8 + 2 + 1 + 1 + 1 + MAX_UCI_LENGTH)
 #define WAMBLE_PENDING_PACKET_CAP 64
+#define WAMBLE_EXT_MAGIC_0 0x57
+#define WAMBLE_EXT_MAGIC_1 0x58
+#define WAMBLE_EXT_VERSION 1
 
 typedef struct WambleClientSession {
   struct sockaddr_in addr;
@@ -50,6 +53,7 @@ typedef struct WambleClientSession {
 static WAMBLE_THREAD_LOCAL WambleClientSession *client_sessions;
 static WAMBLE_THREAD_LOCAL int num_sessions = 0;
 static WAMBLE_THREAD_LOCAL uint32_t global_seq_num = 1;
+static WAMBLE_THREAD_LOCAL uint32_t global_fragment_transfer_id = 1;
 
 #define SESSION_MAP_SIZE (get_config()->max_client_sessions * 2)
 static WAMBLE_THREAD_LOCAL int *session_index_map;
@@ -279,13 +283,210 @@ static inline uint64_t net_to_host64(uint64_t x) {
 }
 #endif
 
+static NetworkStatus encode_msg_extensions(const struct WambleMsg *msg,
+                                           uint8_t *dst, size_t cap,
+                                           size_t *out_len) {
+  if (!dst || !out_len)
+    return NET_ERR_INVALID;
+  *out_len = 0;
+  if (!msg || msg->ext_count == 0)
+    return NET_OK;
+
+  size_t off = 0;
+  if (cap < 2)
+    return NET_ERR_TRUNCATED;
+  dst[off++] = WAMBLE_EXT_VERSION;
+  size_t count_pos = off++;
+  uint8_t written = 0;
+
+  for (uint8_t i = 0; i < msg->ext_count; i++) {
+    const WambleMessageExtField *field = &msg->ext[i];
+    size_t key_len = strnlen(field->key, WAMBLE_MESSAGE_EXT_KEY_MAX);
+    if (key_len == 0 || key_len > 255)
+      continue;
+    if (field->value_type != WAMBLE_TREATMENT_VALUE_STRING &&
+        field->value_type != WAMBLE_TREATMENT_VALUE_INT &&
+        field->value_type != WAMBLE_TREATMENT_VALUE_DOUBLE &&
+        field->value_type != WAMBLE_TREATMENT_VALUE_BOOL) {
+      continue;
+    }
+
+    if (off + 1 + key_len + 1 > cap)
+      return NET_ERR_TRUNCATED;
+    dst[off++] = (uint8_t)key_len;
+    memcpy(dst + off, field->key, key_len);
+    off += key_len;
+    dst[off++] = (uint8_t)field->value_type;
+
+    if (field->value_type == WAMBLE_TREATMENT_VALUE_STRING) {
+      size_t slen =
+          strnlen(field->string_value, WAMBLE_MESSAGE_EXT_STRING_MAX - 1);
+      if (off + 2 + slen > cap)
+        return NET_ERR_TRUNCATED;
+      uint16_t sbe = htons((uint16_t)slen);
+      memcpy(dst + off, &sbe, 2);
+      off += 2;
+      if (slen) {
+        memcpy(dst + off, field->string_value, slen);
+        off += slen;
+      }
+    } else if (field->value_type == WAMBLE_TREATMENT_VALUE_INT) {
+      if (off + 8 > cap)
+        return NET_ERR_TRUNCATED;
+      uint64_t ibe = host_to_net64((uint64_t)field->int_value);
+      memcpy(dst + off, &ibe, 8);
+      off += 8;
+    } else if (field->value_type == WAMBLE_TREATMENT_VALUE_DOUBLE) {
+      if (off + 8 > cap)
+        return NET_ERR_TRUNCATED;
+      uint64_t bits = 0;
+      memcpy(&bits, &field->double_value, sizeof(bits));
+      bits = host_to_net64(bits);
+      memcpy(dst + off, &bits, 8);
+      off += 8;
+    } else if (field->value_type == WAMBLE_TREATMENT_VALUE_BOOL) {
+      if (off + 1 > cap)
+        return NET_ERR_TRUNCATED;
+      dst[off++] = (uint8_t)(field->bool_value ? 1 : 0);
+    }
+    written++;
+  }
+
+  if (written == 0)
+    return NET_OK;
+  dst[count_pos] = written;
+  size_t body_len = off;
+  if (off + 4 > cap)
+    return NET_ERR_TRUNCATED;
+  dst[off++] = WAMBLE_EXT_MAGIC_0;
+  dst[off++] = WAMBLE_EXT_MAGIC_1;
+  uint16_t body_be = htons((uint16_t)body_len);
+  memcpy(dst + off, &body_be, 2);
+  off += 2;
+  *out_len = off;
+  return NET_OK;
+}
+
+static NetworkStatus decode_msg_extensions(const uint8_t *payload,
+                                           size_t payload_len,
+                                           struct WambleMsg *msg,
+                                           size_t *out_base_len) {
+  if (!payload || !msg || !out_base_len)
+    return NET_ERR_INVALID;
+  msg->ext_count = 0;
+  *out_base_len = payload_len;
+  if (payload_len < 4)
+    return NET_ERR_INVALID;
+  if (payload[payload_len - 4] != WAMBLE_EXT_MAGIC_0 ||
+      payload[payload_len - 3] != WAMBLE_EXT_MAGIC_1) {
+    return NET_ERR_INVALID;
+  }
+
+  uint16_t body_be = 0;
+  memcpy(&body_be, payload + payload_len - 2, 2);
+  size_t body_len = (size_t)ntohs(body_be);
+  if (body_len < 2 || body_len > payload_len - 4)
+    return NET_ERR_INVALID;
+  size_t body_start = payload_len - 4 - body_len;
+  const uint8_t *p = payload + body_start;
+  const uint8_t *end = p + body_len;
+
+  if (p[0] != WAMBLE_EXT_VERSION)
+    return NET_ERR_INVALID;
+  uint8_t count = p[1];
+  p += 2;
+
+  uint8_t parsed = 0;
+  while (p < end && parsed < count && parsed < WAMBLE_MAX_MESSAGE_EXT_FIELDS) {
+    if ((size_t)(end - p) < 2)
+      return NET_ERR_INVALID;
+    uint8_t key_len = *p++;
+    if (key_len == 0 || (size_t)(end - p) < (size_t)key_len + 1)
+      return NET_ERR_INVALID;
+    WambleMessageExtField *field = &msg->ext[parsed];
+    memset(field, 0, sizeof(*field));
+    memcpy(field->key, p, key_len);
+    field->key[key_len] = '\0';
+    p += key_len;
+    field->value_type = (WambleTreatmentValueType)(*p++);
+
+    if (field->value_type == WAMBLE_TREATMENT_VALUE_STRING) {
+      if ((size_t)(end - p) < 2)
+        return NET_ERR_INVALID;
+      uint16_t slen_be = 0;
+      memcpy(&slen_be, p, 2);
+      p += 2;
+      size_t slen = (size_t)ntohs(slen_be);
+      if ((size_t)(end - p) < slen)
+        return NET_ERR_INVALID;
+      size_t copy = slen;
+      if (copy > WAMBLE_MESSAGE_EXT_STRING_MAX - 1)
+        copy = WAMBLE_MESSAGE_EXT_STRING_MAX - 1;
+      if (copy)
+        memcpy(field->string_value, p, copy);
+      field->string_value[copy] = '\0';
+      p += slen;
+    } else if (field->value_type == WAMBLE_TREATMENT_VALUE_INT) {
+      if ((size_t)(end - p) < 8)
+        return NET_ERR_INVALID;
+      uint64_t ibe = 0;
+      memcpy(&ibe, p, 8);
+      p += 8;
+      field->int_value = (int64_t)net_to_host64(ibe);
+    } else if (field->value_type == WAMBLE_TREATMENT_VALUE_DOUBLE) {
+      if ((size_t)(end - p) < 8)
+        return NET_ERR_INVALID;
+      uint64_t bits = 0;
+      memcpy(&bits, p, 8);
+      p += 8;
+      bits = net_to_host64(bits);
+      memcpy(&field->double_value, &bits, sizeof(bits));
+    } else if (field->value_type == WAMBLE_TREATMENT_VALUE_BOOL) {
+      if ((size_t)(end - p) < 1)
+        return NET_ERR_INVALID;
+      field->bool_value = (*p++ != 0) ? 1 : 0;
+    } else {
+      return NET_ERR_INVALID;
+    }
+    parsed++;
+  }
+
+  if (parsed != count || p != end)
+    return NET_ERR_INVALID;
+  msg->ext_count = parsed;
+  *out_base_len = body_start;
+  return NET_OK;
+}
+
 static int ctrl_supports_fragment_payload(uint8_t ctrl) {
   switch (ctrl) {
+  case WAMBLE_CTRL_SERVER_HELLO:
+  case WAMBLE_CTRL_BOARD_UPDATE:
+  case WAMBLE_CTRL_PROFILE_INFO:
+  case WAMBLE_CTRL_ERROR:
+  case WAMBLE_CTRL_SERVER_NOTIFICATION:
+  case WAMBLE_CTRL_SPECTATE_UPDATE:
+  case WAMBLE_CTRL_LOGIN_CHALLENGE:
+  case WAMBLE_CTRL_LOGIN_FAILED:
+  case WAMBLE_CTRL_PLAYER_STATS_DATA:
+  case WAMBLE_CTRL_PROFILES_LIST:
+  case WAMBLE_CTRL_LEGAL_MOVES:
+  case WAMBLE_CTRL_LEADERBOARD_DATA:
+  case WAMBLE_CTRL_PREDICTION_DATA:
   case WAMBLE_CTRL_PROFILE_TOS_DATA:
     return 1;
   default:
     return 0;
   }
+}
+
+static uint32_t next_fragment_transfer_id(void) {
+  uint32_t id = global_fragment_transfer_id++;
+  if (id == 0) {
+    global_fragment_transfer_id = 2;
+    id = 1;
+  }
+  return id;
 }
 
 static int msg_uses_fragment_payload(const struct WambleMsg *msg) {
@@ -558,26 +759,28 @@ wamble_fragment_reassembly_push(WambleFragmentReassembly *reassembly,
   return WAMBLE_FRAGMENT_REASSEMBLY_COMPLETE_BAD_HASH;
 }
 
-NetworkStatus wamble_packet_serialize(const struct WambleMsg *msg,
-                                      uint8_t *buffer, size_t buffer_capacity,
-                                      size_t *out_len, uint8_t flags) {
-  if (!buffer || buffer_capacity < WAMBLE_HEADER_SIZE)
+static NetworkStatus encode_message_payload(const struct WambleMsg *msg,
+                                            uint8_t *payload,
+                                            size_t payload_capacity,
+                                            size_t *payload_len,
+                                            int *out_has_ext) {
+  if (!msg || !payload || !payload_len)
     return NET_ERR_INVALID;
-
-  WambleHeader hdr = {0};
-  hdr.ctrl = msg->ctrl;
-  hdr.flags = flags;
-  uint8_t header_version =
-      (msg->header_version != 0) ? msg->header_version : WAMBLE_PROTO_VERSION;
-  hdr.version = header_version;
-  hdr.reserved = 0;
-  memcpy(hdr.token, msg->token, TOKEN_LENGTH);
-  hdr.board_id = host_to_net64(msg->board_id);
-  hdr.seq_num = htonl(msg->seq_num);
-
-  uint8_t payload[WAMBLE_MAX_PAYLOAD];
-  size_t payload_len = 0;
-
+  if (ctrl_supports_fragment_payload(msg->ctrl) &&
+      msg_uses_fragment_payload(msg)) {
+    if (msg->ext_count > 0)
+      return NET_ERR_INVALID;
+    size_t fragment_len = 0;
+    NetworkStatus frag_status =
+        encode_fragment_payload(msg, payload, payload_capacity, &fragment_len);
+    if (frag_status != NET_OK)
+      return frag_status;
+    *payload_len = fragment_len;
+    if (out_has_ext)
+      *out_has_ext = 0;
+    return NET_OK;
+  }
+  size_t body_len = 0;
   switch (msg->ctrl) {
   case WAMBLE_CTRL_CLIENT_HELLO:
   case WAMBLE_CTRL_ACK:
@@ -586,41 +789,44 @@ NetworkStatus wamble_packet_serialize(const struct WambleMsg *msg,
   case WAMBLE_CTRL_LOGOUT:
   case WAMBLE_CTRL_GET_PLAYER_STATS:
   case WAMBLE_CTRL_SPECTATE_STOP:
-    payload_len = 0;
+  case WAMBLE_CTRL_SPECTATE_GAME:
+    body_len = 0;
     break;
-  case WAMBLE_CTRL_GET_LEADERBOARD: {
-    uint8_t lb_type = msg->leaderboard_type ? msg->leaderboard_type
-                                            : WAMBLE_LEADERBOARD_SCORE;
-    uint8_t limit = msg->leaderboard_limit ? msg->leaderboard_limit : 10;
-    payload[0] = lb_type;
-    payload[1] = limit;
-    payload_len = 2;
+  case WAMBLE_CTRL_GET_LEADERBOARD:
+    if (payload_capacity < 2)
+      return NET_ERR_TRUNCATED;
+    payload[0] = msg->leaderboard_type ? msg->leaderboard_type
+                                       : WAMBLE_LEADERBOARD_SCORE;
+    payload[1] = msg->leaderboard_limit ? msg->leaderboard_limit : 10;
+    body_len = 2;
     break;
-  }
-  case WAMBLE_CTRL_GET_PREDICTIONS: {
+  case WAMBLE_CTRL_GET_PREDICTIONS:
+    if (payload_capacity < 2)
+      return NET_ERR_TRUNCATED;
     payload[0] = msg->prediction_depth;
     payload[1] = msg->prediction_limit;
-    payload_len = 2;
+    body_len = 2;
     break;
-  }
   case WAMBLE_CTRL_PLAYER_MOVE: {
     size_t need = 1 + (size_t)msg->uci_len;
-    if (need > WAMBLE_MAX_PAYLOAD)
+    if (need > payload_capacity)
       return NET_ERR_TRUNCATED;
     payload[0] = msg->uci_len;
-    memcpy(&payload[1], msg->uci, msg->uci_len);
-    payload_len = need;
+    if (msg->uci_len)
+      memcpy(&payload[1], msg->uci, msg->uci_len);
+    body_len = need;
     break;
   }
   case WAMBLE_CTRL_SUBMIT_PREDICTION: {
     size_t need = 1 + (size_t)msg->uci_len + 8;
-    if (need > WAMBLE_MAX_PAYLOAD)
+    if (need > payload_capacity)
       return NET_ERR_TRUNCATED;
     payload[0] = msg->uci_len;
-    memcpy(&payload[1], msg->uci, msg->uci_len);
+    if (msg->uci_len)
+      memcpy(&payload[1], msg->uci, msg->uci_len);
     uint64_t parent_be = host_to_net64(msg->prediction_parent_id);
     memcpy(&payload[1 + msg->uci_len], &parent_be, 8);
-    payload_len = need;
+    body_len = need;
     break;
   }
   case WAMBLE_CTRL_SERVER_HELLO:
@@ -628,10 +834,11 @@ NetworkStatus wamble_packet_serialize(const struct WambleMsg *msg,
   case WAMBLE_CTRL_SERVER_NOTIFICATION:
   case WAMBLE_CTRL_SPECTATE_UPDATE: {
     size_t len = strnlen(msg->fen, FEN_MAX_LENGTH);
-    if (len > WAMBLE_MAX_PAYLOAD)
+    if (len > payload_capacity)
       return NET_ERR_TRUNCATED;
-    memcpy(payload, msg->fen, len);
-    payload_len = len;
+    if (len)
+      memcpy(payload, msg->fen, len);
+    body_len = len;
     break;
   }
   case WAMBLE_CTRL_PROFILE_INFO: {
@@ -640,52 +847,28 @@ NetworkStatus wamble_packet_serialize(const struct WambleMsg *msg,
                      : strnlen(msg->profile_info, FEN_MAX_LENGTH);
     if (len > FEN_MAX_LENGTH - 1)
       return NET_ERR_INVALID;
-    if (len > WAMBLE_MAX_PAYLOAD)
+    if (len > payload_capacity)
       return NET_ERR_TRUNCATED;
-    memcpy(payload, msg->profile_info, len);
-    payload_len = len;
+    if (len)
+      memcpy(payload, msg->profile_info, len);
+    body_len = len;
     break;
   }
   case WAMBLE_CTRL_PROFILE_TOS_DATA: {
-    int fragmented = ctrl_supports_fragment_payload(msg->ctrl) &&
-                     msg_uses_fragment_payload(msg);
-    if (fragmented) {
-      NetworkStatus frag_status = encode_fragment_payload(
-          msg, payload, WAMBLE_MAX_PAYLOAD, &payload_len);
-      if (frag_status != NET_OK)
-        return frag_status;
-      break;
-    }
-    const char *src = msg->profile_info;
     size_t len = msg->profile_info_len
                      ? (size_t)msg->profile_info_len
                      : strnlen(msg->profile_info, FEN_MAX_LENGTH);
-    if (len > WAMBLE_MAX_PAYLOAD)
+    if (len > FEN_MAX_LENGTH - 1)
+      return NET_ERR_INVALID;
+    if (len > payload_capacity)
       return NET_ERR_TRUNCATED;
     if (len)
-      memcpy(payload, src, len);
-    payload_len = len;
+      memcpy(payload, msg->profile_info, len);
+    body_len = len;
     break;
   }
-  case WAMBLE_CTRL_GET_PROFILE_INFO: {
-    const char *name = msg->profile_name;
-    size_t name_len =
-        msg->profile_name_len
-            ? (size_t)msg->profile_name_len
-            : strnlen(msg->profile_name, PROFILE_NAME_MAX_LENGTH - 1);
-    if (name_len > 255)
-      return NET_ERR_INVALID;
-    size_t need = 1 + name_len;
-    if (need > WAMBLE_MAX_PAYLOAD)
-      return NET_ERR_TRUNCATED;
-    payload[0] = (uint8_t)name_len;
-    if (name_len)
-      memcpy(&payload[1], name, name_len);
-    payload_len = need;
-    break;
-  }
+  case WAMBLE_CTRL_GET_PROFILE_INFO:
   case WAMBLE_CTRL_GET_PROFILE_TOS: {
-    const char *name = msg->profile_name;
     size_t name_len =
         msg->profile_name_len
             ? (size_t)msg->profile_name_len
@@ -693,39 +876,38 @@ NetworkStatus wamble_packet_serialize(const struct WambleMsg *msg,
     if (name_len > 255)
       return NET_ERR_INVALID;
     size_t need = 1 + name_len;
-    if (need > WAMBLE_MAX_PAYLOAD)
+    if (need > payload_capacity)
       return NET_ERR_TRUNCATED;
     payload[0] = (uint8_t)name_len;
     if (name_len)
-      memcpy(&payload[1], name, name_len);
-    payload_len = need;
+      memcpy(&payload[1], msg->profile_name, name_len);
+    body_len = need;
     break;
   }
-  case WAMBLE_CTRL_GET_LEGAL_MOVES: {
-    size_t need = 1;
-    if (need > WAMBLE_MAX_PAYLOAD)
+  case WAMBLE_CTRL_GET_LEGAL_MOVES:
+    if (payload_capacity < 1)
       return NET_ERR_TRUNCATED;
     payload[0] = msg->move_square;
-    payload_len = need;
+    body_len = 1;
     break;
-  }
   case WAMBLE_CTRL_PROFILES_LIST: {
     size_t len = msg->profiles_list_len
                      ? (size_t)msg->profiles_list_len
                      : strnlen(msg->profiles_list, FEN_MAX_LENGTH);
     if (len > FEN_MAX_LENGTH - 1)
       return NET_ERR_INVALID;
-    if (len > WAMBLE_MAX_PAYLOAD)
+    if (len > payload_capacity)
       return NET_ERR_TRUNCATED;
-    memcpy(payload, msg->profiles_list, len);
-    payload_len = len;
+    if (len)
+      memcpy(payload, msg->profiles_list, len);
+    body_len = len;
     break;
   }
   case WAMBLE_CTRL_LEGAL_MOVES: {
     if (msg->move_count > WAMBLE_MAX_LEGAL_MOVES)
       return NET_ERR_INVALID;
     size_t need = 2 + (size_t)msg->move_count * 3;
-    if (need > WAMBLE_MAX_PAYLOAD)
+    if (need > payload_capacity)
       return NET_ERR_TRUNCATED;
     payload[0] = msg->move_square;
     payload[1] = msg->move_count;
@@ -735,89 +917,72 @@ NetworkStatus wamble_packet_serialize(const struct WambleMsg *msg,
       payload[offset++] = msg->moves[i].to;
       payload[offset++] = (uint8_t)msg->moves[i].promotion;
     }
-    payload_len = need;
+    body_len = need;
     break;
   }
-  case WAMBLE_CTRL_ERROR: {
-
+  case WAMBLE_CTRL_ERROR:
+  case WAMBLE_CTRL_LOGIN_FAILED: {
     uint16_t code_net = htons(msg->error_code);
     size_t reason_len = strnlen(msg->error_reason, FEN_MAX_LENGTH);
     if (reason_len > 255)
       reason_len = 255;
-    if (3 + reason_len > WAMBLE_MAX_PAYLOAD)
+    size_t need = 3 + reason_len;
+    if (need > payload_capacity)
       return NET_ERR_TRUNCATED;
     payload[0] = (uint8_t)(code_net >> 8);
     payload[1] = (uint8_t)(code_net & 0xFF);
     payload[2] = (uint8_t)reason_len;
     if (reason_len)
       memcpy(&payload[3], msg->error_reason, reason_len);
-    payload_len = 3 + reason_len;
-    break;
-  }
-  case WAMBLE_CTRL_SPECTATE_GAME: {
-
-    payload_len = 0;
+    body_len = need;
     break;
   }
   case WAMBLE_CTRL_LOGIN_REQUEST: {
     size_t need = WAMBLE_PUBLIC_KEY_LENGTH;
     if (msg->login_has_signature)
       need += WAMBLE_LOGIN_SIGNATURE_LENGTH;
-    if (need > WAMBLE_MAX_PAYLOAD)
+    if (need > payload_capacity)
       return NET_ERR_TRUNCATED;
     memcpy(payload, msg->login_pubkey, WAMBLE_PUBLIC_KEY_LENGTH);
     if (msg->login_has_signature) {
       memcpy(payload + WAMBLE_PUBLIC_KEY_LENGTH, msg->login_signature,
              WAMBLE_LOGIN_SIGNATURE_LENGTH);
     }
-    payload_len = need;
+    body_len = need;
     break;
   }
-  case WAMBLE_CTRL_LOGIN_CHALLENGE: {
-    memcpy(payload, msg->login_challenge, WAMBLE_LOGIN_CHALLENGE_LENGTH);
-    payload_len = WAMBLE_LOGIN_CHALLENGE_LENGTH;
-    break;
-  }
-  case WAMBLE_CTRL_PLAYER_STATS_DATA: {
-    uint64_t bits = 0;
-    memcpy(&bits, &msg->player_stats_score, sizeof(double));
-    uint64_t be = host_to_net64(bits);
-    for (int i = 0; i < 8; i++) {
-      payload[i] = (uint8_t)((be >> (8 * (7 - i))) & 0xFF);
-    }
-    uint32_t gp_be = htonl(msg->player_stats_games_played);
-    memcpy(payload + 8, &gp_be, 4);
-    uint32_t c960_be = htonl(msg->player_stats_chess960_games_played);
-    memcpy(payload + 12, &c960_be, 4);
-    payload_len = 16;
-    break;
-  }
-  case WAMBLE_CTRL_LOGIN_FAILED: {
-
-    uint16_t code_net = htons(msg->error_code);
-    size_t reason_len = strnlen(msg->error_reason, FEN_MAX_LENGTH);
-    if (reason_len > 255)
-      reason_len = 255;
-    if (3 + reason_len > WAMBLE_MAX_PAYLOAD)
+  case WAMBLE_CTRL_LOGIN_CHALLENGE:
+    if (WAMBLE_LOGIN_CHALLENGE_LENGTH > payload_capacity)
       return NET_ERR_TRUNCATED;
-    payload[0] = (uint8_t)(code_net >> 8);
-    payload[1] = (uint8_t)(code_net & 0xFF);
-    payload[2] = (uint8_t)reason_len;
-    if (reason_len)
-      memcpy(&payload[3], msg->error_reason, reason_len);
-    payload_len = 3 + reason_len;
+    memcpy(payload, msg->login_challenge, WAMBLE_LOGIN_CHALLENGE_LENGTH);
+    body_len = WAMBLE_LOGIN_CHALLENGE_LENGTH;
     break;
-  }
+  case WAMBLE_CTRL_PLAYER_STATS_DATA:
+    if (payload_capacity < 16)
+      return NET_ERR_TRUNCATED;
+    {
+      uint64_t bits = 0;
+      memcpy(&bits, &msg->player_stats_score, sizeof(double));
+      uint64_t be = host_to_net64(bits);
+      for (int i = 0; i < 8; i++) {
+        payload[i] = (uint8_t)((be >> (8 * (7 - i))) & 0xFF);
+      }
+      uint32_t gp_be = htonl(msg->player_stats_games_played);
+      memcpy(payload + 8, &gp_be, 4);
+      uint32_t c960_be = htonl(msg->player_stats_chess960_games_played);
+      memcpy(payload + 12, &c960_be, 4);
+      body_len = 16;
+    }
+    break;
   case WAMBLE_CTRL_LEADERBOARD_DATA: {
-    uint8_t lb_type = msg->leaderboard_type ? msg->leaderboard_type
-                                            : WAMBLE_LEADERBOARD_SCORE;
     uint8_t count = msg->leaderboard_count;
     if (count > WAMBLE_MAX_LEADERBOARD_ENTRIES)
       return NET_ERR_INVALID;
     size_t need = 1 + 1 + 4 + (size_t)count * 32;
-    if (need > WAMBLE_MAX_PAYLOAD)
+    if (need > payload_capacity)
       return NET_ERR_TRUNCATED;
-    payload[0] = lb_type;
+    payload[0] = msg->leaderboard_type ? msg->leaderboard_type
+                                       : WAMBLE_LEADERBOARD_SCORE;
     payload[1] = count;
     uint32_t self_rank_be = htonl(msg->leaderboard_self_rank);
     memcpy(payload + 2, &self_rank_be, 4);
@@ -844,7 +1009,7 @@ NetworkStatus wamble_packet_serialize(const struct WambleMsg *msg,
       memcpy(payload + offset, &games_be, 4);
       offset += 4;
     }
-    payload_len = need;
+    body_len = need;
     break;
   }
   case WAMBLE_CTRL_PREDICTION_DATA: {
@@ -852,7 +1017,7 @@ NetworkStatus wamble_packet_serialize(const struct WambleMsg *msg,
     if (count > WAMBLE_MAX_PREDICTION_ENTRIES)
       return NET_ERR_INVALID;
     size_t need = 1 + (size_t)count * WAMBLE_PREDICTION_ENTRY_WIRE_SIZE;
-    if (need > WAMBLE_MAX_PAYLOAD)
+    if (need > payload_capacity)
       return NET_ERR_TRUNCATED;
     payload[0] = count;
     size_t offset = 1;
@@ -880,14 +1045,106 @@ NetworkStatus wamble_packet_serialize(const struct WambleMsg *msg,
       memcpy(payload + offset, e->uci, MAX_UCI_LENGTH);
       offset += MAX_UCI_LENGTH;
     }
-    payload_len = need;
+    body_len = need;
     break;
   }
   default:
-
-    payload_len = 0;
+    body_len = 0;
     break;
   }
+
+  int has_ext = 0;
+  if (msg->ext_count > 0) {
+    if (body_len > payload_capacity)
+      return NET_ERR_TRUNCATED;
+    size_t ext_len = 0;
+    NetworkStatus ext_status = encode_msg_extensions(
+        msg, payload + body_len, payload_capacity - body_len, &ext_len);
+    if (ext_status != NET_OK)
+      return ext_status;
+    if (ext_len > 0) {
+      body_len += ext_len;
+      has_ext = 1;
+    }
+  }
+
+  *payload_len = body_len;
+  if (out_has_ext)
+    *out_has_ext = has_ext;
+  return NET_OK;
+}
+
+static NetworkStatus build_message_payload_dynamic(const struct WambleMsg *msg,
+                                                   uint8_t **out_payload,
+                                                   size_t *out_payload_len,
+                                                   int *out_has_ext) {
+  if (!msg || !out_payload || !out_payload_len)
+    return NET_ERR_INVALID;
+  *out_payload = NULL;
+  *out_payload_len = 0;
+  if (out_has_ext)
+    *out_has_ext = 0;
+
+  size_t cap = WAMBLE_MAX_PAYLOAD;
+  const size_t max_cap = 1024u * 1024u;
+  while (cap <= max_cap) {
+    uint8_t *buf = (uint8_t *)malloc(cap);
+    if (!buf)
+      return NET_ERR_IO;
+    size_t len = 0;
+    int has_ext = 0;
+    NetworkStatus st = encode_message_payload(msg, buf, cap, &len, &has_ext);
+    if (st == NET_OK) {
+      *out_payload = buf;
+      *out_payload_len = len;
+      if (out_has_ext)
+        *out_has_ext = has_ext;
+      return NET_OK;
+    }
+    free(buf);
+    if (st != NET_ERR_TRUNCATED)
+      return st;
+    if (cap == max_cap)
+      break;
+    size_t next = cap * 2u;
+    if (next < cap)
+      break;
+    cap = (next > max_cap) ? max_cap : next;
+  }
+  return NET_ERR_TRUNCATED;
+}
+
+NetworkStatus wamble_packet_serialize(const struct WambleMsg *msg,
+                                      uint8_t *buffer, size_t buffer_capacity,
+                                      size_t *out_len, uint8_t flags) {
+  if (!msg || !buffer || buffer_capacity < WAMBLE_HEADER_SIZE)
+    return NET_ERR_INVALID;
+
+  WambleHeader hdr = {0};
+  hdr.ctrl = msg->ctrl;
+  hdr.flags = (uint8_t)(flags & (uint8_t)~(WAMBLE_FLAG_EXT_PAYLOAD |
+                                           WAMBLE_FLAG_FRAGMENT_PAYLOAD));
+  uint8_t header_version =
+      (msg->header_version != 0) ? msg->header_version : WAMBLE_PROTO_VERSION;
+  hdr.version = header_version;
+  hdr.reserved = 0;
+  memcpy(hdr.token, msg->token, TOKEN_LENGTH);
+  hdr.board_id = host_to_net64(msg->board_id);
+  hdr.seq_num = htonl(msg->seq_num);
+  int uses_fragment_payload = ctrl_supports_fragment_payload(msg->ctrl) &&
+                              msg_uses_fragment_payload(msg);
+
+  uint8_t payload[WAMBLE_MAX_PAYLOAD];
+  size_t payload_len = 0;
+  int has_ext = 0;
+  NetworkStatus payload_status = encode_message_payload(
+      msg, payload, sizeof(payload), &payload_len, &has_ext);
+  if (payload_status != NET_OK)
+    return payload_status;
+  if (has_ext)
+    hdr.flags |= WAMBLE_FLAG_EXT_PAYLOAD;
+  if (uses_fragment_payload)
+    hdr.flags |= WAMBLE_FLAG_FRAGMENT_PAYLOAD;
 
   hdr.payload_len = htons((uint16_t)payload_len);
 
@@ -928,6 +1185,80 @@ NetworkStatus wamble_packet_deserialize(const uint8_t *buffer,
     *out_flags = hdr.flags;
 
   const uint8_t *payload = buffer + WAMBLE_HEADER_SIZE;
+  int has_ext_payload = (hdr.flags & WAMBLE_FLAG_EXT_PAYLOAD) != 0;
+  int has_fragment_payload = (hdr.flags & WAMBLE_FLAG_FRAGMENT_PAYLOAD) != 0;
+  if (has_ext_payload && has_fragment_payload)
+    return NET_ERR_INVALID;
+  if (has_ext_payload) {
+    size_t base_len = 0;
+    NetworkStatus ext_status =
+        decode_msg_extensions(payload, payload_len, msg, &base_len);
+    if (ext_status != NET_OK)
+      return ext_status;
+    payload_len = base_len;
+  } else {
+    msg->ext_count = 0;
+  }
+
+  int is_fragmented = 0;
+  if (has_fragment_payload) {
+    if (!ctrl_supports_fragment_payload(hdr.ctrl))
+      return NET_ERR_INVALID;
+    NetworkStatus frag_status =
+        decode_fragment_payload(payload, payload_len, msg, &is_fragmented);
+    if (frag_status != NET_OK)
+      return frag_status;
+    if (!is_fragmented)
+      return NET_ERR_INVALID;
+    if (is_fragmented) {
+      size_t preview_copy = msg->fragment_data_len;
+      if (preview_copy > FEN_MAX_LENGTH - 1)
+        preview_copy = FEN_MAX_LENGTH - 1;
+      switch (hdr.ctrl) {
+      case WAMBLE_CTRL_SERVER_HELLO:
+      case WAMBLE_CTRL_BOARD_UPDATE:
+      case WAMBLE_CTRL_SERVER_NOTIFICATION:
+      case WAMBLE_CTRL_SPECTATE_UPDATE:
+        if (preview_copy)
+          memcpy(msg->fen, msg->fragment_data, preview_copy);
+        msg->fen[preview_copy] = '\0';
+        break;
+      case WAMBLE_CTRL_PROFILE_INFO:
+      case WAMBLE_CTRL_PROFILE_TOS_DATA:
+        if (preview_copy)
+          memcpy(msg->profile_info, msg->fragment_data, preview_copy);
+        msg->profile_info[preview_copy] = '\0';
+        msg->profile_info_len = (uint16_t)preview_copy;
+        break;
+      case WAMBLE_CTRL_PROFILES_LIST:
+        if (preview_copy)
+          memcpy(msg->profiles_list, msg->fragment_data, preview_copy);
+        msg->profiles_list[preview_copy] = '\0';
+        msg->profiles_list_len = (uint16_t)preview_copy;
+        break;
+      case WAMBLE_CTRL_ERROR:
+      case WAMBLE_CTRL_LOGIN_FAILED:
+        if (msg->fragment_chunk_index == 0 && msg->fragment_data_len >= 3) {
+          uint16_t code_net =
+              (uint16_t)((msg->fragment_data[0] << 8) | msg->fragment_data[1]);
+          msg->error_code = ntohs(code_net);
+          uint8_t reason_len = msg->fragment_data[2];
+          size_t available = (size_t)msg->fragment_data_len - 3;
+          if ((size_t)reason_len > available)
+            reason_len = (uint8_t)available;
+          size_t reason_copy =
+              reason_len < FEN_MAX_LENGTH - 1 ? reason_len : FEN_MAX_LENGTH - 1;
+          if (reason_copy)
+            memcpy(msg->error_reason, msg->fragment_data + 3, reason_copy);
+          msg->error_reason[reason_copy] = '\0';
+        }
+        break;
+      default:
+        break;
+      }
+      return NET_OK;
+    }
+  }
 
   switch (hdr.ctrl) {
   case WAMBLE_CTRL_CLIENT_HELLO:
@@ -1037,23 +1368,6 @@ NetworkStatus wamble_packet_deserialize(const uint8_t *buffer,
     break;
   }
   case WAMBLE_CTRL_PROFILE_TOS_DATA: {
-    int is_fragmented = 0;
-    if (ctrl_supports_fragment_payload(hdr.ctrl)) {
-      NetworkStatus frag_status =
-          decode_fragment_payload(payload, payload_len, msg, &is_fragmented);
-      if (frag_status != NET_OK)
-        return frag_status;
-    }
-    if (is_fragmented) {
-      size_t info_copy = msg->fragment_data_len;
-      if (info_copy > FEN_MAX_LENGTH - 1)
-        info_copy = FEN_MAX_LENGTH - 1;
-      if (info_copy)
-        memcpy(msg->profile_info, msg->fragment_data, info_copy);
-      msg->profile_info[info_copy] = '\0';
-      msg->profile_info_len = (uint16_t)info_copy;
-      break;
-    }
     if (payload_len > WAMBLE_FRAGMENT_DATA_MAX)
       return NET_ERR_TRUNCATED;
     if (payload_len)
@@ -1549,9 +1863,152 @@ void send_ack(wamble_socket_t sockfd, const struct WambleMsg *msg,
 #endif
 }
 
+static int send_fragmented_reliable_payload(wamble_socket_t sockfd,
+                                            const struct WambleMsg *source_msg,
+                                            const struct sockaddr_in *cliaddr,
+                                            int timeout_ms, int max_retries) {
+  if (!source_msg || !cliaddr || msg_uses_fragment_payload(source_msg) ||
+      !ctrl_supports_fragment_payload(source_msg->ctrl) ||
+      WAMBLE_FRAGMENT_DATA_MAX == 0) {
+    return -1;
+  }
+
+  uint8_t *full_payload = NULL;
+  size_t full_len = 0;
+  NetworkStatus st =
+      build_message_payload_dynamic(source_msg, &full_payload, &full_len, NULL);
+  if (st != NET_OK)
+    return -1;
+  if (full_len <= WAMBLE_MAX_PAYLOAD || full_len > UINT32_MAX) {
+    free(full_payload);
+    return -1;
+  }
+
+  size_t chunk_size = (size_t)WAMBLE_FRAGMENT_DATA_MAX;
+  size_t needed_chunks = (full_len + chunk_size - 1u) / chunk_size;
+  if (needed_chunks == 0 || needed_chunks > UINT16_MAX) {
+    free(full_payload);
+    return -1;
+  }
+
+  uint8_t payload_hash[WAMBLE_FRAGMENT_HASH_LENGTH] = {0};
+  crypto_blake2b(payload_hash, WAMBLE_FRAGMENT_HASH_LENGTH, full_payload,
+                 full_len);
+  uint32_t transfer_id = next_fragment_transfer_id();
+  uint16_t chunk_count = (uint16_t)needed_chunks;
+
+  for (uint16_t chunk_index = 0; chunk_index < chunk_count; chunk_index++) {
+    size_t offset = (size_t)chunk_index * chunk_size;
+    size_t chunk_len = full_len - offset;
+    if (chunk_len > chunk_size)
+      chunk_len = chunk_size;
+
+    struct WambleMsg fragment = {0};
+    fragment.ctrl = source_msg->ctrl;
+    fragment.flags =
+        (uint8_t)(source_msg->flags & (uint8_t)~(WAMBLE_FLAG_EXT_PAYLOAD |
+                                                 WAMBLE_FLAG_FRAGMENT_PAYLOAD));
+    fragment.header_version = source_msg->header_version;
+    memcpy(fragment.token, source_msg->token, TOKEN_LENGTH);
+    fragment.board_id = source_msg->board_id;
+    fragment.fragment_version = WAMBLE_FRAGMENT_VERSION;
+    fragment.fragment_hash_algo = WAMBLE_FRAGMENT_HASH_BLAKE2B_256;
+    fragment.fragment_chunk_index = chunk_index;
+    fragment.fragment_chunk_count = chunk_count;
+    fragment.fragment_total_len = (uint32_t)full_len;
+    fragment.fragment_transfer_id = transfer_id;
+    memcpy(fragment.fragment_hash, payload_hash, WAMBLE_FRAGMENT_HASH_LENGTH);
+    fragment.fragment_data_len = (uint16_t)chunk_len;
+    if (chunk_len) {
+      memcpy(fragment.fragment_data, full_payload + offset, chunk_len);
+    }
+
+    if (send_reliable_message(sockfd, &fragment, cliaddr, timeout_ms,
+                              max_retries) != 0) {
+      free(full_payload);
+      return -1;
+    }
+  }
+
+  free(full_payload);
+  return 0;
+}
+
+static int
+send_fragmented_unreliable_payload(wamble_socket_t sockfd,
+                                   const struct WambleMsg *source_msg,
+                                   const struct sockaddr_in *cliaddr) {
+  if (!source_msg || !cliaddr || msg_uses_fragment_payload(source_msg) ||
+      !ctrl_supports_fragment_payload(source_msg->ctrl) ||
+      WAMBLE_FRAGMENT_DATA_MAX == 0) {
+    return -1;
+  }
+
+  uint8_t *full_payload = NULL;
+  size_t full_len = 0;
+  NetworkStatus st =
+      build_message_payload_dynamic(source_msg, &full_payload, &full_len, NULL);
+  if (st != NET_OK)
+    return -1;
+  if (full_len <= WAMBLE_MAX_PAYLOAD || full_len > UINT32_MAX) {
+    free(full_payload);
+    return -1;
+  }
+
+  size_t chunk_size = (size_t)WAMBLE_FRAGMENT_DATA_MAX;
+  size_t needed_chunks = (full_len + chunk_size - 1u) / chunk_size;
+  if (needed_chunks == 0 || needed_chunks > UINT16_MAX) {
+    free(full_payload);
+    return -1;
+  }
+
+  uint8_t payload_hash[WAMBLE_FRAGMENT_HASH_LENGTH] = {0};
+  crypto_blake2b(payload_hash, WAMBLE_FRAGMENT_HASH_LENGTH, full_payload,
+                 full_len);
+  uint32_t transfer_id = next_fragment_transfer_id();
+  uint16_t chunk_count = (uint16_t)needed_chunks;
+
+  for (uint16_t chunk_index = 0; chunk_index < chunk_count; chunk_index++) {
+    size_t offset = (size_t)chunk_index * chunk_size;
+    size_t chunk_len = full_len - offset;
+    if (chunk_len > chunk_size)
+      chunk_len = chunk_size;
+
+    struct WambleMsg fragment = {0};
+    fragment.ctrl = source_msg->ctrl;
+    fragment.flags =
+        (uint8_t)(source_msg->flags & (uint8_t)~(WAMBLE_FLAG_EXT_PAYLOAD |
+                                                 WAMBLE_FLAG_FRAGMENT_PAYLOAD));
+    fragment.header_version = source_msg->header_version;
+    memcpy(fragment.token, source_msg->token, TOKEN_LENGTH);
+    fragment.board_id = source_msg->board_id;
+    fragment.fragment_version = WAMBLE_FRAGMENT_VERSION;
+    fragment.fragment_hash_algo = WAMBLE_FRAGMENT_HASH_BLAKE2B_256;
+    fragment.fragment_chunk_index = chunk_index;
+    fragment.fragment_chunk_count = chunk_count;
+    fragment.fragment_total_len = (uint32_t)full_len;
+    fragment.fragment_transfer_id = transfer_id;
+    memcpy(fragment.fragment_hash, payload_hash, WAMBLE_FRAGMENT_HASH_LENGTH);
+    fragment.fragment_data_len = (uint16_t)chunk_len;
+    if (chunk_len) {
+      memcpy(fragment.fragment_data, full_payload + offset, chunk_len);
+    }
+
+    if (send_unreliable_packet(sockfd, &fragment, cliaddr) != 0) {
+      free(full_payload);
+      return -1;
+    }
+  }
+
+  free(full_payload);
+  return 0;
+}
+
 int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
                           const struct sockaddr_in *cliaddr, int timeout_ms,
                           int max_retries) {
+  if (!msg || !cliaddr)
+    return -1;
   if (timeout_ms <= 0)
     timeout_ms = get_config()->timeout_ms;
   if (max_retries <= 0)
@@ -1581,8 +2038,14 @@ int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
   uint8_t send_buffer[WAMBLE_MAX_PACKET_SIZE];
   size_t serialized_size = 0;
   uint8_t send_flags = reliable_msg.flags;
-  if (wamble_packet_serialize(&reliable_msg, send_buffer, sizeof(send_buffer),
-                              &serialized_size, send_flags) != NET_OK) {
+  NetworkStatus serialize_status =
+      wamble_packet_serialize(&reliable_msg, send_buffer, sizeof(send_buffer),
+                              &serialized_size, send_flags);
+  if (serialize_status != NET_OK) {
+    if (serialize_status == NET_ERR_TRUNCATED) {
+      return send_fragmented_reliable_payload(sockfd, &reliable_msg, cliaddr,
+                                              timeout_ms, max_retries);
+    }
     return -1;
   }
 
@@ -1667,8 +2130,11 @@ int send_unreliable_packet(wamble_socket_t sockfd, const struct WambleMsg *msg,
     return -1;
   uint8_t buffer[WAMBLE_MAX_PACKET_SIZE];
   size_t serialized_size = 0;
-  if (wamble_packet_serialize(msg, buffer, sizeof(buffer), &serialized_size,
-                              WAMBLE_FLAG_UNRELIABLE) != NET_OK) {
+  NetworkStatus serialize_status = wamble_packet_serialize(
+      msg, buffer, sizeof(buffer), &serialized_size, WAMBLE_FLAG_UNRELIABLE);
+  if (serialize_status != NET_OK) {
+    if (serialize_status == NET_ERR_TRUNCATED)
+      return send_fragmented_unreliable_payload(sockfd, msg, cliaddr);
     return -1;
   }
   int ws_rc = ws_gateway_queue_packet(cliaddr, buffer, serialized_size);

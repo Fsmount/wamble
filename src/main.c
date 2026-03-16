@@ -780,21 +780,22 @@ static void drain_runtime_issue_queues(void) {
   WambleRuntimeEvent ev;
   while (wamble_runtime_event_take(&ev)) {
     const char *profile_name = ev.profile[0] ? ev.profile : "default";
-    switch (ev.kind) {
-    case WAMBLE_RUNTIME_EVENT_WS_GATEWAY:
-      LOG_ERROR("WS gateway issue profile=%s status=%d", profile_name, ev.code);
+    switch (ev.status.module) {
+    case WAMBLE_RUNTIME_STATUS_WS_GATEWAY:
+      LOG_ERROR("WS gateway issue profile=%s status=%d", profile_name,
+                ev.status.code);
       break;
-    case WAMBLE_RUNTIME_EVENT_PREDICTION_MANAGER:
-      if (ev.code < 0) {
+    case WAMBLE_RUNTIME_STATUS_PREDICTION_MANAGER:
+      if (ev.status.code < 0) {
         LOG_ERROR("prediction manager issue profile=%s status=%d", profile_name,
-                  ev.code);
+                  ev.status.code);
       } else {
         LOG_WARN("prediction manager issue profile=%s status=%d", profile_name,
-                 ev.code);
+                 ev.status.code);
       }
       break;
-    case WAMBLE_RUNTIME_EVENT_TRUST_DECISION:
-      switch ((ProfileTrustDecisionStatus)ev.code) {
+    case WAMBLE_RUNTIME_STATUS_TRUST_DECISION:
+      switch ((ProfileTrustDecisionStatus)ev.status.code) {
       case PROFILE_TRUST_DECISION_ALLOWED:
         LOG_DEBUG("trust decision profile=%s status=allowed", profile_name);
         break;
@@ -807,8 +808,8 @@ static void drain_runtime_issue_queues(void) {
         break;
       }
       break;
-    case WAMBLE_RUNTIME_EVENT_PROFILE_ADMIN:
-      switch ((ProfileAdminStatus)ev.code) {
+    case WAMBLE_RUNTIME_STATUS_PROFILE_ADMIN:
+      switch ((ProfileAdminStatus)ev.status.code) {
       case PROFILE_ADMIN_STATUS_SPECTATOR_FOCUS_DISABLED_FALLBACK:
         LOG_INFO("runtime status profile=%s spectator focus fell back to "
                  "summary because focus was disabled",
@@ -829,8 +830,8 @@ static void drain_runtime_issue_queues(void) {
         break;
       }
       break;
-    case WAMBLE_RUNTIME_EVENT_SERVER_PROTOCOL:
-      switch ((ServerProtocolStatus)ev.code) {
+    case WAMBLE_RUNTIME_STATUS_SERVER_PROTOCOL:
+      switch ((ServerProtocolStatus)ev.status.code) {
       case SERVER_PROTOCOL_STATUS_FRAGMENTATION_SINGLE_PACKET:
         LOG_DEBUG("runtime status profile=%s server protocol payload served in "
                   "single packet",
@@ -925,6 +926,25 @@ static void drain_runtime_issue_queues(void) {
                  profile_name);
         break;
       case SERVER_PROTOCOL_STATUS_NONE:
+      default:
+        break;
+      }
+      break;
+    case WAMBLE_RUNTIME_STATUS_TREATMENT_AUDIT:
+      switch ((TreatmentAuditStatus)ev.status.code) {
+      case TREATMENT_AUDIT_STATUS_TREATED:
+        LOG_DEBUG("runtime treatment audit profile=%s status=treated",
+                  profile_name);
+        break;
+      case TREATMENT_AUDIT_STATUS_UNTREATED:
+        LOG_DEBUG("runtime treatment audit profile=%s status=untreated",
+                  profile_name);
+        break;
+      case TREATMENT_AUDIT_STATUS_QUERY_FAILED:
+        LOG_WARN("runtime treatment audit profile=%s status=query_failed",
+                 profile_name);
+        break;
+      case TREATMENT_AUDIT_STATUS_NONE:
       default:
         break;
       }

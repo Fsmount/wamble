@@ -385,21 +385,10 @@ static int board_assignment_apply_treatment(const WambleBoard *board,
                                             double *score) {
   if (!board || !player || !score)
     return 0;
-  WambleFact facts[7];
+  WambleFact facts[24];
   int fact_count = 0;
   memset(facts, 0, sizeof(facts));
-
-  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
-           "board.id");
-  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
-  facts[fact_count].int_value = (int64_t)board->id;
-  fact_count++;
-
-  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
-           "board.move_count");
-  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
-  facts[fact_count].int_value = board->board.fullmove_number;
-  fact_count++;
+  fact_count = wamble_collect_board_treatment_facts(board, facts, 24);
 
   snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
            "player.games_played");
@@ -412,19 +401,15 @@ static int board_assignment_apply_treatment(const WambleBoard *board,
   facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
   facts[fact_count].double_value = player->rating;
   fact_count++;
-
   snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
-           "board.is_chess960");
-  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_BOOL;
-  facts[fact_count].bool_value =
-      (board->board.game_mode == GAME_MODE_CHESS960) ? 1 : 0;
+           "player.score");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+  facts[fact_count].double_value = player->score;
   fact_count++;
-
   snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
-           "board.chess960_position_id");
-  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
-  facts[fact_count].int_value =
-      (int64_t)board->mode_params.chess960_position_id;
+           "player.prediction_score");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+  facts[fact_count].double_value = player->prediction_score;
   fact_count++;
 
   snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
@@ -433,14 +418,48 @@ static int board_assignment_apply_treatment(const WambleBoard *board,
   facts[fact_count].int_value = player->chess960_games_played;
   fact_count++;
 
+  int have_prev = 0;
+  for (int i = 0; i < TOKEN_LENGTH; i++) {
+    if (board->last_mover_token[i] != 0) {
+      have_prev = 1;
+      break;
+    }
+  }
+  if (have_prev) {
+    WamblePlayer *prev = get_player_by_token(board->last_mover_token);
+    if (prev) {
+      snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+               "previous_player.rating");
+      facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+      facts[fact_count].double_value = prev->rating;
+      fact_count++;
+
+      snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+               "previous_player.score");
+      facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+      facts[fact_count].double_value = prev->score;
+      fact_count++;
+    }
+  }
+
   WambleTreatmentAction actions[16];
   int action_count = 0;
-  if (wamble_query_resolve_treatment_actions(
-          player->token, "", "board.assignment",
-          board->last_mover_treatment_group, facts, fact_count, actions, 16,
-          &action_count) != DB_OK) {
+  DbStatus treatment_status = wamble_query_resolve_treatment_actions(
+      player->token, "", "board.assignment", board->last_mover_treatment_group,
+      facts, fact_count, actions, 16, &action_count);
+  if (treatment_status != DB_OK) {
+    WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_TREATMENT_AUDIT,
+                                          TREATMENT_AUDIT_STATUS_QUERY_FAILED};
+    wamble_runtime_event_publish_status(runtime_status,
+                                        wamble_runtime_profile_key());
     return 0;
   }
+  WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_TREATMENT_AUDIT,
+                                        action_count > 0
+                                            ? TREATMENT_AUDIT_STATUS_TREATED
+                                            : TREATMENT_AUDIT_STATUS_UNTREATED};
+  wamble_runtime_event_publish_status(runtime_status,
+                                      wamble_runtime_profile_key());
 
   int board_is_960 = (board->board.game_mode == GAME_MODE_CHESS960);
   for (int i = 0; i < action_count; i++) {
@@ -581,9 +600,11 @@ static WambleBoard *load_board_into_cache(uint64_t board_id) {
       (br.created_at > 0) ? br.created_at : wamble_now_wall();
   board->last_assignment_time = br.last_assignment_time;
   board->last_move_time = br.last_move_time;
+  board->last_move_uci[0] = '\0';
   snprintf(board->last_mover_treatment_group,
            sizeof(board->last_mover_treatment_group), "%s",
            br.last_mover_treatment_group);
+  memset(board->last_mover_token, 0, TOKEN_LENGTH);
   memset(board->reservation_player_token, 0, TOKEN_LENGTH);
   board->reservation_time = br.reservation_time;
   board->reserved_for_white = br.reserved_for_white;
@@ -656,7 +677,8 @@ static int find_cache_slot_for_board(void) {
   return -1;
 }
 
-void board_move_played(uint64_t board_id) {
+void board_move_played(uint64_t board_id, const uint8_t *player_token,
+                       const char *uci_move) {
   if (!board_manager_ready())
     return;
   wamble_mutex_lock(&board_mutex);
@@ -674,6 +696,14 @@ void board_move_played(uint64_t board_id) {
                  sizeof(board->last_mover_treatment_group), "%s",
                  assignment.group_key);
       }
+      if (player_token)
+        memcpy(board->last_mover_token, player_token, TOKEN_LENGTH);
+      if (uci_move) {
+        snprintf(board->last_move_uci, sizeof(board->last_move_uci), "%s",
+                 uci_move);
+      } else {
+        board->last_move_uci[0] = '\0';
+      }
       board->state = BOARD_STATE_ACTIVE;
       board->last_move_time = wamble_now_wall();
 
@@ -687,6 +717,14 @@ void board_move_played(uint64_t board_id) {
       board->reservation_time = 0;
       board->reserved_for_white = false;
     } else if (board->state == BOARD_STATE_ACTIVE) {
+      if (player_token)
+        memcpy(board->last_mover_token, player_token, TOKEN_LENGTH);
+      if (uci_move) {
+        snprintf(board->last_move_uci, sizeof(board->last_move_uci), "%s",
+                 uci_move);
+      } else {
+        board->last_move_uci[0] = '\0';
+      }
       board->last_move_time = wamble_now_wall();
       wamble_emit_update_board_move_meta(board->id,
                                          board->last_mover_treatment_group);
@@ -1031,7 +1069,9 @@ static int create_new_board_for_player(WamblePlayer *player) {
   parse_fen_to_bitboard(board->fen, &board->board);
   board->last_move_time = now;
   board->creation_time = now;
+  board->last_move_uci[0] = '\0';
   board->last_mover_treatment_group[0] = '\0';
+  memset(board->last_mover_token, 0, TOKEN_LENGTH);
 
   apply_reservation_to_board(board, player);
 

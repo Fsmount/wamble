@@ -255,6 +255,7 @@ Treatment Groups
   - `(treatment-context group-key hook-name key value)`
   - `(treatment-behavior group-key hook-name key value)`
   - `(treatment-meta group-key hook-name key value)`
+  - `(treatment-payload group-key ctrl-alias key value)`
 - `predicate` form:
   - `(match fact-key op value)`
 - Supported ops: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `exists`, `absent`
@@ -265,6 +266,10 @@ Treatment Groups
   - `tag`: persistent `global_identity_tags` upsert
   - `feature`, `context`, `behavior`, `meta`: hook-scoped outputs returned by
     treatment action lookup
+  - `payload`: ctrl-scoped outputs persisted and queryable server-side.
+    `ctrl-alias` accepts symbolic ctrl names (for example `prediction_data`) or
+    `*`. Runtime gameplay/view paths do not emit payload outputs directly onto
+    the client wire protocol.
 - Hook keys consumed by runtime:
   - `prediction.submit`
     - feature: `prediction.gated`
@@ -283,6 +288,12 @@ Treatment Groups
     - behavior: `board.score.multiplier`, `board.score.bonus`
   - `trust.resolve`
     - behavior: `trust.tier.set`, `trust.tier.delta`, `trust.tier.min`
+  - `<ctrl-alias>` payload scope
+    - payload: arbitrary keys with string/int/double/bool values (server-side)
+
+- Runtime fact surface:
+  - Gameplay/view treatment hooks use a fixed fact contract documented in
+    `docs/treatment_gameplay_view.txt`.
 
 Examples
 - Computed value:

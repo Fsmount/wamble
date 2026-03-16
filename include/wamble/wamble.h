@@ -785,16 +785,28 @@ typedef enum {
 } ServerStatus;
 
 typedef enum {
-  WAMBLE_RUNTIME_EVENT_WS_GATEWAY = 1,
-  WAMBLE_RUNTIME_EVENT_PREDICTION_MANAGER = 2,
-  WAMBLE_RUNTIME_EVENT_TRUST_DECISION = 3,
-  WAMBLE_RUNTIME_EVENT_PROFILE_ADMIN = 4,
-  WAMBLE_RUNTIME_EVENT_SERVER_PROTOCOL = 5,
-} WambleRuntimeEventKind;
+  WAMBLE_RUNTIME_STATUS_WS_GATEWAY = 1,
+  WAMBLE_RUNTIME_STATUS_PREDICTION_MANAGER = 2,
+  WAMBLE_RUNTIME_STATUS_TRUST_DECISION = 3,
+  WAMBLE_RUNTIME_STATUS_PROFILE_ADMIN = 4,
+  WAMBLE_RUNTIME_STATUS_SERVER_PROTOCOL = 5,
+  WAMBLE_RUNTIME_STATUS_TREATMENT_AUDIT = 6,
+} WambleRuntimeStatusModule;
+
+typedef struct WambleRuntimeStatus {
+  WambleRuntimeStatusModule module;
+  int code;
+} WambleRuntimeStatus;
+
+typedef enum {
+  TREATMENT_AUDIT_STATUS_NONE = 0,
+  TREATMENT_AUDIT_STATUS_TREATED = 1,
+  TREATMENT_AUDIT_STATUS_UNTREATED = 2,
+  TREATMENT_AUDIT_STATUS_QUERY_FAILED = 3,
+} TreatmentAuditStatus;
 
 typedef struct WambleRuntimeEvent {
-  WambleRuntimeEventKind kind;
-  int code;
+  WambleRuntimeStatus status;
   char profile[64];
 } WambleRuntimeEvent;
 
@@ -802,8 +814,8 @@ ProfileStartStatus start_profile_listeners(int *out_started);
 void stop_profile_listeners(void);
 ProfileStartStatus reconcile_profile_listeners(void);
 int profile_runtime_pump_inline(void);
-void wamble_runtime_event_publish(WambleRuntimeEventKind kind, int code,
-                                  const char *profile_name);
+void wamble_runtime_event_publish_status(WambleRuntimeStatus status,
+                                         const char *profile_name);
 int wamble_runtime_event_take(WambleRuntimeEvent *out_event);
 const char *wamble_runtime_profile_key(void);
 typedef enum {
@@ -1195,12 +1207,41 @@ typedef enum {
   BOARD_STATE_ARCHIVED
 } BoardState;
 
+static inline const char *board_state_to_str(BoardState state) {
+  switch (state) {
+  case BOARD_STATE_ACTIVE:
+    return "active";
+  case BOARD_STATE_RESERVED:
+    return "reserved";
+  case BOARD_STATE_DORMANT:
+    return "dormant";
+  case BOARD_STATE_ARCHIVED:
+    return "archived";
+  default:
+    return "unknown";
+  }
+}
+
 typedef enum {
   GAME_RESULT_IN_PROGRESS,
   GAME_RESULT_WHITE_WINS,
   GAME_RESULT_BLACK_WINS,
   GAME_RESULT_DRAW
 } GameResult;
+
+static inline const char *game_result_to_str(GameResult result) {
+  switch (result) {
+  case GAME_RESULT_WHITE_WINS:
+    return "white";
+  case GAME_RESULT_BLACK_WINS:
+    return "black";
+  case GAME_RESULT_DRAW:
+    return "draw";
+  case GAME_RESULT_IN_PROGRESS:
+  default:
+    return "in_progress";
+  }
+}
 
 typedef enum {
   MOVE_OK = 0,
@@ -1223,6 +1264,8 @@ typedef enum {
 #define WAMBLE_FLAG_BOARD_IS_960 0x01
 #define WAMBLE_FLAG_MODE_FILTER_CHESS960 0x02
 #define WAMBLE_FLAG_MODE_FILTER_STANDARD 0x04
+#define WAMBLE_FLAG_EXT_PAYLOAD 0x08
+#define WAMBLE_FLAG_FRAGMENT_PAYLOAD 0x10
 
 static inline size_t wamble_build_login_signature_message(
     uint8_t *out, size_t out_size, const uint8_t token[TOKEN_LENGTH],
@@ -1250,6 +1293,9 @@ static inline size_t wamble_build_login_signature_message(
 #define WAMBLE_MAX_LEGAL_MOVES 218
 #define WAMBLE_MAX_LEADERBOARD_ENTRIES 16
 #define WAMBLE_MAX_PREDICTION_ENTRIES 16
+#define WAMBLE_MAX_MESSAGE_EXT_FIELDS 8
+#define WAMBLE_MESSAGE_EXT_KEY_MAX 64
+#define WAMBLE_MESSAGE_EXT_STRING_MAX 256
 #define WAMBLE_LEADERBOARD_SCORE 1
 #define WAMBLE_LEADERBOARD_RATING 2
 #define WAMBLE_PREDICTION_STATUS_PENDING 0
@@ -1282,6 +1328,15 @@ typedef struct {
   uint8_t uci_len;
   char uci[MAX_UCI_LENGTH];
 } WamblePredictionEntry;
+
+typedef struct {
+  char key[WAMBLE_MESSAGE_EXT_KEY_MAX];
+  WambleTreatmentValueType value_type;
+  char string_value[WAMBLE_MESSAGE_EXT_STRING_MAX];
+  int64_t int_value;
+  double double_value;
+  int bool_value;
+} WambleMessageExtField;
 
 struct WambleMsg {
   uint8_t ctrl;
@@ -1330,6 +1385,8 @@ struct WambleMsg {
   uint8_t prediction_limit;
   uint8_t prediction_count;
   WamblePredictionEntry predictions[WAMBLE_MAX_PREDICTION_ENTRIES];
+  uint8_t ext_count;
+  WambleMessageExtField ext[WAMBLE_MAX_MESSAGE_EXT_FIELDS];
 };
 
 #define WAMBLE_DUP_WINDOW 1024
@@ -1391,6 +1448,7 @@ typedef union {
 
 typedef struct WambleBoard {
   char fen[FEN_MAX_LENGTH];
+  char last_move_uci[MAX_UCI_LENGTH];
   Board board;
   uint64_t id;
   BoardState state;
@@ -1399,6 +1457,7 @@ typedef struct WambleBoard {
   time_t creation_time;
   time_t last_assignment_time;
   char last_mover_treatment_group[128];
+  uint8_t last_mover_token[TOKEN_LENGTH];
   uint8_t reservation_player_token[TOKEN_LENGTH];
   bool reserved_for_white;
   time_t reservation_time;
@@ -1450,6 +1509,89 @@ static inline int wamble_collect_board_treatment_facts(const WambleBoard *board,
              "board.move_count");
     facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
     facts[fact_count].int_value = board->board.fullmove_number;
+    fact_count++;
+  }
+  if (fact_count < max_facts) {
+    int64_t ply = 0;
+    if (board->board.fullmove_number > 0) {
+      ply = ((int64_t)board->board.fullmove_number - 1) * 2;
+      if (board->board.turn == 'b')
+        ply += 1;
+    }
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "board.ply");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+    facts[fact_count].int_value = ply;
+    fact_count++;
+  }
+  if (fact_count < max_facts) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "board.turn");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+    snprintf(facts[fact_count].string_value,
+             sizeof(facts[fact_count].string_value), "%s",
+             (board->board.turn == 'b') ? "black" : "white");
+    fact_count++;
+  }
+  if (fact_count < max_facts) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "board.halfmove_clock");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+    facts[fact_count].int_value = board->board.halfmove_clock;
+    fact_count++;
+  }
+  if (fact_count < max_facts) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "board.castling");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+    snprintf(facts[fact_count].string_value,
+             sizeof(facts[fact_count].string_value), "%s",
+             board->board.castling);
+    fact_count++;
+  }
+  if (fact_count < max_facts) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "board.en_passant");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+    snprintf(facts[fact_count].string_value,
+             sizeof(facts[fact_count].string_value), "%s",
+             board->board.en_passant);
+    fact_count++;
+  }
+  if (fact_count < max_facts) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "board.state");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+    snprintf(facts[fact_count].string_value,
+             sizeof(facts[fact_count].string_value), "%s",
+             board_state_to_str(board->state));
+    fact_count++;
+  }
+  if (fact_count < max_facts) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "board.result");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+    snprintf(facts[fact_count].string_value,
+             sizeof(facts[fact_count].string_value), "%s",
+             game_result_to_str(board->result));
+    fact_count++;
+  }
+  if (fact_count < max_facts) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "last_move.uci");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+    snprintf(facts[fact_count].string_value,
+             sizeof(facts[fact_count].string_value), "%s",
+             board->last_move_uci);
+    fact_count++;
+  }
+  if (fact_count < max_facts) {
+    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+             "last_move.time_ms");
+    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+    facts[fact_count].int_value = (board->last_move_time > 0)
+                                      ? ((int64_t)board->last_move_time * 1000)
+                                      : 0;
     fact_count++;
   }
   if (fact_count < max_facts) {
@@ -1557,7 +1699,8 @@ typedef struct WamblePredictionView {
 void board_manager_init(void);
 void board_manager_tick(void);
 WambleBoard *find_board_for_player(WamblePlayer *player);
-void board_move_played(uint64_t board_id);
+void board_move_played(uint64_t board_id, const uint8_t *player_token,
+                       const char *uci_move);
 void board_game_completed(uint64_t board_id, GameResult result);
 bool board_is_reserved_for_player(uint64_t board_id,
                                   const uint8_t *player_token);
@@ -1612,6 +1755,9 @@ PredictionStatus prediction_collect_tree(uint64_t board_id,
                                          int trust_tier, int max_depth,
                                          WamblePredictionView *out, int max_out,
                                          int *out_count);
+int prediction_get_runtime_counts(uint64_t board_id, const uint8_t *token,
+                                  int *out_pending_count,
+                                  int *out_failed_count);
 void prediction_expire_board(uint64_t board_id);
 
 typedef enum {

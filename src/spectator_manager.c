@@ -37,6 +37,16 @@ static int spectator_current_port(void);
 static int spectator_count_for_port_locked(int owner_port);
 static int spectator_active_count_for_port_locked(int owner_port);
 
+static int token_has_any_byte(const uint8_t *token) {
+  if (!token)
+    return 0;
+  for (int i = 0; i < TOKEN_LENGTH; i++) {
+    if (token[i] != 0)
+      return 1;
+  }
+  return 0;
+}
+
 static void rebuild_summary_cache_locked(int max_to_scan) {
   if (max_to_scan <= 0) {
     summary_cache_count = 0;
@@ -111,17 +121,44 @@ static void spectator_write_visible_fen(const uint8_t *token,
   wamble_strip_fen_history(board->fen, out_fen, out_fen_size);
   if (!token)
     return;
-  WambleFact facts[5];
+  WambleFact facts[24];
   memset(facts, 0, sizeof(facts));
-  int fact_count = wamble_collect_board_treatment_facts(board, facts, 5);
+  int fact_count = wamble_collect_board_treatment_facts(board, facts, 24);
+  if (token_has_any_byte(board->last_mover_token) && fact_count + 2 <= 24) {
+    WamblePlayer *prev = get_player_by_token(board->last_mover_token);
+    if (prev) {
+      snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+               "previous_player.rating");
+      facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+      facts[fact_count].double_value = prev->rating;
+      fact_count++;
+
+      snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+               "previous_player.score");
+      facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+      facts[fact_count].double_value = prev->score;
+      fact_count++;
+    }
+  }
   WambleTreatmentAction actions[8];
   int action_count = 0;
-  if (wamble_query_resolve_treatment_actions(
-          token, wamble_runtime_profile_key(), "board.read",
-          board->last_mover_treatment_group, facts, fact_count, actions, 8,
-          &action_count) != DB_OK) {
+  DbStatus treatment_status = wamble_query_resolve_treatment_actions(
+      token, wamble_runtime_profile_key(), "board.read",
+      board->last_mover_treatment_group, facts, fact_count, actions, 8,
+      &action_count);
+  if (treatment_status != DB_OK) {
+    WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_TREATMENT_AUDIT,
+                                          TREATMENT_AUDIT_STATUS_QUERY_FAILED};
+    wamble_runtime_event_publish_status(runtime_status,
+                                        wamble_runtime_profile_key());
     return;
   }
+  WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_TREATMENT_AUDIT,
+                                        action_count > 0
+                                            ? TREATMENT_AUDIT_STATUS_TREATED
+                                            : TREATMENT_AUDIT_STATUS_UNTREATED};
+  wamble_runtime_event_publish_status(runtime_status,
+                                      wamble_runtime_profile_key());
   for (int i = 0; i < action_count; i++) {
     if (strcmp(actions[i].output_kind, "view") != 0 ||
         strcmp(actions[i].output_key, "board.fen") != 0 ||
@@ -361,10 +398,11 @@ void spectator_manager_tick(void) {
           snprintf(e->pending_notice, sizeof(e->pending_notice),
                    "focus ended; switched to summary mode (board %" PRIu64 ")",
                    e->focus_board_id);
-          wamble_runtime_event_publish(
-              WAMBLE_RUNTIME_EVENT_PROFILE_ADMIN,
-              PROFILE_ADMIN_STATUS_SPECTATOR_FOCUS_DISABLED_FALLBACK,
-              wamble_runtime_profile_key());
+          WambleRuntimeStatus runtime_status = {
+              WAMBLE_RUNTIME_STATUS_PROFILE_ADMIN,
+              PROFILE_ADMIN_STATUS_SPECTATOR_FOCUS_DISABLED_FALLBACK};
+          wamble_runtime_event_publish_status(runtime_status,
+                                              wamble_runtime_profile_key());
         }
         e->state = SPECTATOR_STATE_SUMMARY;
         e->focus_board_id = 0;
@@ -381,10 +419,11 @@ void spectator_manager_tick(void) {
                      "focused game finished; switched to summary mode "
                      "(board %" PRIu64 ")",
                      e->focus_board_id);
-            wamble_runtime_event_publish(
-                WAMBLE_RUNTIME_EVENT_PROFILE_ADMIN,
-                PROFILE_ADMIN_STATUS_SPECTATOR_BOARD_FINISHED_FALLBACK,
-                wamble_runtime_profile_key());
+            WambleRuntimeStatus runtime_status = {
+                WAMBLE_RUNTIME_STATUS_PROFILE_ADMIN,
+                PROFILE_ADMIN_STATUS_SPECTATOR_BOARD_FINISHED_FALLBACK};
+            wamble_runtime_event_publish_status(runtime_status,
+                                                wamble_runtime_profile_key());
           }
           e->state = SPECTATOR_STATE_SUMMARY;
           e->focus_board_id = 0;
@@ -412,10 +451,11 @@ void spectator_manager_tick(void) {
         e->pending_notice_board_id = e->focus_board_id;
         snprintf(e->pending_notice, sizeof(e->pending_notice),
                  "spectating stopped; max-spectators is 0");
-        wamble_runtime_event_publish(
-            WAMBLE_RUNTIME_EVENT_PROFILE_ADMIN,
-            PROFILE_ADMIN_STATUS_SPECTATOR_STOPPED_BY_ZERO_CAP,
-            wamble_runtime_profile_key());
+        WambleRuntimeStatus runtime_status = {
+            WAMBLE_RUNTIME_STATUS_PROFILE_ADMIN,
+            PROFILE_ADMIN_STATUS_SPECTATOR_STOPPED_BY_ZERO_CAP};
+        wamble_runtime_event_publish_status(runtime_status,
+                                            wamble_runtime_profile_key());
       }
       e->state = SPECTATOR_STATE_IDLE;
       e->focus_board_id = 0;

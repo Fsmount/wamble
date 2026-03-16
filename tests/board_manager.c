@@ -30,7 +30,7 @@ WAMBLE_TEST(board_move_transitions_to_active) {
   WambleBoard *b = find_board_for_player(p);
   T_ASSERT(b != NULL);
 
-  board_move_played(b->id);
+  board_move_played(b->id, NULL, NULL);
   WambleBoard *b2 = get_board_by_id(b->id);
   T_ASSERT(b2 != NULL);
   T_ASSERT_EQ_INT(b2->state, BOARD_STATE_ACTIVE);
@@ -106,7 +106,7 @@ WAMBLE_TEST(board_inactivity_timeout_transitions_to_dormant) {
   T_ASSERT(p != NULL);
   WambleBoard *b = find_board_for_player(p);
   T_ASSERT(b != NULL);
-  board_move_played(b->id);
+  board_move_played(b->id, NULL, NULL);
   WambleBoard *active = get_board_by_id(b->id);
   T_ASSERT(active != NULL);
   T_ASSERT_EQ_INT(active->state, BOARD_STATE_ACTIVE);
