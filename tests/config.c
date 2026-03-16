@@ -236,7 +236,9 @@ WAMBLE_TEST(config_treatment_groups_parse) {
       "\"8/8/8/8/8/8/8/8 w - - 0 1\")\n"
       "(treatment-predictions-from-moves \"fast-lane\" \"prediction.read\")\n"
       "(treatment-meta \"fast-lane\" \"prediction.submit\" \"note\" "
-      "\"boosted\")\n";
+      "\"boosted\")\n"
+      "(treatment-payload \"fast-lane\" \"prediction_data\" \"last_move.uci\" "
+      "(fact \"last_move.uci\"))\n";
   FILE *f = fopen(p, "w");
   T_ASSERT(f != NULL);
   fwrite(cfg, 1, strlen(cfg), f);
@@ -246,7 +248,7 @@ WAMBLE_TEST(config_treatment_groups_parse) {
   T_ASSERT_EQ_INT(config_treatment_group_count(), 2);
   T_ASSERT_EQ_INT(config_treatment_rule_count(), 1);
   T_ASSERT_EQ_INT(config_treatment_edge_count(), 2);
-  T_ASSERT_EQ_INT(config_treatment_output_count(), 7);
+  T_ASSERT_EQ_INT(config_treatment_output_count(), 8);
   {
     const WambleTreatmentGroupSpec *g = config_treatment_group_get(0);
     T_ASSERT(g != NULL);
@@ -269,6 +271,7 @@ WAMBLE_TEST(config_treatment_groups_parse) {
     int found_visible_fen = 0;
     int found_move_projection = 0;
     int found_wildcard_feature = 0;
+    int found_payload = 0;
     for (int i = 0; i < config_treatment_output_count(); i++) {
       const WambleTreatmentOutputSpec *o = config_treatment_output_get(i);
       if (!o)
@@ -289,10 +292,20 @@ WAMBLE_TEST(config_treatment_groups_parse) {
           strcmp(o->output_key, "prediction.source") == 0) {
         found_move_projection = 1;
       }
+      if (o->output_kind && o->output_key && o->hook_name &&
+          strcmp(o->output_kind, "payload") == 0 &&
+          strcmp(o->hook_name, "prediction_data") == 0 &&
+          strcmp(o->output_key, "last_move.uci") == 0 &&
+          o->value.type == WAMBLE_TREATMENT_VALUE_FACT_REF &&
+          o->value.fact_key &&
+          strcmp(o->value.fact_key, "last_move.uci") == 0) {
+        found_payload = 1;
+      }
     }
     T_ASSERT(found_wildcard_feature);
     T_ASSERT(found_visible_fen);
     T_ASSERT(found_move_projection);
+    T_ASSERT(found_payload);
   }
   return 0;
 }
@@ -931,6 +944,43 @@ WAMBLE_TEST(config_db_apply_treatment_view_rules) {
   return 0;
 }
 
+WAMBLE_TEST(config_db_apply_treatment_payload_rules) {
+  uint8_t token[TOKEN_LENGTH] = {0x51, 0x52, 0x53, 0x54, 0x55, 0x56,
+                                 0x57, 0x58, 0x59, 0x5a, 0x5b, 0x5c,
+                                 0x5d, 0x5e, 0x5f, 0x60};
+  if (config_db_prepare() != 0)
+    T_FAIL_SIMPLE("config_db_prepare failed");
+  const char *cfg_path = "build/test_treatment_payload_rules.conf";
+  const char *cfg =
+      "(def experiment-enabled 1)\n"
+      "(treatment-group \"vip\" 20)\n"
+      "(treatment-default \"vip\")\n"
+      "(treatment-payload \"vip\" \"prediction_data\" \"last_move.uci\" "
+      "(fact \"last_move.uci\"))\n";
+  T_ASSERT_EQ_INT(wamble_test_write_optional_db_config_file(cfg_path, cfg), 0);
+  T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
+  T_ASSERT_STATUS_OK(db_apply_config_treatment_rules("__default__"));
+
+  T_ASSERT(db_create_session(token, 0) > 0);
+  WambleFact facts[1] = {0};
+  snprintf(facts[0].key, sizeof(facts[0].key), "%s", "last_move.uci");
+  facts[0].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+  snprintf(facts[0].string_value, sizeof(facts[0].string_value), "%s", "e2e4");
+
+  WambleTreatmentAction actions[8];
+  int action_count = 0;
+  T_ASSERT_STATUS(db_resolve_treatment_actions(token, "", "prediction_data",
+                                               NULL, facts, 1, actions, 8,
+                                               &action_count),
+                  DB_OK);
+  T_ASSERT_EQ_INT(action_count, 1);
+  T_ASSERT_STREQ(actions[0].output_kind, "payload");
+  T_ASSERT_STREQ(actions[0].output_key, "last_move.uci");
+  T_ASSERT_EQ_INT(actions[0].value_type, WAMBLE_TREATMENT_VALUE_STRING);
+  T_ASSERT_STREQ(actions[0].string_value, "e2e4");
+  return 0;
+}
+
 WAMBLE_TEST(config_db_apply_treatment_edges_without_snapshot_revision) {
   if (config_db_prepare() != 0)
     T_FAIL_SIMPLE("config_db_prepare failed");
@@ -1261,6 +1311,7 @@ WAMBLE_TESTS_ADD_DB_FM(config_db_reapply_policy_rules_reexpands_tag_selectors,
 WAMBLE_TESTS_ADD_DB_FM(config_db_apply_treatment_rules_and_assign_session,
                        "config");
 WAMBLE_TESTS_ADD_DB_FM(config_db_apply_treatment_view_rules, "config");
+WAMBLE_TESTS_ADD_DB_FM(config_db_apply_treatment_payload_rules, "config");
 WAMBLE_TESTS_ADD_DB_FM(
     config_db_apply_treatment_edges_without_snapshot_revision, "config");
 WAMBLE_TESTS_ADD_DB_FM(config_db_treatment_reassigns_when_runtime_facts_arrive,

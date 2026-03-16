@@ -238,29 +238,106 @@ static uint64_t prediction_hash_token(const uint8_t *token) {
   return h;
 }
 
+static int prediction_pending_count_locked(uint64_t board_id);
+static int prediction_failed_count_for_locked(uint64_t board_id,
+                                              const uint8_t *token);
+
 static int prediction_treatment_feature_bool(const uint8_t *token,
                                              const WambleBoard *board,
                                              const char *key, int *out_value) {
   if (!token || !key || !out_value)
     return 0;
-  WambleFact facts[2];
+  WambleFact facts[32];
   int fact_count = 0;
   memset(facts, 0, sizeof(facts));
   if (board && board->id > 0) {
-    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
-             "board.id");
-    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
-    facts[fact_count].int_value = (int64_t)board->id;
-    fact_count++;
+    fact_count = wamble_collect_board_treatment_facts(board, facts, 32);
+
+    int have_prev = 0;
+    for (int i = 0; i < TOKEN_LENGTH; i++) {
+      if (board->last_mover_token[i] != 0) {
+        have_prev = 1;
+        break;
+      }
+    }
+    if (have_prev && fact_count + 2 <= 32) {
+      WamblePlayer *prev = get_player_by_token(board->last_mover_token);
+      if (prev) {
+        snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+                 "previous_player.rating");
+        facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+        facts[fact_count].double_value = prev->rating;
+        fact_count++;
+        snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+                 "previous_player.score");
+        facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+        facts[fact_count].double_value = prev->score;
+        fact_count++;
+      }
+    }
   }
+  if (fact_count + 5 <= 32) {
+    WamblePlayer *self = get_player_by_token(token);
+    if (self) {
+      snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+               "player.rating");
+      facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+      facts[fact_count].double_value = self->rating;
+      fact_count++;
+      snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+               "player.score");
+      facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+      facts[fact_count].double_value = self->score;
+      fact_count++;
+      snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+               "player.prediction_score");
+      facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+      facts[fact_count].double_value = self->prediction_score;
+      fact_count++;
+      snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+               "player.games_played");
+      facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+      facts[fact_count].int_value = self->games_played;
+      fact_count++;
+      snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+               "player.chess960_games_played");
+      facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+      facts[fact_count].int_value = self->chess960_games_played;
+      fact_count++;
+    }
+  }
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "failed_predictions.count");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+  facts[fact_count].int_value =
+      board ? prediction_failed_count_for_locked(board->id, token) : 0;
+  fact_count++;
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "pending_predictions.count");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+  facts[fact_count].int_value =
+      board ? prediction_pending_count_locked(board->id) : 0;
+  fact_count++;
+
   WambleTreatmentAction actions[8];
   int action_count = 0;
-  if (wamble_query_resolve_treatment_actions(
-          token, "", "prediction.submit",
-          board ? board->last_mover_treatment_group : NULL, facts, fact_count,
-          actions, 8, &action_count) != DB_OK) {
+  DbStatus treatment_status = wamble_query_resolve_treatment_actions(
+      token, "", "prediction.submit",
+      board ? board->last_mover_treatment_group : NULL, facts, fact_count,
+      actions, 8, &action_count);
+  if (treatment_status != DB_OK) {
+    WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_TREATMENT_AUDIT,
+                                          TREATMENT_AUDIT_STATUS_QUERY_FAILED};
+    wamble_runtime_event_publish_status(runtime_status,
+                                        wamble_runtime_profile_key());
     return 0;
   }
+  WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_TREATMENT_AUDIT,
+                                        action_count > 0
+                                            ? TREATMENT_AUDIT_STATUS_TREATED
+                                            : TREATMENT_AUDIT_STATUS_UNTREATED};
+  wamble_runtime_event_publish_status(runtime_status,
+                                      wamble_runtime_profile_key());
   for (int i = 0; i < action_count; i++) {
     if (strcmp(actions[i].output_kind, "feature") != 0 ||
         strcmp(actions[i].output_key, key) != 0) {
@@ -277,8 +354,6 @@ static int prediction_treatment_feature_bool(const uint8_t *token,
   }
   return 0;
 }
-
-static int prediction_pending_count_locked(uint64_t board_id);
 
 static int prediction_failed_count_for_locked(uint64_t board_id,
                                               const uint8_t *token) {
@@ -302,15 +377,11 @@ static int prediction_collect_actions(const uint8_t *token,
     *out_count = 0;
   if (!token || !hook_name || !actions || max_actions <= 0)
     return -1;
-  WambleFact facts[4];
+  WambleFact facts[32];
   int fact_count = 0;
   memset(facts, 0, sizeof(facts));
   if (board && board->id > 0) {
-    snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
-             "board.id");
-    facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
-    facts[fact_count].int_value = (int64_t)board->id;
-    fact_count++;
+    fact_count = wamble_collect_board_treatment_facts(board, facts, 32);
 
     snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
              "board.last_move");
@@ -318,9 +389,69 @@ static int prediction_collect_actions(const uint8_t *token,
     snprintf(facts[fact_count].string_value,
              sizeof(facts[fact_count].string_value), "%s", board->fen);
     fact_count++;
+
+    int have_prev = 0;
+    for (int i = 0; i < TOKEN_LENGTH; i++) {
+      if (board->last_mover_token[i] != 0) {
+        have_prev = 1;
+        break;
+      }
+    }
+    if (have_prev && fact_count + 2 <= 32) {
+      WamblePlayer *prev = get_player_by_token(board->last_mover_token);
+      if (prev) {
+        snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+                 "previous_player.rating");
+        facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+        facts[fact_count].double_value = prev->rating;
+        fact_count++;
+
+        snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+                 "previous_player.score");
+        facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+        facts[fact_count].double_value = prev->score;
+        fact_count++;
+      }
+    }
+  }
+  if (fact_count + 5 <= 32) {
+    WamblePlayer *self = get_player_by_token(token);
+    if (self) {
+      snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+               "player.rating");
+      facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+      facts[fact_count].double_value = self->rating;
+      fact_count++;
+      snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+               "player.score");
+      facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+      facts[fact_count].double_value = self->score;
+      fact_count++;
+      snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+               "player.prediction_score");
+      facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+      facts[fact_count].double_value = self->prediction_score;
+      fact_count++;
+      snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+               "player.games_played");
+      facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+      facts[fact_count].int_value = self->games_played;
+      fact_count++;
+      snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+               "player.chess960_games_played");
+      facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+      facts[fact_count].int_value = self->chess960_games_played;
+      fact_count++;
+    }
   }
   snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
            "prediction.failed_count");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+  facts[fact_count].int_value =
+      board ? prediction_failed_count_for_locked(board->id, token) : 0;
+  fact_count++;
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "failed_predictions.count");
   facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
   facts[fact_count].int_value =
       board ? prediction_failed_count_for_locked(board->id, token) : 0;
@@ -332,13 +463,52 @@ static int prediction_collect_actions(const uint8_t *token,
   facts[fact_count].int_value =
       board ? prediction_pending_count_locked(board->id) : 0;
   fact_count++;
+  snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+           "pending_predictions.count");
+  facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_INT;
+  facts[fact_count].int_value =
+      board ? prediction_pending_count_locked(board->id) : 0;
+  fact_count++;
 
-  return (wamble_query_resolve_treatment_actions(
-              token, "", hook_name,
-              board ? board->last_mover_treatment_group : NULL, facts,
-              fact_count, actions, max_actions, out_count) == DB_OK)
-             ? 0
-             : -1;
+  DbStatus treatment_status = wamble_query_resolve_treatment_actions(
+      token, "", hook_name, board ? board->last_mover_treatment_group : NULL,
+      facts, fact_count, actions, max_actions, out_count);
+  if (treatment_status != DB_OK) {
+    WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_TREATMENT_AUDIT,
+                                          TREATMENT_AUDIT_STATUS_QUERY_FAILED};
+    wamble_runtime_event_publish_status(runtime_status,
+                                        wamble_runtime_profile_key());
+    return -1;
+  }
+  WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_TREATMENT_AUDIT,
+                                        (out_count && *out_count > 0)
+                                            ? TREATMENT_AUDIT_STATUS_TREATED
+                                            : TREATMENT_AUDIT_STATUS_UNTREATED};
+  wamble_runtime_event_publish_status(runtime_status,
+                                      wamble_runtime_profile_key());
+  return 0;
+}
+
+int prediction_get_runtime_counts(uint64_t board_id, const uint8_t *token,
+                                  int *out_pending_count,
+                                  int *out_failed_count) {
+  if (out_pending_count)
+    *out_pending_count = 0;
+  if (out_failed_count)
+    *out_failed_count = 0;
+  if (board_id == 0 || !token)
+    return -1;
+  if (!g_prediction_mutex_ready)
+    return -1;
+  wamble_mutex_lock(&g_prediction_mutex);
+  int pending = prediction_pending_count_locked(board_id);
+  int failed = prediction_failed_count_for_locked(board_id, token);
+  wamble_mutex_unlock(&g_prediction_mutex);
+  if (out_pending_count)
+    *out_pending_count = pending;
+  if (out_failed_count)
+    *out_failed_count = failed;
+  return 0;
 }
 
 static int prediction_gated_allowed(const uint8_t *token,

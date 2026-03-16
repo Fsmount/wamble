@@ -35,6 +35,67 @@ Message Layout
   - `0x01` (`WAMBLE_FLAG_BOARD_IS_960`): board in this packet is Chess960.
   - `0x02` (`WAMBLE_FLAG_MODE_FILTER_CHESS960`): spectator summary filter includes Chess960 boards.
   - `0x04` (`WAMBLE_FLAG_MODE_FILTER_STANDARD`): spectator summary filter includes standard boards.
+  - `0x08` (`WAMBLE_FLAG_EXT_PAYLOAD`): this packet payload carries an
+    extension trailer (non-fragment envelope packets).
+  - `0x10` (`WAMBLE_FLAG_FRAGMENT_PAYLOAD`): payload is encoded using the
+    Fragment Payload Envelope.
+
+Extension Trailer (reserved)
+- Reserved typed key/value trailer for protocol metadata.
+- It is present only when a sender explicitly sets `WambleMsg.ext_count > 0`
+  and provides `ext[]` fields.
+- When `WAMBLE_FLAG_EXT_PAYLOAD` is set, the message payload is:
+  - `<base payload bytes>`
+  - `<extension body>`
+  - footer: `0x57 0x58 <uint16 extension_body_len_be>`
+- Extension body format (version 1):
+  - `uint8 version` (`1`)
+  - `uint8 field_count`
+  - Repeated fields:
+    - `uint8 key_len`, `char key[key_len]`
+    - `uint8 value_type` (`string=1`, `int=2`, `double=3`, `bool=4`)
+    - value:
+      - string: `uint16 str_len`, `char str[str_len]`
+      - int: `int64` big-endian
+      - double: IEEE754 `uint64` bit pattern, big-endian
+      - bool: `uint8` (`0` or `1`)
+
+Fragment Payload Envelope (version 1)
+- The sender uses this envelope when an eligible control payload does not fit
+  in a single packet (`WAMBLE_MAX_PAYLOAD` bytes).
+- Sender default for eligible controls: fragment instead of truncate.
+- Receivers only decode the fragment envelope when
+  `WAMBLE_FLAG_FRAGMENT_PAYLOAD` is set.
+- Eligible controls (exhaustive):
+  - `SERVER_HELLO`
+  - `BOARD_UPDATE`
+  - `PROFILE_INFO`
+  - `ERROR`
+  - `SERVER_NOTIFICATION`
+  - `SPECTATE_UPDATE`
+  - `LOGIN_CHALLENGE`
+  - `LOGIN_FAILED`
+  - `PLAYER_STATS_DATA`
+  - `PROFILES_LIST`
+  - `LEGAL_MOVES`
+  - `LEADERBOARD_DATA`
+  - `PREDICTION_DATA`
+  - `PROFILE_TOS_DATA`
+- Fragment wire payload format:
+  - `uint8 fragment_version` (`1`)
+  - `uint8 hash_algo` (`1` = BLAKE2b-256)
+  - `uint16 chunk_index_be`
+  - `uint16 chunk_count_be`
+  - `uint32 total_len_be`
+  - `uint32 transfer_id_be`
+  - `uint8 fragment_hash[32]` (BLAKE2b-256 over the full reassembled payload)
+  - `uint16 chunk_len_be`
+  - `uint8 chunk_bytes[chunk_len]`
+- All chunks in one transfer share `hash_algo`, `total_len_be`,
+  `transfer_id_be`, and `fragment_hash`.
+- Chunk payload max is 1154 bytes (`WAMBLE_MAX_PAYLOAD - 46`).
+- The chunk byte stream is the exact original payload byte stream (including
+  any extension trailer bytes if present).
 
 Control Codes
 - `0x01` CLIENT_HELLO (client to server): Initial connection request.
@@ -90,7 +151,7 @@ Control Codes
     - Signed proof: `uint8 public_key[32]; uint8 signature[64]`.
   - Signature message format:
     - ASCII context bytes: `"wamble.login.v1"`
-    - `uint8 protocol_version` (currently `1`)
+    - `uint8 protocol_version` (`1`)
     - `uint8 token[16]`
     - `uint8 public_key[32]`
     - `uint8 challenge[32]` (from `LOGIN_CHALLENGE`)
@@ -172,19 +233,9 @@ Control Codes
   - Same authorization rules as GET_PROFILE_INFO: profile must be discoverable
     by the requesting session's trust tier.
 - `0x1F` PROFILE_TOS_DATA (server to client): Response to GET_PROFILE_TOS.
-  - Fragmented payload format (`fragment_version = 1`):
-    - `uint8 fragment_version` (`1`)
-    - `uint8 hash_algo` (`1` = BLAKE2b-256)
-    - `uint16 chunk_index_be`
-    - `uint16 chunk_count_be`
-    - `uint32 total_len_be`
-    - `uint32 transfer_id_be`
-    - `uint8 fragment_hash[32]` (BLAKE2b-256 over full payload bytes)
-    - `uint16 chunk_len_be`
-    - `uint8 chunk_bytes[chunk_len]`
-  - All fragments for a transfer share `hash_algo`, `total_len_be`,
-    `transfer_id_be`, and `fragment_hash`.
-  - Current chunk payload max is 1154 bytes (`WAMBLE_MAX_PAYLOAD - 46`).
+  - Payload is the ToS text bytes.
+  - If payload size exceeds `WAMBLE_MAX_PAYLOAD`, sender uses the
+    Fragment Payload Envelope.
   - If the profile is not found or not accessible: `NOTFOUND;<name>`.
   - Sent reliably.
 

@@ -29,6 +29,18 @@ static WAMBLE_THREAD_LOCAL int g_login_challenge_capacity = 0;
 
 static void publish_server_protocol_status(int status_code,
                                            const char *profile_name);
+static void publish_treatment_audit_status(int status_code,
+                                           const char *profile_name);
+
+static int token_has_any_byte(const uint8_t *token) {
+  if (!token)
+    return 0;
+  for (int i = 0; i < TOKEN_LENGTH; i++) {
+    if (token[i] != 0)
+      return 1;
+  }
+  return 0;
+}
 
 static int ensure_rate_limit_entries(void) {
   int desired = get_config()->max_client_sessions;
@@ -212,8 +224,9 @@ static int resolve_profile_trust_tier(const uint8_t *token,
       trust_event = PROFILE_TRUST_DECISION_DENIED;
     }
   }
-  wamble_runtime_event_publish(WAMBLE_RUNTIME_EVENT_TRUST_DECISION, trust_event,
-                               profile_name);
+  WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_TRUST_DECISION,
+                                        trust_event};
+  wamble_runtime_event_publish_status(runtime_status, profile_name);
 
   WambleFact facts[2];
   int fact_count = 0;
@@ -234,9 +247,14 @@ static int resolve_profile_trust_tier(const uint8_t *token,
 
   WambleTreatmentAction actions[8];
   int action_count = 0;
-  if (wamble_query_resolve_treatment_actions(
-          token, profile_name ? profile_name : "", "trust.resolve", NULL, facts,
-          fact_count, actions, 8, &action_count) == DB_OK) {
+  DbStatus treatment_status = wamble_query_resolve_treatment_actions(
+      token, profile_name ? profile_name : "", "trust.resolve", NULL, facts,
+      fact_count, actions, 8, &action_count);
+  if (treatment_status == DB_OK) {
+    publish_treatment_audit_status(action_count > 0
+                                       ? TREATMENT_AUDIT_STATUS_TREATED
+                                       : TREATMENT_AUDIT_STATUS_UNTREATED,
+                                   profile_name);
     for (int i = 0; i < action_count; i++) {
       if (strcmp(actions[i].output_kind, "behavior") != 0)
         continue;
@@ -252,6 +270,9 @@ static int resolve_profile_trust_tier(const uint8_t *token,
         trust_tier = (int)actions[i].int_value;
       }
     }
+  } else {
+    publish_treatment_audit_status(TREATMENT_AUDIT_STATUS_QUERY_FAILED,
+                                   profile_name);
   }
   if (trust_tier < 0)
     trust_tier = 0;
@@ -271,17 +292,40 @@ static void write_visible_board_fen(const uint8_t *token,
   if (!token)
     return;
 
-  WambleFact facts[3];
+  WambleFact facts[24];
   memset(facts, 0, sizeof(facts));
-  int fact_count = wamble_collect_board_treatment_facts(board, facts, 3);
+  int fact_count = wamble_collect_board_treatment_facts(board, facts, 24);
+  if (token_has_any_byte(board->last_mover_token) && fact_count + 2 <= 24) {
+    WamblePlayer *prev = get_player_by_token(board->last_mover_token);
+    if (prev) {
+      snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+               "previous_player.rating");
+      facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+      facts[fact_count].double_value = prev->rating;
+      fact_count++;
+
+      snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+               "previous_player.score");
+      facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+      facts[fact_count].double_value = prev->score;
+      fact_count++;
+    }
+  }
   WambleTreatmentAction actions[8];
   int action_count = 0;
-  if (wamble_query_resolve_treatment_actions(
-          token, profile_name ? profile_name : "", "board.read",
-          board->last_mover_treatment_group, facts, fact_count, actions, 8,
-          &action_count) != DB_OK) {
+  DbStatus treatment_status = wamble_query_resolve_treatment_actions(
+      token, profile_name ? profile_name : "", "board.read",
+      board->last_mover_treatment_group, facts, fact_count, actions, 8,
+      &action_count);
+  if (treatment_status != DB_OK) {
+    publish_treatment_audit_status(TREATMENT_AUDIT_STATUS_QUERY_FAILED,
+                                   profile_name);
     return;
   }
+  publish_treatment_audit_status(action_count > 0
+                                     ? TREATMENT_AUDIT_STATUS_TREATED
+                                     : TREATMENT_AUDIT_STATUS_UNTREATED,
+                                 profile_name);
   for (int i = 0; i < action_count; i++) {
     if (strcmp(actions[i].output_kind, "view") != 0 ||
         strcmp(actions[i].output_key, "board.fen") != 0 ||
@@ -298,17 +342,40 @@ static int prediction_read_uses_move_projection(const uint8_t *token,
                                                 const WambleBoard *board) {
   if (!token || !board)
     return 0;
-  WambleFact facts[3];
+  WambleFact facts[24];
   memset(facts, 0, sizeof(facts));
-  int fact_count = wamble_collect_board_treatment_facts(board, facts, 3);
+  int fact_count = wamble_collect_board_treatment_facts(board, facts, 24);
+  if (token_has_any_byte(board->last_mover_token) && fact_count + 2 <= 24) {
+    WamblePlayer *prev = get_player_by_token(board->last_mover_token);
+    if (prev) {
+      snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+               "previous_player.rating");
+      facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+      facts[fact_count].double_value = prev->rating;
+      fact_count++;
+
+      snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+               "previous_player.score");
+      facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+      facts[fact_count].double_value = prev->score;
+      fact_count++;
+    }
+  }
   WambleTreatmentAction actions[8];
   int action_count = 0;
-  if (wamble_query_resolve_treatment_actions(
-          token, profile_name ? profile_name : "", "prediction.read",
-          board->last_mover_treatment_group, facts, fact_count, actions, 8,
-          &action_count) != DB_OK) {
+  DbStatus treatment_status = wamble_query_resolve_treatment_actions(
+      token, profile_name ? profile_name : "", "prediction.read",
+      board->last_mover_treatment_group, facts, fact_count, actions, 8,
+      &action_count);
+  if (treatment_status != DB_OK) {
+    publish_treatment_audit_status(TREATMENT_AUDIT_STATUS_QUERY_FAILED,
+                                   profile_name);
     return 0;
   }
+  publish_treatment_audit_status(action_count > 0
+                                     ? TREATMENT_AUDIT_STATUS_TREATED
+                                     : TREATMENT_AUDIT_STATUS_UNTREATED,
+                                 profile_name);
   for (int i = 0; i < action_count; i++) {
     if (strcmp(actions[i].output_kind, "view") == 0 &&
         strcmp(actions[i].output_key, "prediction.source") == 0 &&
@@ -739,7 +806,7 @@ static ServerStatus handle_player_move(wamble_socket_t sockfd,
                           board->board.fullmove_number);
   (void)prediction_resolve_move(board, uci_move);
 
-  board_move_played(board->id);
+  board_move_played(board->id, player->token, uci_move);
   board_release_reservation(board->id);
 
   if (board->result != GAME_RESULT_IN_PROGRESS) {
@@ -944,8 +1011,19 @@ static uint32_t next_fragment_transfer_id(void) {
 
 static void publish_server_protocol_status(int status_code,
                                            const char *profile_name) {
-  wamble_runtime_event_publish(
-      WAMBLE_RUNTIME_EVENT_SERVER_PROTOCOL, status_code,
+  WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_SERVER_PROTOCOL,
+                                        status_code};
+  wamble_runtime_event_publish_status(
+      runtime_status,
+      profile_name && profile_name[0] ? profile_name : "default");
+}
+
+static void publish_treatment_audit_status(int status_code,
+                                           const char *profile_name) {
+  WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_TREATMENT_AUDIT,
+                                        status_code};
+  wamble_runtime_event_publish_status(
+      runtime_status,
       profile_name && profile_name[0] ? profile_name : "default");
 }
 

@@ -179,6 +179,8 @@ static LispValue *builtin_treatment_context(struct LispEnv *env,
 static LispValue *builtin_treatment_behavior(struct LispEnv *env,
                                              LispValue *args);
 static LispValue *builtin_treatment_meta(struct LispEnv *env, LispValue *args);
+static LispValue *builtin_treatment_payload(struct LispEnv *env,
+                                            LispValue *args);
 static LispValue *builtin_treatment_visible_fen(struct LispEnv *env,
                                                 LispValue *args);
 static LispValue *builtin_treatment_predictions_from_moves(struct LispEnv *env,
@@ -1673,6 +1675,36 @@ static LispValue *builtin_treatment_meta(LispEnv *env, LispValue *args) {
   return builtin_treatment_output_record(env, args, "meta");
 }
 
+static LispValue *builtin_treatment_payload(LispEnv *env, LispValue *args) {
+  int before = g_treatment_output_count;
+  LispValue *res = builtin_treatment_output_record(env, args, "payload");
+  if (!args || args->type != LISP_VALUE_PAIR ||
+      g_treatment_output_count <= before)
+    return res;
+
+  WambleTreatmentOutputSpec *out = NULL;
+  if (g_treatment_output_count > 0)
+    out = &g_treatment_outputs[g_treatment_output_count - 1];
+  if (!out || !out->hook_name || strcmp(out->output_kind, "payload") != 0)
+    return res;
+
+  for (char *p = out->hook_name; *p; ++p) {
+    if (*p >= 'A' && *p <= 'Z')
+      *p = (char)(*p - 'A' + 'a');
+    else if (*p == '-')
+      *p = '_';
+  }
+  if (strcmp(out->hook_name, "") == 0) {
+    char *grown = (char *)realloc(out->hook_name, 2);
+    if (grown) {
+      out->hook_name = grown;
+      out->hook_name[0] = '*';
+      out->hook_name[1] = '\0';
+    }
+  }
+  return res;
+}
+
 static LispValue *builtin_treatment_visible_fen(LispEnv *env, LispValue *args) {
   return builtin_treatment_view_record(env, args, "board.fen");
 }
@@ -2101,6 +2133,7 @@ static LispEnv *build_policy_env_from_source(const char *source) {
       {"treatment-context", builtin_treatment_context},
       {"treatment-behavior", builtin_treatment_behavior},
       {"treatment-meta", builtin_treatment_meta},
+      {"treatment-payload", builtin_treatment_payload},
       {"treatment-visible-fen", builtin_treatment_visible_fen},
       {"treatment-predictions-from-moves",
        builtin_treatment_predictions_from_moves},
@@ -2312,6 +2345,7 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
       {"treatment-context", builtin_treatment_context},
       {"treatment-behavior", builtin_treatment_behavior},
       {"treatment-meta", builtin_treatment_meta},
+      {"treatment-payload", builtin_treatment_payload},
       {"treatment-visible-fen", builtin_treatment_visible_fen},
       {"treatment-predictions-from-moves",
        builtin_treatment_predictions_from_moves},
@@ -2371,19 +2405,13 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
           LispEnv *profile_env = lisp_env_create(env);
           {
             const char *unsupported[] = {
-                "policy-allow",
-                "policy-deny",
-                "treatment-group",
-                "treatment-default",
-                "treatment-assign",
-                "treatment-edge",
-                "treatment-tag",
-                "treatment-feature",
-                "treatment-context",
-                "treatment-behavior",
-                "treatment-meta",
-                "treatment-visible-fen",
-                "treatment-predictions-from-moves",
+                "policy-allow",          "policy-deny",
+                "treatment-group",       "treatment-default",
+                "treatment-assign",      "treatment-edge",
+                "treatment-tag",         "treatment-feature",
+                "treatment-context",     "treatment-behavior",
+                "treatment-meta",        "treatment-payload",
+                "treatment-visible-fen", "treatment-predictions-from-moves",
             };
             for (size_t u = 0; u < sizeof(unsupported) / sizeof(unsupported[0]);
                  u++) {

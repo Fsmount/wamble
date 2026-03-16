@@ -1,0 +1,100 @@
+Gameplay/View Treatment Surface
+===============================
+
+Transport Rule
+- Gameplay/view runtime paths do not inject treatment outputs into outbound
+  protocol packets.
+- `treatment-payload` outputs are server-side data only in gameplay/view
+  runtime paths.
+
+Shared Board Fact Set
+- The following keys are emitted by `wamble_collect_board_treatment_facts`:
+  - `board.id`
+  - `board.fen`
+  - `board.move_count`
+  - `board.ply`
+  - `board.turn`
+  - `board.halfmove_clock`
+  - `board.castling`
+  - `board.en_passant`
+  - `board.state`
+  - `board.result`
+  - `last_move.uci`
+  - `last_move.time_ms`
+  - `board.is_chess960`
+  - `board.chess960_position_id`
+
+Conditional Fact Rules
+- `previous_player.rating` and `previous_player.score` are emitted only when
+  `board.last_mover_token` is non-zero and resolves to a player.
+- `player.*` keys in prediction hooks are emitted only when
+  `get_player_by_token(token)` resolves.
+- Prediction count keys use board context when provided. Without board context,
+  those keys are emitted with value `0`.
+
+Hook-to-Facts Mapping (Exhaustive)
+- `board.assignment`
+  - Shared board fact set
+  - `player.games_played`
+  - `player.rating`
+  - `player.score`
+  - `player.prediction_score`
+  - `player.chess960_games_played`
+  - `previous_player.rating` (conditional)
+  - `previous_player.score` (conditional)
+- `board.read` (server protocol + spectator manager)
+  - Shared board fact set
+  - `previous_player.rating` (conditional)
+  - `previous_player.score` (conditional)
+- `prediction.read` (server-protocol move-projection path)
+  - Shared board fact set
+  - `previous_player.rating` (conditional)
+  - `previous_player.score` (conditional)
+- `prediction.submit` (feature gate path)
+  - Shared board fact set when board context is provided
+  - `player.rating` (conditional)
+  - `player.score` (conditional)
+  - `player.prediction_score` (conditional)
+  - `player.games_played` (conditional)
+  - `player.chess960_games_played` (conditional)
+  - `previous_player.rating` (conditional)
+  - `previous_player.score` (conditional)
+  - `failed_predictions.count`
+  - `pending_predictions.count`
+- `prediction.submit` and `prediction.read` (action-collection path)
+  - Shared board fact set when board context is provided
+  - `board.last_move`
+  - `player.rating` (conditional)
+  - `player.score` (conditional)
+  - `player.prediction_score` (conditional)
+  - `player.games_played` (conditional)
+  - `player.chess960_games_played` (conditional)
+  - `previous_player.rating` (conditional)
+  - `previous_player.score` (conditional)
+  - `prediction.failed_count`
+  - `failed_predictions.count`
+  - `prediction.pending_count`
+  - `pending_predictions.count`
+- `scoring.apply`
+  - Shared board fact set
+  - `player.white_moves`
+  - `player.black_moves`
+  - `player.rating`
+  - `player.score`
+  - `player.prediction_score`
+  - `player.games_played`
+  - `player.chess960_games_played`
+  - `previous_player.rating` (conditional)
+  - `previous_player.score` (conditional)
+- `rating.adjust`
+  - Shared board fact set
+  - `player.rating`
+  - `player.score`
+  - `player.prediction_score`
+  - `player.games_played`
+  - `player.chess960_games_played`
+  - `previous_player.rating` (conditional)
+  - `previous_player.score` (conditional)
+- `trust.resolve`
+  - `trust.tier`
+  - `profile.name` (if non-empty)

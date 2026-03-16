@@ -86,8 +86,8 @@ static void profile_runtime_set_profile_key(const char *profile_name) {
            (profile_name && profile_name[0]) ? profile_name : "__default__");
 }
 
-void wamble_runtime_event_publish(WambleRuntimeEventKind kind, int code,
-                                  const char *profile_name) {
+void wamble_runtime_event_publish_status(WambleRuntimeStatus status,
+                                         const char *profile_name) {
   ensure_mutex_init();
   wamble_mutex_lock(&g_mutex);
   if (g_runtime_event_count >= RUNTIME_EVENT_QUEUE_CAP) {
@@ -95,8 +95,7 @@ void wamble_runtime_event_publish(WambleRuntimeEventKind kind, int code,
     g_runtime_event_count--;
   }
   WambleRuntimeEvent *ev = &g_runtime_event_queue[g_runtime_event_tail];
-  ev->kind = kind;
-  ev->code = code;
+  ev->status = status;
   snprintf(ev->profile, sizeof(ev->profile), "%s",
            (profile_name && profile_name[0]) ? profile_name : "default");
   g_runtime_event_tail = (g_runtime_event_tail + 1) % RUNTIME_EVENT_QUEUE_CAP;
@@ -125,14 +124,16 @@ int wamble_runtime_event_take(WambleRuntimeEvent *out_event) {
 
 static void publish_prediction_manager_status(PredictionManagerStatus status,
                                               const char *profile_name) {
-  wamble_runtime_event_publish(WAMBLE_RUNTIME_EVENT_PREDICTION_MANAGER,
-                               (int)status, profile_name);
+  WambleRuntimeStatus runtime_status = {
+      WAMBLE_RUNTIME_STATUS_PREDICTION_MANAGER, (int)status};
+  wamble_runtime_event_publish_status(runtime_status, profile_name);
 }
 
 static void publish_ws_gateway_status(WsGatewayStatus status,
                                       const char *profile_name) {
-  wamble_runtime_event_publish(WAMBLE_RUNTIME_EVENT_WS_GATEWAY, (int)status,
-                               profile_name);
+  WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_WS_GATEWAY,
+                                        (int)status};
+  wamble_runtime_event_publish_status(runtime_status, profile_name);
 }
 
 enum {

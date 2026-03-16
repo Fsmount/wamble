@@ -14,7 +14,7 @@ WAMBLE_TEST(spectator_summary_and_focus_flow) {
   WambleBoard *board = find_board_for_player(player);
   T_ASSERT(board != NULL);
   uint64_t active_id = board->id;
-  board_move_played(board->id);
+  board_move_played(board->id, NULL, NULL);
 
   struct sockaddr_in addr;
   memset(&addr, 0, sizeof(addr));
@@ -79,7 +79,7 @@ WAMBLE_TEST(spectator_visibility_and_capacity) {
   WambleBoard *board = find_board_for_player(player);
   T_ASSERT(board != NULL);
   uint64_t active_id = board->id;
-  board_move_played(board->id);
+  board_move_played(board->id, NULL, NULL);
 
   struct sockaddr_in addr;
   memset(&addr, 0, sizeof(addr));
