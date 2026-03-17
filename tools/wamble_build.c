@@ -240,13 +240,18 @@ static int is_msvc_cc(const char *cc) {
   return 0;
 }
 
+typedef struct {
+  const char *dir;
+} clean_obj_ctx;
+
 static int clean_obj_cb(const char *name, int is_dir, void *ctx) {
-  (void)ctx;
+  const clean_obj_ctx *c = (const clean_obj_ctx *)ctx;
+  const char *dir = (c && c->dir) ? c->dir : "build/obj";
   if (is_dir)
     return 0;
   if (has_suffix(name, ".o") || has_suffix(name, ".obj")) {
     char p[512];
-    snprintf(p, sizeof p, "build/obj/%s", name);
+    snprintf(p, sizeof p, "%s/%s", dir, name);
     remove(p);
   }
   return 0;
@@ -270,6 +275,8 @@ static int compile_src_cb(const char *name, int is_dir, void *vctx) {
   if (strcmp(name, "main.c") == 0)
     return 0;
   if (strcmp(name, "database.c") == 0)
+    return 0;
+  if (strcmp(name, "monocypher.c") == 0)
     return 0;
   char srcpath[512], objpath[512];
   snprintf(srcpath, sizeof(srcpath), "src/%s", name);
@@ -323,6 +330,151 @@ static int compile_src_cb(const char *name, int is_dir, void *vctx) {
     sv_push(&ccargs, "-o");
     sv_push(&ccargs, objpath);
   }
+  if (runv(NULL, ccargs.data) != 0) {
+    fprintf(stderr, "[err] failed compiling %s\n", srcpath);
+    sv_free(&ccargs);
+    c->err = 1;
+    return -1;
+  }
+  sv_free(&ccargs);
+  return 0;
+}
+
+static int compile_client_cb(const char *name, int is_dir, void *vctx) {
+  compile_ctx *c = (compile_ctx *)vctx;
+  if (is_dir)
+    return 0;
+  if (!has_suffix(name, ".c"))
+    return 0;
+
+  char srcpath[512], objpath[512];
+  snprintf(srcpath, sizeof(srcpath), "client/%s", name);
+  {
+    struct stat st;
+    if (stat(srcpath, &st) != 0 || !S_ISREG(st.st_mode))
+      return 0;
+  }
+
+  char base[256];
+  snprintf(base, sizeof(base), "%s", name);
+  {
+    size_t bl = strlen(base);
+    if (bl > 2 && base[bl - 2] == '.' && base[bl - 1] == 'c')
+      base[bl - 2] = '\0';
+  }
+  {
+    const char *objext = c->use_msvc ? ".obj" : ".o";
+    snprintf(objpath, sizeof(objpath), "build/obj_client/%s%s", base, objext);
+  }
+
+  if (!is_src_newer_than_obj(srcpath, objpath)) {
+    fprintf(stderr, "[skip] up-to-date %s\n", objpath);
+    return 0;
+  }
+
+  strvec ccargs;
+  sv_init(&ccargs);
+  sv_push(&ccargs, (char *)c->cc);
+#if defined(WAMBLE_BUILD_WINDOWS)
+  if (c->use_msvc) {
+    sv_push(&ccargs, "/nologo");
+    sv_push(&ccargs, "/O2");
+    if (c->warn)
+      sv_push(&ccargs, "/W4");
+    sv_push(&ccargs, "/Iinclude");
+    sv_push(&ccargs, "/c");
+    sv_push(&ccargs, srcpath);
+    {
+      char fo[600];
+      snprintf(fo, sizeof fo, "/Fo%s", objpath);
+      sv_push(&ccargs, fo);
+    }
+  } else
+#endif
+  {
+    sv_push(&ccargs, "-O2");
+    sv_push(&ccargs, "-std=c99");
+    sv_push(&ccargs, "-ffunction-sections");
+    sv_push(&ccargs, "-fdata-sections");
+    append_warn_flags(&ccargs, c->warn);
+    sv_push(&ccargs, "-Iinclude");
+    sv_push(&ccargs, "-c");
+    sv_push(&ccargs, srcpath);
+    sv_push(&ccargs, "-o");
+    sv_push(&ccargs, objpath);
+  }
+
+  if (runv(NULL, ccargs.data) != 0) {
+    fprintf(stderr, "[err] failed compiling %s\n", srcpath);
+    sv_free(&ccargs);
+    c->err = 1;
+    return -1;
+  }
+  sv_free(&ccargs);
+  return 0;
+}
+
+static int compile_thirdparty_cb(const char *name, int is_dir, void *vctx) {
+  compile_ctx *c = (compile_ctx *)vctx;
+  if (is_dir)
+    return 0;
+  if (!has_suffix(name, ".c"))
+    return 0;
+
+  char srcpath[512], objpath[512];
+  snprintf(srcpath, sizeof(srcpath), "thirdparty/%s", name);
+  {
+    struct stat st;
+    if (stat(srcpath, &st) != 0 || !S_ISREG(st.st_mode))
+      return 0;
+  }
+
+  char base[256];
+  snprintf(base, sizeof(base), "%s", name);
+  {
+    size_t bl = strlen(base);
+    if (bl > 2 && base[bl - 2] == '.' && base[bl - 1] == 'c')
+      base[bl - 2] = '\0';
+  }
+  {
+    const char *objext = c->use_msvc ? ".obj" : ".o";
+    snprintf(objpath, sizeof(objpath), "build/obj/%s%s", base, objext);
+  }
+
+  if (!is_src_newer_than_obj(srcpath, objpath)) {
+    fprintf(stderr, "[skip] up-to-date %s\n", objpath);
+    return 0;
+  }
+
+  strvec ccargs;
+  sv_init(&ccargs);
+  sv_push(&ccargs, (char *)c->cc);
+#if defined(WAMBLE_BUILD_WINDOWS)
+  if (c->use_msvc) {
+    sv_push(&ccargs, "/nologo");
+    sv_push(&ccargs, "/O2");
+    sv_push(&ccargs, "/Iinclude");
+    sv_push(&ccargs, "/c");
+    sv_push(&ccargs, srcpath);
+    {
+      char fo[600];
+      snprintf(fo, sizeof fo, "/Fo%s", objpath);
+      sv_push(&ccargs, fo);
+    }
+  } else
+#endif
+  {
+    sv_push(&ccargs, "-O2");
+    sv_push(&ccargs, "-std=c99");
+    sv_push(&ccargs, "-ffunction-sections");
+    sv_push(&ccargs, "-fdata-sections");
+    sv_push(&ccargs, "-Iinclude");
+    sv_push(&ccargs, "-c");
+    sv_push(&ccargs, srcpath);
+    sv_push(&ccargs, "-o");
+    sv_push(&ccargs, objpath);
+  }
+
   if (runv(NULL, ccargs.data) != 0) {
     fprintf(stderr, "[err] failed compiling %s\n", srcpath);
     sv_free(&ccargs);
@@ -389,6 +541,8 @@ static int compile_objects_to_lib(const char *cc, int with_db, int warn,
 
   if (iterate_dir("src", compile_src_cb, &ctx) != 0 || ctx.err)
     return -1;
+  if (iterate_dir("thirdparty", compile_thirdparty_cb, &ctx) != 0 || ctx.err)
+    return -1;
 
   if (!ctx.use_msvc) {
     strvec ar;
@@ -404,6 +558,42 @@ static int compile_objects_to_lib(const char *cc, int with_db, int warn,
     }
     if (runv(NULL, ar.data) != 0) {
       fprintf(stderr, "[err] failed to archive build/libwamble.a\n");
+      sv_free(&ar);
+      return -1;
+    }
+    sv_free(&ar);
+  }
+  return 0;
+}
+
+static int compile_client_objects_to_lib(const char *cc, int warn) {
+  compile_ctx ctx;
+  ctx.cc = cc;
+  ctx.warn = warn;
+  ctx.use_msvc = is_msvc_cc(cc);
+  ctx.err = 0;
+  ctx.with_db = 1;
+  ctx.test_mode = 0;
+
+  if (iterate_dir("client", compile_client_cb, &ctx) != 0 || ctx.err)
+    return -1;
+
+  if (!ctx.use_msvc) {
+    strvec ar;
+    sv_init(&ar);
+    sv_push(&ar, "ar");
+    sv_push(&ar, "rcs");
+    sv_push(&ar, "build/libwamble_client.a");
+    {
+      collect_ctx cc2 = {&ar, "build/obj_client/", ".o"};
+      if (iterate_dir("build/obj_client", collect_with_suffix_cb, &cc2) != 0) {
+        perror("iterate_dir build/obj_client");
+        sv_free(&ar);
+        return -1;
+      }
+    }
+    if (runv(NULL, ar.data) != 0) {
+      fprintf(stderr, "[err] failed to archive build/libwamble_client.a\n");
       sv_free(&ar);
       return -1;
     }
@@ -495,16 +685,21 @@ int main(int argc, char **argv) {
   }
 
   if (clean) {
+    clean_obj_ctx obj_ctx = {"build/obj"};
+    clean_obj_ctx client_obj_ctx = {"build/obj_client"};
     remove("build/libwamble.a");
     remove("build/libwamble.lib");
+    remove("build/libwamble_client.a");
     remove("build/wamble");
     remove("build/wamble.exe");
     remove("build/tests/wamble_tests");
     remove("build/tests/wamble_tests.exe");
-    iterate_dir("build/obj", clean_obj_cb, NULL);
+    iterate_dir("build/obj", clean_obj_cb, &obj_ctx);
+    iterate_dir("build/obj_client", clean_obj_cb, &client_obj_ctx);
   }
   if (ensure_dir("build") || ensure_dir("build/obj") ||
-      ensure_dir("build/tests"))
+      ensure_dir("build/obj_client") || ensure_dir("build/tests") ||
+      ensure_dir("thirdparty"))
     return 1;
 
   {
@@ -536,7 +731,8 @@ int main(int argc, char **argv) {
       }
       char cur_mode = test_mode ? '1' : '0';
       if (prev_mode != cur_mode) {
-        iterate_dir("build/obj", clean_obj_cb, NULL);
+        clean_obj_ctx obj_ctx = {"build/obj"};
+        iterate_dir("build/obj", clean_obj_cb, &obj_ctx);
       }
       f = fopen("build/.testmode", "wb");
       if (f) {
@@ -545,6 +741,8 @@ int main(int argc, char **argv) {
       }
     }
     if (compile_objects_to_lib(cc, with_db, warn, test_mode) != 0)
+      return 1;
+    if (compile_client_objects_to_lib(cc, warn) != 0)
       return 1;
   }
 
@@ -568,6 +766,8 @@ int main(int argc, char **argv) {
         sv_push(&link_args, "src/database.c");
       collect_ctx lctx = {&link_args, "build/obj/", ".obj"};
       iterate_dir("build/obj", collect_with_suffix_cb, &lctx);
+      collect_ctx lctx_client = {&link_args, "build/obj_client/", ".obj"};
+      iterate_dir("build/obj_client", collect_with_suffix_cb, &lctx_client);
       sv_push(&link_args, "Ws2_32.lib");
       sv_push(&link_args, "Bcrypt.lib");
       if (with_db)
@@ -585,6 +785,7 @@ int main(int argc, char **argv) {
       sv_push(&link_args, "src/main.c");
       sv_push(&link_args, "src/database.c");
       sv_push(&link_args, "build/libwamble.a");
+      sv_push(&link_args, "build/libwamble_client.a");
       sv_push(&link_args, "-lm");
       sv_push(&link_args, "-lpthread");
       sv_push(&link_args, "-Wl,--gc-sections");
@@ -624,10 +825,11 @@ int main(int argc, char **argv) {
         sv_push(&targs, "/DWAMBLE_ENABLE_DB");
       sv_push(&targs, "tests/common/wamble_test.c");
       sv_push(&targs, "tests/common/wamble_test_helpers.c");
-      sv_push(&targs, "tests/common/wamble_net_helpers.c");
       sv_push(&targs, "src/database.c");
       collect_ctx tcollect = {&targs, "build/obj/", ".obj"};
       iterate_dir("build/obj", collect_with_suffix_cb, &tcollect);
+      collect_ctx tcollect_client = {&targs, "build/obj_client/", ".obj"};
+      iterate_dir("build/obj_client", collect_with_suffix_cb, &tcollect_client);
       sv_push(&targs, "Ws2_32.lib");
       sv_push(&targs, "Bcrypt.lib");
       if (with_db)
@@ -649,7 +851,6 @@ int main(int argc, char **argv) {
         sv_push(&targs, "-DWAMBLE_ENABLE_DB");
       sv_push(&targs, "tests/common/wamble_test.c");
       sv_push(&targs, "tests/common/wamble_test_helpers.c");
-      sv_push(&targs, "tests/common/wamble_net_helpers.c");
       sv_push(&targs, "src/database.c");
       sv_push(&targs, "-Wl,--gc-sections");
     }
@@ -746,6 +947,7 @@ int main(int argc, char **argv) {
     if (msvc) {
     } else {
       sv_push(&targs, "build/libwamble.a");
+      sv_push(&targs, "build/libwamble_client.a");
       sv_push(&targs, "-lws2_32");
       sv_push(&targs, "-lbcrypt");
       sv_push(&targs, "-o");
@@ -753,6 +955,7 @@ int main(int argc, char **argv) {
     }
 #else
     sv_push(&targs, "build/libwamble.a");
+    sv_push(&targs, "build/libwamble_client.a");
     sv_push(&targs, "-lm");
     sv_push(&targs, "-lpthread");
     if (with_db)

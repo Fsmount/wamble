@@ -2,13 +2,6 @@
 #include "../include/wamble/wamble_db.h"
 #include <stdlib.h>
 #include <string.h>
-int receive_message_packet(const uint8_t *packet, size_t packet_len,
-                           struct WambleMsg *msg,
-                           const struct sockaddr_in *cliaddr);
-int ws_gateway_pop_packet(WambleWsGateway *gateway, uint8_t *packet,
-                          size_t packet_cap, size_t *out_packet_len,
-                          struct sockaddr_in *out_cliaddr);
-void ws_gateway_flush_outbound(WambleWsGateway *gateway);
 #if defined(_MSC_VER) && !defined(strtoull)
 #define strtoull _strtoui64
 #endif
