@@ -1,19 +1,14 @@
-#include "common/wamble_net_helpers.h"
 #include "common/wamble_test.h"
+#include "common/wamble_test_helpers.h"
 #include "wamble/wamble.h"
-NetworkStatus wamble_packet_serialize(const struct WambleMsg *msg,
-                                      uint8_t *buffer, size_t buffer_capacity,
-                                      size_t *out_len, uint8_t flags);
-NetworkStatus wamble_packet_deserialize(const uint8_t *buffer,
-                                        size_t buffer_size,
-                                        struct WambleMsg *msg,
-                                        uint8_t *out_flags);
-int ws_gateway_pop_packet(WambleWsGateway *gateway, uint8_t *packet,
-                          size_t packet_cap, size_t *out_packet_len,
-                          struct sockaddr_in *out_cliaddr);
-int ws_gateway_queue_packet(const struct sockaddr_in *cliaddr,
-                            const uint8_t *packet, size_t packet_len);
-void ws_gateway_flush_outbound(WambleWsGateway *gateway);
+#include "wamble/wamble_client.h"
+
+#if defined(WAMBLE_PLATFORM_POSIX)
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#endif
 
 static WsGatewayStatus g_last_ws_status = WS_GATEWAY_OK;
 static int g_last_ws_port = 0;
@@ -42,31 +37,69 @@ static void ws_test_teardown(void) {
   wamble_net_cleanup();
 }
 
+static int ws_alloc_port(void) {
+  wamble_socket_t sock = create_and_bind_socket(0);
+  if (sock == WAMBLE_INVALID_SOCKET)
+    return -1;
+  {
+    int port = wamble_socket_bound_port(sock);
+    wamble_close_socket(sock);
+    return port;
+  }
+}
+
 static int ws_start_gateway(int *out_port) {
   if (!out_port)
     return -1;
-  wamble_socket_t unused_udp = WAMBLE_INVALID_SOCKET;
-  int port = 0;
-  g_test_gateway = wamble_test_start_gateway(
-      &port, &unused_udp, &g_last_ws_status, &g_last_ws_port);
-  if (!g_test_gateway)
-    return -1;
-  *out_port = port;
-  return 0;
+  for (int i = 0; i < 64; i++) {
+    int port = ws_alloc_port();
+    if (port <= 0) {
+      g_last_ws_status = WS_GATEWAY_ERR_BIND;
+      g_last_ws_port = -1;
+      return -1;
+    }
+    g_last_ws_port = port;
+    g_test_gateway =
+        ws_gateway_start("test", port, 1, "/ws", 8, &g_last_ws_status);
+    if (g_test_gateway) {
+      *out_port = port;
+      return 0;
+    }
+    if (g_last_ws_status != WS_GATEWAY_ERR_BIND)
+      return -1;
+  }
+  return -1;
+}
+
+static wamble_socket_t ws_connect_loopback(int port) {
+  wamble_socket_t sock = socket(AF_INET, SOCK_STREAM, 0);
+  if (sock == WAMBLE_INVALID_SOCKET)
+    return WAMBLE_INVALID_SOCKET;
+  {
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((uint16_t)port);
+    if (connect(sock, (const struct sockaddr *)&addr, sizeof(addr)) != 0) {
+      wamble_close_socket(sock);
+      return WAMBLE_INVALID_SOCKET;
+    }
+  }
+  return sock;
 }
 
 static int ws_connect_and_upgrade(int port) {
-  wamble_socket_t c = wamble_test_ws_connect(port);
-  g_test_client = c;
+  wamble_socket_t c = ws_connect_loopback(port);
+  wamble_client_t client = {0};
   if (c == WAMBLE_INVALID_SOCKET)
     return -1;
-  if (wamble_test_ws_handshake(c, "/ws", "dGhlIHNhbXBsZSBub25jZQ==", "13") != 0)
+  if (wamble_client_upgrade_ws(&client, c, "/ws", "localhost").code !=
+      WAMBLE_CLIENT_STATUS_OK) {
+    wamble_close_socket(c);
     return -1;
-  char hresp[1024];
-  if (wamble_test_ws_recv_http(c, hresp, sizeof(hresp)) != 0)
-    return -1;
-  if (strstr(hresp, "HTTP/1.1 101") == NULL)
-    return -1;
+  }
+  g_test_client = client.sock;
   return 0;
 }
 
@@ -104,13 +137,14 @@ WAMBLE_TEST(ws_handshake_rejects_invalid_key) {
   int port = 0;
   T_ASSERT_EQ_INT(ws_start_gateway(&port), 0);
 
-  wamble_socket_t c = wamble_test_ws_connect(port);
+  wamble_socket_t c = ws_connect_loopback(port);
   g_test_client = c;
   T_ASSERT(c != WAMBLE_INVALID_SOCKET);
-  T_ASSERT_STATUS_OK(wamble_test_ws_handshake(c, "/ws", "abc", "13"));
+  T_ASSERT_CLIENT_STATUS_OK(
+      wamble_client_ws_send_handshake(c, "/ws", "localhost", "abc", "13"));
 
   char resp[1024];
-  T_ASSERT_STATUS_OK(wamble_test_ws_recv_http(c, resp, sizeof(resp)));
+  T_ASSERT_CLIENT_STATUS_OK(wamble_client_ws_recv_http(c, resp, sizeof(resp)));
   T_ASSERT(strstr(resp, "HTTP/1.1 400") != NULL);
 
   return 0;
@@ -121,14 +155,14 @@ WAMBLE_TEST(ws_handshake_wrong_version_426) {
   int port = 0;
   T_ASSERT_EQ_INT(ws_start_gateway(&port), 0);
 
-  wamble_socket_t c = wamble_test_ws_connect(port);
+  wamble_socket_t c = ws_connect_loopback(port);
   g_test_client = c;
   T_ASSERT(c != WAMBLE_INVALID_SOCKET);
-  T_ASSERT_STATUS_OK(
-      wamble_test_ws_handshake(c, "/ws", "dGhlIHNhbXBsZSBub25jZQ==", "12"));
+  T_ASSERT_CLIENT_STATUS_OK(wamble_client_ws_send_handshake(
+      c, "/ws", "localhost", "dGhlIHNhbXBsZSBub25jZQ==", "12"));
 
   char resp[1024];
-  T_ASSERT_STATUS_OK(wamble_test_ws_recv_http(c, resp, sizeof(resp)));
+  T_ASSERT_CLIENT_STATUS_OK(wamble_client_ws_recv_http(c, resp, sizeof(resp)));
   T_ASSERT(strstr(resp, "HTTP/1.1 426") != NULL);
   T_ASSERT(strstr(resp, "Sec-WebSocket-Version: 13") != NULL);
 
@@ -143,14 +177,14 @@ WAMBLE_TEST(ws_oversized_control_frame_closes_protocol_error) {
 
   uint8_t payload[126];
   memset(payload, 0xAB, sizeof(payload));
-  T_ASSERT_STATUS_OK(wamble_test_ws_send_frame(g_test_client, 0x9u, payload,
-                                               sizeof(payload), 1));
+  T_ASSERT_CLIENT_STATUS_OK(wamble_client_ws_send_frame(
+      g_test_client, 0x9u, payload, sizeof(payload), 1));
 
   uint8_t opcode = 0;
   uint8_t in[128];
   size_t in_len = 0;
-  T_ASSERT_STATUS_OK(wamble_test_ws_recv_frame(g_test_client, &opcode, in,
-                                               sizeof(in), &in_len));
+  T_ASSERT_CLIENT_STATUS_OK(wamble_client_ws_recv_frame(
+      g_test_client, &opcode, in, sizeof(in), &in_len));
   T_ASSERT_EQ_INT(opcode, 0x8);
   T_ASSERT(in_len >= 2u);
   uint16_t code = (uint16_t)(((uint16_t)in[0] << 8) | in[1]);
@@ -166,14 +200,14 @@ WAMBLE_TEST(ws_unsupported_opcode_closes_protocol_error) {
   T_ASSERT_EQ_INT(ws_connect_and_upgrade(port), 0);
 
   uint8_t payload[2] = {'h', 'i'};
-  T_ASSERT_STATUS_OK(wamble_test_ws_send_frame(g_test_client, 0x1u, payload,
-                                               sizeof(payload), 0));
+  T_ASSERT_CLIENT_STATUS_OK(wamble_client_ws_send_frame(
+      g_test_client, 0x1u, payload, sizeof(payload), 0));
 
   uint8_t opcode = 0;
   uint8_t in[128];
   size_t in_len = 0;
-  T_ASSERT_STATUS_OK(wamble_test_ws_recv_frame(g_test_client, &opcode, in,
-                                               sizeof(in), &in_len));
+  T_ASSERT_CLIENT_STATUS_OK(wamble_client_ws_recv_frame(
+      g_test_client, &opcode, in, sizeof(in), &in_len));
   T_ASSERT_EQ_INT(opcode, 0x8);
   T_ASSERT(in_len >= 2u);
   uint16_t code = (uint16_t)(((uint16_t)in[0] << 8) | in[1]);
@@ -187,7 +221,7 @@ WAMBLE_TEST(ws_binary_roundtrip_and_coalesced_first_frame) {
   int port = 0;
   T_ASSERT_EQ_INT(ws_start_gateway(&port), 0);
 
-  wamble_socket_t c = wamble_test_ws_connect(port);
+  wamble_socket_t c = ws_connect_loopback(port);
   g_test_client = c;
   T_ASSERT(c != WAMBLE_INVALID_SOCKET);
 
@@ -203,11 +237,13 @@ WAMBLE_TEST(ws_binary_roundtrip_and_coalesced_first_frame) {
                                    &first_packet_len),
                   0);
 
-  T_ASSERT_STATUS_OK(wamble_test_ws_send_handshake_with_first_frame(
-      c, "/ws", first_packet, first_packet_len));
+  T_ASSERT_CLIENT_STATUS_OK(wamble_client_ws_send_handshake_with_first_frame(
+      c, "/ws", "localhost", "dGhlIHNhbXBsZSBub25jZQ==", "13", first_packet,
+      first_packet_len));
   {
     char resp[1024];
-    T_ASSERT_STATUS_OK(wamble_test_ws_recv_http(c, resp, sizeof(resp)));
+    T_ASSERT_CLIENT_STATUS_OK(
+        wamble_client_ws_recv_http(c, resp, sizeof(resp)));
     T_ASSERT(strstr(resp, "HTTP/1.1 101") != NULL);
   }
 
@@ -237,7 +273,7 @@ WAMBLE_TEST(ws_binary_roundtrip_and_coalesced_first_frame) {
   uint8_t opcode = 0;
   uint8_t in_frame[WAMBLE_MAX_PACKET_SIZE];
   size_t in_frame_len = 0;
-  T_ASSERT_STATUS_OK(wamble_test_ws_recv_frame(
+  T_ASSERT_CLIENT_STATUS_OK(wamble_client_ws_recv_frame(
       c, &opcode, in_frame, sizeof(in_frame), &in_frame_len));
   T_ASSERT_EQ_INT(opcode, 0x2);
   T_ASSERT_EQ_INT((int)in_frame_len, (int)out_packet_len);
@@ -268,9 +304,9 @@ WAMBLE_TEST(ws_fragmented_binary_frame_reassembled) {
   if (part1_len == 0)
     part1_len = 1;
   size_t part2_len = packet_len - part1_len;
-  T_ASSERT_STATUS_OK(wamble_test_ws_send_frame_ex(g_test_client, 0u, 0x2u,
-                                                  packet, part1_len, 0));
-  T_ASSERT_STATUS_OK(wamble_test_ws_send_frame_ex(
+  T_ASSERT_CLIENT_STATUS_OK(wamble_client_ws_send_frame_ex(
+      g_test_client, 0u, 0x2u, packet, part1_len, 0));
+  T_ASSERT_CLIENT_STATUS_OK(wamble_client_ws_send_frame_ex(
       g_test_client, 1u, 0x0u, packet + part1_len, part2_len, 0));
 
   uint8_t queued[WAMBLE_MAX_PACKET_SIZE];
@@ -302,7 +338,7 @@ WAMBLE_TEST(ws_reliable_send_skips_ack_retry_for_ws) {
   T_ASSERT_EQ_INT(ws_serialize_msg(&bootstrap, 0, bootstrap_packet,
                                    sizeof(bootstrap_packet), &bootstrap_len),
                   0);
-  T_ASSERT_STATUS_OK(wamble_test_ws_send_frame(
+  T_ASSERT_CLIENT_STATUS_OK(wamble_client_ws_send_frame(
       g_test_client, 0x2u, bootstrap_packet, bootstrap_len, 0));
 
   uint8_t queued[WAMBLE_MAX_PACKET_SIZE];
@@ -328,8 +364,8 @@ WAMBLE_TEST(ws_reliable_send_skips_ack_retry_for_ws) {
   uint8_t opcode = 0;
   uint8_t frame[WAMBLE_MAX_PACKET_SIZE];
   size_t frame_len = 0;
-  T_ASSERT_STATUS_OK(wamble_test_ws_recv_frame(g_test_client, &opcode, frame,
-                                               sizeof(frame), &frame_len));
+  T_ASSERT_CLIENT_STATUS_OK(wamble_client_ws_recv_frame(
+      g_test_client, &opcode, frame, sizeof(frame), &frame_len));
   T_ASSERT_EQ_INT(opcode, 0x2);
 
   struct WambleMsg decoded = {0};
@@ -358,7 +394,7 @@ WAMBLE_TEST(ws_outbound_batches_multiple_packets_per_frame) {
   T_ASSERT_EQ_INT(ws_serialize_msg(&bootstrap, 0, bootstrap_packet,
                                    sizeof(bootstrap_packet), &bootstrap_len),
                   0);
-  T_ASSERT_STATUS_OK(wamble_test_ws_send_frame(
+  T_ASSERT_CLIENT_STATUS_OK(wamble_client_ws_send_frame(
       g_test_client, 0x2u, bootstrap_packet, bootstrap_len, 0));
 
   uint8_t queued[WAMBLE_MAX_PACKET_SIZE];
@@ -388,8 +424,8 @@ WAMBLE_TEST(ws_outbound_batches_multiple_packets_per_frame) {
   uint8_t opcode = 0;
   uint8_t frame[4096];
   size_t frame_len = 0;
-  T_ASSERT_STATUS_OK(wamble_test_ws_recv_frame(g_test_client, &opcode, frame,
-                                               sizeof(frame), &frame_len));
+  T_ASSERT_CLIENT_STATUS_OK(wamble_client_ws_recv_frame(
+      g_test_client, &opcode, frame, sizeof(frame), &frame_len));
   T_ASSERT_EQ_INT(opcode, 0x2);
 
   size_t p1_len = 0;

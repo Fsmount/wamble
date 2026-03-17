@@ -1,6 +1,9 @@
 #include "../include/wamble/wamble.h"
 void crypto_blake2b(uint8_t *hash, size_t hash_size, const uint8_t *msg,
                     size_t msg_size);
+int crypto_eddsa_check(const uint8_t signature[64],
+                       const uint8_t public_key[32], const uint8_t *message,
+                       size_t message_size);
 
 typedef struct {
   int used;
@@ -163,8 +166,8 @@ static int verify_login_proof(const struct WambleMsg *msg) {
   if (sign_message_len == 0)
     goto done;
 
-  verified = (wamble_ed25519_verify(msg->login_signature, msg->login_pubkey,
-                                    sign_message, sign_message_len) == 0)
+  verified = (crypto_eddsa_check(msg->login_signature, msg->login_pubkey,
+                                 sign_message, sign_message_len) == 0)
                  ? 1
                  : 0;
 

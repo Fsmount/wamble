@@ -157,6 +157,18 @@ void wamble_param_register(const char *base_name, const char *tags,
       T_FAIL("Expected status %d, but got %d for %s", _e, _s, #status);        \
   } while (0)
 
+#define T_ASSERT_CLIENT_STATUS(status_expr, expected_code)                     \
+  do {                                                                         \
+    WambleClientStatus _s = (status_expr);                                     \
+    int _e = (int)(expected_code);                                             \
+    if ((int)_s.code != _e)                                                    \
+      T_FAIL("Expected client status %d, but got %d (detail=%d) for %s", _e,   \
+             (int)_s.code, _s.detail, #status_expr);                           \
+  } while (0)
+
+#define T_ASSERT_CLIENT_STATUS_OK(status_expr)                                 \
+  T_ASSERT_CLIENT_STATUS((status_expr), WAMBLE_CLIENT_STATUS_OK)
+
 #ifdef __cplusplus
 }
 #endif

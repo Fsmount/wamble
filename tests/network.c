@@ -1,13 +1,9 @@
-#include "common/wamble_net_helpers.h"
 #include "common/wamble_test.h"
 #include "common/wamble_test_helpers.h"
 #include "wamble/wamble.h"
+#include "wamble/wamble_client.h"
 #include "wamble/wamble_db.h"
 
-void crypto_eddsa_key_pair(uint8_t secret_key[64], uint8_t public_key[32],
-                           uint8_t seed[32]);
-void crypto_eddsa_sign(uint8_t signature[64], const uint8_t secret_key[64],
-                       const uint8_t *message, size_t message_size);
 void crypto_blake2b(uint8_t *hash, size_t hash_size, const uint8_t *msg,
                     size_t msg_size);
 
@@ -2047,7 +2043,7 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
   uint8_t public_key[32] = {0};
   for (int i = 0; i < 32; i++)
     seed[i] = (uint8_t)(0x20 + i);
-  crypto_eddsa_key_pair(secret_key, public_key, seed);
+  wamble_client_keygen(seed, public_key, secret_key);
 
   struct WambleMsg challenge_req = {0};
   challenge_req.ctrl = WAMBLE_CTRL_LOGIN_REQUEST;
@@ -2064,14 +2060,10 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
   T_ASSERT_EQ_INT(rx_challenge.received, 1);
   T_ASSERT_EQ_INT(rx_challenge.msg.ctrl, WAMBLE_CTRL_LOGIN_CHALLENGE);
 
-  uint8_t sign_message[128] = {0};
-  size_t sign_message_len = wamble_build_login_signature_message(
-      sign_message, sizeof(sign_message), player->token, public_key,
-      rx_challenge.msg.login_challenge);
-  T_ASSERT(sign_message_len > 0);
-
   uint8_t bad_signature[WAMBLE_LOGIN_SIGNATURE_LENGTH] = {0};
-  crypto_eddsa_sign(bad_signature, secret_key, sign_message, sign_message_len);
+  T_ASSERT(wamble_client_sign_challenge(secret_key, player->token, public_key,
+                                        rx_challenge.msg.login_challenge,
+                                        bad_signature) == 0);
   bad_signature[0] ^= 0x80;
 
   struct WambleMsg bad_req = {0};
@@ -2102,11 +2094,9 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
   T_ASSERT_EQ_INT(rx_challenge_2.msg.ctrl, WAMBLE_CTRL_LOGIN_CHALLENGE);
 
   uint8_t good_signature[WAMBLE_LOGIN_SIGNATURE_LENGTH] = {0};
-  sign_message_len = wamble_build_login_signature_message(
-      sign_message, sizeof(sign_message), player->token, public_key,
-      rx_challenge_2.msg.login_challenge);
-  T_ASSERT(sign_message_len > 0);
-  crypto_eddsa_sign(good_signature, secret_key, sign_message, sign_message_len);
+  T_ASSERT(wamble_client_sign_challenge(secret_key, player->token, public_key,
+                                        rx_challenge_2.msg.login_challenge,
+                                        good_signature) == 0);
 
   struct WambleMsg good_req = {0};
   good_req.ctrl = WAMBLE_CTRL_LOGIN_REQUEST;

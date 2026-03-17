@@ -4,10 +4,6 @@
 #include <sys/random.h>
 #endif
 
-int crypto_eddsa_check(const uint8_t signature[WAMBLE_LOGIN_SIGNATURE_LENGTH],
-                       const uint8_t public_key[WAMBLE_PUBLIC_KEY_LENGTH],
-                       const uint8_t *message, size_t message_size);
-
 static WAMBLE_THREAD_LOCAL WamblePlayer *player_pool;
 static WAMBLE_THREAD_LOCAL int num_players = 0;
 static WAMBLE_THREAD_LOCAL wamble_mutex_t player_mutex;
@@ -91,13 +87,6 @@ double rng_double(void) {
   uint64_t r = rng_u64();
   r >>= 11;
   return (double)r * (1.0 / 9007199254740992.0);
-}
-
-int wamble_ed25519_verify(const uint8_t *signature, const uint8_t *public_key,
-                          const uint8_t *message, size_t message_size) {
-  if (!signature || !public_key || (!message && message_size != 0))
-    return -1;
-  return crypto_eddsa_check(signature, public_key, message, message_size);
 }
 
 void rng_bytes(uint8_t *out, size_t len) {

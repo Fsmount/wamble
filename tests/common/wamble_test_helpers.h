@@ -1,6 +1,7 @@
 #ifndef WAMBLE_TEST_HELPERS_H
 #define WAMBLE_TEST_HELPERS_H
 
+#include "wamble/wamble.h"
 #include <stddef.h>
 #include <stdint.h>
 
