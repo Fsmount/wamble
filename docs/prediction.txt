@@ -2,7 +2,8 @@ Wamble Prediction
 =================
 
 Overview
-- Lets sessions submit move predictions against the next half-move on a board.
+- Lets sessions submit move predictions against the next half-move on a board,
+  or a later half-move when the prediction references a parent branch.
 - Prediction scoring is separate from normal board pot scoring.
 - Predictions may reference an earlier prediction, which lets the server expose
   a prediction tree for the active board.
@@ -27,17 +28,28 @@ Scoring
 - Session aggregates are stored in `sessions.total_prediction_score`.
 
 Policy
-- Submit access uses policy action `prediction.submit`.
-- Submit resources are `self`, `streak`, or `gated`, depending on mode.
-- Submit requests pass `board=<board-id>` as context when the runtime has it.
+- Write access uses policy action `prediction.write`.
+- Write resources are `self`, `streak`, or `gated`, depending on mode.
+- Write requests pass `board=<board-id>` as context when the runtime has it.
+- For `prediction.write`, the resolved policy `permission_level` is treated as
+  the maximum writable tree depth.
 - Tree reads use policy action `prediction.read` with resource `tree`.
 - Tree reads pass `depth=<requested-depth>` as context.
 - For `prediction.read`, the resolved policy `permission_level` is treated as
   the maximum readable tree depth.
+- Root submissions require writable depth `0`.
+- Reply submissions require writable depth `parent_depth + 1`.
+- Write and read are independent; a session may be allowed to submit without
+  being allowed to read the tree.
 
-Tree Reads
+Tree Semantics
 - Each prediction may reference `parent_prediction_id`.
 - Root predictions have no parent.
+- Root predictions target the board's next half-move.
+- Child predictions target the next half-move after their parent target.
+- Descendants of an incorrect or expired branch are expired automatically.
+
+Tree Reads
 - Tree reads return flat rows with `id`, `parent_id`, `board_id`,
   predictor token, move, status, target ply, depth, awarded points, and
   creation time.
@@ -46,6 +58,10 @@ Tree Reads
   - `prediction-view-depth-limit`
   - requested depth
   - policy `permission_level` for `prediction.read`
+
+Compatibility
+- Treatment hooks for prediction scoring and gating still use the existing
+  `prediction.submit` hook name.
 
 Persistence
 - Prediction submissions are stored in `predictions`.

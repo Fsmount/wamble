@@ -14,6 +14,9 @@ static void prediction_set_streak(uint64_t board_id, const uint8_t *token,
                                   int streak);
 static int prediction_resolve_session_id(const uint8_t *player_token,
                                          uint64_t *out_session_id);
+static void prediction_expire_invalid_descendants_locked(uint64_t board_id);
+static PredictionStatus prediction_write_allowed_for_player_depth(
+    const WambleBoard *board, const uint8_t *player_token, int depth);
 
 static WAMBLE_THREAD_LOCAL WamblePrediction *g_predictions = NULL;
 static WAMBLE_THREAD_LOCAL int g_prediction_count = 0;
@@ -622,6 +625,30 @@ static int prediction_find_by_id_locked(uint64_t prediction_id) {
   return -1;
 }
 
+static void prediction_expire_invalid_descendants_locked(uint64_t board_id) {
+  int changed = 0;
+  do {
+    changed = 0;
+    for (int i = 0; i < g_prediction_count; i++) {
+      WamblePrediction *pred = &g_predictions[i];
+      if (pred->board_id != board_id || pred->parent_id == 0 ||
+          strcmp(pred->status, "PENDING") != 0) {
+        continue;
+      }
+      int parent_idx = prediction_find_by_id_locked(pred->parent_id);
+      if (parent_idx < 0 || g_predictions[parent_idx].board_id != board_id ||
+          strcmp(g_predictions[parent_idx].status, "INCORRECT") == 0 ||
+          strcmp(g_predictions[parent_idx].status, "EXPIRED") == 0) {
+        pred->points_awarded = 0.0;
+        snprintf(pred->status, sizeof(pred->status), "EXPIRED");
+        wamble_emit_resolve_prediction(board_id, pred->player_token,
+                                       pred->target_ply, pred->status, 0.0);
+        changed = 1;
+      }
+    }
+  } while (changed);
+}
+
 static int prediction_policy_allowed(const uint8_t *token, const char *action,
                                      const char *resource,
                                      const char *context_key,
@@ -639,12 +666,20 @@ static int prediction_policy_allowed(const uint8_t *token, const char *action,
   return decision.allowed ? 1 : 0;
 }
 
-static PredictionStatus prediction_submit_allowed(const WambleBoard *board,
-                                                  const uint8_t *player_token) {
+PredictionStatus
+prediction_submit_allowed_for_player(const WambleBoard *board,
+                                     const uint8_t *player_token) {
+  return prediction_write_allowed_for_player_depth(board, player_token, 0);
+}
+
+static PredictionStatus prediction_write_allowed_for_player_depth(
+    const WambleBoard *board, const uint8_t *player_token, int depth) {
   if (!board || !player_token)
     return PREDICTION_ERR_INVALID;
   if (get_config()->prediction_mode == PREDICTION_MODE_DISABLED)
     return PREDICTION_ERR_DISABLED;
+  if (depth < 0)
+    depth = 0;
 
   const char *resource = "streak";
   if (get_config()->prediction_mode == PREDICTION_MODE_NEXT_SELF_MOVE) {
@@ -658,9 +693,13 @@ static PredictionStatus prediction_submit_allowed(const WambleBoard *board,
   }
 
   char board_buf[32];
+  WamblePolicyDecision decision = {0};
   snprintf(board_buf, sizeof(board_buf), "%llu", (unsigned long long)board->id);
-  if (!prediction_policy_allowed(player_token, "prediction.submit", resource,
-                                 "board", board_buf, NULL)) {
+  if (!prediction_policy_allowed(player_token, "prediction.write", resource,
+                                 "board", board_buf, &decision)) {
+    return PREDICTION_ERR_NOT_ALLOWED;
+  }
+  if (decision.permission_level < depth) {
     return PREDICTION_ERR_NOT_ALLOWED;
   }
   return PREDICTION_OK;
@@ -768,7 +807,8 @@ PredictionStatus prediction_submit_with_parent(WambleBoard *board,
                                                int trust_tier,
                                                uint64_t *out_prediction_id) {
   (void)trust_tier;
-  PredictionStatus st = prediction_submit_allowed(board, player_token);
+  PredictionStatus st =
+      prediction_submit_allowed_for_player(board, player_token);
   if (st != PREDICTION_OK)
     return st;
   if (!prediction_valid_uci(predicted_move_uci))
@@ -797,20 +837,37 @@ PredictionStatus prediction_submit_with_parent(WambleBoard *board,
   }
 
   int depth = 0;
+  int target_ply = prediction_next_ply(board);
+  int current_ply = prediction_current_ply(board);
   if (parent_prediction_id > 0) {
     int parent_idx = prediction_find_by_id_locked(parent_prediction_id);
     if (parent_idx < 0 || g_predictions[parent_idx].board_id != board->id) {
       wamble_mutex_unlock(&g_prediction_mutex);
       return PREDICTION_ERR_NOT_FOUND;
     }
+    if (strcmp(g_predictions[parent_idx].status, "INCORRECT") == 0 ||
+        strcmp(g_predictions[parent_idx].status, "EXPIRED") == 0) {
+      wamble_mutex_unlock(&g_prediction_mutex);
+      return PREDICTION_ERR_INVALID;
+    }
     depth = g_predictions[parent_idx].depth + 1;
+    target_ply = g_predictions[parent_idx].target_ply + 1;
+    if (prediction_write_allowed_for_player_depth(board, player_token, depth) !=
+        PREDICTION_OK) {
+      wamble_mutex_unlock(&g_prediction_mutex);
+      return PREDICTION_ERR_NOT_ALLOWED;
+    }
+  }
+  if (target_ply <= current_ply) {
+    wamble_mutex_unlock(&g_prediction_mutex);
+    return PREDICTION_ERR_INVALID;
   }
 
   int streak_before = prediction_streak_for(board->id, player_token);
   uint64_t db_prediction_id = 0;
   if (prediction_persist_new_locked(
           board->id, player_token, parent_prediction_id, predicted_move_uci,
-          prediction_next_ply(board), streak_before, &db_prediction_id) != 0 ||
+          target_ply, streak_before, &db_prediction_id) != 0 ||
       db_prediction_id == 0) {
     wamble_mutex_unlock(&g_prediction_mutex);
     return PREDICTION_ERR_INVALID;
@@ -825,7 +882,7 @@ PredictionStatus prediction_submit_with_parent(WambleBoard *board,
   snprintf(slot->predicted_move_uci, sizeof(slot->predicted_move_uci), "%s",
            predicted_move_uci);
   snprintf(slot->status, sizeof(slot->status), "PENDING");
-  slot->target_ply = prediction_next_ply(board);
+  slot->target_ply = target_ply;
   slot->depth = depth;
   slot->correct_streak = streak_before;
   slot->points_awarded = 0.0;
@@ -883,6 +940,8 @@ PredictionStatus prediction_resolve_move(WambleBoard *board,
                                      pred->target_ply, pred->status, penalty);
     }
   }
+
+  prediction_expire_invalid_descendants_locked(board->id);
 
   if (get_config()->prediction_mode != PREDICTION_MODE_NEXT_SELF_MOVE) {
     for (int i = g_streak_count - 1; i >= 0; i--) {

@@ -222,8 +222,9 @@ Policy Rule Builtins
     `ctrl=<control-resource>`.
   - `stats.read`: query resource `player`.
   - `leaderboard.read`: query resource `global`.
-  - `prediction.submit`: query resources `self`, `streak`, `gated`.
-    Context includes `board=<board-id>` when available.
+  - `prediction.write`: query resources `self`, `streak`, `gated`.
+    Context includes `board=<board-id>` when available. The resolved
+    `permission-level` is treated as the maximum writable prediction depth.
   - `prediction.read`: query resource `tree`; context `depth=<n>`.
     The rule permission level is treated as the maximum readable depth cap.
 - Example:
@@ -271,6 +272,9 @@ Treatment Groups
     `*`. Runtime gameplay/view paths do not emit payload outputs directly onto
     the client wire protocol.
 - Hook keys consumed by runtime:
+  Policy action keys and treatment hook keys are separate surfaces. Prediction
+  mutation policy uses `prediction.write`; the treatment hook remains
+  `prediction.submit`.
   - `prediction.submit`
     - feature: `prediction.gated`
     - behavior: `prediction.max_pending`, `prediction.points.multiplier`,

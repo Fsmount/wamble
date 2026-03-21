@@ -174,6 +174,17 @@ static void build_oversized_string_extensions(struct WambleMsg *msg) {
   }
 }
 
+static const WambleMessageExtField *find_ext_field(const struct WambleMsg *msg,
+                                                   const char *key) {
+  if (!msg || !key)
+    return NULL;
+  for (uint8_t i = 0; i < msg->ext_count; i++) {
+    if (strcmp(msg->ext[i].key, key) == 0)
+      return &msg->ext[i];
+  }
+  return NULL;
+}
+
 WAMBLE_TEST(spectate_update_roundtrip) {
   config_load(NULL, NULL, NULL, 0);
   wamble_socket_t srv = create_and_bind_socket(0);
@@ -2002,6 +2013,151 @@ WAMBLE_TEST(server_protocol_client_hello_requires_policy) {
   return 0;
 }
 
+WAMBLE_TEST(server_protocol_client_hello_advertises_session_caps) {
+  const char *cfg_path = "build/test_network_client_hello_caps.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(def prediction-mode 0)\n"
+                    "(defprofile p1 ((def port 19420) (def advertise 1) "
+                    "(def tos-text \"terms\")))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 2, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'client_hello', '*', 'allow', 0, "
+          "'hello_access', 'test'), "
+          "(0, 'protocol.ctrl', 'login_request', '*', 'allow', 0, "
+          "'login_access', 'test'), "
+          "(0, 'protocol.ctrl', 'logout', '*', 'allow', 0, "
+          "'logout_access', 'test'), "
+          "(0, 'protocol.ctrl', 'get_legal_moves', '*', 'allow', 0, "
+          "'legal_access', 'test'), "
+          "(0, 'protocol.ctrl', 'player_move', '*', 'allow', 0, "
+          "'move_access', 'test'), "
+          "(0, 'protocol.ctrl', 'spectate_game', '*', 'allow', 0, "
+          "'spectate_access', 'test'), "
+          "(0, 'protocol.ctrl', 'spectate_stop', '*', 'allow', 0, "
+          "'spectate_stop_access', 'test'), "
+          "(0, 'game.move', 'legal', '*', 'allow', 0, 'legal', 'test'), "
+          "(0, 'game.move', 'play', '*', 'allow', 0, 'play', 'test'), "
+          "(0, 'spectate.access', 'view', '*', 'allow', 0, 'spectate', "
+          "'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  struct WambleMsg hello = {0};
+  hello.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  hello.token[0] = 0x33;
+
+  RecvOneCtx rx = {.sock = cli};
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
+
+  T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  T_ASSERT_EQ_INT(rx.received, 1);
+  T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+
+  const WambleMessageExtField *caps = find_ext_field(&rx.msg, "session.caps");
+  T_ASSERT(caps != NULL);
+  T_ASSERT_EQ_INT(caps->value_type, WAMBLE_TREATMENT_VALUE_INT);
+  T_ASSERT((caps->int_value & WAMBLE_SESSION_UI_CAP_ATTACH_IDENTITY) != 0);
+  T_ASSERT((caps->int_value & WAMBLE_SESSION_UI_CAP_LOGOUT) != 0);
+  T_ASSERT((caps->int_value & WAMBLE_SESSION_UI_CAP_MOVE) != 0);
+  T_ASSERT((caps->int_value & WAMBLE_SESSION_UI_CAP_SPECTATE_SUMMARY) != 0);
+  T_ASSERT((caps->int_value & WAMBLE_SESSION_UI_CAP_SPECTATE_FOCUS) != 0);
+  T_ASSERT((caps->int_value & WAMBLE_SESSION_UI_CAP_STATS) == 0);
+  T_ASSERT((caps->int_value & WAMBLE_SESSION_UI_CAP_LEADERBOARD) == 0);
+  T_ASSERT((caps->int_value & WAMBLE_SESSION_UI_CAP_PREDICTION_SUBMIT) == 0);
+  T_ASSERT((caps->int_value & WAMBLE_SESSION_UI_CAP_PREDICTION_READ) == 0);
+  T_ASSERT(find_ext_field(&rx.msg, "trust.tier") == NULL);
+  T_ASSERT(find_ext_field(&rx.msg, "prediction.source") == NULL);
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(server_protocol_profile_info_advertises_profile_caps) {
+  const char *cfg_path = "build/test_network_profile_info_caps.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19421) (def advertise 1) "
+                    "(def tos-text \"terms\")))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'get_profile_info', '*', 'allow', 0, "
+          "'profile_info_access', 'test'), "
+          "(0, 'protocol.ctrl', 'get_profile_tos', '*', 'allow', 0, "
+          "'profile_tos_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  struct WambleMsg req = {0};
+  req.ctrl = WAMBLE_CTRL_GET_PROFILE_INFO;
+  req.token[0] = 0x44;
+  req.profile_name_len = 2;
+  memcpy(req.profile_name, "p1", 2);
+
+  RecvOneCtx rx = {.sock = cli};
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
+
+  T_ASSERT_EQ_INT(handle_message(srv, &req, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  T_ASSERT_EQ_INT(rx.received, 1);
+  T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_PROFILE_INFO);
+
+  const WambleMessageExtField *caps = find_ext_field(&rx.msg, "profile.caps");
+  T_ASSERT(caps != NULL);
+  T_ASSERT_EQ_INT(caps->value_type, WAMBLE_TREATMENT_VALUE_INT);
+  T_ASSERT((caps->int_value & WAMBLE_PROFILE_UI_CAP_JOIN) == 0);
+  T_ASSERT((caps->int_value & WAMBLE_PROFILE_UI_CAP_TOS) != 0);
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
 WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
   const char *cfg_path = "build/test_network_login_ed25519.conf";
   const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
@@ -2018,6 +2174,7 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
   }
 
   player_manager_init();
+  board_manager_init();
 
   wamble_socket_t srv = create_and_bind_socket(0);
   T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
@@ -2114,6 +2271,13 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
   T_ASSERT_EQ_INT(ok_st, SERVER_OK);
   T_ASSERT_EQ_INT(rx_ok.received, 1);
   T_ASSERT_EQ_INT(rx_ok.msg.ctrl, WAMBLE_CTRL_LOGIN_SUCCESS);
+  {
+    const WambleMessageExtField *caps =
+        find_ext_field(&rx_ok.msg, "session.caps");
+    T_ASSERT(caps != NULL);
+    T_ASSERT((caps->int_value & WAMBLE_SESSION_UI_CAP_ATTACH_IDENTITY) != 0);
+    T_ASSERT(find_ext_field(&rx_ok.msg, "trust.tier") == NULL);
+  }
 
   WamblePlayer *after = get_player_by_token(player->token);
   T_ASSERT(after != NULL);
@@ -2295,6 +2459,10 @@ WAMBLE_TESTS_ADD_SM(profile_info_roundtrip, WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(profiles_list_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
 WAMBLE_TESTS_ADD_DB_SM(server_protocol_client_hello_requires_policy,
+                       WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(server_protocol_client_hello_advertises_session_caps,
+                       WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(server_protocol_profile_info_advertises_profile_caps,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(server_protocol_login_uses_ed25519_challenge_response,
                        WAMBLE_SUITE_FUNCTIONAL, "network");

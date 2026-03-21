@@ -1926,6 +1926,9 @@ PredictionStatus prediction_submit(WambleBoard *board,
                                    const uint8_t *player_token,
                                    const char *predicted_move_uci,
                                    int trust_tier);
+PredictionStatus
+prediction_submit_allowed_for_player(const WambleBoard *board,
+                                     const uint8_t *player_token);
 PredictionStatus prediction_submit_with_parent(WambleBoard *board,
                                                const uint8_t *player_token,
                                                const char *predicted_move_uci,
