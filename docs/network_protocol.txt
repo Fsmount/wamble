@@ -59,6 +59,24 @@ Extension Trailer (reserved)
       - int: `int64` big-endian
       - double: IEEE754 `uint64` bit pattern, big-endian
       - bool: `uint8` (`0` or `1`)
+- Current capability metadata keys:
+  - `session.caps` (`int` bitmask): server-advertised UI/session actions.
+  - `profile.caps` (`int` bitmask): per-profile discovery actions.
+  - `prediction.source` (`string`): `tree` or `moves` for prediction reads.
+- Current bitmasks:
+  - `session.caps`
+    - `0x00000001`: attach identity
+    - `0x00000002`: logout
+    - `0x00000004`: move interaction
+    - `0x00000008`: stats
+    - `0x00000010`: leaderboard
+    - `0x00000020`: spectate summary
+    - `0x00000040`: spectate focus
+    - `0x00000080`: prediction submit
+    - `0x00000100`: prediction read
+  - `profile.caps`
+    - `0x00000001`: join/profile attach
+    - `0x00000002`: terms available
 
 Fragment Payload Envelope (version 1)
 - The sender uses this envelope when an eligible control payload does not fit
@@ -102,17 +120,20 @@ Control Codes
   - Payload: empty.
 - `0x02` SERVER_HELLO (server to client): Response to HELLO.
   - Payload: `char fen[]` (current board state).
+  - May include extension fields: `session.caps`, `prediction.source`.
 - `0x03` PLAYER_MOVE (client to server): Submit a move.
   - Payload: `uint8 uci_len; char uci[uci_len]` (max 6 bytes).
 - `0x04` BOARD_UPDATE (server to client): Board state has changed.
   - Payload: `char fen[]`.
   - `flags`: server sets `0x01` when the assigned board is Chess960.
+  - May include extension fields: `session.caps`, `prediction.source`.
 - `0x05` ACK (bidirectional): Acknowledges a reliable packet.
   - Payload: empty. Header `seq_num` matches the packet being ACKed.
 - `0x06` LIST_PROFILES (client to server): Request available profiles.
   - Payload: empty.
 - `0x07` PROFILE_INFO (server to client): Response to GET_PROFILE_INFO.
   - Payload: `name;port;advertise;visibility` or `NOTFOUND;<name>`.
+  - May include extension field `profile.caps`.
 - `0x08` ERROR (server to client): Reports an error.
   - Payload: `uint16 code; uint8 reason_len; char reason[reason_len]`.
   - Reliable by default.
@@ -168,6 +189,7 @@ Control Codes
   - Payload: empty.
 - `0x10` LOGIN_SUCCESS (server to client): Successful login.
   - Payload: empty.
+  - May include extension fields: `session.caps`, `prediction.source`.
 - `0x11` LOGIN_FAILED (server to client): Failed login.
   - Payload: `uint16 code; uint8 reason_len; char reason[reason_len]`.
 - `0x12` GET_PLAYER_STATS (client to server): Request player statistics.
@@ -202,7 +224,8 @@ Control Codes
   - `score_bits_be` and `rating_bits_be` are IEEE-754 double bit patterns in big-endian order.
   - Maximum entries per packet: 16.
 - `0x1B` SUBMIT_PREDICTION (client to server): Submit a prediction for the next
-  half-move on `board_id`.
+  half-move on `board_id`, or for the next half-move after
+  `parent_prediction_id_be` when replying on a prediction branch.
   - Payload: `uint8 uci_len; char uci[uci_len]; uint64 parent_prediction_id_be`.
   - `parent_prediction_id_be = 0` means a root prediction.
 - `0x1C` GET_PREDICTIONS (client to server): Request prediction tree rows for a

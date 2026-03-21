@@ -34,6 +34,7 @@ static void publish_server_protocol_status(int status_code,
                                            const char *profile_name);
 static void publish_treatment_audit_status(int status_code,
                                            const char *profile_name);
+static const char *ctrl_policy_resource(uint8_t ctrl);
 
 static int token_has_any_byte(const uint8_t *token) {
   if (!token)
@@ -627,6 +628,156 @@ static const char *ctrl_policy_resource(uint8_t ctrl) {
   }
 }
 
+static int append_ext_int(struct WambleMsg *msg, const char *key,
+                          int64_t value) {
+  WambleMessageExtField *field = NULL;
+  if (!msg || !key || !key[0] ||
+      msg->ext_count >= WAMBLE_MAX_MESSAGE_EXT_FIELDS) {
+    return -1;
+  }
+  field = &msg->ext[msg->ext_count++];
+  memset(field, 0, sizeof(*field));
+  snprintf(field->key, sizeof(field->key), "%s", key);
+  field->value_type = WAMBLE_TREATMENT_VALUE_INT;
+  field->int_value = value;
+  return 0;
+}
+
+static int append_ext_string(struct WambleMsg *msg, const char *key,
+                             const char *value) {
+  WambleMessageExtField *field = NULL;
+  if (!msg || !key || !key[0] || !value ||
+      msg->ext_count >= WAMBLE_MAX_MESSAGE_EXT_FIELDS) {
+    return -1;
+  }
+  field = &msg->ext[msg->ext_count++];
+  memset(field, 0, sizeof(*field));
+  snprintf(field->key, sizeof(field->key), "%s", key);
+  field->value_type = WAMBLE_TREATMENT_VALUE_STRING;
+  snprintf(field->string_value, sizeof(field->string_value), "%s", value);
+  return 0;
+}
+
+static int protocol_ctrl_allowed(const uint8_t *token, const char *profile_name,
+                                 uint8_t ctrl) {
+  return policy_check(token, profile_name, "protocol.ctrl",
+                      ctrl_policy_resource(ctrl), NULL, NULL, NULL);
+}
+
+static int prediction_tree_read_allowed(uint64_t board_id,
+                                        const uint8_t *token) {
+  WamblePredictionView probe[1];
+  int count = 0;
+  return prediction_collect_tree(board_id, token, 0, 0, probe, 1, &count) ==
+                 PREDICTION_OK
+             ? 1
+             : 0;
+}
+
+static uint32_t compute_profile_ui_caps(const uint8_t *token,
+                                        const WambleProfile *p) {
+  uint32_t caps = 0;
+  if (!token || !p || !p->name || !p->name[0])
+    return 0;
+  if (protocol_ctrl_allowed(token, p->name, WAMBLE_CTRL_CLIENT_HELLO))
+    caps |= WAMBLE_PROFILE_UI_CAP_JOIN;
+  if (p->tos_text && p->tos_text[0] &&
+      protocol_ctrl_allowed(token, p->name, WAMBLE_CTRL_GET_PROFILE_TOS)) {
+    caps |= WAMBLE_PROFILE_UI_CAP_TOS;
+  }
+  return caps;
+}
+
+static uint32_t compute_session_ui_caps(const uint8_t *token,
+                                        const char *profile_name,
+                                        const WambleBoard *board,
+                                        const char **out_prediction_source) {
+  uint32_t caps = 0;
+  int spectate_proto = 0;
+  int prediction_read_proto = 0;
+
+  if (out_prediction_source)
+    *out_prediction_source = "tree";
+  if (!token || !profile_name || !profile_name[0] || !board)
+    return 0;
+
+  if (protocol_ctrl_allowed(token, profile_name, WAMBLE_CTRL_LOGIN_REQUEST))
+    caps |= WAMBLE_SESSION_UI_CAP_ATTACH_IDENTITY;
+  if (protocol_ctrl_allowed(token, profile_name, WAMBLE_CTRL_LOGOUT))
+    caps |= WAMBLE_SESSION_UI_CAP_LOGOUT;
+
+  if (board_is_reserved_for_player(board->id, token) &&
+      protocol_ctrl_allowed(token, profile_name, WAMBLE_CTRL_GET_LEGAL_MOVES) &&
+      protocol_ctrl_allowed(token, profile_name, WAMBLE_CTRL_PLAYER_MOVE) &&
+      policy_check(token, profile_name, "game.move", "legal", NULL, NULL,
+                   NULL) &&
+      policy_check(token, profile_name, "game.move", "play", NULL, NULL,
+                   NULL)) {
+    caps |= WAMBLE_SESSION_UI_CAP_MOVE;
+  }
+
+  if (protocol_ctrl_allowed(token, profile_name,
+                            WAMBLE_CTRL_GET_PLAYER_STATS) &&
+      policy_check(token, profile_name, "stats.read", "player", NULL, NULL,
+                   NULL)) {
+    caps |= WAMBLE_SESSION_UI_CAP_STATS;
+  }
+
+  if (protocol_ctrl_allowed(token, profile_name, WAMBLE_CTRL_GET_LEADERBOARD) &&
+      policy_check(token, profile_name, "leaderboard.read", "global", NULL,
+                   NULL, NULL)) {
+    caps |= WAMBLE_SESSION_UI_CAP_LEADERBOARD;
+  }
+
+  spectate_proto =
+      protocol_ctrl_allowed(token, profile_name, WAMBLE_CTRL_SPECTATE_GAME) &&
+      protocol_ctrl_allowed(token, profile_name, WAMBLE_CTRL_SPECTATE_STOP);
+  if (spectate_proto && policy_check(token, profile_name, "spectate.access",
+                                     "view", "mode", "summary", NULL)) {
+    caps |= WAMBLE_SESSION_UI_CAP_SPECTATE_SUMMARY;
+  }
+  if (spectate_proto && policy_check(token, profile_name, "spectate.access",
+                                     "view", "mode", "focus", NULL)) {
+    caps |= WAMBLE_SESSION_UI_CAP_SPECTATE_FOCUS;
+  }
+
+  if (protocol_ctrl_allowed(token, profile_name,
+                            WAMBLE_CTRL_SUBMIT_PREDICTION) &&
+      prediction_submit_allowed_for_player(board, token) == PREDICTION_OK) {
+    caps |= WAMBLE_SESSION_UI_CAP_PREDICTION_SUBMIT;
+  }
+
+  prediction_read_proto =
+      protocol_ctrl_allowed(token, profile_name, WAMBLE_CTRL_GET_PREDICTIONS);
+  if (prediction_read_proto &&
+      prediction_read_uses_move_projection(token, profile_name, board)) {
+    caps |= WAMBLE_SESSION_UI_CAP_PREDICTION_READ;
+    if (out_prediction_source)
+      *out_prediction_source = "moves";
+  } else if (prediction_read_proto &&
+             prediction_tree_read_allowed(board->id, token)) {
+    caps |= WAMBLE_SESSION_UI_CAP_PREDICTION_READ;
+  }
+
+  return caps;
+}
+
+static void append_session_capability_extensions(struct WambleMsg *msg,
+                                                 const uint8_t *token,
+                                                 const char *profile_name,
+                                                 const WambleBoard *board) {
+  const char *prediction_source = "tree";
+  uint32_t caps = 0;
+  if (!msg || !token || !profile_name || !profile_name[0] || !board)
+    return;
+  caps =
+      compute_session_ui_caps(token, profile_name, board, &prediction_source);
+  (void)append_ext_int(msg, "session.caps", (int64_t)caps);
+  if ((caps & WAMBLE_SESSION_UI_CAP_PREDICTION_READ) != 0) {
+    (void)append_ext_string(msg, "prediction.source", prediction_source);
+  }
+}
+
 static uint8_t prediction_status_code(const char *status) {
   if (!status)
     return WAMBLE_PREDICTION_STATUS_PENDING;
@@ -732,6 +883,8 @@ static ServerStatus handle_client_hello(wamble_socket_t sockfd,
   response.seq_num = WAMBLE_PROTO_VERSION;
   write_visible_board_fen(player->token, profile_name, board, response.fen,
                           sizeof(response.fen));
+  append_session_capability_extensions(&response, player->token, profile_name,
+                                       board);
 
   if (send_reliable_default(sockfd, &response, cliaddr) != 0) {
     return SERVER_ERR_SEND_FAILED;
@@ -832,6 +985,8 @@ static ServerStatus handle_player_move(wamble_socket_t sockfd,
     response.flags |= WAMBLE_FLAG_BOARD_IS_960;
   write_visible_board_fen(msg->token, profile_name, next_board, response.fen,
                           sizeof(response.fen));
+  append_session_capability_extensions(&response, player->token, profile_name,
+                                       next_board);
 
   if (send_reliable_default(sockfd, &response, cliaddr) != 0) {
     return SERVER_ERR_SEND_FAILED;
@@ -984,6 +1139,8 @@ static ServerStatus handle_get_profile_info(wamble_socket_t sockfd,
     if (wrote >= FEN_MAX_LENGTH)
       wrote = FEN_MAX_LENGTH - 1;
     resp.profile_info_len = (uint16_t)wrote;
+    (void)append_ext_int(&resp, "profile.caps",
+                         (int64_t)compute_profile_ui_caps(msg->token, p));
   } else {
     publish_server_protocol_status(
         p ? SERVER_PROTOCOL_STATUS_PROFILE_INFO_HIDDEN
@@ -1204,6 +1361,13 @@ static ServerStatus handle_login_request(wamble_socket_t sockfd,
                                    profile_name);
     response.ctrl = WAMBLE_CTRL_LOGIN_SUCCESS;
     memcpy(response.token, player->token, TOKEN_LENGTH);
+    {
+      WambleBoard *board = find_board_for_player(player);
+      if (board) {
+        append_session_capability_extensions(&response, player->token,
+                                             profile_name, board);
+      }
+    }
   } else {
     publish_server_protocol_status(SERVER_PROTOCOL_STATUS_LOGIN_FAILED,
                                    profile_name);
