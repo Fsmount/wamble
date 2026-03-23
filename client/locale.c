@@ -117,6 +117,8 @@ static const WambleClientLocaleCatalog locale_catalogs[] = {{
         "Prediction board",
         "Moves here stage a prediction only. They do not play the live game.",
         "This prediction board is read-only in this session.",
+        "Finish saving your new identity before joining so it can be attached.",
+        "Accept the terms before joining this profile.",
     },
 }};
 
