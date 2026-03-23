@@ -105,7 +105,7 @@ static uint16_t mnemonic_bits_read_index(const uint8_t *bits,
     size_t absolute_bit = bit_offset + bit;
     uint8_t byte = bits[absolute_bit / 8];
     uint8_t mask = (uint8_t)(0x80u >> (absolute_bit % 8));
-    value = (uint16_t)((value << 1) | ((byte & mask) != 0 ? 1u : 0u));
+    value = (uint16_t)((value << 1) | ((byte & mask) != 0 ? 1 : 0));
   }
   return value;
 }

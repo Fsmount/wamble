@@ -63,6 +63,7 @@ static const WambleClientLocaleCatalog locale_catalogs[] = {{
         "Standard",
         "Available profiles for this deployment",
         "not stored in browser",
+        "saved in browser",
         "Replying to: root",
         "Replying to: #%llu",
         "Terms unavailable for this profile.",
@@ -110,6 +111,12 @@ static const WambleClientLocaleCatalog locale_catalogs[] = {{
         "Failed to gather browser entropy",
         "Failed to generate identity",
         "word1 word2 ...",
+        "Live board",
+        "Moves here affect your current game.",
+        "This is the live game board. Moves are disabled in this session.",
+        "Prediction board",
+        "Moves here stage a prediction only. They do not play the live game.",
+        "This prediction board is read-only in this session.",
     },
 }};
 
