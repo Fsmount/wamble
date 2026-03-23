@@ -149,16 +149,16 @@ static void spectator_write_visible_fen(const uint8_t *token,
   if (treatment_status != DB_OK) {
     WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_TREATMENT_AUDIT,
                                           TREATMENT_AUDIT_STATUS_QUERY_FAILED};
-    wamble_runtime_event_publish_status(runtime_status,
-                                        wamble_runtime_profile_key());
+    wamble_runtime_event_publish(runtime_status, wamble_runtime_profile_key(),
+                                 NULL);
     return;
   }
   WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_TREATMENT_AUDIT,
                                         action_count > 0
                                             ? TREATMENT_AUDIT_STATUS_TREATED
                                             : TREATMENT_AUDIT_STATUS_UNTREATED};
-  wamble_runtime_event_publish_status(runtime_status,
-                                      wamble_runtime_profile_key());
+  wamble_runtime_event_publish(runtime_status, wamble_runtime_profile_key(),
+                               NULL);
   for (int i = 0; i < action_count; i++) {
     if (strcmp(actions[i].output_kind, "view") != 0 ||
         strcmp(actions[i].output_key, "board.fen") != 0 ||
@@ -401,8 +401,8 @@ void spectator_manager_tick(void) {
           WambleRuntimeStatus runtime_status = {
               WAMBLE_RUNTIME_STATUS_PROFILE_ADMIN,
               PROFILE_ADMIN_STATUS_SPECTATOR_FOCUS_DISABLED_FALLBACK};
-          wamble_runtime_event_publish_status(runtime_status,
-                                              wamble_runtime_profile_key());
+          wamble_runtime_event_publish(runtime_status,
+                                       wamble_runtime_profile_key(), NULL);
         }
         e->state = SPECTATOR_STATE_SUMMARY;
         e->focus_board_id = 0;
@@ -422,8 +422,8 @@ void spectator_manager_tick(void) {
             WambleRuntimeStatus runtime_status = {
                 WAMBLE_RUNTIME_STATUS_PROFILE_ADMIN,
                 PROFILE_ADMIN_STATUS_SPECTATOR_BOARD_FINISHED_FALLBACK};
-            wamble_runtime_event_publish_status(runtime_status,
-                                                wamble_runtime_profile_key());
+            wamble_runtime_event_publish(runtime_status,
+                                         wamble_runtime_profile_key(), NULL);
           }
           e->state = SPECTATOR_STATE_SUMMARY;
           e->focus_board_id = 0;
@@ -454,8 +454,8 @@ void spectator_manager_tick(void) {
         WambleRuntimeStatus runtime_status = {
             WAMBLE_RUNTIME_STATUS_PROFILE_ADMIN,
             PROFILE_ADMIN_STATUS_SPECTATOR_STOPPED_BY_ZERO_CAP};
-        wamble_runtime_event_publish_status(runtime_status,
-                                            wamble_runtime_profile_key());
+        wamble_runtime_event_publish(runtime_status,
+                                     wamble_runtime_profile_key(), NULL);
       }
       e->state = SPECTATOR_STATE_IDLE;
       e->focus_board_id = 0;

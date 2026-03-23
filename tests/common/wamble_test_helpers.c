@@ -338,6 +338,8 @@ static PGconn *db_connect(void) {
     return NULL;
   PGconn *c = PQconnectdb(dsn);
   if (PQstatus(c) != CONNECTION_OK) {
+    fprintf(stderr, "[test-db] connect failed: %s\n",
+            PQerrorMessage(c) ? PQerrorMessage(c) : "(unknown)");
     PQfinish(c);
     return NULL;
   }
@@ -415,11 +417,54 @@ int test_db_set_search_path(const char *schema_name) {
 }
 
 #ifdef WAMBLE_ENABLE_DB
+static const char *test_db_tool_path(void) {
+#if defined(WAMBLE_PLATFORM_WINDOWS)
+  return "build\\wamble_db_tool.exe";
+#else
+  return "build/wamble_db_tool";
+#endif
+}
+
+static int test_db_run_tool(const char *schema_name, const char *args) {
+  char cmd[512];
+  const char *tool = test_db_tool_path();
+
+  if (!args || !args[0])
+    return -1;
+  if (schema_name && *schema_name && !schema_name_valid(schema_name))
+    return -1;
+
+  if (schema_name && *schema_name) {
+#if defined(WAMBLE_PLATFORM_WINDOWS)
+    snprintf(cmd, sizeof cmd, "\"%s\" --schema \"%s\" %s", tool, schema_name,
+             args);
+#else
+    snprintf(cmd, sizeof cmd, "%s --schema %s %s", tool, schema_name, args);
+#endif
+  } else {
+#if defined(WAMBLE_PLATFORM_WINDOWS)
+    snprintf(cmd, sizeof cmd, "\"%s\" %s", tool, args);
+#else
+    snprintf(cmd, sizeof cmd, "%s %s", tool, args);
+#endif
+  }
+
+  if (system(cmd) != 0) {
+    fprintf(stderr, "[test-db] db_tool failed cmd=%s\n", cmd);
+    return -1;
+  }
+  return 0;
+}
+
 static int apply_sql_stream(PGconn *c, const char *sql) {
   PGresult *r = PQexec(c, sql);
   if (!r)
     return -1;
   ExecStatusType st = PQresultStatus(r);
+  if (!(st == PGRES_COMMAND_OK || st == PGRES_TUPLES_OK)) {
+    fprintf(stderr, "[test-db] sql error: %s\n",
+            PQerrorMessage(c) ? PQerrorMessage(c) : "(unknown)");
+  }
   PQclear(r);
   return (st == PGRES_COMMAND_OK || st == PGRES_TUPLES_OK) ? 0 : -1;
 }
@@ -482,6 +527,9 @@ int test_db_apply_sql_file(const char *sql_path) {
   buf[n] = '\0';
   fclose(f);
   int rc = apply_sql_stream(c, buf);
+  if (rc != 0) {
+    fprintf(stderr, "[test-db] apply_sql_file failed path=%s\n", sql_path);
+  }
   free(buf);
   PQfinish(c);
   return rc;
@@ -495,43 +543,7 @@ int test_db_apply_migrations(const char *schema_name) {
 #ifdef WAMBLE_ENABLE_DB
   if ((!schema_name || !*schema_name) && migrations_already_applied())
     return 0;
-  if (test_db_create_schema_if_needed(schema_name) != 0)
-    return -1;
-  if (test_db_set_search_path(schema_name) != 0)
-    return -1;
-  if (test_db_apply_sql_file("migrations/001_profile_initial_schema.sql") != 0)
-    return -1;
-  if (test_db_apply_sql_file("migrations/002_profile_runtime_metadata.sql") !=
-      0)
-    return -1;
-  if (test_db_apply_sql_file(
-          "migrations/003_profile_leaderboard_indexes.sql") != 0)
-    return -1;
-  if (test_db_apply_sql_file(
-          "migrations/004_profile_session_stats_counters.sql") != 0)
-    return -1;
-  if (test_db_apply_sql_file("migrations/005_global_identity_trust.sql") != 0)
-    return -1;
-  if (test_db_apply_sql_file("migrations/006_global_config_snapshots.sql") != 0)
-    return -1;
-  if (test_db_apply_sql_file(
-          "migrations/007_global_policy_runtime_expansion.sql") != 0)
-    return -1;
-  if (test_db_apply_sql_file("migrations/008_profile_identity_sessions.sql") !=
-      0)
-    return -1;
-  if (test_db_apply_sql_file("migrations/009_global_identity_tags.sql") != 0)
-    return -1;
-  if (test_db_apply_sql_file(
-          "migrations/010_profile_prediction_resolution.sql") != 0)
-    return -1;
-  if (test_db_apply_sql_file("migrations/011_profile_treatment_groups.sql") !=
-      0)
-    return -1;
-  if (test_db_apply_sql_file("migrations/011_global_treatment_groups.sql") != 0)
-    return -1;
-  return test_db_apply_sql_file(
-      "migrations/012_profile_board_mode_variants.sql");
+  return test_db_run_tool(schema_name, "--migrate-profile --migrate-global");
 #else
   (void)schema_name;
   return -1;
@@ -540,9 +552,7 @@ int test_db_apply_migrations(const char *schema_name) {
 
 int test_db_apply_fixture(const char *schema_name) {
 #ifdef WAMBLE_ENABLE_DB
-  if (test_db_set_search_path(schema_name) != 0)
-    return -1;
-  return test_db_apply_sql_file("tests/db/fixture.sql");
+  return test_db_run_tool(schema_name, "--fixture");
 #else
   (void)schema_name;
   return -1;
@@ -551,36 +561,7 @@ int test_db_apply_fixture(const char *schema_name) {
 
 int test_db_reset(const char *schema_name) {
 #ifdef WAMBLE_ENABLE_DB
-  PGconn *c = db_connect();
-  if (!c)
-    return -1;
-  if (schema_name && *schema_name) {
-    if (!schema_name_valid(schema_name)) {
-      PQfinish(c);
-      return -1;
-    }
-    char sqlsp[256];
-    snprintf(sqlsp, sizeof sqlsp, "SET search_path TO \"%s\"", schema_name);
-    if (exec1(c, sqlsp) != 0) {
-      PQfinish(c);
-      return -1;
-    }
-  }
-  if (exec1(
-          c,
-          "TRUNCATE TABLE predictions, payouts, game_results, reservations, "
-          "moves, boards, sessions, players, global_policy_rules, "
-          "global_treatment_assignment_predicates, "
-          "global_treatment_assignment_rules, global_treatment_group_outputs, "
-          "global_treatment_group_edges, global_treatment_groups, "
-          "global_runtime_config_revisions, global_runtime_config_blobs, "
-          "global_identities, global_identity_tags RESTART IDENTITY "
-          "CASCADE") != 0) {
-    PQfinish(c);
-    return -1;
-  }
-  PQfinish(c);
-  return test_db_apply_fixture(schema_name);
+  return test_db_run_tool(schema_name, "--reset --fixture");
 #else
   (void)schema_name;
   return -1;
@@ -622,9 +603,8 @@ int test_db_reset_schema(const char *schema_name) {
     return -1;
   if (test_db_drop_schema(schema_name) != 0)
     return -1;
-  if (test_db_apply_migrations(schema_name) != 0)
-    return -1;
-  return test_db_apply_fixture(schema_name);
+  return test_db_run_tool(schema_name,
+                          "--migrate-profile --migrate-global --fixture");
 }
 #else
 int test_db_drop_schema(const char *schema_name) {
@@ -641,20 +621,48 @@ int wamble_test_prepare_db(const char *cfg_path, const char *cfg_suffix,
                            const char *extra_sql) {
   if (!cfg_path || !cfg_suffix || !wamble_db_available())
     return -1;
-  if (test_db_apply_migrations(NULL) != 0)
+  if (test_db_apply_migrations(NULL) != 0) {
+    fprintf(stderr, "[test-db] apply_migrations failed dsn=%s\n",
+            wamble_test_dsn() ? wamble_test_dsn() : "(null)");
     return -1;
-  if (test_db_reset(NULL) != 0)
+  }
+  if (test_db_reset(NULL) != 0) {
+    fprintf(stderr, "[test-db] reset failed dsn=%s\n",
+            wamble_test_dsn() ? wamble_test_dsn() : "(null)");
     return -1;
-  if (wamble_test_write_db_config_file(cfg_path, cfg_suffix) != 0)
+  }
+  if (wamble_test_write_db_config_file(cfg_path, cfg_suffix) != 0) {
+    fprintf(stderr, "[test-db] write_db_config_file failed path=%s\n",
+            cfg_path);
     return -1;
-  if (config_load(cfg_path, NULL, NULL, 0) != CONFIG_LOAD_OK)
+  }
+  {
+    char cfg_status[256];
+    ConfigLoadStatus st =
+        config_load(cfg_path, NULL, cfg_status, sizeof(cfg_status));
+    if (st != CONFIG_LOAD_OK) {
+      fprintf(stderr, "[test-db] config_load failed status=%d msg=%s path=%s\n",
+              (int)st, cfg_status, cfg_path);
+      return -1;
+    }
+  }
+  if (db_set_global_store_connection(NULL) != 0) {
+    fprintf(stderr, "[test-db] db_set_global_store_connection failed path=%s\n",
+            cfg_path);
     return -1;
-  if (db_set_global_store_connection(NULL) != 0)
+  }
+  if (db_init(NULL) != 0) {
+    fprintf(stderr, "[test-db] db_init failed path=%s\n", cfg_path);
     return -1;
-  if (db_init(NULL) != 0)
+  }
+  if (!wamble_get_db_query_service()) {
+    fprintf(stderr, "[test-db] get_db_query_service returned null\n");
     return -1;
+  }
   wamble_set_query_service(wamble_get_db_query_service());
-  if (extra_sql && extra_sql[0] && test_db_apply_sql(extra_sql) != 0)
+  if (extra_sql && extra_sql[0] && test_db_apply_sql(extra_sql) != 0) {
+    fprintf(stderr, "[test-db] apply_sql failed path=%s\n", cfg_path);
     return -1;
+  }
   return 0;
 }

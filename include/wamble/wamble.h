@@ -846,14 +846,15 @@ typedef enum {
 typedef struct WambleRuntimeEvent {
   WambleRuntimeStatus status;
   char profile[64];
+  char detail[160];
 } WambleRuntimeEvent;
 
 ProfileStartStatus start_profile_listeners(int *out_started);
 void stop_profile_listeners(void);
 ProfileStartStatus reconcile_profile_listeners(void);
 int profile_runtime_pump_inline(void);
-void wamble_runtime_event_publish_status(WambleRuntimeStatus status,
-                                         const char *profile_name);
+void wamble_runtime_event_publish(WambleRuntimeStatus status,
+                                  const char *profile_name, const char *detail);
 int wamble_runtime_event_take(WambleRuntimeEvent *out_event);
 const char *wamble_runtime_profile_key(void);
 typedef enum {
@@ -884,6 +885,11 @@ typedef enum {
   SERVER_PROTOCOL_STATUS_UNKNOWN_CTRL = 18,
   SERVER_PROTOCOL_STATUS_LEGAL_MOVES_INVALID_REQUEST = 19,
   SERVER_PROTOCOL_STATUS_PREDICTION_REJECTED = 20,
+  SERVER_PROTOCOL_STATUS_PROFILES_LIST_SERVED = 21,
+  SERVER_PROTOCOL_STATUS_PROFILE_TOS_SERVED = 22,
+  SERVER_PROTOCOL_STATUS_PROFILE_TOS_FALLBACK = 23,
+  SERVER_PROTOCOL_STATUS_PROFILE_TOS_ACCEPTED = 24,
+  SERVER_PROTOCOL_STATUS_PROFILE_TOS_ACCEPT_FAILED = 25,
 } ServerProtocolStatus;
 typedef enum {
   PROFILE_TRUST_DECISION_DENIED = 0,
@@ -1176,6 +1182,7 @@ typedef struct {
 
 #define WAMBLE_CTRL_GET_PROFILE_TOS 0x1E
 #define WAMBLE_CTRL_PROFILE_TOS_DATA 0x1F
+#define WAMBLE_CTRL_ACCEPT_PROFILE_TOS 0x20
 
 #define get_bit(square) (1ULL << (square))
 
@@ -1312,6 +1319,8 @@ typedef enum {
 #define WAMBLE_FLAG_MODE_FILTER_STANDARD 0x04
 #define WAMBLE_FLAG_EXT_PAYLOAD 0x08
 #define WAMBLE_FLAG_FRAGMENT_PAYLOAD 0x10
+#define WAMBLE_FLAG_SPECTATE_NOTICE_SUMMARY_FALLBACK 0x20
+#define WAMBLE_FLAG_SPECTATE_NOTICE_STOPPED 0x40
 
 static inline size_t wamble_build_login_signature_message(
     uint8_t *out, size_t out_size, const uint8_t token[TOKEN_LENGTH],
@@ -1494,6 +1503,26 @@ NetworkStatus wamble_packet_deserialize(const uint8_t *buffer,
 
 typedef enum {
   WS_GATEWAY_OK = 0,
+  WS_GATEWAY_STATUS_UPGRADE_ACCEPTED = 1,
+  WS_GATEWAY_STATUS_ROUTE_REGISTERED = 2,
+  WS_GATEWAY_STATUS_STREAM_STARTED = 3,
+  WS_GATEWAY_STATUS_CLOSE_RECEIVED = 4,
+  WS_GATEWAY_STATUS_OUTBOUND_FLUSHED = 5,
+  WS_GATEWAY_STATUS_OUTBOUND_QUEUED = 6,
+  WS_GATEWAY_STATUS_STREAM_EXITED = 7,
+  WS_GATEWAY_STATUS_HANDSHAKE_READ_FAILED = 8,
+  WS_GATEWAY_STATUS_BAD_REQUEST_LINE = 9,
+  WS_GATEWAY_STATUS_PATH_MISMATCH = 10,
+  WS_GATEWAY_STATUS_UPGRADE_HEADER_INVALID = 11,
+  WS_GATEWAY_STATUS_SEND_101_FAILED = 12,
+  WS_GATEWAY_STATUS_ROUTE_REGISTER_FAILED = 13,
+  WS_GATEWAY_STATUS_WAIT_FAILED = 14,
+  WS_GATEWAY_STATUS_OUTBOUND_FLUSH_FAILED = 15,
+  WS_GATEWAY_STATUS_READ_FAILED = 16,
+  WS_GATEWAY_STATUS_CLOSE_TOO_LARGE = 17,
+  WS_GATEWAY_STATUS_NON_BINARY_OPCODE = 18,
+  WS_GATEWAY_STATUS_BINARY_REJECTED = 19,
+  WS_GATEWAY_STATUS_QUEUE_REJECTED = 20,
   WS_GATEWAY_ERR_CONFIG = -1,
   WS_GATEWAY_ERR_BIND = -2,
   WS_GATEWAY_ERR_THREAD = -3,
@@ -1580,6 +1609,12 @@ void send_ack(wamble_socket_t sockfd, const struct WambleMsg *msg,
 int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
                           const struct sockaddr_in *cliaddr, int timeout_ms,
                           int max_retries);
+int send_reliable_payload_bytes(wamble_socket_t sockfd, uint8_t ctrl,
+                                const uint8_t *token, uint64_t board_id,
+                                const uint8_t *payload, size_t payload_len,
+                                const struct sockaddr_in *cliaddr,
+                                int timeout_ms, int max_retries,
+                                int force_fragment);
 int send_unreliable_packet(wamble_socket_t sockfd, const struct WambleMsg *msg,
                            const struct sockaddr_in *cliaddr);
 int wamble_socket_bound_port(wamble_socket_t sock);
@@ -1634,6 +1669,20 @@ typedef struct WamblePersistentPlayerStats {
   int games_played;
   int chess960_games_played;
 } WamblePersistentPlayerStats;
+
+typedef struct WambleProfileTermsAcceptance {
+  char profile_name[PROFILE_NAME_MAX_LENGTH];
+  uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH];
+  char *tos_text;
+} WambleProfileTermsAcceptance;
+
+static inline void wamble_profile_terms_acceptance_clear(
+    WambleProfileTermsAcceptance *acceptance) {
+  if (!acceptance)
+    return;
+  free(acceptance->tos_text);
+  acceptance->tos_text = NULL;
+}
 
 typedef union {
   int chess960_position_id;
@@ -1997,6 +2046,16 @@ DbStatus wamble_query_get_session_by_token(const uint8_t *token,
                                            uint64_t *out_session);
 DbStatus wamble_query_create_session(const uint8_t *token, uint64_t player_id,
                                      uint64_t *out_session);
+DbStatus wamble_query_record_profile_terms_acceptance(
+    const uint8_t *token, const char *profile_name,
+    const uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH], const char *tos_text,
+    uint64_t *out_acceptance_id);
+DbStatus wamble_query_has_profile_terms_acceptance(
+    const uint8_t *token, const char *profile_name,
+    const uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH], int *out_accepted);
+DbStatus wamble_query_get_latest_profile_terms_acceptance(
+    const uint8_t *token, const char *profile_name,
+    WambleProfileTermsAcceptance *out);
 DbStatus wamble_query_create_prediction(uint64_t board_id, uint64_t session_id,
                                         uint64_t parent_prediction_id,
                                         const char *predicted_move_uci,

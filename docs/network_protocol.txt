@@ -253,14 +253,20 @@ Control Codes
   - Maximum entries per packet: 16.
 - `0x1E` GET_PROFILE_TOS (client to server): Request ToS text for a profile.
   - Payload: `uint8 name_len; char name[name_len]`.
-  - Same authorization rules as GET_PROFILE_INFO: profile must be discoverable
-    by the requesting session's trust tier.
+  - Authorization: profile must be discoverable by the requesting session's
+    trust tier, unless the request is sent to that profile's bound listener.
 - `0x1F` PROFILE_TOS_DATA (server to client): Response to GET_PROFILE_TOS.
   - Payload is the ToS text bytes.
   - If payload size exceeds `WAMBLE_MAX_PAYLOAD`, sender uses the
     Fragment Payload Envelope.
   - If the profile is not found or not accessible: `NOTFOUND;<name>`.
   - Sent reliably.
+- `0x20` ACCEPT_PROFILE_TOS (client to server): Persist acceptance of the
+  current ToS for a profile.
+  - Payload: `uint8 name_len; char name[name_len]`.
+  - Authorization matches `GET_PROFILE_TOS`: discoverable profile or the
+    caller's currently bound listener profile.
+  - Reliable clients receive an immediate `ACK`; failures return `ERROR`.
 
 Reliability
 - Reliable messages are sent with a sequence number (`seq_num`).

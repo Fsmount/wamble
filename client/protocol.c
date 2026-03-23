@@ -340,6 +340,43 @@ static NetworkStatus decode_fragment_payload(const uint8_t *payload,
   return NET_OK;
 }
 
+static NetworkStatus encode_profile_target_payload(const struct WambleMsg *msg,
+                                                   uint8_t *payload,
+                                                   size_t payload_capacity,
+                                                   size_t *out_len) {
+  size_t name_len = 0;
+  if (!msg || !payload || !out_len)
+    return NET_ERR_INVALID;
+  name_len = msg->profile_name_len
+                 ? (size_t)msg->profile_name_len
+                 : strnlen(msg->profile_name, PROFILE_NAME_MAX_LENGTH - 1);
+  if (name_len > 255)
+    return NET_ERR_INVALID;
+  if (1 + name_len > payload_capacity)
+    return NET_ERR_TRUNCATED;
+  payload[0] = (uint8_t)name_len;
+  if (name_len)
+    memcpy(&payload[1], msg->profile_name, name_len);
+  *out_len = 1 + name_len;
+  return NET_OK;
+}
+
+static NetworkStatus decode_profile_target_payload(const uint8_t *payload,
+                                                   size_t payload_len,
+                                                   struct WambleMsg *msg) {
+  if (!payload || !msg)
+    return NET_ERR_INVALID;
+  if (payload_len < 1)
+    return NET_ERR_TRUNCATED;
+  msg->profile_name_len = payload[0];
+  if ((size_t)msg->profile_name_len > payload_len - 1)
+    return NET_ERR_INVALID;
+  if (msg->profile_name_len)
+    memcpy(msg->profile_name, &payload[1], msg->profile_name_len);
+  msg->profile_name[msg->profile_name_len] = '\0';
+  return NET_OK;
+}
+
 NetworkStatus wamble_payload_serialize(const struct WambleMsg *msg,
                                        uint8_t *payload,
                                        size_t payload_capacity, size_t *out_len,
@@ -444,19 +481,12 @@ NetworkStatus wamble_payload_serialize(const struct WambleMsg *msg,
     break;
   }
   case WAMBLE_CTRL_GET_PROFILE_INFO:
-  case WAMBLE_CTRL_GET_PROFILE_TOS: {
-    size_t name_len =
-        msg->profile_name_len
-            ? (size_t)msg->profile_name_len
-            : strnlen(msg->profile_name, PROFILE_NAME_MAX_LENGTH - 1);
-    if (name_len > 255)
-      return NET_ERR_INVALID;
-    if (1 + name_len > payload_capacity)
-      return NET_ERR_TRUNCATED;
-    payload[0] = (uint8_t)name_len;
-    if (name_len)
-      memcpy(&payload[1], msg->profile_name, name_len);
-    body_len = 1 + name_len;
+  case WAMBLE_CTRL_GET_PROFILE_TOS:
+  case WAMBLE_CTRL_ACCEPT_PROFILE_TOS: {
+    NetworkStatus st = encode_profile_target_payload(
+        msg, payload, payload_capacity, &body_len);
+    if (st != NET_OK)
+      return st;
     break;
   }
   case WAMBLE_CTRL_GET_LEGAL_MOVES:
@@ -811,15 +841,8 @@ static NetworkStatus decode_message_payload(uint8_t ctrl, uint8_t flags,
   }
   case WAMBLE_CTRL_GET_PROFILE_INFO:
   case WAMBLE_CTRL_GET_PROFILE_TOS:
-    if (payload_len < 1)
-      return NET_ERR_TRUNCATED;
-    msg->profile_name_len = payload[0];
-    if ((size_t)msg->profile_name_len > payload_len - 1)
-      return NET_ERR_INVALID;
-    if (msg->profile_name_len)
-      memcpy(msg->profile_name, &payload[1], msg->profile_name_len);
-    msg->profile_name[msg->profile_name_len] = '\0';
-    break;
+  case WAMBLE_CTRL_ACCEPT_PROFILE_TOS:
+    return decode_profile_target_payload(payload, payload_len, msg);
   case WAMBLE_CTRL_GET_LEGAL_MOVES:
     if (payload_len < 1)
       return NET_ERR_TRUNCATED;

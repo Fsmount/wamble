@@ -331,16 +331,16 @@ static int prediction_treatment_feature_bool(const uint8_t *token,
   if (treatment_status != DB_OK) {
     WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_TREATMENT_AUDIT,
                                           TREATMENT_AUDIT_STATUS_QUERY_FAILED};
-    wamble_runtime_event_publish_status(runtime_status,
-                                        wamble_runtime_profile_key());
+    wamble_runtime_event_publish(runtime_status, wamble_runtime_profile_key(),
+                                 NULL);
     return 0;
   }
   WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_TREATMENT_AUDIT,
                                         action_count > 0
                                             ? TREATMENT_AUDIT_STATUS_TREATED
                                             : TREATMENT_AUDIT_STATUS_UNTREATED};
-  wamble_runtime_event_publish_status(runtime_status,
-                                      wamble_runtime_profile_key());
+  wamble_runtime_event_publish(runtime_status, wamble_runtime_profile_key(),
+                               NULL);
   for (int i = 0; i < action_count; i++) {
     if (strcmp(actions[i].output_kind, "feature") != 0 ||
         strcmp(actions[i].output_key, key) != 0) {
@@ -479,16 +479,16 @@ static int prediction_collect_actions(const uint8_t *token,
   if (treatment_status != DB_OK) {
     WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_TREATMENT_AUDIT,
                                           TREATMENT_AUDIT_STATUS_QUERY_FAILED};
-    wamble_runtime_event_publish_status(runtime_status,
-                                        wamble_runtime_profile_key());
+    wamble_runtime_event_publish(runtime_status, wamble_runtime_profile_key(),
+                                 NULL);
     return -1;
   }
   WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_TREATMENT_AUDIT,
                                         (out_count && *out_count > 0)
                                             ? TREATMENT_AUDIT_STATUS_TREATED
                                             : TREATMENT_AUDIT_STATUS_UNTREATED};
-  wamble_runtime_event_publish_status(runtime_status,
-                                      wamble_runtime_profile_key());
+  wamble_runtime_event_publish(runtime_status, wamble_runtime_profile_key(),
+                               NULL);
   return 0;
 }
 

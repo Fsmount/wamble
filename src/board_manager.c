@@ -450,16 +450,16 @@ static int board_assignment_apply_treatment(const WambleBoard *board,
   if (treatment_status != DB_OK) {
     WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_TREATMENT_AUDIT,
                                           TREATMENT_AUDIT_STATUS_QUERY_FAILED};
-    wamble_runtime_event_publish_status(runtime_status,
-                                        wamble_runtime_profile_key());
+    wamble_runtime_event_publish(runtime_status, wamble_runtime_profile_key(),
+                                 NULL);
     return 0;
   }
   WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_TREATMENT_AUDIT,
                                         action_count > 0
                                             ? TREATMENT_AUDIT_STATUS_TREATED
                                             : TREATMENT_AUDIT_STATUS_UNTREATED};
-  wamble_runtime_event_publish_status(runtime_status,
-                                      wamble_runtime_profile_key());
+  wamble_runtime_event_publish(runtime_status, wamble_runtime_profile_key(),
+                               NULL);
 
   int board_is_960 = (board->board.game_mode == GAME_MODE_CHESS960);
   for (int i = 0; i < action_count; i++) {

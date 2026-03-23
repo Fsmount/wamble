@@ -79,8 +79,9 @@ static void profile_runtime_set_profile_key(const char *profile_name) {
            (profile_name && profile_name[0]) ? profile_name : "__default__");
 }
 
-void wamble_runtime_event_publish_status(WambleRuntimeStatus status,
-                                         const char *profile_name) {
+void wamble_runtime_event_publish(WambleRuntimeStatus status,
+                                  const char *profile_name,
+                                  const char *detail) {
   ensure_mutex_init();
   wamble_mutex_lock(&g_mutex);
   if (g_runtime_event_count >= RUNTIME_EVENT_QUEUE_CAP) {
@@ -91,6 +92,7 @@ void wamble_runtime_event_publish_status(WambleRuntimeStatus status,
   ev->status = status;
   snprintf(ev->profile, sizeof(ev->profile), "%s",
            (profile_name && profile_name[0]) ? profile_name : "default");
+  snprintf(ev->detail, sizeof(ev->detail), "%s", detail ? detail : "");
   g_runtime_event_tail = (g_runtime_event_tail + 1) % RUNTIME_EVENT_QUEUE_CAP;
   g_runtime_event_count++;
   wamble_mutex_unlock(&g_mutex);
@@ -119,14 +121,14 @@ static void publish_prediction_manager_status(PredictionManagerStatus status,
                                               const char *profile_name) {
   WambleRuntimeStatus runtime_status = {
       WAMBLE_RUNTIME_STATUS_PREDICTION_MANAGER, (int)status};
-  wamble_runtime_event_publish_status(runtime_status, profile_name);
+  wamble_runtime_event_publish(runtime_status, profile_name, NULL);
 }
 
 static void publish_ws_gateway_status(WsGatewayStatus status,
                                       const char *profile_name) {
   WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_WS_GATEWAY,
                                         (int)status};
-  wamble_runtime_event_publish_status(runtime_status, profile_name);
+  wamble_runtime_event_publish(runtime_status, profile_name, NULL);
 }
 
 enum {
@@ -1119,7 +1121,7 @@ static void send_spectator_batch(wamble_socket_t sockfd,
     memcpy(out.token, events[i].token, TOKEN_LENGTH);
     out.board_id = events[i].board_id;
     out.seq_num = 0;
-    out.flags = events[i].flags ? events[i].flags : WAMBLE_FLAG_UNRELIABLE;
+    out.flags = (uint8_t)(events[i].flags | WAMBLE_FLAG_UNRELIABLE);
     {
       size_t __len = strnlen(events[i].fen, FEN_MAX_LENGTH - 1);
       memcpy(out.fen, events[i].fen, __len);

@@ -117,6 +117,9 @@ Artifacts are placed under `build/`
   - Migrate a global schema: `WAMBLE_TEST_DSN=... build/wamble_db_tool --schema test_schema --migrate-global`
   - Load fixtures: `WAMBLE_TEST_DSN=... build/wamble_db_tool --schema test_schema --fixture`
   - Reset tables: `WAMBLE_TEST_DSN=... build/wamble_db_tool --schema test_schema --reset`
+    - `--reset` clears profile gameplay state, policy/runtime snapshots, profile
+      terms acceptances, and the global identity tag / treatment tables. Pair
+      it with `--fixture` when you want the deterministic seed rows restored.
 
 DB-backed tests are automatically skipped if `WAMBLE_TEST_DSN` is not set.
 

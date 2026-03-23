@@ -19,6 +19,17 @@ int db_write_batch_commit(void);
 void db_write_batch_rollback(void);
 
 uint64_t db_create_session(const uint8_t *token, uint64_t player_id);
+DbStatus db_record_profile_terms_acceptance(
+    const uint8_t *token, const char *profile_name,
+    const uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH], const char *tos_text,
+    uint64_t *out_acceptance_id);
+DbStatus db_has_profile_terms_acceptance(
+    const uint8_t *token, const char *profile_name,
+    const uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH], int *out_accepted);
+DbStatus
+db_get_latest_profile_terms_acceptance(const uint8_t *token,
+                                       const char *profile_name,
+                                       WambleProfileTermsAcceptance *out);
 DbStatus db_assign_session_treatment(const uint8_t *token, const char *profile,
                                      const WambleFact *facts, int fact_count,
                                      WambleTreatmentAssignment *out);
@@ -98,6 +109,16 @@ typedef struct WambleQueryService {
   DbStatus (*get_max_board_id)(uint64_t *out_max_id);
   DbStatus (*get_session_by_token)(const uint8_t *token, uint64_t *out_session);
   uint64_t (*create_session)(const uint8_t *token, uint64_t player_id);
+  DbStatus (*record_profile_terms_acceptance)(
+      const uint8_t *token, const char *profile_name,
+      const uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH], const char *tos_text,
+      uint64_t *out_acceptance_id);
+  DbStatus (*has_profile_terms_acceptance)(
+      const uint8_t *token, const char *profile_name,
+      const uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH], int *out_accepted);
+  DbStatus (*get_latest_profile_terms_acceptance)(
+      const uint8_t *token, const char *profile_name,
+      WambleProfileTermsAcceptance *out);
   DbStatus (*get_persistent_session_by_token)(const uint8_t *token,
                                               uint64_t *out_session);
   DbStatus (*get_player_total_score)(uint64_t session_id, double *out_total);
