@@ -18,6 +18,17 @@ static DbStatus db_get_active_session_count(int *out_count);
 static DbStatus db_get_max_board_id(uint64_t *out_max_id);
 static DbStatus db_get_session_by_token(const uint8_t *token,
                                         uint64_t *out_session);
+DbStatus db_record_profile_terms_acceptance(
+    const uint8_t *token, const char *profile_name,
+    const uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH], const char *tos_text,
+    uint64_t *out_acceptance_id);
+DbStatus db_has_profile_terms_acceptance(
+    const uint8_t *token, const char *profile_name,
+    const uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH], int *out_accepted);
+DbStatus
+db_get_latest_profile_terms_acceptance(const uint8_t *token,
+                                       const char *profile_name,
+                                       WambleProfileTermsAcceptance *out);
 static DbStatus db_get_persistent_session_by_token(const uint8_t *token,
                                                    uint64_t *out_session);
 static DbStatus db_get_player_total_score(uint64_t session_id,
@@ -416,6 +427,25 @@ static int db_ensure_profile_treatment_schema(void) {
       "ADD COLUMN IF NOT EXISTS treatment_snapshot_revision_id BIGINT",
       "ALTER TABLE sessions "
       "ADD COLUMN IF NOT EXISTS treatment_assigned_at TIMESTAMPTZ",
+      "CREATE TABLE IF NOT EXISTS profile_terms_acceptances ("
+      "  id BIGSERIAL PRIMARY KEY,"
+      "  session_id BIGINT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,"
+      "  global_identity_id BIGINT,"
+      "  profile_name VARCHAR(256) NOT NULL,"
+      "  tos_hash BYTEA NOT NULL CHECK (OCTET_LENGTH(tos_hash) = 32),"
+      "  tos_text TEXT NOT NULL,"
+      "  config_revision_id BIGINT,"
+      "  policy_snapshot_revision_id BIGINT,"
+      "  accepted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
+      ")",
+      "ALTER TABLE profile_terms_acceptances "
+      "ALTER COLUMN profile_name TYPE VARCHAR(256)",
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_terms_acceptances_unique "
+      "ON profile_terms_acceptances(session_id, profile_name, tos_hash)",
+      "CREATE INDEX IF NOT EXISTS idx_profile_terms_acceptances_session "
+      "ON profile_terms_acceptances(session_id, accepted_at DESC)",
+      "CREATE INDEX IF NOT EXISTS idx_profile_terms_acceptances_identity "
+      "ON profile_terms_acceptances(global_identity_id, accepted_at DESC)",
       "ALTER TABLE boards "
       "ADD COLUMN IF NOT EXISTS last_mover_treatment_group VARCHAR(128)",
       "CREATE INDEX IF NOT EXISTS idx_sessions_treatment_group "
@@ -2091,7 +2121,7 @@ DbStatus db_resolve_policy_decision(const uint8_t *token, const char *profile,
 
   uint64_t identity_id = 0;
   DbStatus sid_status = db_get_or_create_session_identity(token, &identity_id);
-  if (sid_status != DB_OK)
+  if (sid_status != DB_OK && sid_status != DB_NOT_FOUND)
     return sid_status;
   out->global_identity_id = identity_id;
 
@@ -2196,6 +2226,10 @@ const WambleQueryService *wamble_get_db_query_service(void) {
     svc.get_max_board_id = db_get_max_board_id;
     svc.get_session_by_token = db_get_session_by_token;
     svc.create_session = db_create_session;
+    svc.record_profile_terms_acceptance = db_record_profile_terms_acceptance;
+    svc.has_profile_terms_acceptance = db_has_profile_terms_acceptance;
+    svc.get_latest_profile_terms_acceptance =
+        db_get_latest_profile_terms_acceptance;
     svc.get_persistent_session_by_token = db_get_persistent_session_by_token;
     svc.get_player_total_score = db_get_player_total_score;
     svc.get_player_prediction_score = db_get_player_prediction_score;
@@ -2342,6 +2376,36 @@ DbStatus wamble_query_create_session(const uint8_t *token, uint64_t player_id,
   if (out_session)
     *out_session = sid;
   return DB_OK;
+}
+
+DbStatus wamble_query_record_profile_terms_acceptance(
+    const uint8_t *token, const char *profile_name,
+    const uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH], const char *tos_text,
+    uint64_t *out_acceptance_id) {
+  const WambleQueryService *qs = get_query_service();
+  if (!qs || !qs->record_profile_terms_acceptance)
+    return DB_ERR_EXEC;
+  return qs->record_profile_terms_acceptance(token, profile_name, tos_hash,
+                                             tos_text, out_acceptance_id);
+}
+
+DbStatus wamble_query_has_profile_terms_acceptance(
+    const uint8_t *token, const char *profile_name,
+    const uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH], int *out_accepted) {
+  const WambleQueryService *qs = get_query_service();
+  if (!qs || !qs->has_profile_terms_acceptance)
+    return DB_ERR_EXEC;
+  return qs->has_profile_terms_acceptance(token, profile_name, tos_hash,
+                                          out_accepted);
+}
+
+DbStatus wamble_query_get_latest_profile_terms_acceptance(
+    const uint8_t *token, const char *profile_name,
+    WambleProfileTermsAcceptance *out) {
+  const WambleQueryService *qs = get_query_service();
+  if (!qs || !qs->get_latest_profile_terms_acceptance)
+    return DB_ERR_EXEC;
+  return qs->get_latest_profile_terms_acceptance(token, profile_name, out);
 }
 
 DbStatus wamble_query_create_prediction(uint64_t board_id, uint64_t session_id,
@@ -2605,6 +2669,159 @@ static DbStatus db_get_session_by_token(const uint8_t *token,
   token_cache_u64_store(tls_session_cache, TOKEN_READ_CACHE_CAP,
                         &tls_session_cache_next, token, DB_OK, session_id,
                         now_ms);
+  return DB_OK;
+}
+
+DbStatus db_record_profile_terms_acceptance(
+    const uint8_t *token, const char *profile_name,
+    const uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH], const char *tos_text,
+    uint64_t *out_acceptance_id) {
+  if (out_acceptance_id)
+    *out_acceptance_id = 0;
+  if (!token || !profile_name || !profile_name[0] || !tos_hash || !tos_text)
+    return DB_ERR_BAD_DATA;
+
+  if (db_ensure_profile_treatment_schema() != 0)
+    return DB_ERR_EXEC;
+
+  uint64_t session_id = 0;
+  if (db_get_session_by_token(token, &session_id) != DB_OK || session_id == 0) {
+    session_id = db_create_session(token, 0);
+    if (session_id == 0)
+      return DB_ERR_EXEC;
+  }
+
+  const char *query =
+      "INSERT INTO profile_terms_acceptances ("
+      "  session_id, global_identity_id, profile_name, tos_hash, tos_text, "
+      "  config_revision_id, policy_snapshot_revision_id"
+      ") "
+      "SELECT s.id, s.global_identity_id, $2, decode($3, 'hex'), $4, "
+      "       s.config_revision_id, s.policy_snapshot_revision_id "
+      "FROM sessions s "
+      "WHERE s.token = decode($1, 'hex') "
+      "ON CONFLICT (session_id, profile_name, tos_hash) DO UPDATE "
+      "SET global_identity_id = EXCLUDED.global_identity_id, "
+      "    tos_text = EXCLUDED.tos_text, "
+      "    config_revision_id = EXCLUDED.config_revision_id, "
+      "    policy_snapshot_revision_id = "
+      "        EXCLUDED.policy_snapshot_revision_id, "
+      "    accepted_at = NOW() "
+      "RETURNING id";
+
+  char token_hex[33];
+  char hash_hex[(WAMBLE_FRAGMENT_HASH_LENGTH * 2) + 1];
+  bytes_to_hex(token, TOKEN_LENGTH, token_hex);
+  bytes_to_hex(tos_hash, WAMBLE_FRAGMENT_HASH_LENGTH, hash_hex);
+
+  const char *paramValues[] = {token_hex, profile_name, hash_hex, tos_text};
+  PGresult *res =
+      pq_exec_params_locked(query, 4, NULL, paramValues, NULL, NULL, 0);
+  if (!res)
+    return DB_ERR_CONN;
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    PQclear(res);
+    return DB_ERR_EXEC;
+  }
+  if (PQntuples(res) == 0) {
+    PQclear(res);
+    return DB_NOT_FOUND;
+  }
+  if (out_acceptance_id)
+    *out_acceptance_id = strtoull(PQgetvalue(res, 0, 0), NULL, 10);
+  PQclear(res);
+  return DB_OK;
+}
+
+DbStatus db_has_profile_terms_acceptance(
+    const uint8_t *token, const char *profile_name,
+    const uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH], int *out_accepted) {
+  if (out_accepted)
+    *out_accepted = 0;
+  if (!token || !profile_name || !profile_name[0] || !tos_hash ||
+      !out_accepted) {
+    return DB_ERR_BAD_DATA;
+  }
+
+  if (db_ensure_profile_treatment_schema() != 0)
+    return DB_ERR_EXEC;
+
+  const char *query = "SELECT 1 "
+                      "FROM profile_terms_acceptances a "
+                      "JOIN sessions s ON s.id = a.session_id "
+                      "WHERE s.token = decode($1, 'hex') "
+                      "  AND a.profile_name = $2 "
+                      "  AND a.tos_hash = decode($3, 'hex') "
+                      "LIMIT 1";
+
+  char token_hex[33];
+  char hash_hex[(WAMBLE_FRAGMENT_HASH_LENGTH * 2) + 1];
+  bytes_to_hex(token, TOKEN_LENGTH, token_hex);
+  bytes_to_hex(tos_hash, WAMBLE_FRAGMENT_HASH_LENGTH, hash_hex);
+
+  const char *paramValues[] = {token_hex, profile_name, hash_hex};
+  PGresult *res =
+      pq_exec_params_locked(query, 3, NULL, paramValues, NULL, NULL, 0);
+  if (!res)
+    return DB_ERR_CONN;
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    PQclear(res);
+    return DB_ERR_EXEC;
+  }
+
+  *out_accepted = PQntuples(res) > 0 ? 1 : 0;
+  PQclear(res);
+  return DB_OK;
+}
+
+DbStatus
+db_get_latest_profile_terms_acceptance(const uint8_t *token,
+                                       const char *profile_name,
+                                       WambleProfileTermsAcceptance *out) {
+  if (!token || !profile_name || !profile_name[0] || !out)
+    return DB_ERR_BAD_DATA;
+
+  memset(out, 0, sizeof(*out));
+
+  if (db_ensure_profile_treatment_schema() != 0)
+    return DB_ERR_EXEC;
+
+  const char *query =
+      "SELECT a.profile_name, encode(a.tos_hash, 'hex'), a.tos_text "
+      "FROM profile_terms_acceptances a "
+      "JOIN sessions s ON s.id = a.session_id "
+      "WHERE s.token = decode($1, 'hex') "
+      "  AND a.profile_name = $2 "
+      "ORDER BY a.accepted_at DESC, a.id DESC "
+      "LIMIT 1";
+
+  char token_hex[33];
+  bytes_to_hex(token, TOKEN_LENGTH, token_hex);
+
+  const char *paramValues[] = {token_hex, profile_name};
+  PGresult *res =
+      pq_exec_params_locked(query, 2, NULL, paramValues, NULL, NULL, 0);
+  if (!res)
+    return DB_ERR_CONN;
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    PQclear(res);
+    return DB_ERR_EXEC;
+  }
+  if (PQntuples(res) == 0) {
+    PQclear(res);
+    return DB_NOT_FOUND;
+  }
+
+  snprintf(out->profile_name, sizeof(out->profile_name), "%s",
+           PQgetvalue(res, 0, 0));
+  hex_to_bytes(PQgetvalue(res, 0, 1), out->tos_hash,
+               WAMBLE_FRAGMENT_HASH_LENGTH);
+  out->tos_text = wamble_strdup(PQgetvalue(res, 0, 2));
+  if (!out->tos_text) {
+    PQclear(res);
+    return DB_ERR_EXEC;
+  }
+  PQclear(res);
   return DB_OK;
 }
 

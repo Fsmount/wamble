@@ -32,6 +32,9 @@ static WAMBLE_THREAD_LOCAL int g_login_challenge_capacity = 0;
 
 static void publish_server_protocol_status(int status_code,
                                            const char *profile_name);
+static void publish_server_protocol_status_detail(int status_code,
+                                                  const char *profile_name,
+                                                  const char *detail);
 static void publish_treatment_audit_status(int status_code,
                                            const char *profile_name);
 static const char *ctrl_policy_resource(uint8_t ctrl);
@@ -230,7 +233,7 @@ static int resolve_profile_trust_tier(const uint8_t *token,
   }
   WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_TRUST_DECISION,
                                         trust_event};
-  wamble_runtime_event_publish_status(runtime_status, profile_name);
+  wamble_runtime_event_publish(runtime_status, profile_name, NULL);
 
   WambleFact facts[2];
   int fact_count = 0;
@@ -543,6 +546,22 @@ static int profile_discovery_allowed(const uint8_t *token,
   return (p->advertise && effective_trust >= p->visibility) ? 1 : 0;
 }
 
+static int profile_terms_route_allowed(const uint8_t *token,
+                                       const WambleProfile *p,
+                                       const char *requested_profile_name,
+                                       const char *bound_profile_name,
+                                       int trust_tier) {
+  if (!p || !requested_profile_name || !requested_profile_name[0])
+    return 0;
+  if (p->abstract)
+    return 0;
+  if (bound_profile_name && bound_profile_name[0] &&
+      strcmp(requested_profile_name, bound_profile_name) == 0) {
+    return 1;
+  }
+  return profile_discovery_allowed(token, p, trust_tier);
+}
+
 static ServerStatus send_policy_denied(wamble_socket_t sockfd,
                                        const struct sockaddr_in *cliaddr,
                                        const uint8_t *token,
@@ -556,6 +575,26 @@ static ServerStatus send_policy_denied(wamble_socket_t sockfd,
   if (send_reliable_default(sockfd, &err, cliaddr) != 0) {
     return SERVER_ERR_SEND_FAILED;
   }
+  return SERVER_ERR_FORBIDDEN;
+}
+
+static ServerStatus send_terms_required(wamble_socket_t sockfd,
+                                        const struct sockaddr_in *cliaddr,
+                                        const uint8_t *token,
+                                        const char *profile_name) {
+  char detail[160];
+  snprintf(detail, sizeof(detail), "profile=%s terms acceptance required",
+           profile_name && profile_name[0] ? profile_name : "default");
+  publish_server_protocol_status_detail(SERVER_PROTOCOL_STATUS_POLICY_DENIED,
+                                        profile_name, detail);
+  struct WambleMsg err = {0};
+  err.ctrl = WAMBLE_CTRL_ERROR;
+  memcpy(err.token, token, TOKEN_LENGTH);
+  err.error_code = WAMBLE_ERR_ACCESS_DENIED;
+  snprintf(err.error_reason, sizeof(err.error_reason),
+           "terms acceptance required");
+  if (send_reliable_default(sockfd, &err, cliaddr) != 0)
+    return SERVER_ERR_SEND_FAILED;
   return SERVER_ERR_FORBIDDEN;
 }
 
@@ -623,6 +662,8 @@ static const char *ctrl_policy_resource(uint8_t ctrl) {
     return "get_profile_tos";
   case WAMBLE_CTRL_PROFILE_TOS_DATA:
     return "profile_tos_data";
+  case WAMBLE_CTRL_ACCEPT_PROFILE_TOS:
+    return "accept_profile_tos";
   default:
     return "unknown";
   }
@@ -658,10 +699,78 @@ static int append_ext_string(struct WambleMsg *msg, const char *key,
   return 0;
 }
 
+static int effective_profile_websocket_port(const WambleProfile *profile) {
+  if (!profile || profile->config.websocket_enabled == 0)
+    return 0;
+  return (profile->config.websocket_port > 0) ? profile->config.websocket_port
+                                              : profile->config.port;
+}
+
+static const char *
+effective_profile_websocket_path(const WambleProfile *profile) {
+  if (!profile || profile->config.websocket_enabled == 0)
+    return NULL;
+  if (!profile->config.websocket_path ||
+      profile->config.websocket_path[0] == '\0')
+    return "/ws";
+  return profile->config.websocket_path;
+}
+
 static int protocol_ctrl_allowed(const uint8_t *token, const char *profile_name,
                                  uint8_t ctrl) {
   return policy_check(token, profile_name, "protocol.ctrl",
                       ctrl_policy_resource(ctrl), NULL, NULL, NULL);
+}
+
+static int profile_terms_required_for_profile(const WambleProfile *profile) {
+  return (profile && profile->tos_text && profile->tos_text[0]) ? 1 : 0;
+}
+
+static int profile_terms_currently_accepted(const uint8_t *token,
+                                            const char *profile_name) {
+  const WambleProfile *profile = NULL;
+  uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH] = {0};
+  int accepted = 0;
+  if (!token || !profile_name || !profile_name[0])
+    return 1;
+  profile = config_find_profile(profile_name);
+  if (!profile_terms_required_for_profile(profile))
+    return 1;
+  crypto_blake2b(tos_hash, sizeof(tos_hash), (const uint8_t *)profile->tos_text,
+                 strlen(profile->tos_text));
+  if (wamble_query_has_profile_terms_acceptance(token, profile_name, tos_hash,
+                                                &accepted) != DB_OK) {
+    return 0;
+  }
+  return accepted ? 1 : 0;
+}
+
+typedef enum { CTRL_SCOPE_GLOBAL = 0, CTRL_SCOPE_PROFILE = 1 } CtrlScope;
+
+static CtrlScope ctrl_scope(uint8_t ctrl) {
+  switch (ctrl) {
+  case WAMBLE_CTRL_ACK:
+  case WAMBLE_CTRL_CLIENT_HELLO:
+  case WAMBLE_CTRL_CLIENT_GOODBYE:
+  case WAMBLE_CTRL_LIST_PROFILES:
+  case WAMBLE_CTRL_GET_PROFILE_INFO:
+  case WAMBLE_CTRL_GET_PROFILE_TOS:
+  case WAMBLE_CTRL_ACCEPT_PROFILE_TOS:
+  case WAMBLE_CTRL_LOGIN_REQUEST:
+  case WAMBLE_CTRL_LOGOUT:
+    return CTRL_SCOPE_GLOBAL;
+  case WAMBLE_CTRL_PLAYER_MOVE:
+  case WAMBLE_CTRL_SPECTATE_GAME:
+  case WAMBLE_CTRL_SPECTATE_STOP:
+  case WAMBLE_CTRL_GET_PLAYER_STATS:
+  case WAMBLE_CTRL_GET_LEGAL_MOVES:
+  case WAMBLE_CTRL_GET_LEADERBOARD:
+  case WAMBLE_CTRL_SUBMIT_PREDICTION:
+  case WAMBLE_CTRL_GET_PREDICTIONS:
+    return CTRL_SCOPE_PROFILE;
+  default:
+    return CTRL_SCOPE_PROFILE;
+  }
 }
 
 static int prediction_tree_read_allowed(uint64_t board_id,
@@ -679,7 +788,9 @@ static uint32_t compute_profile_ui_caps(const uint8_t *token,
   uint32_t caps = 0;
   if (!token || !p || !p->name || !p->name[0])
     return 0;
-  if (protocol_ctrl_allowed(token, p->name, WAMBLE_CTRL_CLIENT_HELLO))
+  int join_allowed =
+      protocol_ctrl_allowed(token, p->name, WAMBLE_CTRL_CLIENT_HELLO);
+  if (join_allowed)
     caps |= WAMBLE_PROFILE_UI_CAP_JOIN;
   if (p->tos_text && p->tos_text[0] &&
       protocol_ctrl_allowed(token, p->name, WAMBLE_CTRL_GET_PROFILE_TOS)) {
@@ -699,6 +810,8 @@ static uint32_t compute_session_ui_caps(const uint8_t *token,
   if (out_prediction_source)
     *out_prediction_source = "tree";
   if (!token || !profile_name || !profile_name[0] || !board)
+    return 0;
+  if (!profile_terms_currently_accepted(token, profile_name))
     return 0;
 
   if (protocol_ctrl_allowed(token, profile_name, WAMBLE_CTRL_LOGIN_REQUEST))
@@ -834,7 +947,8 @@ static ServerStatus handle_client_hello(wamble_socket_t sockfd,
                                         const struct WambleMsg *msg,
                                         const struct sockaddr_in *cliaddr,
                                         const char *profile_name) {
-  uint32_t client_version = msg->seq_num;
+  uint32_t client_version =
+      (msg->header_version != 0) ? msg->header_version : msg->seq_num;
   if (client_version < WAMBLE_MIN_CLIENT_VERSION)
     client_version = WAMBLE_MIN_CLIENT_VERSION;
 
@@ -877,7 +991,7 @@ static ServerStatus handle_client_hello(wamble_socket_t sockfd,
   struct WambleMsg response = {0};
   response.ctrl = WAMBLE_CTRL_SERVER_HELLO;
   response.flags = negotiated_caps;
-  response.header_version = (uint8_t)client_version;
+  response.header_version = WAMBLE_PROTO_VERSION;
   memcpy(response.token, player->token, TOKEN_LENGTH);
   response.board_id = board->id;
   response.seq_num = WAMBLE_PROTO_VERSION;
@@ -1084,12 +1198,16 @@ static ServerStatus handle_list_profiles(wamble_socket_t sockfd,
                                          const struct sockaddr_in *cliaddr,
                                          const struct WambleMsg *msg,
                                          int effective_trust_tier) {
-  struct WambleMsg resp = {0};
-  resp.ctrl = WAMBLE_CTRL_PROFILES_LIST;
-  memcpy(resp.token, msg->token, TOKEN_LENGTH);
+  const WambleConfig *cfg = get_config();
+  char detail[96];
+  snprintf(detail, sizeof(detail), "trust_tier=%d profile_count=%d",
+           effective_trust_tier, config_profile_count());
+  publish_server_protocol_status_detail(
+      SERVER_PROTOCOL_STATUS_PROFILES_LIST_SERVED, wamble_runtime_profile_key(),
+      detail);
 
   int count = config_profile_count();
-  int written = 0;
+  size_t payload_len = 0;
   for (int i = 0; i < count; i++) {
     const WambleProfile *p = config_get_profile(i);
     if (!p)
@@ -1097,20 +1215,40 @@ static ServerStatus handle_list_profiles(wamble_socket_t sockfd,
     if (!profile_discovery_allowed(msg->token, p, effective_trust_tier))
       continue;
     const char *name = p->name ? p->name : "";
-    int need = (int)strlen(name);
-    if (written + need + (written ? 1 : 0) >= FEN_MAX_LENGTH)
-      break;
-    if (written)
-      resp.profiles_list[written++] = ',';
-    memcpy(&resp.profiles_list[written], name, (size_t)need);
-    written += need;
+    payload_len += strlen(name) + (payload_len ? 1u : 0u);
   }
-  if (written < FEN_MAX_LENGTH)
-    resp.profiles_list[written] = '\0';
-  resp.profiles_list_len = (uint16_t)written;
-  if (send_reliable_default(sockfd, &resp, cliaddr) != 0) {
+
+  char *payload = payload_len > 0 ? (char *)malloc(payload_len + 1) : NULL;
+  size_t written = 0;
+  if (payload_len > 0 && !payload)
+    return SERVER_ERR_SEND_FAILED;
+
+  for (int i = 0; i < count; i++) {
+    const WambleProfile *p = config_get_profile(i);
+    if (!p)
+      continue;
+    if (!profile_discovery_allowed(msg->token, p, effective_trust_tier))
+      continue;
+    const char *name = p->name ? p->name : "";
+    size_t name_len = strlen(name);
+    if (written > 0)
+      payload[written++] = ',';
+    if (name_len > 0) {
+      memcpy(payload + written, name, name_len);
+      written += name_len;
+    }
+  }
+  if (payload)
+    payload[written] = '\0';
+
+  if (send_reliable_payload_bytes(
+          sockfd, WAMBLE_CTRL_PROFILES_LIST, msg->token, 0,
+          (const uint8_t *)payload, written, cliaddr, cfg->timeout_ms,
+          cfg->max_retries, written > (size_t)(FEN_MAX_LENGTH - 1)) != 0) {
+    free(payload);
     return SERVER_ERR_SEND_FAILED;
   }
+  free(payload);
   return SERVER_OK;
 }
 
@@ -1132,6 +1270,8 @@ static ServerStatus handle_get_profile_info(wamble_socket_t sockfd,
   resp.ctrl = WAMBLE_CTRL_PROFILE_INFO;
   memcpy(resp.token, msg->token, TOKEN_LENGTH);
   if (p && profile_discovery_allowed(msg->token, p, effective_trust_tier)) {
+    int ws_port = effective_profile_websocket_port(p);
+    const char *ws_path = effective_profile_websocket_path(p);
     int wrote = snprintf(resp.profile_info, FEN_MAX_LENGTH, "%s;%d;%d;%d",
                          p->name, p->config.port, p->advertise, p->visibility);
     if (wrote < 0)
@@ -1141,6 +1281,9 @@ static ServerStatus handle_get_profile_info(wamble_socket_t sockfd,
     resp.profile_info_len = (uint16_t)wrote;
     (void)append_ext_int(&resp, "profile.caps",
                          (int64_t)compute_profile_ui_caps(msg->token, p));
+    (void)append_ext_int(&resp, "profile.websocket_port", (int64_t)ws_port);
+    if (ws_path)
+      (void)append_ext_string(&resp, "profile.websocket_path", ws_path);
   } else {
     publish_server_protocol_status(
         p ? SERVER_PROTOCOL_STATUS_PROFILE_INFO_HIDDEN
@@ -1171,20 +1314,26 @@ static uint32_t next_fragment_transfer_id(void) {
 
 static void publish_server_protocol_status(int status_code,
                                            const char *profile_name) {
+  publish_server_protocol_status_detail(status_code, profile_name, NULL);
+}
+
+static void publish_server_protocol_status_detail(int status_code,
+                                                  const char *profile_name,
+                                                  const char *detail) {
   WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_SERVER_PROTOCOL,
                                         status_code};
-  wamble_runtime_event_publish_status(
+  wamble_runtime_event_publish(
       runtime_status,
-      profile_name && profile_name[0] ? profile_name : "default");
+      profile_name && profile_name[0] ? profile_name : "default", detail);
 }
 
 static void publish_treatment_audit_status(int status_code,
                                            const char *profile_name) {
   WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_TREATMENT_AUDIT,
                                         status_code};
-  wamble_runtime_event_publish_status(
+  wamble_runtime_event_publish(
       runtime_status,
-      profile_name && profile_name[0] ? profile_name : "default");
+      profile_name && profile_name[0] ? profile_name : "default", NULL);
 }
 
 static ServerStatus send_fragmented_payload(
@@ -1261,6 +1410,7 @@ static ServerStatus send_fragmented_payload(
 static ServerStatus handle_get_profile_tos(wamble_socket_t sockfd,
                                            const struct sockaddr_in *cliaddr,
                                            const struct WambleMsg *msg,
+                                           const char *profile_name,
                                            int effective_trust_tier) {
   if (!msg || !cliaddr)
     return SERVER_ERR_INTERNAL;
@@ -1271,14 +1421,24 @@ static ServerStatus handle_get_profile_tos(wamble_socket_t sockfd,
   if (nlen > 0)
     memcpy(name, msg->profile_name, (size_t)nlen);
   name[nlen] = '\0';
+  if (!name[0] && profile_name && profile_name[0]) {
+    snprintf(name, sizeof(name), "%s", profile_name);
+  }
 
   const WambleProfile *p = config_find_profile(name);
-  if (p && profile_discovery_allowed(msg->token, p, effective_trust_tier)) {
+  if (p && profile_terms_route_allowed(msg->token, p, name, profile_name,
+                                       effective_trust_tier)) {
     const char *tos = p->tos_text ? p->tos_text : "";
-    size_t tos_len = p->tos_text ? strlen(p->tos_text) : 0;
+    unsigned long long tos_len =
+        (unsigned long long)(p->tos_text ? strlen(p->tos_text) : 0);
+    char detail[128];
+    snprintf(detail, sizeof(detail), "profile=%.48s trust_tier=%d tos_len=%llu",
+             name, effective_trust_tier, tos_len);
+    publish_server_protocol_status_detail(
+        SERVER_PROTOCOL_STATUS_PROFILE_TOS_SERVED, name, detail);
     return send_fragmented_payload(sockfd, cliaddr,
                                    WAMBLE_CTRL_PROFILE_TOS_DATA, msg->token,
-                                   (const uint8_t *)tos, tos_len, name);
+                                   (const uint8_t *)tos, (size_t)tos_len, name);
   } else {
     publish_server_protocol_status(
         p ? SERVER_PROTOCOL_STATUS_PROFILE_INFO_HIDDEN
@@ -1290,10 +1450,85 @@ static ServerStatus handle_get_profile_tos(wamble_socket_t sockfd,
       wrote = 0;
     if (wrote >= FEN_MAX_LENGTH)
       wrote = FEN_MAX_LENGTH - 1;
+    {
+      char detail[128];
+      snprintf(detail, sizeof(detail),
+               "profile=%.48s found=%d trust_tier=%d fallback_len=%d", name,
+               p ? 1 : 0, effective_trust_tier, wrote);
+      publish_server_protocol_status_detail(
+          SERVER_PROTOCOL_STATUS_PROFILE_TOS_FALLBACK, name, detail);
+    }
     return send_fragmented_payload(
         sockfd, cliaddr, WAMBLE_CTRL_PROFILE_TOS_DATA, msg->token,
         (const uint8_t *)fallback, (size_t)wrote, name);
   }
+}
+
+static ServerStatus handle_accept_profile_tos(wamble_socket_t sockfd,
+                                              const struct sockaddr_in *cliaddr,
+                                              const struct WambleMsg *msg,
+                                              const char *profile_name,
+                                              int effective_trust_tier) {
+  if (!msg || !cliaddr)
+    return SERVER_ERR_INTERNAL;
+
+  char name[PROFILE_NAME_MAX_LENGTH];
+  int nlen = msg->profile_name_len < (PROFILE_NAME_MAX_LENGTH - 1)
+                 ? msg->profile_name_len
+                 : (PROFILE_NAME_MAX_LENGTH - 1);
+  if (nlen > 0)
+    memcpy(name, msg->profile_name, (size_t)nlen);
+  name[nlen] = '\0';
+  if (!name[0] && profile_name && profile_name[0]) {
+    snprintf(name, sizeof(name), "%s", profile_name);
+  }
+
+  if ((profile_name && profile_name[0] && strcmp(name, profile_name) != 0) ||
+      !name[0]) {
+    publish_server_protocol_status(
+        SERVER_PROTOCOL_STATUS_PROFILE_TOS_ACCEPT_FAILED, profile_name);
+    return send_policy_denied(sockfd, cliaddr, msg->token, profile_name);
+  }
+
+  const WambleProfile *p = config_find_profile(name);
+  if (!p ||
+      !profile_terms_route_allowed(msg->token, p, name, profile_name,
+                                   effective_trust_tier) ||
+      !p->tos_text || !p->tos_text[0]) {
+    publish_server_protocol_status(
+        SERVER_PROTOCOL_STATUS_PROFILE_TOS_ACCEPT_FAILED, name);
+    return send_policy_denied(sockfd, cliaddr, msg->token, name);
+  }
+
+  uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH] = {0};
+  const char *tos = p->tos_text;
+  uint64_t acceptance_id = 0;
+  crypto_blake2b(tos_hash, sizeof(tos_hash), (const uint8_t *)tos, strlen(tos));
+  DbStatus st = wamble_query_record_profile_terms_acceptance(
+      msg->token, name, tos_hash, tos, &acceptance_id);
+  if (st != DB_OK) {
+    publish_server_protocol_status(
+        SERVER_PROTOCOL_STATUS_PROFILE_TOS_ACCEPT_FAILED, name);
+    struct WambleMsg out = {0};
+    out.ctrl = WAMBLE_CTRL_ERROR;
+    memcpy(out.token, msg->token, TOKEN_LENGTH);
+    out.error_code = WAMBLE_ERR_ACCESS_DENIED;
+    snprintf(out.error_reason, sizeof(out.error_reason),
+             "failed to persist terms acceptance");
+    if (send_reliable_default(sockfd, &out, cliaddr) != 0)
+      return SERVER_ERR_SEND_FAILED;
+    return SERVER_ERR_INTERNAL;
+  }
+
+  {
+    char detail[160];
+    snprintf(detail, sizeof(detail),
+             "profile=%.48s trust_tier=%d acceptance_id=%llu", name,
+             effective_trust_tier, (unsigned long long)acceptance_id);
+    publish_server_protocol_status_detail(
+        SERVER_PROTOCOL_STATUS_PROFILE_TOS_ACCEPTED, name, detail);
+  }
+  return SERVER_OK;
 }
 
 static int login_has_pubkey(const struct WambleMsg *msg) {
@@ -1415,6 +1650,12 @@ static ServerStatus enforce_message_access_policies(
     }
   }
 
+  if (msg->ctrl != WAMBLE_CTRL_ACK && profile_name && profile_name[0] &&
+      ctrl_scope(msg->ctrl) == CTRL_SCOPE_PROFILE &&
+      !profile_terms_currently_accepted(msg->token, profile_name)) {
+    return send_terms_required(sockfd, cliaddr, msg->token, profile_name);
+  }
+
   return SERVER_OK;
 }
 
@@ -1445,7 +1686,13 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
   case WAMBLE_CTRL_GET_PROFILE_INFO:
     return handle_get_profile_info(sockfd, cliaddr, msg, effective_trust_tier);
   case WAMBLE_CTRL_GET_PROFILE_TOS:
-    return handle_get_profile_tos(sockfd, cliaddr, msg, effective_trust_tier);
+    return handle_get_profile_tos(sockfd, cliaddr, msg, profile_name,
+                                  effective_trust_tier);
+  case WAMBLE_CTRL_ACCEPT_PROFILE_TOS:
+    if ((msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0)
+      send_ack(sockfd, msg, cliaddr);
+    return handle_accept_profile_tos(sockfd, cliaddr, msg, profile_name,
+                                     effective_trust_tier);
   case WAMBLE_CTRL_LOGIN_REQUEST:
     return handle_login_request(sockfd, cliaddr, msg, profile_name);
   case WAMBLE_CTRL_LOGOUT:

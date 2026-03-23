@@ -845,6 +845,78 @@ WAMBLE_TEST(config_db_reapply_policy_rules_reexpands_tag_selectors) {
   return 0;
 }
 
+WAMBLE_TEST(config_db_reset_clears_tag_and_treatment_state) {
+  if (config_db_prepare() != 0)
+    T_FAIL_SIMPLE("config_db_prepare failed");
+  T_ASSERT_STATUS_OK(test_db_apply_sql(
+      "INSERT INTO global_identities (public_key) "
+      "VALUES (decode('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      "aaaaaaaaaa', 'hex'));"
+      "INSERT INTO global_identity_tags (global_identity_id, tag) "
+      "SELECT id, 'ops' FROM global_identities "
+      "WHERE public_key = "
+      "decode('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      "', 'hex');"
+      "INSERT INTO global_treatment_groups "
+      "(group_key, priority, is_default, source, snapshot_revision_id) "
+      "VALUES ('control', 10, TRUE, 'test', 0), "
+      "       ('vip', 20, FALSE, 'test', 0);"
+      "INSERT INTO global_treatment_assignment_rules "
+      "(global_identity_id, profile_scope, group_key, priority, source, "
+      "snapshot_revision_id) "
+      "SELECT id, '*', 'vip', 100, 'test', 0 "
+      "FROM global_identities "
+      "WHERE public_key = "
+      "decode('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      "', 'hex');"
+      "INSERT INTO global_treatment_assignment_predicates "
+      "(rule_id, fact_key, op, value_type, value_num) "
+      "SELECT id, 'session.games', 'gte', 2, 3 "
+      "FROM global_treatment_assignment_rules "
+      "WHERE source = 'test' AND group_key = 'vip';"
+      "INSERT INTO global_treatment_group_edges "
+      "(source_group_key, target_group_key, source, snapshot_revision_id) "
+      "VALUES ('vip', 'control', 'test', 0);"
+      "INSERT INTO global_treatment_group_outputs "
+      "(group_key, hook_name, output_kind, output_key, value_type, "
+      "value_bool, source, snapshot_revision_id) "
+      "VALUES ('vip', '*', 'feature', 'prediction.gated', 4, TRUE, 'test', "
+      "0);"));
+
+  T_ASSERT_STATUS_OK(test_db_apply_sql(
+      "DO $$ DECLARE c_tags INT; c_groups INT; c_rules INT; c_predicates INT; "
+      "c_edges INT; c_outputs INT; BEGIN "
+      "SELECT COUNT(*) INTO c_tags FROM global_identity_tags; "
+      "SELECT COUNT(*) INTO c_groups FROM global_treatment_groups; "
+      "SELECT COUNT(*) INTO c_rules FROM global_treatment_assignment_rules; "
+      "SELECT COUNT(*) INTO c_predicates "
+      "FROM global_treatment_assignment_predicates; "
+      "SELECT COUNT(*) INTO c_edges FROM global_treatment_group_edges; "
+      "SELECT COUNT(*) INTO c_outputs FROM global_treatment_group_outputs; "
+      "IF c_tags <> 1 OR c_groups <> 2 OR c_rules <> 1 OR c_predicates <> 1 "
+      "OR c_edges <> 1 OR c_outputs <> 1 THEN "
+      "  RAISE EXCEPTION 'failed to seed treatment reset state'; "
+      "END IF; END $$;"));
+
+  T_ASSERT_STATUS_OK(test_db_reset(NULL));
+
+  T_ASSERT_STATUS_OK(test_db_apply_sql(
+      "DO $$ DECLARE c_tags INT; c_groups INT; c_rules INT; c_predicates INT; "
+      "c_edges INT; c_outputs INT; BEGIN "
+      "SELECT COUNT(*) INTO c_tags FROM global_identity_tags; "
+      "SELECT COUNT(*) INTO c_groups FROM global_treatment_groups; "
+      "SELECT COUNT(*) INTO c_rules FROM global_treatment_assignment_rules; "
+      "SELECT COUNT(*) INTO c_predicates "
+      "FROM global_treatment_assignment_predicates; "
+      "SELECT COUNT(*) INTO c_edges FROM global_treatment_group_edges; "
+      "SELECT COUNT(*) INTO c_outputs FROM global_treatment_group_outputs; "
+      "IF c_tags <> 0 OR c_groups <> 0 OR c_rules <> 0 OR c_predicates <> 0 "
+      "OR c_edges <> 0 OR c_outputs <> 0 THEN "
+      "  RAISE EXCEPTION 'reset leaked tag/treatment state'; "
+      "END IF; END $$;"));
+  return 0;
+}
+
 WAMBLE_TEST(config_db_apply_treatment_rules_and_assign_session) {
   uint8_t token[TOKEN_LENGTH] = {0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
                                  0xcd, 0xef, 0x10, 0x32, 0x54, 0x76,
@@ -1307,6 +1379,8 @@ WAMBLE_TESTS_ADD_DB_FM(config_db_apply_policy_rule_with_identity_selector,
                        "config");
 WAMBLE_TESTS_ADD_DB_FM(config_db_apply_policy_rule_with_tag_selector, "config");
 WAMBLE_TESTS_ADD_DB_FM(config_db_reapply_policy_rules_reexpands_tag_selectors,
+                       "config");
+WAMBLE_TESTS_ADD_DB_FM(config_db_reset_clears_tag_and_treatment_state,
                        "config");
 WAMBLE_TESTS_ADD_DB_FM(config_db_apply_treatment_rules_and_assign_session,
                        "config");

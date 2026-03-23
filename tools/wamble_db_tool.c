@@ -111,6 +111,10 @@ int main(int argc, char **argv) {
     exec_sql(c,
              "DO $$ "
              "BEGIN "
+             "  IF to_regclass('profile_terms_acceptances') IS NOT NULL THEN "
+             "    EXECUTE 'TRUNCATE TABLE profile_terms_acceptances "
+             "RESTART IDENTITY CASCADE'; "
+             "  END IF; "
              "  IF to_regclass('predictions') IS NOT NULL THEN "
              "    EXECUTE 'TRUNCATE TABLE predictions, payouts, game_results, "
              "reservations, moves, boards, sessions, players RESTART IDENTITY "
@@ -119,6 +123,35 @@ int main(int argc, char **argv) {
              "  IF to_regclass('global_policy_rules') IS NOT NULL THEN "
              "    EXECUTE 'TRUNCATE TABLE global_policy_rules RESTART IDENTITY "
              "CASCADE'; "
+             "  END IF; "
+             "  IF to_regclass('global_identity_tags') IS NOT NULL THEN "
+             "    EXECUTE 'TRUNCATE TABLE global_identity_tags RESTART "
+             "IDENTITY CASCADE'; "
+             "  END IF; "
+             "  IF to_regclass('global_treatment_assignment_predicates') IS "
+             "NOT NULL THEN "
+             "    EXECUTE 'TRUNCATE TABLE "
+             "global_treatment_assignment_predicates RESTART IDENTITY "
+             "CASCADE'; "
+             "  END IF; "
+             "  IF to_regclass('global_treatment_group_outputs') IS NOT NULL "
+             "THEN "
+             "    EXECUTE 'TRUNCATE TABLE global_treatment_group_outputs "
+             "RESTART IDENTITY CASCADE'; "
+             "  END IF; "
+             "  IF to_regclass('global_treatment_group_edges') IS NOT NULL "
+             "THEN "
+             "    EXECUTE 'TRUNCATE TABLE global_treatment_group_edges "
+             "RESTART IDENTITY CASCADE'; "
+             "  END IF; "
+             "  IF to_regclass('global_treatment_assignment_rules') IS NOT "
+             "NULL THEN "
+             "    EXECUTE 'TRUNCATE TABLE "
+             "global_treatment_assignment_rules RESTART IDENTITY CASCADE'; "
+             "  END IF; "
+             "  IF to_regclass('global_treatment_groups') IS NOT NULL THEN "
+             "    EXECUTE 'TRUNCATE TABLE global_treatment_groups RESTART "
+             "IDENTITY CASCADE'; "
              "  END IF; "
              "  IF to_regclass('global_runtime_config_revisions') IS NOT NULL "
              "THEN "
@@ -140,6 +173,7 @@ int main(int argc, char **argv) {
     exec_file(c, "migrations/010_profile_prediction_resolution.sql");
     exec_file(c, "migrations/011_profile_treatment_groups.sql");
     exec_file(c, "migrations/012_profile_board_mode_variants.sql");
+    exec_file(c, "migrations/013_profile_terms_acceptances.sql");
   }
   if (do_migrate_global) {
     exec_file(c, "migrations/005_global_identity_trust.sql");
