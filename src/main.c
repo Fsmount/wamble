@@ -776,14 +776,121 @@ static void restore_hot_reload_state(void) {
 #endif
 }
 
+static const char *runtime_status_detail(const WambleRuntimeEvent *ev) {
+  return (ev && ev->detail[0]) ? ev->detail : NULL;
+}
+
 static void drain_runtime_issue_queues(void) {
   WambleRuntimeEvent ev;
   while (wamble_runtime_event_take(&ev)) {
     const char *profile_name = ev.profile[0] ? ev.profile : "default";
     switch (ev.status.module) {
     case WAMBLE_RUNTIME_STATUS_WS_GATEWAY:
-      LOG_ERROR("WS gateway issue profile=%s status=%d", profile_name,
-                ev.status.code);
+      switch ((WsGatewayStatus)ev.status.code) {
+      case WS_GATEWAY_STATUS_UPGRADE_ACCEPTED:
+        LOG_INFO("runtime status profile=%s ws gateway upgrade accepted%s%s",
+                 profile_name, runtime_status_detail(&ev) ? " " : "",
+                 runtime_status_detail(&ev) ? runtime_status_detail(&ev) : "");
+        break;
+      case WS_GATEWAY_STATUS_ROUTE_REGISTERED:
+        LOG_INFO("runtime status profile=%s ws gateway route registered%s%s",
+                 profile_name, runtime_status_detail(&ev) ? " " : "",
+                 runtime_status_detail(&ev) ? runtime_status_detail(&ev) : "");
+        break;
+      case WS_GATEWAY_STATUS_STREAM_STARTED:
+        LOG_DEBUG("runtime status profile=%s ws gateway stream started%s%s",
+                  profile_name, runtime_status_detail(&ev) ? " " : "",
+                  runtime_status_detail(&ev) ? runtime_status_detail(&ev) : "");
+        break;
+      case WS_GATEWAY_STATUS_CLOSE_RECEIVED:
+        LOG_INFO("runtime status profile=%s ws gateway close received%s%s",
+                 profile_name, runtime_status_detail(&ev) ? " " : "",
+                 runtime_status_detail(&ev) ? runtime_status_detail(&ev) : "");
+        break;
+      case WS_GATEWAY_STATUS_OUTBOUND_FLUSHED:
+      case WS_GATEWAY_STATUS_OUTBOUND_QUEUED:
+        LOG_DEBUG("runtime status profile=%s ws gateway %s%s%s", profile_name,
+                  ev.status.code == WS_GATEWAY_STATUS_OUTBOUND_FLUSHED
+                      ? "outbound flushed"
+                      : "outbound queued",
+                  runtime_status_detail(&ev) ? " " : "",
+                  runtime_status_detail(&ev) ? runtime_status_detail(&ev) : "");
+        break;
+      case WS_GATEWAY_STATUS_STREAM_EXITED:
+        LOG_INFO("runtime status profile=%s ws gateway stream exited%s%s",
+                 profile_name, runtime_status_detail(&ev) ? " " : "",
+                 runtime_status_detail(&ev) ? runtime_status_detail(&ev) : "");
+        break;
+      case WS_GATEWAY_STATUS_HANDSHAKE_READ_FAILED:
+      case WS_GATEWAY_STATUS_BAD_REQUEST_LINE:
+      case WS_GATEWAY_STATUS_PATH_MISMATCH:
+      case WS_GATEWAY_STATUS_UPGRADE_HEADER_INVALID:
+      case WS_GATEWAY_STATUS_SEND_101_FAILED:
+      case WS_GATEWAY_STATUS_ROUTE_REGISTER_FAILED:
+      case WS_GATEWAY_STATUS_WAIT_FAILED:
+      case WS_GATEWAY_STATUS_OUTBOUND_FLUSH_FAILED:
+      case WS_GATEWAY_STATUS_READ_FAILED:
+      case WS_GATEWAY_STATUS_CLOSE_TOO_LARGE:
+      case WS_GATEWAY_STATUS_NON_BINARY_OPCODE:
+      case WS_GATEWAY_STATUS_BINARY_REJECTED:
+      case WS_GATEWAY_STATUS_QUEUE_REJECTED: {
+        const char *label = "issue";
+        switch ((WsGatewayStatus)ev.status.code) {
+        case WS_GATEWAY_STATUS_HANDSHAKE_READ_FAILED:
+          label = "handshake read failed";
+          break;
+        case WS_GATEWAY_STATUS_BAD_REQUEST_LINE:
+          label = "bad request line";
+          break;
+        case WS_GATEWAY_STATUS_PATH_MISMATCH:
+          label = "path mismatch";
+          break;
+        case WS_GATEWAY_STATUS_UPGRADE_HEADER_INVALID:
+          label = "upgrade header invalid";
+          break;
+        case WS_GATEWAY_STATUS_SEND_101_FAILED:
+          label = "send 101 failed";
+          break;
+        case WS_GATEWAY_STATUS_ROUTE_REGISTER_FAILED:
+          label = "route register failed";
+          break;
+        case WS_GATEWAY_STATUS_WAIT_FAILED:
+          label = "wait failed";
+          break;
+        case WS_GATEWAY_STATUS_OUTBOUND_FLUSH_FAILED:
+          label = "outbound flush failed";
+          break;
+        case WS_GATEWAY_STATUS_READ_FAILED:
+          label = "frame read failed";
+          break;
+        case WS_GATEWAY_STATUS_CLOSE_TOO_LARGE:
+          label = "close frame too large";
+          break;
+        case WS_GATEWAY_STATUS_NON_BINARY_OPCODE:
+          label = "non-binary opcode";
+          break;
+        case WS_GATEWAY_STATUS_BINARY_REJECTED:
+          label = "binary payload rejected";
+          break;
+        case WS_GATEWAY_STATUS_QUEUE_REJECTED:
+          label = "queue rejected";
+          break;
+        default:
+          break;
+        }
+        LOG_WARN("runtime status profile=%s ws gateway %s%s%s", profile_name,
+                 label, runtime_status_detail(&ev) ? " " : "",
+                 runtime_status_detail(&ev) ? runtime_status_detail(&ev) : "");
+        break;
+      }
+      case WS_GATEWAY_OK:
+      default:
+        if (ev.status.code < 0) {
+          LOG_ERROR("WS gateway issue profile=%s status=%d", profile_name,
+                    ev.status.code);
+        }
+        break;
+      }
       break;
     case WAMBLE_RUNTIME_STATUS_PREDICTION_MANAGER:
       if (ev.status.code < 0) {
@@ -924,6 +1031,36 @@ static void drain_runtime_issue_queues(void) {
         LOG_WARN("runtime status profile=%s server protocol prediction "
                  "request rejected",
                  profile_name);
+        break;
+      case SERVER_PROTOCOL_STATUS_PROFILES_LIST_SERVED:
+        LOG_INFO("runtime status profile=%s server protocol profiles list "
+                 "served%s%s",
+                 profile_name, runtime_status_detail(&ev) ? " " : "",
+                 runtime_status_detail(&ev) ? runtime_status_detail(&ev) : "");
+        break;
+      case SERVER_PROTOCOL_STATUS_PROFILE_TOS_SERVED:
+        LOG_INFO("runtime status profile=%s server protocol profile tos "
+                 "served%s%s",
+                 profile_name, runtime_status_detail(&ev) ? " " : "",
+                 runtime_status_detail(&ev) ? runtime_status_detail(&ev) : "");
+        break;
+      case SERVER_PROTOCOL_STATUS_PROFILE_TOS_FALLBACK:
+        LOG_INFO("runtime status profile=%s server protocol profile tos "
+                 "fallback%s%s",
+                 profile_name, runtime_status_detail(&ev) ? " " : "",
+                 runtime_status_detail(&ev) ? runtime_status_detail(&ev) : "");
+        break;
+      case SERVER_PROTOCOL_STATUS_PROFILE_TOS_ACCEPTED:
+        LOG_INFO("runtime status profile=%s server protocol profile tos "
+                 "accepted%s%s",
+                 profile_name, runtime_status_detail(&ev) ? " " : "",
+                 runtime_status_detail(&ev) ? runtime_status_detail(&ev) : "");
+        break;
+      case SERVER_PROTOCOL_STATUS_PROFILE_TOS_ACCEPT_FAILED:
+        LOG_WARN("runtime status profile=%s server protocol profile tos "
+                 "accept failed%s%s",
+                 profile_name, runtime_status_detail(&ev) ? " " : "",
+                 runtime_status_detail(&ev) ? runtime_status_detail(&ev) : "");
         break;
       case SERVER_PROTOCOL_STATUS_NONE:
       default:

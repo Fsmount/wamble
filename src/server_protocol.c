@@ -38,6 +38,7 @@ static void publish_server_protocol_status_detail(int status_code,
 static void publish_treatment_audit_status(int status_code,
                                            const char *profile_name);
 static const char *ctrl_policy_resource(uint8_t ctrl);
+static int compare_cstr_ptrs(const void *a, const void *b);
 
 static int token_has_any_byte(const uint8_t *token) {
   if (!token)
@@ -47,6 +48,14 @@ static int token_has_any_byte(const uint8_t *token) {
       return 1;
   }
   return 0;
+}
+
+static int compare_cstr_ptrs(const void *a, const void *b) {
+  const char *const *lhs = (const char *const *)a;
+  const char *const *rhs = (const char *const *)b;
+  const char *l = (lhs && *lhs) ? *lhs : "";
+  const char *r = (rhs && *rhs) ? *rhs : "";
+  return strcmp(l, r);
 }
 
 static int ensure_rate_limit_entries(void) {
@@ -1207,7 +1216,12 @@ static ServerStatus handle_list_profiles(wamble_socket_t sockfd,
       detail);
 
   int count = config_profile_count();
+  const char **names =
+      count > 0 ? (const char **)calloc((size_t)count, sizeof(*names)) : NULL;
+  int name_count = 0;
   size_t payload_len = 0;
+  if (count > 0 && !names)
+    return SERVER_ERR_SEND_FAILED;
   for (int i = 0; i < count; i++) {
     const WambleProfile *p = config_get_profile(i);
     if (!p)
@@ -1215,21 +1229,21 @@ static ServerStatus handle_list_profiles(wamble_socket_t sockfd,
     if (!profile_discovery_allowed(msg->token, p, effective_trust_tier))
       continue;
     const char *name = p->name ? p->name : "";
+    names[name_count++] = name;
     payload_len += strlen(name) + (payload_len ? 1u : 0u);
   }
+  if (name_count > 1)
+    qsort(names, (size_t)name_count, sizeof(*names), compare_cstr_ptrs);
 
   char *payload = payload_len > 0 ? (char *)malloc(payload_len + 1) : NULL;
   size_t written = 0;
-  if (payload_len > 0 && !payload)
+  if (payload_len > 0 && !payload) {
+    free(names);
     return SERVER_ERR_SEND_FAILED;
+  }
 
-  for (int i = 0; i < count; i++) {
-    const WambleProfile *p = config_get_profile(i);
-    if (!p)
-      continue;
-    if (!profile_discovery_allowed(msg->token, p, effective_trust_tier))
-      continue;
-    const char *name = p->name ? p->name : "";
+  for (int i = 0; i < name_count; i++) {
+    const char *name = names[i];
     size_t name_len = strlen(name);
     if (written > 0)
       payload[written++] = ',';
@@ -1246,9 +1260,11 @@ static ServerStatus handle_list_profiles(wamble_socket_t sockfd,
           (const uint8_t *)payload, written, cliaddr, cfg->timeout_ms,
           cfg->max_retries, written > (size_t)(FEN_MAX_LENGTH - 1)) != 0) {
     free(payload);
+    free(names);
     return SERVER_ERR_SEND_FAILED;
   }
   free(payload);
+  free(names);
   return SERVER_OK;
 }
 
