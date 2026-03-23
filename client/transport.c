@@ -2,6 +2,7 @@
 
 #if defined(WAMBLE_PLATFORM_WASM)
 /* ---- WASM transport: Emscripten WebSocket API + ring buffer ---- */
+#include <emscripten/emscripten.h>
 #include <emscripten/websocket.h>
 
 static struct WambleMsg *wasm_ring_buf;
@@ -79,12 +80,24 @@ static EM_BOOL wasm_on_ws_message(int event_type,
   (void)event_type;
   (void)user_data;
   if (!event->isText && event->numBytes > 0) {
-    struct WambleMsg msg;
-    uint8_t flags = 0;
-    memset(&msg, 0, sizeof(msg));
-    if (wamble_packet_deserialize(event->data, (size_t)event->numBytes, &msg,
-                                  &flags) == NET_OK) {
-      wasm_ring_push(&msg);
+    const uint8_t *buf = (const uint8_t *)event->data;
+    size_t total = (size_t)event->numBytes;
+    size_t offset = 0;
+    while (offset < total) {
+      size_t packet_len = 0;
+      struct WambleMsg msg;
+      uint8_t flags = 0;
+      if (wamble_wire_packet_size(buf + offset, total - offset, &packet_len) !=
+              NET_OK ||
+          packet_len == 0 || packet_len > (total - offset)) {
+        break;
+      }
+      memset(&msg, 0, sizeof(msg));
+      if (wamble_packet_deserialize(buf + offset, packet_len, &msg, &flags) ==
+          NET_OK) {
+        wasm_ring_push(&msg);
+      }
+      offset += packet_len;
     }
   }
   return EM_TRUE;
@@ -127,7 +140,7 @@ static int wasm_client_connect(const char *url) {
   wasm_ring_tail = 0;
   wasm_ring_count = 0;
 
-  EmscriptenWebSocketCreateAttributes attrs = {url, "binary", EM_TRUE};
+  EmscriptenWebSocketCreateAttributes attrs = {url, NULL, EM_TRUE};
   wasm_ws_handle = emscripten_websocket_new(&attrs);
   if (wasm_ws_handle <= 0)
     return -1;
@@ -201,6 +214,7 @@ static WambleClientStatus wasm_client_send(wamble_client_t *c,
                                            struct WambleMsg *msg) {
   if (!c || !msg || c->kind != WAMBLE_TRANSPORT_WS)
     return (WambleClientStatus){WAMBLE_CLIENT_STATUS_INVALID_ARGUMENT, 0};
+  msg->seq_num = c->seq++;
   if (wasm_client_send_msg(msg) != 0)
     return (WambleClientStatus){WAMBLE_CLIENT_STATUS_NETWORK, 0};
   return (WambleClientStatus){WAMBLE_CLIENT_STATUS_OK, 0};
@@ -681,6 +695,8 @@ static int native_client_init_ws(wamble_client_t *c, wamble_socket_t sock) {
   c->sock = sock;
   memset(&c->peer, 0, sizeof(c->peer));
   c->seq = 0;
+  c->ws_rx_len = 0;
+  c->ws_rx_offset = 0;
   return 0;
 }
 
@@ -710,6 +726,8 @@ static int native_client_init_udp(wamble_client_t *c,
   c->sock = sock;
   c->peer = *server;
   c->seq = 1;
+  c->ws_rx_len = 0;
+  c->ws_rx_offset = 0;
   return 0;
 }
 
@@ -751,6 +769,7 @@ static int native_client_send(wamble_client_t *c, struct WambleMsg *msg) {
   if (!c || !msg)
     return -1;
   if (c->kind == WAMBLE_TRANSPORT_WS) {
+    msg->seq_num = c->seq++;
     uint8_t buf[WAMBLE_MAX_PACKET_SIZE];
     size_t len = 0;
     if (wamble_packet_serialize(msg, buf, sizeof(buf), &len, msg->flags) !=
@@ -769,12 +788,51 @@ static int native_client_send(wamble_client_t *c, struct WambleMsg *msg) {
   return -1;
 }
 
+static int native_client_recv_ws_packet(wamble_client_t *c,
+                                        struct WambleMsg *out) {
+  if (!c || !out || c->kind != WAMBLE_TRANSPORT_WS)
+    return -1;
+
+  while (c->ws_rx_offset < c->ws_rx_len) {
+    size_t packet_len = 0;
+    uint8_t flags = 0;
+    if (wamble_wire_packet_size(c->ws_rx_buf + c->ws_rx_offset,
+                                c->ws_rx_len - c->ws_rx_offset,
+                                &packet_len) != NET_OK ||
+        packet_len == 0 || packet_len > (c->ws_rx_len - c->ws_rx_offset)) {
+      c->ws_rx_len = 0;
+      c->ws_rx_offset = 0;
+      return -1;
+    }
+    if (wamble_packet_deserialize(c->ws_rx_buf + c->ws_rx_offset, packet_len,
+                                  out, &flags) == NET_OK) {
+      c->ws_rx_offset += packet_len;
+      if (c->ws_rx_offset >= c->ws_rx_len) {
+        c->ws_rx_len = 0;
+        c->ws_rx_offset = 0;
+      }
+      return 0;
+    }
+    c->ws_rx_len = 0;
+    c->ws_rx_offset = 0;
+    return -1;
+  }
+
+  c->ws_rx_len = 0;
+  c->ws_rx_offset = 0;
+  return 1;
+}
+
 static int native_client_recv(wamble_client_t *c, struct WambleMsg *out,
                               int timeout_ms) {
   if (!c || !out)
     return -1;
   if (c->kind == WAMBLE_TRANSPORT_WS) {
-    uint8_t buf[WAMBLE_MAX_PACKET_SIZE];
+    int buffered_rc = native_client_recv_ws_packet(c, out);
+    if (buffered_rc <= 0)
+      return buffered_rc;
+
+    uint8_t buf[WAMBLE_CLIENT_WS_FRAME_MAX];
     uint8_t opcode = 0;
     size_t len = 0;
     if (sock_wait_readable(c->sock, timeout_ms) != 0)
@@ -783,10 +841,12 @@ static int native_client_recv(wamble_client_t *c, struct WambleMsg *out,
       return -1;
     if (opcode == 0x8u)
       return -1;
-    uint8_t flags = 0;
-    if (wamble_packet_deserialize(buf, len, out, &flags) != NET_OK)
+    if (len == 0 || len > sizeof(c->ws_rx_buf))
       return -1;
-    return 0;
+    memcpy(c->ws_rx_buf, buf, len);
+    c->ws_rx_len = len;
+    c->ws_rx_offset = 0;
+    return native_client_recv_ws_packet(c, out);
   }
   if (c->kind == WAMBLE_TRANSPORT_UDP)
     return udp_recv_msg(c->sock, out, NULL, timeout_ms);
@@ -800,6 +860,8 @@ static void native_client_close(wamble_client_t *c) {
     ws_send_close(c->sock, 1000);
   wamble_close_socket(c->sock);
   c->sock = WAMBLE_INVALID_SOCKET;
+  c->ws_rx_len = 0;
+  c->ws_rx_offset = 0;
 }
 
 #endif /* !WAMBLE_PLATFORM_WASM */
