@@ -257,47 +257,54 @@ static int clean_obj_cb(const char *name, int is_dir, void *ctx) {
   return 0;
 }
 
+#define COMPILE_SKIP_MAX 8
+
 typedef struct {
   const char *cc;
+  const char *src_dir;
+  const char *obj_dir;
   int warn;
+  int gnu99;         /* 1: -std=gnu99, 0: -std=c99 */
+  int section_flags; /* 1: add -ffunction-sections -fdata-sections */
+  int test_mode;     /* 1: add WAMBLE_TEST_ONLY / TEST_PROFILE_RUNTIME */
   int use_msvc;
+  const char *skip[COMPILE_SKIP_MAX]; /* NULL terminated list of filenames */
   int err;
-  int with_db;
-  int test_mode;
-} compile_ctx;
+} compile_unit_ctx;
 
-static int compile_src_cb(const char *name, int is_dir, void *vctx) {
-  compile_ctx *c = (compile_ctx *)vctx;
+static int compile_unit_cb(const char *name, int is_dir, void *vctx) {
+  compile_unit_ctx *c = (compile_unit_ctx *)vctx;
+  char srcpath[512], objpath[512], base[256], fo_buf[600];
+  const char *objext;
+  size_t bl;
+  struct stat st;
+  int i;
+  strvec ccargs;
+
   if (is_dir)
     return 0;
   if (!has_suffix(name, ".c"))
     return 0;
-  if (strcmp(name, "main.c") == 0)
-    return 0;
-  if (strcmp(name, "database.c") == 0)
-    return 0;
-  if (strcmp(name, "monocypher.c") == 0)
-    return 0;
-  char srcpath[512], objpath[512];
-  snprintf(srcpath, sizeof(srcpath), "src/%s", name);
-  struct stat st;
+  for (i = 0; c->skip[i]; i++)
+    if (strcmp(name, c->skip[i]) == 0)
+      return 0;
+
+  snprintf(srcpath, sizeof(srcpath), "%s/%s", c->src_dir, name);
   if (stat(srcpath, &st) != 0 || !S_ISREG(st.st_mode))
     return 0;
-  char base[256];
+
   snprintf(base, sizeof(base), "%s", name);
-  size_t bl = strlen(base);
+  bl = strlen(base);
   if (bl > 2 && base[bl - 2] == '.' && base[bl - 1] == 'c')
     base[bl - 2] = '\0';
-  const char *objext = c->use_msvc ? ".obj" : ".o";
-  snprintf(objpath, sizeof(objpath), "build/obj/%s%s", base, objext);
+  objext = c->use_msvc ? ".obj" : ".o";
+  snprintf(objpath, sizeof(objpath), "%s/%s%s", c->obj_dir, base, objext);
 
-  int need = is_src_newer_than_obj(srcpath, objpath);
-  if (!need) {
+  if (!is_src_newer_than_obj(srcpath, objpath)) {
     fprintf(stderr, "[skip] up-to-date %s\n", objpath);
     return 0;
   }
 
-  strvec ccargs;
   sv_init(&ccargs);
   sv_push(&ccargs, (char *)c->cc);
 #if defined(WAMBLE_BUILD_WINDOWS)
@@ -307,18 +314,23 @@ static int compile_src_cb(const char *name, int is_dir, void *vctx) {
     if (c->warn)
       sv_push(&ccargs, "/W4");
     sv_push(&ccargs, "/Iinclude");
+    if (c->test_mode) {
+      sv_push(&ccargs, "/DTEST_PROFILE_RUNTIME");
+      sv_push(&ccargs, "/DWAMBLE_TEST_ONLY");
+    }
     sv_push(&ccargs, "/c");
     sv_push(&ccargs, srcpath);
-    char fo[600];
-    snprintf(fo, sizeof fo, "/Fo%s", objpath);
-    sv_push(&ccargs, fo);
+    snprintf(fo_buf, sizeof(fo_buf), "/Fo%s", objpath);
+    sv_push(&ccargs, fo_buf);
   } else
 #endif
   {
     sv_push(&ccargs, "-O2");
-    sv_push(&ccargs, "-std=c99");
-    sv_push(&ccargs, "-ffunction-sections");
-    sv_push(&ccargs, "-fdata-sections");
+    sv_push(&ccargs, c->gnu99 ? "-std=gnu99" : "-std=c99");
+    if (c->section_flags) {
+      sv_push(&ccargs, "-ffunction-sections");
+      sv_push(&ccargs, "-fdata-sections");
+    }
     append_warn_flags(&ccargs, c->warn);
     sv_push(&ccargs, "-Iinclude");
     if (c->test_mode) {
@@ -330,151 +342,6 @@ static int compile_src_cb(const char *name, int is_dir, void *vctx) {
     sv_push(&ccargs, "-o");
     sv_push(&ccargs, objpath);
   }
-  if (runv(NULL, ccargs.data) != 0) {
-    fprintf(stderr, "[err] failed compiling %s\n", srcpath);
-    sv_free(&ccargs);
-    c->err = 1;
-    return -1;
-  }
-  sv_free(&ccargs);
-  return 0;
-}
-
-static int compile_client_cb(const char *name, int is_dir, void *vctx) {
-  compile_ctx *c = (compile_ctx *)vctx;
-  if (is_dir)
-    return 0;
-  if (!has_suffix(name, ".c"))
-    return 0;
-
-  char srcpath[512], objpath[512];
-  snprintf(srcpath, sizeof(srcpath), "client/%s", name);
-  {
-    struct stat st;
-    if (stat(srcpath, &st) != 0 || !S_ISREG(st.st_mode))
-      return 0;
-  }
-
-  char base[256];
-  snprintf(base, sizeof(base), "%s", name);
-  {
-    size_t bl = strlen(base);
-    if (bl > 2 && base[bl - 2] == '.' && base[bl - 1] == 'c')
-      base[bl - 2] = '\0';
-  }
-  {
-    const char *objext = c->use_msvc ? ".obj" : ".o";
-    snprintf(objpath, sizeof(objpath), "build/obj_client/%s%s", base, objext);
-  }
-
-  if (!is_src_newer_than_obj(srcpath, objpath)) {
-    fprintf(stderr, "[skip] up-to-date %s\n", objpath);
-    return 0;
-  }
-
-  strvec ccargs;
-  sv_init(&ccargs);
-  sv_push(&ccargs, (char *)c->cc);
-#if defined(WAMBLE_BUILD_WINDOWS)
-  if (c->use_msvc) {
-    sv_push(&ccargs, "/nologo");
-    sv_push(&ccargs, "/O2");
-    if (c->warn)
-      sv_push(&ccargs, "/W4");
-    sv_push(&ccargs, "/Iinclude");
-    sv_push(&ccargs, "/c");
-    sv_push(&ccargs, srcpath);
-    {
-      char fo[600];
-      snprintf(fo, sizeof fo, "/Fo%s", objpath);
-      sv_push(&ccargs, fo);
-    }
-  } else
-#endif
-  {
-    sv_push(&ccargs, "-O2");
-    sv_push(&ccargs, "-std=c99");
-    sv_push(&ccargs, "-ffunction-sections");
-    sv_push(&ccargs, "-fdata-sections");
-    append_warn_flags(&ccargs, c->warn);
-    sv_push(&ccargs, "-Iinclude");
-    sv_push(&ccargs, "-c");
-    sv_push(&ccargs, srcpath);
-    sv_push(&ccargs, "-o");
-    sv_push(&ccargs, objpath);
-  }
-
-  if (runv(NULL, ccargs.data) != 0) {
-    fprintf(stderr, "[err] failed compiling %s\n", srcpath);
-    sv_free(&ccargs);
-    c->err = 1;
-    return -1;
-  }
-  sv_free(&ccargs);
-  return 0;
-}
-
-static int compile_thirdparty_cb(const char *name, int is_dir, void *vctx) {
-  compile_ctx *c = (compile_ctx *)vctx;
-  if (is_dir)
-    return 0;
-  if (!has_suffix(name, ".c"))
-    return 0;
-
-  char srcpath[512], objpath[512];
-  snprintf(srcpath, sizeof(srcpath), "thirdparty/%s", name);
-  {
-    struct stat st;
-    if (stat(srcpath, &st) != 0 || !S_ISREG(st.st_mode))
-      return 0;
-  }
-
-  char base[256];
-  snprintf(base, sizeof(base), "%s", name);
-  {
-    size_t bl = strlen(base);
-    if (bl > 2 && base[bl - 2] == '.' && base[bl - 1] == 'c')
-      base[bl - 2] = '\0';
-  }
-  {
-    const char *objext = c->use_msvc ? ".obj" : ".o";
-    snprintf(objpath, sizeof(objpath), "build/obj/%s%s", base, objext);
-  }
-
-  if (!is_src_newer_than_obj(srcpath, objpath)) {
-    fprintf(stderr, "[skip] up-to-date %s\n", objpath);
-    return 0;
-  }
-
-  strvec ccargs;
-  sv_init(&ccargs);
-  sv_push(&ccargs, (char *)c->cc);
-#if defined(WAMBLE_BUILD_WINDOWS)
-  if (c->use_msvc) {
-    sv_push(&ccargs, "/nologo");
-    sv_push(&ccargs, "/O2");
-    sv_push(&ccargs, "/Iinclude");
-    sv_push(&ccargs, "/c");
-    sv_push(&ccargs, srcpath);
-    {
-      char fo[600];
-      snprintf(fo, sizeof fo, "/Fo%s", objpath);
-      sv_push(&ccargs, fo);
-    }
-  } else
-#endif
-  {
-    sv_push(&ccargs, "-O2");
-    sv_push(&ccargs, "-std=c99");
-    sv_push(&ccargs, "-ffunction-sections");
-    sv_push(&ccargs, "-fdata-sections");
-    sv_push(&ccargs, "-Iinclude");
-    sv_push(&ccargs, "-c");
-    sv_push(&ccargs, srcpath);
-    sv_push(&ccargs, "-o");
-    sv_push(&ccargs, objpath);
-  }
-
   if (runv(NULL, ccargs.data) != 0) {
     fprintf(stderr, "[err] failed compiling %s\n", srcpath);
     sv_free(&ccargs);
@@ -528,77 +395,54 @@ static int append_tests_cb(const char *name, int is_dir, void *vctx) {
   return 0;
 }
 
+static int archive_obj_dir(const char *obj_dir, const char *obj_prefix,
+                           const char *out_lib) {
+  strvec ar;
+  sv_init(&ar);
+  sv_push(&ar, "ar");
+  sv_push(&ar, "rcs");
+  sv_push(&ar, (char *)out_lib);
+  collect_ctx cc2 = {&ar, obj_prefix, ".o"};
+  if (iterate_dir(obj_dir, collect_with_suffix_cb, &cc2) != 0) {
+    fprintf(stderr, "[err] iterate_dir %s\n", obj_dir);
+    sv_free(&ar);
+    return -1;
+  }
+  if (runv(NULL, ar.data) != 0) {
+    fprintf(stderr, "[err] failed to archive %s\n", out_lib);
+    sv_free(&ar);
+    return -1;
+  }
+  sv_free(&ar);
+  return 0;
+}
+
 static int compile_objects_to_lib(const char *cc, int with_db, int warn,
                                   int test_mode) {
   (void)with_db;
-  compile_ctx ctx;
-  ctx.cc = cc;
-  ctx.warn = warn;
-  ctx.use_msvc = is_msvc_cc(cc);
-  ctx.err = 0;
-  ctx.with_db = with_db;
-  ctx.test_mode = test_mode;
-
-  if (iterate_dir("src", compile_src_cb, &ctx) != 0 || ctx.err)
+  int msvc = is_msvc_cc(cc);
+  compile_unit_ctx src_ctx = {cc, "src",     "build/obj", warn,  0,
+                              0,  test_mode, msvc,        {NULL}};
+  compile_unit_ctx tp_ctx = {cc, "thirdparty", "build/obj", 0, 0, 0,
+                             0,  msvc,         {NULL}};
+  if (iterate_dir("src", compile_unit_cb, &src_ctx) != 0 || src_ctx.err)
     return -1;
-  if (iterate_dir("thirdparty", compile_thirdparty_cb, &ctx) != 0 || ctx.err)
+  if (iterate_dir("thirdparty", compile_unit_cb, &tp_ctx) != 0 || tp_ctx.err)
     return -1;
-
-  if (!ctx.use_msvc) {
-    strvec ar;
-    sv_init(&ar);
-    sv_push(&ar, "ar");
-    sv_push(&ar, "rcs");
-    sv_push(&ar, "build/libwamble.a");
-    collect_ctx cc2 = {&ar, "build/obj/", ".o"};
-    if (iterate_dir("build/obj", collect_with_suffix_cb, &cc2) != 0) {
-      perror("iterate_dir build/obj");
-      sv_free(&ar);
-      return -1;
-    }
-    if (runv(NULL, ar.data) != 0) {
-      fprintf(stderr, "[err] failed to archive build/libwamble.a\n");
-      sv_free(&ar);
-      return -1;
-    }
-    sv_free(&ar);
-  }
+  if (!msvc)
+    return archive_obj_dir("build/obj", "build/obj/", "build/libwamble.a");
   return 0;
 }
 
 static int compile_client_objects_to_lib(const char *cc, int warn) {
-  compile_ctx ctx;
-  ctx.cc = cc;
-  ctx.warn = warn;
-  ctx.use_msvc = is_msvc_cc(cc);
-  ctx.err = 0;
-  ctx.with_db = 1;
-  ctx.test_mode = 0;
-
-  if (iterate_dir("client", compile_client_cb, &ctx) != 0 || ctx.err)
+  int msvc = is_msvc_cc(cc);
+  compile_unit_ctx ctx = {cc,   "client", "build/obj_client", warn, 0, 0, 0,
+                          msvc, {NULL}};
+  if (iterate_dir("client", compile_unit_cb, &ctx) != 0 || ctx.err)
     return -1;
-
-  if (!ctx.use_msvc) {
-    strvec ar;
-    sv_init(&ar);
-    sv_push(&ar, "ar");
-    sv_push(&ar, "rcs");
-    sv_push(&ar, "build/libwamble_client.a");
-    {
-      collect_ctx cc2 = {&ar, "build/obj_client/", ".o"};
-      if (iterate_dir("build/obj_client", collect_with_suffix_cb, &cc2) != 0) {
-        perror("iterate_dir build/obj_client");
-        sv_free(&ar);
-        return -1;
-      }
-    }
-    if (runv(NULL, ar.data) != 0) {
-      fprintf(stderr, "[err] failed to archive build/libwamble_client.a\n");
-      sv_free(&ar);
-      return -1;
-    }
-    sv_free(&ar);
-  }
+  if (!msvc)
+    return archive_obj_dir("build/obj_client", "build/obj_client/",
+                           "build/libwamble_client.a");
   return 0;
 }
 
@@ -616,9 +460,88 @@ static void append_warn_flags(strvec *v, int warn) {
   sv_push(v, "-Wstrict-prototypes");
 }
 
+static int copy_file(const char *src, const char *dst) {
+  FILE *in = fopen(src, "rb");
+  if (!in) {
+    perror(src);
+    return -1;
+  }
+  FILE *out = fopen(dst, "wb");
+  if (!out) {
+    perror(dst);
+    fclose(in);
+    return -1;
+  }
+  char buf[4096];
+  size_t n;
+  while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+    if (fwrite(buf, 1, n, out) != n) {
+      fclose(in);
+      fclose(out);
+      return -1;
+    }
+  }
+  fclose(in);
+  fclose(out);
+  return 0;
+}
+
+static int path_join(char *out, size_t out_size, const char *a, const char *b) {
+  int n = snprintf(out, out_size, "%s/%s", a, b);
+  if (n < 0 || (size_t)n >= out_size) {
+    fprintf(stderr, "[err] path too long: %s/%s\n", a, b);
+    return -1;
+  }
+  return 0;
+}
+
+typedef struct {
+  const char *src_dir;
+  const char *dst_dir;
+} copy_dir_ctx;
+
+static int copy_dir_contents(const char *src_dir, const char *dst_dir);
+
+static int has_c_extension(const char *name) {
+  size_t len = strlen(name);
+  return len >= 2 && name[len - 2] == '.' && name[len - 1] == 'c';
+}
+
+static int copy_dir_cb(const char *name, int is_dir, void *ctx) {
+  const copy_dir_ctx *copy = (const copy_dir_ctx *)ctx;
+  char src_path[512];
+  char dst_path[512];
+
+  if (path_join(src_path, sizeof(src_path), copy->src_dir, name) != 0)
+    return -1;
+  if (path_join(dst_path, sizeof(dst_path), copy->dst_dir, name) != 0)
+    return -1;
+
+  if (is_dir)
+    return copy_dir_contents(src_path, dst_path);
+
+  if (has_c_extension(name))
+    return 0;
+
+  if (copy_file(src_path, dst_path) != 0)
+    return -1;
+  fprintf(stderr, "[copy] %s -> %s\n", src_path, dst_path);
+  return 0;
+}
+
+static int copy_dir_contents(const char *src_dir, const char *dst_dir) {
+  copy_dir_ctx ctx;
+  if (ensure_dir(dst_dir) != 0)
+    return -1;
+  ctx.src_dir = src_dir;
+  ctx.dst_dir = dst_dir;
+  return iterate_dir(src_dir, copy_dir_cb, &ctx);
+}
+
 int main(int argc, char **argv) {
   int build_tests = 0;
   int build_server = 0;
+  int build_web = 0;
   int run_tests = 0;
   int with_db = 1;
   const char *cc = "c99";
@@ -642,6 +565,8 @@ int main(int argc, char **argv) {
       fprintf(stderr, "Error: --with-no-db is no longer supported. The project "
                       "always builds with DB enabled.\n");
       return 1;
+    } else if (strcmp(argv[i], "--web") == 0) {
+      build_web = 1;
     } else if (strcmp(argv[i], "--clean") == 0) {
       clean = 1;
     } else if (strcmp(argv[i], "--warn") == 0) {
@@ -653,7 +578,7 @@ int main(int argc, char **argv) {
       run_tests = 1;
       list_tests = 1;
     } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-      printf("Usage: %s [--server] [--tests] [--run-tests] "
+      printf("Usage: %s [--server] [--tests] [--run-tests] [--web] "
              "[--clean] "
              "[--warn] [--list-tests] [--cc=CC] [-- <test args>]\n",
              argv[0]);
@@ -661,6 +586,7 @@ int main(int argc, char **argv) {
              "installed)\n");
       printf("  --tests       Build unified test binary\n");
       printf("  --run-tests   Execute tests after building\n");
+      printf("  --web         Build WASM web client (requires emcc)\n");
       printf("  --list-tests  Build tests and list them (no run)\n");
       printf("  --warn        Enable extra compiler warnings\n");
       printf("  --cc=CC       Use custom C compiler (default: c99 or $CC)\n");
@@ -687,6 +613,7 @@ int main(int argc, char **argv) {
   if (clean) {
     clean_obj_ctx obj_ctx = {"build/obj"};
     clean_obj_ctx client_obj_ctx = {"build/obj_client"};
+    clean_obj_ctx web_obj_ctx = {"build/obj_web"};
     remove("build/libwamble.a");
     remove("build/libwamble.lib");
     remove("build/libwamble_client.a");
@@ -696,10 +623,11 @@ int main(int argc, char **argv) {
     remove("build/tests/wamble_tests.exe");
     iterate_dir("build/obj", clean_obj_cb, &obj_ctx);
     iterate_dir("build/obj_client", clean_obj_cb, &client_obj_ctx);
+    iterate_dir("build/obj_web", clean_obj_cb, &web_obj_ctx);
   }
   if (ensure_dir("build") || ensure_dir("build/obj") ||
-      ensure_dir("build/obj_client") || ensure_dir("build/tests") ||
-      ensure_dir("thirdparty"))
+      ensure_dir("build/obj_client") || ensure_dir("build/obj_web") ||
+      ensure_dir("build/tests") || ensure_dir("thirdparty"))
     return 1;
 
   {
@@ -986,6 +914,109 @@ int main(int argc, char **argv) {
       }
       sv_free(&runv_args);
     }
+  }
+  if (build_web) {
+    if (ensure_dir("build/web") != 0)
+      return 1;
+
+    const char *emcc = "emcc";
+    {
+      const char *emcc_env = getenv("EMCC");
+      if (emcc_env && *emcc_env)
+        emcc = emcc_env;
+    }
+    const char *monocypher_obj = "build/obj_web/monocypher.o";
+
+    if (is_src_newer_than_obj("thirdparty/monocypher.c", monocypher_obj)) {
+      strvec monocypher_args;
+      sv_init(&monocypher_args);
+      sv_push(&monocypher_args, (char *)emcc);
+      sv_push(&monocypher_args, "-O2");
+      sv_push(&monocypher_args, "-std=gnu99");
+      sv_push(&monocypher_args, "-ffunction-sections");
+      sv_push(&monocypher_args, "-fdata-sections");
+      sv_push(&monocypher_args, "-Iinclude");
+      sv_push(&monocypher_args, "-c");
+      sv_push(&monocypher_args, "thirdparty/monocypher.c");
+      sv_push(&monocypher_args, "-o");
+      sv_push(&monocypher_args, (char *)monocypher_obj);
+      if (runv(NULL, monocypher_args.data) != 0) {
+        fprintf(stderr, "[err] failed to compile thirdparty/monocypher.c\n");
+        sv_free(&monocypher_args);
+        return 1;
+      }
+      sv_free(&monocypher_args);
+    } else {
+      fprintf(stderr, "[skip] up-to-date %s\n", monocypher_obj);
+    }
+
+    {
+      compile_unit_ctx wctx = {emcc, "web", "build/obj_web", warn, 1, 1,
+                               0,    0,     {NULL}};
+      if (iterate_dir("web", compile_unit_cb, &wctx) != 0 || wctx.err)
+        return 1;
+      wctx.src_dir = "client";
+      wctx.err = 0;
+      if (iterate_dir("client", compile_unit_cb, &wctx) != 0 || wctx.err)
+        return 1;
+    }
+
+    if (is_src_newer_than_obj("src/move_engine.c",
+                              "build/obj_web/move_engine.o")) {
+      strvec wc;
+      sv_init(&wc);
+      sv_push(&wc, (char *)emcc);
+      sv_push(&wc, "-O2");
+      sv_push(&wc, "-std=gnu99");
+      append_warn_flags(&wc, warn);
+      sv_push(&wc, "-Iinclude");
+      sv_push(&wc, "-c");
+      sv_push(&wc, "src/move_engine.c");
+      sv_push(&wc, "-o");
+      sv_push(&wc, "build/obj_web/move_engine.o");
+      if (runv(NULL, wc.data) != 0) {
+        fprintf(stderr, "[err] failed compiling src/move_engine.c\n");
+        sv_free(&wc);
+        return 1;
+      }
+      sv_free(&wc);
+    } else {
+      fprintf(stderr, "[skip] up-to-date build/obj_web/move_engine.o\n");
+    }
+
+    {
+      strvec wargs;
+      sv_init(&wargs);
+      sv_push(&wargs, (char *)emcc);
+      sv_push(&wargs, "-O2");
+      {
+        collect_ctx wcc = {&wargs, "build/obj_web/", ".o"};
+        if (iterate_dir("build/obj_web", collect_with_suffix_cb, &wcc) != 0) {
+          perror("iterate_dir build/obj_web");
+          sv_free(&wargs);
+          return 1;
+        }
+      }
+      sv_push(&wargs, "-lwebsocket.js");
+      sv_push(&wargs, "-sALLOW_MEMORY_GROWTH=1");
+      sv_push(&wargs, "-sEXPORTED_RUNTIME_METHODS=ccall");
+      sv_push(&wargs,
+              "-sEXPORTED_FUNCTIONS=_main,_wasm_on_click,_wasm_on_unload");
+      sv_push(&wargs, "-o");
+      sv_push(&wargs, "build/web/wamble.js");
+      if (runv(NULL, wargs.data) != 0) {
+        fprintf(stderr, "[err] failed to link WASM web client\n");
+        sv_free(&wargs);
+        return 1;
+      }
+      sv_free(&wargs);
+    }
+
+    if (copy_dir_contents("web", "build/web") != 0) {
+      fprintf(stderr, "[err] failed to copy web directory\n");
+      return 1;
+    }
+    fprintf(stderr, "[done] WASM web client -> build/web/\n");
   }
   if (with_db) {
     strvec dbt;
