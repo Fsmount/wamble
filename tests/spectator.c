@@ -162,8 +162,77 @@ WAMBLE_TEST(spectator_visibility_and_capacity) {
   return 0;
 }
 
+WAMBLE_TEST(spectator_notifications_use_structured_flags) {
+  char msg[128];
+  T_ASSERT_STATUS(config_load(NULL, NULL, msg, sizeof(msg)),
+                  CONFIG_LOAD_DEFAULTS);
+  spectator_manager_init();
+  board_manager_init();
+  player_manager_init();
+
+  WamblePlayer *player = create_new_player();
+  T_ASSERT(player != NULL);
+  WambleBoard *board = find_board_for_player(player);
+  T_ASSERT(board != NULL);
+  uint64_t active_id = board->id;
+  board_move_played(board->id, NULL, NULL);
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons((uint16_t)get_config()->port);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+  uint8_t token[TOKEN_LENGTH] = {7};
+  struct WambleMsg focus = {0};
+  focus.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  focus.board_id = active_id;
+  memcpy(focus.token, token, TOKEN_LENGTH);
+
+  SpectatorState state = SPECTATOR_STATE_IDLE;
+  uint64_t focus_id = 0;
+  T_ASSERT_EQ_INT(
+      spectator_handle_request(&focus, &addr, 0, 0, &state, &focus_id),
+      SPECTATOR_OK_FOCUS);
+
+  WambleConfig cfg = *get_config();
+  cfg.spectator_max_focus_per_session = 0;
+  wamble_config_push(&cfg);
+  spectator_manager_tick();
+
+  SpectatorUpdate notices[4];
+  int count = spectator_collect_notifications(notices, 4);
+  T_ASSERT_EQ_INT(count, 1);
+  T_ASSERT(tokens_equal(notices[0].token, token));
+  T_ASSERT_EQ_INT((int)notices[0].board_id, (int)active_id);
+  T_ASSERT((notices[0].flags & WAMBLE_FLAG_SPECTATE_NOTICE_SUMMARY_FALLBACK) !=
+           0);
+  T_ASSERT((notices[0].flags & WAMBLE_FLAG_SPECTATE_NOTICE_STOPPED) == 0);
+
+  wamble_config_pop();
+
+  cfg = *get_config();
+  cfg.max_spectators = 0;
+  wamble_config_push(&cfg);
+  spectator_manager_tick();
+
+  count = spectator_collect_notifications(notices, 4);
+  T_ASSERT_EQ_INT(count, 1);
+  T_ASSERT(tokens_equal(notices[0].token, token));
+  T_ASSERT_EQ_INT((int)notices[0].board_id, 0);
+  T_ASSERT((notices[0].flags & WAMBLE_FLAG_SPECTATE_NOTICE_STOPPED) != 0);
+  T_ASSERT((notices[0].flags & WAMBLE_FLAG_SPECTATE_NOTICE_SUMMARY_FALLBACK) ==
+           0);
+
+  spectator_manager_shutdown();
+  wamble_config_pop();
+  return 0;
+}
+
 WAMBLE_TESTS_BEGIN_NAMED(spectator_tests) {
   WAMBLE_TESTS_ADD_FM(spectator_summary_and_focus_flow, "spectator");
   WAMBLE_TESTS_ADD_FM(spectator_visibility_and_capacity, "spectator");
+  WAMBLE_TESTS_ADD_FM(spectator_notifications_use_structured_flags,
+                      "spectator");
 }
 WAMBLE_TESTS_END()
