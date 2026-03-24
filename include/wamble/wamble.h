@@ -799,7 +799,10 @@ typedef enum {
   PREDICTION_ERR_LIMIT = -4,
   PREDICTION_ERR_DUPLICATE = -5,
   PREDICTION_ERR_NOT_FOUND = -6,
+  PREDICTION_ERR_DUPLICATE_MOVE = -7,
 } PredictionStatus;
+
+#define WAMBLE_PREDICTION_SKIP_MOVE_DUP 0x100
 
 typedef enum {
   PREDICTION_MANAGER_OK = 0,
@@ -1321,6 +1324,7 @@ typedef enum {
 #define WAMBLE_FLAG_FRAGMENT_PAYLOAD 0x10
 #define WAMBLE_FLAG_SPECTATE_NOTICE_SUMMARY_FALLBACK 0x20
 #define WAMBLE_FLAG_SPECTATE_NOTICE_STOPPED 0x40
+#define WAMBLE_FLAG_PREDICTION_CONTEXT 0x02
 
 static inline size_t wamble_build_login_signature_message(
     uint8_t *out, size_t out_size, const uint8_t token[TOKEN_LENGTH],
@@ -1368,6 +1372,12 @@ static inline size_t wamble_build_login_signature_message(
 #define WAMBLE_PREDICTION_STATUS_CORRECT 1
 #define WAMBLE_PREDICTION_STATUS_INCORRECT 2
 #define WAMBLE_PREDICTION_STATUS_EXPIRED 3
+
+#define WAMBLE_NOTIFICATION_TYPE_GENERIC 0
+#define WAMBLE_NOTIFICATION_TYPE_POT_PAYOUT 1
+#define WAMBLE_NOTIFICATION_TYPE_SPECTATE_ENDED 2
+#define WAMBLE_NOTIFICATION_TYPE_MAINTENANCE 3
+#define WAMBLE_NOTIFICATION_TYPE_ANNOUNCEMENT 4
 
 typedef struct {
   uint8_t from;
@@ -1451,6 +1461,7 @@ struct WambleMsg {
   uint8_t prediction_limit;
   uint8_t prediction_count;
   WamblePredictionEntry predictions[WAMBLE_MAX_PREDICTION_ENTRIES];
+  uint8_t notification_type;
   uint8_t ext_count;
   WambleMessageExtField ext[WAMBLE_MAX_MESSAGE_EXT_FIELDS];
 };
@@ -1585,6 +1596,7 @@ typedef struct SpectatorUpdate {
   char fen[FEN_MAX_LENGTH];
   struct sockaddr_in addr;
   uint8_t flags;
+  uint8_t notification_type;
 } SpectatorUpdate;
 
 void network_init_thread_state(void);
@@ -1982,7 +1994,7 @@ PredictionStatus prediction_submit_with_parent(WambleBoard *board,
                                                const uint8_t *player_token,
                                                const char *predicted_move_uci,
                                                uint64_t parent_prediction_id,
-                                               int trust_tier,
+                                               int flags,
                                                uint64_t *out_prediction_id);
 PredictionStatus prediction_resolve_move(WambleBoard *board,
                                          const char *actual_move_uci);
@@ -1991,6 +2003,8 @@ PredictionStatus prediction_collect_tree(uint64_t board_id,
                                          int trust_tier, int max_depth,
                                          WamblePredictionView *out, int max_out,
                                          int *out_count);
+PredictionStatus prediction_get_view_by_id(uint64_t prediction_id,
+                                           WamblePredictionView *out);
 int prediction_get_runtime_counts(uint64_t board_id, const uint8_t *token,
                                   int *out_pending_count,
                                   int *out_failed_count);

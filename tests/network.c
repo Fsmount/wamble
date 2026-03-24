@@ -671,9 +671,10 @@ WAMBLE_TEST(server_notification_ext_auto_fragment_unreliable) {
   T_ASSERT(rx.transfer_id != 0);
   T_ASSERT(rx.total_len > WAMBLE_MAX_PAYLOAD);
   T_ASSERT_EQ_INT((int)rx.assembled_len, (int)rx.total_len);
+  T_ASSERT_EQ_INT((int)rx.assembled[0], (int)out.notification_type);
   size_t base_len = strlen(out.fen);
-  T_ASSERT(memcmp(rx.assembled, out.fen, base_len) == 0);
-  T_ASSERT(rx.total_len >= base_len + 4);
+  T_ASSERT(memcmp(rx.assembled + 1, out.fen, base_len) == 0);
+  T_ASSERT(rx.total_len >= 1 + base_len + 4);
   T_ASSERT_EQ_INT((int)rx.assembled[rx.total_len - 4], 0x57);
   T_ASSERT_EQ_INT((int)rx.assembled[rx.total_len - 3], 0x58);
   uint8_t computed_hash[WAMBLE_FRAGMENT_HASH_LENGTH] = {0};
@@ -732,9 +733,10 @@ WAMBLE_TEST(server_notification_ext_auto_fragment_reliable) {
   T_ASSERT(rx.transfer_id != 0);
   T_ASSERT(rx.total_len > WAMBLE_MAX_PAYLOAD);
   T_ASSERT_EQ_INT((int)rx.assembled_len, (int)rx.total_len);
+  T_ASSERT_EQ_INT((int)rx.assembled[0], (int)out.notification_type);
   size_t base_len = strlen(out.fen);
-  T_ASSERT(memcmp(rx.assembled, out.fen, base_len) == 0);
-  T_ASSERT(rx.total_len >= base_len + 4);
+  T_ASSERT(memcmp(rx.assembled + 1, out.fen, base_len) == 0);
+  T_ASSERT(rx.total_len >= 1 + base_len + 4);
   T_ASSERT_EQ_INT((int)rx.assembled[rx.total_len - 4], 0x57);
   T_ASSERT_EQ_INT((int)rx.assembled[rx.total_len - 3], 0x58);
   uint8_t computed_hash[WAMBLE_FRAGMENT_HASH_LENGTH] = {0};

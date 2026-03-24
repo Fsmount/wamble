@@ -603,16 +603,49 @@ static int prediction_pending_count_locked(uint64_t board_id) {
   return count;
 }
 
-static int prediction_find_pending_locked(uint64_t board_id,
-                                          const uint8_t *token) {
+static int prediction_find_dup_locked(uint64_t board_id, const uint8_t *token,
+                                      const char *move_uci, uint64_t parent_id,
+                                      int check_move_dup, int *out_kind) {
+  int self_idx = -1, move_idx = -1;
   for (int i = 0; i < g_prediction_count; i++) {
-    if (g_predictions[i].board_id == board_id &&
-        strcmp(g_predictions[i].status, "PENDING") == 0 &&
-        tokens_equal(g_predictions[i].player_token, token)) {
-      return i;
-    }
+    const WamblePrediction *p = &g_predictions[i];
+    if (p->board_id != board_id || p->parent_id != parent_id ||
+        strcmp(p->status, "PENDING") != 0)
+      continue;
+    if (self_idx < 0 && tokens_equal(p->player_token, token))
+      self_idx = i;
+    if (move_idx < 0 && check_move_dup &&
+        strcmp(p->predicted_move_uci, move_uci) == 0)
+      move_idx = i;
+    if (self_idx >= 0 && (!check_move_dup || move_idx >= 0))
+      break;
   }
+  if (self_idx >= 0) {
+    *out_kind = 1;
+    return self_idx;
+  }
+  if (move_idx >= 0) {
+    *out_kind = 2;
+    return move_idx;
+  }
+  *out_kind = 0;
   return -1;
+}
+
+static void prediction_fill_view_locked(const WamblePrediction *pred,
+                                        WamblePredictionView *dst) {
+  memset(dst, 0, sizeof(*dst));
+  dst->id = pred->id;
+  dst->parent_id = pred->parent_id;
+  dst->board_id = pred->board_id;
+  memcpy(dst->player_token, pred->player_token, TOKEN_LENGTH);
+  snprintf(dst->predicted_move_uci, sizeof(dst->predicted_move_uci), "%s",
+           pred->predicted_move_uci);
+  snprintf(dst->status, sizeof(dst->status), "%s", pred->status);
+  dst->target_ply = pred->target_ply;
+  dst->depth = pred->depth;
+  dst->points_awarded = pred->points_awarded;
+  dst->created_at = pred->created_at;
 }
 
 static int prediction_find_by_id_locked(uint64_t prediction_id) {
@@ -804,9 +837,8 @@ PredictionStatus prediction_submit_with_parent(WambleBoard *board,
                                                const uint8_t *player_token,
                                                const char *predicted_move_uci,
                                                uint64_t parent_prediction_id,
-                                               int trust_tier,
+                                               int flags,
                                                uint64_t *out_prediction_id) {
-  (void)trust_tier;
   PredictionStatus st =
       prediction_submit_allowed_for_player(board, player_token);
   if (st != PREDICTION_OK)
@@ -816,6 +848,7 @@ PredictionStatus prediction_submit_with_parent(WambleBoard *board,
   if (!g_prediction_mutex_ready || !g_predictions)
     return PREDICTION_ERR_INVALID;
 
+  int check_move_dup = !(flags & WAMBLE_PREDICTION_SKIP_MOVE_DUP);
   wamble_mutex_lock(&g_prediction_mutex);
 
   int max_pending = get_config()->prediction_max_pending;
@@ -827,9 +860,18 @@ PredictionStatus prediction_submit_with_parent(WambleBoard *board,
     wamble_mutex_unlock(&g_prediction_mutex);
     return PREDICTION_ERR_LIMIT;
   }
-  if (prediction_find_pending_locked(board->id, player_token) >= 0) {
-    wamble_mutex_unlock(&g_prediction_mutex);
-    return PREDICTION_ERR_DUPLICATE;
+  {
+    int dup_kind = 0;
+    int dup_idx = prediction_find_dup_locked(
+        board->id, player_token, predicted_move_uci, parent_prediction_id,
+        check_move_dup, &dup_kind);
+    if (dup_idx >= 0) {
+      if (out_prediction_id)
+        *out_prediction_id = g_predictions[dup_idx].id;
+      wamble_mutex_unlock(&g_prediction_mutex);
+      return dup_kind == 1 ? PREDICTION_ERR_DUPLICATE
+                           : PREDICTION_ERR_DUPLICATE_MOVE;
+    }
   }
   if (prediction_ensure_capacity_locked(g_prediction_count + 1) != 0) {
     wamble_mutex_unlock(&g_prediction_mutex);
@@ -994,24 +1036,29 @@ PredictionStatus prediction_collect_tree(uint64_t board_id,
     const WamblePrediction *pred = &g_predictions[i];
     if (pred->board_id != board_id || pred->depth > allowed_depth)
       continue;
-    WamblePredictionView *dst = &out[count++];
-    memset(dst, 0, sizeof(*dst));
-    dst->id = pred->id;
-    dst->parent_id = pred->parent_id;
-    dst->board_id = pred->board_id;
-    memcpy(dst->player_token, pred->player_token, TOKEN_LENGTH);
-    snprintf(dst->predicted_move_uci, sizeof(dst->predicted_move_uci), "%s",
-             pred->predicted_move_uci);
-    snprintf(dst->status, sizeof(dst->status), "%s", pred->status);
-    dst->target_ply = pred->target_ply;
-    dst->depth = pred->depth;
-    dst->points_awarded = pred->points_awarded;
-    dst->created_at = pred->created_at;
+    prediction_fill_view_locked(pred, &out[count++]);
   }
   wamble_mutex_unlock(&g_prediction_mutex);
 
   if (out_count)
     *out_count = count;
+  return PREDICTION_OK;
+}
+
+PredictionStatus prediction_get_view_by_id(uint64_t prediction_id,
+                                           WamblePredictionView *out) {
+  if (!out || prediction_id == 0)
+    return PREDICTION_ERR_INVALID;
+  if (!g_prediction_mutex_ready)
+    return PREDICTION_ERR_INVALID;
+  wamble_mutex_lock(&g_prediction_mutex);
+  int idx = prediction_find_by_id_locked(prediction_id);
+  if (idx < 0) {
+    wamble_mutex_unlock(&g_prediction_mutex);
+    return PREDICTION_ERR_NOT_FOUND;
+  }
+  prediction_fill_view_locked(&g_predictions[idx], out);
+  wamble_mutex_unlock(&g_prediction_mutex);
   return PREDICTION_OK;
 }
 

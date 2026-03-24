@@ -456,7 +456,6 @@ NetworkStatus wamble_payload_serialize(const struct WambleMsg *msg,
   }
   case WAMBLE_CTRL_SERVER_HELLO:
   case WAMBLE_CTRL_BOARD_UPDATE:
-  case WAMBLE_CTRL_SERVER_NOTIFICATION:
   case WAMBLE_CTRL_SPECTATE_UPDATE: {
     size_t len = strnlen(msg->fen, FEN_MAX_LENGTH);
     if (len > payload_capacity)
@@ -464,6 +463,16 @@ NetworkStatus wamble_payload_serialize(const struct WambleMsg *msg,
     if (len)
       memcpy(payload, msg->fen, len);
     body_len = len;
+    break;
+  }
+  case WAMBLE_CTRL_SERVER_NOTIFICATION: {
+    size_t len = strnlen(msg->fen, FEN_MAX_LENGTH);
+    if (1 + len > payload_capacity)
+      return NET_ERR_TRUNCATED;
+    payload[0] = msg->notification_type;
+    if (len)
+      memcpy(payload + 1, msg->fen, len);
+    body_len = 1 + len;
     break;
   }
   case WAMBLE_CTRL_PROFILE_INFO:
@@ -761,7 +770,6 @@ static NetworkStatus decode_message_payload(uint8_t ctrl, uint8_t flags,
     break;
   case WAMBLE_CTRL_SERVER_HELLO:
   case WAMBLE_CTRL_BOARD_UPDATE:
-  case WAMBLE_CTRL_SERVER_NOTIFICATION:
   case WAMBLE_CTRL_SPECTATE_UPDATE:
   case WAMBLE_CTRL_ERROR:
     if (ctrl == WAMBLE_CTRL_ERROR) {
@@ -785,6 +793,19 @@ static NetworkStatus decode_message_payload(uint8_t ctrl, uint8_t flags,
           payload_len < FEN_MAX_LENGTH - 1 ? payload_len : (FEN_MAX_LENGTH - 1);
       if (copy)
         memcpy(msg->fen, payload, copy);
+      msg->fen[copy] = '\0';
+    }
+    break;
+  case WAMBLE_CTRL_SERVER_NOTIFICATION:
+    if (payload_len < 1)
+      return NET_ERR_TRUNCATED;
+    msg->notification_type = payload[0];
+    {
+      size_t text_len = payload_len - 1;
+      size_t copy =
+          text_len < FEN_MAX_LENGTH - 1 ? text_len : (FEN_MAX_LENGTH - 1);
+      if (copy)
+        memcpy(msg->fen, payload + 1, copy);
       msg->fen[copy] = '\0';
     }
     break;
