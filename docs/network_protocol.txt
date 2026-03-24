@@ -39,6 +39,9 @@ Message Layout
     extension trailer (non-fragment envelope packets).
   - `0x10` (`WAMBLE_FLAG_FRAGMENT_PAYLOAD`): payload is encoded using the
     Fragment Payload Envelope.
+  - `0x02` (`WAMBLE_FLAG_PREDICTION_CONTEXT`): on `GET_LEGAL_MOVES` only,
+    requests legal moves for prediction purposes. Bypasses the reservation
+    ownership requirement if the session has prediction submit capability.
 
 Extension Trailer (reserved)
 - Reserved typed key/value trailer for protocol metadata.
@@ -61,8 +64,14 @@ Extension Trailer (reserved)
       - bool: `uint8` (`0` or `1`)
 - Current capability metadata keys:
   - `session.caps` (`int` bitmask): server-advertised UI/session actions.
-  - `profile.caps` (`int` bitmask): per-profile discovery actions.
   - `prediction.source` (`string`): `tree` or `moves` for prediction reads.
+  - `reservation.reserved_at` (`int`): wall-clock Unix epoch seconds when the
+    current board reservation was created. Only present when the board has an
+    active reservation. Carried on `SERVER_HELLO`, `BOARD_UPDATE`, and
+    `LOGIN_SUCCESS`.
+  - `profile.caps` (`int` bitmask): per-profile discovery actions.
+  - `profile.reservation_timeout` (`int`): profile-configured reservation
+    duration in seconds. Carried on `PROFILE_INFO`.
 - Current bitmasks:
   - `session.caps`
     - `0x00000001`: attach identity
@@ -120,25 +129,59 @@ Control Codes
   - Payload: empty.
 - `0x02` SERVER_HELLO (server to client): Response to HELLO.
   - Payload: `char fen[]` (current board state).
-  - May include extension fields: `session.caps`, `prediction.source`.
+  - May include extension fields: `session.caps`, `prediction.source`,
+    `reservation.reserved_at`.
 - `0x03` PLAYER_MOVE (client to server): Submit a move.
   - Payload: `uint8 uci_len; char uci[uci_len]` (max 6 bytes).
 - `0x04` BOARD_UPDATE (server to client): Board state has changed.
   - Payload: `char fen[]`.
   - `flags`: server sets `0x01` when the assigned board is Chess960.
-  - May include extension fields: `session.caps`, `prediction.source`.
+  - May include extension fields: `session.caps`, `prediction.source`,
+    `reservation.reserved_at`.
 - `0x05` ACK (bidirectional): Acknowledges a reliable packet.
   - Payload: empty. Header `seq_num` matches the packet being ACKed.
 - `0x06` LIST_PROFILES (client to server): Request available profiles.
   - Payload: empty.
 - `0x07` PROFILE_INFO (server to client): Response to GET_PROFILE_INFO.
   - Payload: `name;port;advertise;visibility` or `NOTFOUND;<name>`.
-  - May include extension field `profile.caps`.
+  - May include extension fields: `profile.caps`,
+    `profile.websocket_port`, `profile.websocket_path`,
+    `profile.reservation_timeout`.
 - `0x08` ERROR (server to client): Reports an error.
   - Payload: `uint16 code; uint8 reason_len; char reason[reason_len]`.
+  - Error codes:
+    - `1000` (`WAMBLE_ERR_UNSUPPORTED_VERSION`): client version too new.
+    - `1001` (`WAMBLE_ERR_ACCESS_DENIED`): generic access denied.
   - Reliable by default.
-- `0x09` SERVER_NOTIFICATION (server to client): Broadcast message.
-  - Payload: `char text[]`. Often sent as unreliable.
+- `0x09` SERVER_NOTIFICATION (server to client): Typed server-push notification.
+  - Payload: `uint8 notification_type; char text[]`.
+  - Server-initiated only; clients never send this control code.
+  - `notification_type` (first payload byte):
+    - `0` (`GENERIC`): untyped text. Reserved for future or ad-hoc use.
+    - `1` (`POT_PAYOUT`): a board the player contributed to reached a terminal
+      state. Text carries the score delta description. Not yet emitted by the
+      server; reserved for future pot scoring integration.
+    - `2` (`SPECTATE_ENDED`): spectate session interrupted. Emitted when a
+      focused game finishes or focus is disabled (falls back to summary mode),
+      or when `max-spectators` drops to 0 and the session is stopped. Text
+      carries a human-readable reason.
+    - `3` (`MAINTENANCE`): server maintenance or operational warning. Not yet
+      emitted; reserved for future use.
+    - `4` (`ANNOUNCEMENT`): profile-level broadcast. Not yet emitted; reserved
+      for future use.
+  - `flags` bits (carried alongside):
+    - `0x20` (`SPECTATE_NOTICE_SUMMARY_FALLBACK`): the notification is about a
+      spectate focus→summary transition.
+    - `0x40` (`SPECTATE_NOTICE_STOPPED`): the notification is about spectating
+      being fully stopped.
+    - These flags are spectator-specific and only meaningful with type `2`.
+  - Delivery: typically sent as unreliable (`0x80` set). Eligible for fragment
+    payload when extension fields push the packet beyond `WAMBLE_MAX_PAYLOAD`.
+  - Emission path: the profile runtime collects pending notices via
+    `spectator_collect_notifications()` each tick and sends them as a batch of
+    `SERVER_NOTIFICATION` packets to the affected spectator sessions.
+  - Header `board_id` carries the board context that triggered the notification
+    (e.g., the focused board that ended). `token` identifies the recipient.
 - `0x0A` CLIENT_GOODBYE (client to server): Graceful disconnect.
   - Payload: empty.
 - `0x0B` SPECTATE_GAME (client to server): Request to watch a game.
@@ -189,7 +232,8 @@ Control Codes
   - Payload: empty.
 - `0x10` LOGIN_SUCCESS (server to client): Successful login.
   - Payload: empty.
-  - May include extension fields: `session.caps`, `prediction.source`.
+  - May include extension fields: `session.caps`, `prediction.source`,
+    `reservation.reserved_at`.
 - `0x11` LOGIN_FAILED (server to client): Failed login.
   - Payload: `uint16 code; uint8 reason_len; char reason[reason_len]`.
 - `0x12` GET_PLAYER_STATS (client to server): Request player statistics.
@@ -203,9 +247,13 @@ Control Codes
   - Payload: `char csv[]` (comma-separated profile names).
 - `0x17` GET_LEGAL_MOVES (client to server): Request legal moves for a square.
   - Payload: `uint8 square_index` (0-63, 0 = a1).
-  - Header: `board_id` must reference the board assignment for the player.
-  - Authorization: server validates the requesting token owns the reservation;
-    otherwise the response is an empty `LEGAL_MOVES` packet.
+  - Header: `board_id` must reference a valid board.
+  - `flags`: set `0x02` (`WAMBLE_FLAG_PREDICTION_CONTEXT`) to request legal
+    moves for prediction purposes without owning the reservation.
+  - Authorization: without `WAMBLE_FLAG_PREDICTION_CONTEXT`, the requesting
+    token must own the reservation; otherwise the response is an empty
+    `LEGAL_MOVES` packet. With the flag, the reservation check is bypassed if
+    the session has prediction submit capability for the board.
 - `0x18` LEGAL_MOVES (server to client): Response to GET_LEGAL_MOVES.
   - Payload: `uint8 square_index; uint8 move_count; struct { uint8 from; uint8 to; int8 promotion; } moves[move_count]`.
   - `move_count` is capped at 218 and only includes moves originating from `square_index`.
@@ -233,8 +281,8 @@ Control Codes
   - Payload: `uint8 depth; uint8 limit`.
   - `depth = 0` lets the server use its configured default depth cap.
   - `limit` is capped by the implementation maximum entries per packet.
-- `0x1D` PREDICTION_DATA (server to client): Prediction tree response or submit
-  confirmation.
+- `0x1D` PREDICTION_DATA (server to client): Prediction tree response, submit
+  confirmation, or inline failure.
   - Payload:
     - `uint8 count`
     - `count * struct {`
@@ -251,6 +299,13 @@ Control Codes
   - `status`: `0=pending`, `1=correct`, `2=incorrect`, `3=expired`.
   - `points_bits_be` is an IEEE-754 double bit pattern in big-endian order.
   - Maximum entries per packet: 16.
+  - Failure states: prediction failures (access denied, duplicate, invalid
+    request) are returned as PREDICTION_DATA with `count=0` rather than a
+    generic ERROR. On duplicate (PREDICTION_ERR_DUPLICATE or
+    PREDICTION_ERR_DUPLICATE_MOVE) when the submitter has prediction read
+    access, the server returns PREDICTION_DATA with `count=1` containing the
+    existing prediction row. This follows the inline domain response pattern
+    used elsewhere in the protocol (LOGIN_FAILED, LEGAL_MOVES count=0, etc.).
 - `0x1E` GET_PROFILE_TOS (client to server): Request ToS text for a profile.
   - Payload: `uint8 name_len; char name[name_len]`.
   - Authorization: profile must be discoverable by the requesting session's

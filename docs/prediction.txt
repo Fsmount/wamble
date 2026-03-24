@@ -42,6 +42,22 @@ Policy
 - Write and read are independent; a session may be allowed to submit without
   being allowed to read the tree.
 
+Duplicate Policy
+- Per-player-per-parent duplicate: a session may have at most one pending
+  prediction per parent branch on a board. Predictions are immutable — once
+  submitted, the move cannot be changed. Attempting a second submission at the
+  same parent returns `PREDICTION_ERR_DUPLICATE` with the existing prediction's
+  ID in `out_prediction_id`.
+- Move-identical duplicate: if another session has already submitted a pending
+  prediction with the same UCI move at the same parent on the same board:
+  - If the submitting session has prediction read access: rejected with
+    `PREDICTION_ERR_DUPLICATE_MOVE` (the session could have seen it).
+    The server responds with `PREDICTION_DATA` containing the existing
+    prediction row.
+  - If the submitting session lacks read access: accepted. Independent
+    conclusions from sessions that cannot observe each other are valid.
+    The server retries with `WAMBLE_PREDICTION_SKIP_MOVE_DUP` internally.
+
 Tree Semantics
 - Each prediction may reference `parent_prediction_id`.
 - Root predictions have no parent.
@@ -71,8 +87,14 @@ Persistence
 API
 - `prediction_manager_init()`.
 - `prediction_submit()`, `prediction_submit_with_parent()`.
+  - `prediction_submit_with_parent()` outputs the existing prediction ID in
+    `out_prediction_id` on both `PREDICTION_ERR_DUPLICATE` and
+    `PREDICTION_ERR_DUPLICATE_MOVE`.
+  - The `trust_tier` parameter accepts `WAMBLE_PREDICTION_SKIP_MOVE_DUP`
+    (`0x100`) to bypass the move-identical duplicate check.
 - `prediction_resolve_move()`.
 - `prediction_collect_tree()`.
+- `prediction_get_view_by_id()`.
 - `prediction_expire_board()`.
 
 References
@@ -83,5 +105,8 @@ References
   `prediction-max-pending`, `prediction-view-depth-limit`.
 - Protocol (see docs/network_protocol.txt): `SUBMIT_PREDICTION`,
   `GET_PREDICTIONS`, `PREDICTION_DATA`.
+  - Prediction failures respond with `PREDICTION_DATA` (count=0), not generic
+    `ERROR`. On duplicate with read access, the existing prediction row is
+    returned (count=1).
 - Scoring (see docs/scoring.txt): normal board pot scoring remains separate.
 - Database (see docs/database.txt): tables `predictions`, `sessions`.

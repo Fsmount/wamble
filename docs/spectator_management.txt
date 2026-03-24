@@ -32,10 +32,19 @@ Updates
 - Collected by `spectator_collect_updates()` at the configured rate per mode.
 - Ordering favors recent boards, then a simple attractiveness score.
 - `SPECTATE_UPDATE` sets `WAMBLE_FLAG_BOARD_IS_960` when the updated board is Chess960.
-- If a focused game ends or focus gets disabled, we queue an explicit notice and
-  switch back to summary.
+- If a focused game ends or focus gets disabled, we queue an explicit notice
+  (type `SPECTATE_ENDED`) and switch back to summary.
 - If `max-spectators` is reduced to `0`, non-bypass spectators are explicitly
-  stopped rather than silently left active.
+  stopped (type `SPECTATE_ENDED`) rather than silently left active.
+
+Notifications
+- `spectator_collect_notifications()` returns pending notices as
+  `SpectatorUpdate` structs, now including a `notification_type` field.
+- Notifications are sent as `SERVER_NOTIFICATION` packets with a typed
+  1-byte prefix before the text body.
+- Types used by the spectator system:
+  - `WAMBLE_NOTIFICATION_TYPE_SPECTATE_ENDED` (`2`): focus ended or
+    spectating stopped.
 
 Port Affinity
 - Entries are tied to the listener port that created them; only that thread emits updates for that entry.

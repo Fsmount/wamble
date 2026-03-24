@@ -362,6 +362,88 @@ WAMBLE_TEST(prediction_write_depth_zero_blocks_child_reply) {
   return 0;
 }
 
+WAMBLE_TEST(prediction_duplicate_move_policy) {
+  const char *cfg_path = "build/test_prediction_dup_move.conf";
+  const char *sql =
+      "INSERT INTO global_policy_rules "
+      "(global_identity_id, action, resource, scope, effect, permission_level, "
+      "reason, source) VALUES "
+      "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+      "(0, 'prediction.write', 'streak', '*', 'allow', 1, 'write', 'test');";
+  uint8_t player_a[TOKEN_LENGTH];
+  uint8_t player_b[TOKEN_LENGTH];
+  WambleBoard board;
+  uint64_t id_a = 0;
+  uint64_t id_b = 0;
+  uint64_t dup_id = 0;
+
+  if (prediction_test_prepare_db_runtime(cfg_path, sql) != 0)
+    T_FAIL_SIMPLE("prediction_test_prepare_db_runtime failed");
+
+  prediction_test_fill_token(player_a, 0xA0);
+  prediction_test_fill_token(player_b, 0xB0);
+  T_ASSERT_STATUS_OK(prediction_test_seed_session(player_a));
+  T_ASSERT_STATUS_OK(prediction_test_seed_session(player_b));
+  T_ASSERT_STATUS_OK(prediction_test_store_board(
+      &board, 99, "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"));
+
+  T_ASSERT_EQ_INT(
+      prediction_submit_with_parent(&board, player_a, "e2e4", 0, 0, &id_a),
+      PREDICTION_OK);
+  T_ASSERT(id_a > 0);
+
+  {
+    WamblePredictionView probe[1];
+    int probe_count = 0;
+    T_ASSERT(prediction_collect_tree(board.id, player_b, 0, 4, probe, 1,
+                                     &probe_count) != PREDICTION_OK);
+  }
+  dup_id = 0;
+  T_ASSERT_EQ_INT(
+      prediction_submit_with_parent(&board, player_b, "e2e4", 0, 0, &dup_id),
+      PREDICTION_ERR_DUPLICATE_MOVE);
+  T_ASSERT_EQ_INT((int)dup_id, (int)id_a);
+
+  id_b = 0;
+  T_ASSERT_EQ_INT(prediction_submit_with_parent(&board, player_b, "e2e4", 0,
+                                                WAMBLE_PREDICTION_SKIP_MOVE_DUP,
+                                                &id_b),
+                  PREDICTION_OK);
+  T_ASSERT(id_b > 0);
+  T_ASSERT(id_b != id_a);
+
+  {
+    DbPredictionsResult pending = db_get_pending_predictions();
+    int found_a = -1;
+    int found_b = -1;
+    T_ASSERT_STATUS(pending.status, DB_OK);
+    found_a =
+        prediction_test_find_pending_row(pending.rows, pending.count, id_a);
+    found_b =
+        prediction_test_find_pending_row(pending.rows, pending.count, id_b);
+    T_ASSERT(found_a >= 0);
+    T_ASSERT(found_b >= 0);
+  }
+
+  {
+    uint64_t dup_self = 0;
+    T_ASSERT_EQ_INT(prediction_submit_with_parent(&board, player_a, "e2e4", 0,
+                                                  0, &dup_self),
+                    PREDICTION_ERR_DUPLICATE);
+    T_ASSERT_EQ_INT((int)dup_self, (int)id_a);
+  }
+
+  {
+    uint64_t dup_diff = 0;
+    T_ASSERT_EQ_INT(prediction_submit_with_parent(&board, player_a, "d2d4", 0,
+                                                  0, &dup_diff),
+                    PREDICTION_ERR_DUPLICATE);
+    T_ASSERT_EQ_INT((int)dup_diff, (int)id_a);
+  }
+
+  return 0;
+}
+
 WAMBLE_TESTS_BEGIN_NAMED(prediction_tests) {
   WAMBLE_TESTS_ADD_FM(prediction_config_loads_prediction_options, "prediction");
   WAMBLE_TESTS_ADD_DB_EX_SM(prediction_tree_children_advance_target_ply,
@@ -374,6 +456,9 @@ WAMBLE_TESTS_BEGIN_NAMED(prediction_tests) {
                             WAMBLE_SUITE_FUNCTIONAL, "prediction", NULL,
                             prediction_test_teardown, 0);
   WAMBLE_TESTS_ADD_DB_EX_SM(prediction_write_depth_zero_blocks_child_reply,
+                            WAMBLE_SUITE_FUNCTIONAL, "prediction", NULL,
+                            prediction_test_teardown, 0);
+  WAMBLE_TESTS_ADD_DB_EX_SM(prediction_duplicate_move_policy,
                             WAMBLE_SUITE_FUNCTIONAL, "prediction", NULL,
                             prediction_test_teardown, 0);
 }

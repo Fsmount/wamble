@@ -898,6 +898,10 @@ static void append_session_capability_extensions(struct WambleMsg *msg,
   if ((caps & WAMBLE_SESSION_UI_CAP_PREDICTION_READ) != 0) {
     (void)append_ext_string(msg, "prediction.source", prediction_source);
   }
+  if (board->reservation_time > 0) {
+    (void)append_ext_int(msg, "reservation.reserved_at",
+                         (int64_t)board->reservation_time);
+  }
 }
 
 static uint8_t prediction_status_code(const char *status) {
@@ -1136,19 +1140,26 @@ static ServerStatus handle_submit_prediction(wamble_socket_t sockfd,
   uci[uci_len] = '\0';
 
   uint64_t prediction_id = 0;
+  int can_read = prediction_tree_read_allowed(board->id, msg->token);
+  int submit_flags = can_read ? 0 : WAMBLE_PREDICTION_SKIP_MOVE_DUP;
   PredictionStatus st = prediction_submit_with_parent(
-      board, msg->token, uci, msg->prediction_parent_id, 0, &prediction_id);
+      board, msg->token, uci, msg->prediction_parent_id, submit_flags,
+      &prediction_id);
   if (st != PREDICTION_OK) {
     publish_server_protocol_status(SERVER_PROTOCOL_STATUS_PREDICTION_REJECTED,
                                    profile_name);
-    struct WambleMsg out = {0};
-    out.ctrl = WAMBLE_CTRL_ERROR;
-    memcpy(out.token, msg->token, TOKEN_LENGTH);
-    out.error_code = WAMBLE_ERR_ACCESS_DENIED;
-    if (send_reliable_default(sockfd, &out, cliaddr) != 0) {
-      return SERVER_ERR_SEND_FAILED;
+    if ((st == PREDICTION_ERR_DUPLICATE ||
+         st == PREDICTION_ERR_DUPLICATE_MOVE) &&
+        can_read && prediction_id != 0) {
+      WamblePredictionView dup_view;
+      if (prediction_get_view_by_id(prediction_id, &dup_view) ==
+          PREDICTION_OK) {
+        return send_prediction_rows(sockfd, cliaddr, msg->token, board->id,
+                                    &dup_view, 1);
+      }
     }
-    return SERVER_ERR_FORBIDDEN;
+    return send_prediction_rows(sockfd, cliaddr, msg->token, board->id, NULL,
+                                0);
   }
 
   WamblePredictionView rows[WAMBLE_MAX_PREDICTION_ENTRIES];
@@ -1190,14 +1201,8 @@ static ServerStatus handle_get_predictions(wamble_socket_t sockfd,
   if (st != PREDICTION_OK) {
     publish_server_protocol_status(SERVER_PROTOCOL_STATUS_PREDICTION_REJECTED,
                                    profile_name);
-    struct WambleMsg out = {0};
-    out.ctrl = WAMBLE_CTRL_ERROR;
-    memcpy(out.token, msg->token, TOKEN_LENGTH);
-    out.error_code = WAMBLE_ERR_ACCESS_DENIED;
-    if (send_reliable_default(sockfd, &out, cliaddr) != 0) {
-      return SERVER_ERR_SEND_FAILED;
-    }
-    return SERVER_ERR_FORBIDDEN;
+    return send_prediction_rows(sockfd, cliaddr, msg->token, msg->board_id,
+                                NULL, 0);
   }
   return send_prediction_rows(sockfd, cliaddr, msg->token, msg->board_id, rows,
                               count);
@@ -1300,6 +1305,8 @@ static ServerStatus handle_get_profile_info(wamble_socket_t sockfd,
     (void)append_ext_int(&resp, "profile.websocket_port", (int64_t)ws_port);
     if (ws_path)
       (void)append_ext_string(&resp, "profile.websocket_path", ws_path);
+    (void)append_ext_int(&resp, "profile.reservation_timeout",
+                         (int64_t)p->config.reservation_timeout);
   } else {
     publish_server_protocol_status(
         p ? SERVER_PROTOCOL_STATUS_PROFILE_INFO_HIDDEN
@@ -1864,7 +1871,10 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     response.board_id = msg->board_id;
     response.move_square = msg->move_square;
 
-    if (!tokens_equal(board->reservation_player_token, player->token)) {
+    if (!tokens_equal(board->reservation_player_token, player->token) &&
+        !((msg->flags & WAMBLE_FLAG_PREDICTION_CONTEXT) != 0 &&
+          prediction_submit_allowed_for_player(board, player->token) ==
+              PREDICTION_OK)) {
       response.move_count = 0;
     } else if (msg->move_square >= 64) {
       response.move_count = 0;

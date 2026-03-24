@@ -1122,6 +1122,7 @@ static void send_spectator_batch(wamble_socket_t sockfd,
     out.board_id = events[i].board_id;
     out.seq_num = 0;
     out.flags = (uint8_t)(events[i].flags | WAMBLE_FLAG_UNRELIABLE);
+    out.notification_type = events[i].notification_type;
     {
       size_t __len = strnlen(events[i].fen, FEN_MAX_LENGTH - 1);
       memcpy(out.fen, events[i].fen, __len);

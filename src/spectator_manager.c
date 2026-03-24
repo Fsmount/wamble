@@ -14,6 +14,7 @@ typedef struct SpectatorEntry {
   double last_activity;
   int has_pending_notice;
   uint8_t pending_notice_flags;
+  uint8_t pending_notice_type;
   uint64_t pending_notice_board_id;
   char pending_notice[FEN_MAX_LENGTH];
   int capacity_bypass;
@@ -289,6 +290,7 @@ static SpectatorEntry *ensure_spectator(const struct sockaddr_in *addr,
   e->last_activity = monotonic_seconds();
   e->has_pending_notice = 0;
   e->pending_notice_flags = 0;
+  e->pending_notice_type = WAMBLE_NOTIFICATION_TYPE_GENERIC;
   e->pending_notice_board_id = 0;
   e->pending_notice[0] = '\0';
   e->capacity_bypass = 0;
@@ -398,6 +400,7 @@ void spectator_manager_tick(void) {
           e->has_pending_notice = 1;
           e->pending_notice_flags =
               WAMBLE_FLAG_SPECTATE_NOTICE_SUMMARY_FALLBACK;
+          e->pending_notice_type = WAMBLE_NOTIFICATION_TYPE_SPECTATE_ENDED;
           e->pending_notice_board_id = e->focus_board_id;
           snprintf(e->pending_notice, sizeof(e->pending_notice),
                    "focus ended; switched to summary mode (board %" PRIu64 ")",
@@ -420,6 +423,7 @@ void spectator_manager_tick(void) {
             e->has_pending_notice = 1;
             e->pending_notice_flags =
                 WAMBLE_FLAG_SPECTATE_NOTICE_SUMMARY_FALLBACK;
+            e->pending_notice_type = WAMBLE_NOTIFICATION_TYPE_SPECTATE_ENDED;
             e->pending_notice_board_id = e->focus_board_id;
             snprintf(e->pending_notice, sizeof(e->pending_notice),
                      "focused game finished; switched to summary mode "
@@ -455,6 +459,7 @@ void spectator_manager_tick(void) {
       if (!e->has_pending_notice) {
         e->has_pending_notice = 1;
         e->pending_notice_flags = WAMBLE_FLAG_SPECTATE_NOTICE_STOPPED;
+        e->pending_notice_type = WAMBLE_NOTIFICATION_TYPE_SPECTATE_ENDED;
         e->pending_notice_board_id = e->focus_board_id;
         snprintf(e->pending_notice, sizeof(e->pending_notice),
                  "spectating stopped; max-spectators is 0");
@@ -500,8 +505,10 @@ int spectator_collect_notifications(struct SpectatorUpdate *out, int max) {
     u->fen[FEN_MAX_LENGTH - 1] = '\0';
     u->addr = e->addr;
     u->flags = e->pending_notice_flags;
+    u->notification_type = e->pending_notice_type;
     e->has_pending_notice = 0;
     e->pending_notice_flags = 0;
+    e->pending_notice_type = WAMBLE_NOTIFICATION_TYPE_GENERIC;
     e->pending_notice[0] = '\0';
     e->pending_notice_board_id = 0;
   }
@@ -530,6 +537,7 @@ spectator_handle_request(const struct WambleMsg *msg,
       e->last_focus_sent = 0.0;
       e->has_pending_notice = 0;
       e->pending_notice_flags = 0;
+      e->pending_notice_type = WAMBLE_NOTIFICATION_TYPE_GENERIC;
       e->pending_notice_board_id = 0;
       e->pending_notice[0] = '\0';
       e->capacity_bypass = 0;
