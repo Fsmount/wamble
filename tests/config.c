@@ -1268,6 +1268,82 @@ WAMBLE_TEST(config_network_treatment_group_refreshes_after_reassignment) {
   return 0;
 }
 
+WAMBLE_TEST(config_db_record_payout_with_zero_awarded_persists_canonical) {
+  uint8_t token[TOKEN_LENGTH] = {0x31, 0x32, 0x33, 0x34, 0x35, 0x36,
+                                 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c,
+                                 0x3d, 0x3e, 0x3f, 0x40};
+  uint8_t public_key[WAMBLE_PUBLIC_KEY_LENGTH] = {
+      0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a,
+      0x9b, 0x9c, 0x9d, 0x9e, 0x9f, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5,
+      0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf};
+  const uint64_t board_id = 990001ULL;
+  const double canonical_points = 9.25;
+  WambleIntentBuffer intents = {0};
+  WamblePersistentPlayerStats stats = {0};
+  uint64_t session_id = 0;
+  int selected_bytes = 0;
+  int attempted = 0;
+  int failures = 0;
+  char public_key_hex[(WAMBLE_PUBLIC_KEY_LENGTH * 2) + 1];
+  char seed_sql[1400];
+  char payout_assert_sql[512];
+
+  if (config_db_prepare() != 0)
+    T_FAIL_SIMPLE("config_db_prepare failed");
+  wamble_set_query_service(wamble_get_db_query_service());
+
+  session_id = db_create_session(token, 0);
+  T_ASSERT(session_id > 0);
+
+  for (int i = 0; i < WAMBLE_PUBLIC_KEY_LENGTH; i++) {
+    snprintf(public_key_hex + (i * 2), 3, "%02x", public_key[i]);
+  }
+
+  snprintf(seed_sql, sizeof(seed_sql),
+           "INSERT INTO global_identities (public_key) VALUES "
+           "(decode('%s', 'hex')) ON CONFLICT (public_key) DO NOTHING;"
+           "INSERT INTO players (public_key, rating) VALUES "
+           "(decode('%s', 'hex'), 1200) ON CONFLICT (public_key) DO NOTHING;"
+           "UPDATE sessions SET player_id = (SELECT id FROM players WHERE "
+           "public_key = decode('%s', 'hex')), "
+           "global_identity_id = (SELECT id FROM global_identities WHERE "
+           "public_key = decode('%s', 'hex')) "
+           "WHERE id = %llu;"
+           "INSERT INTO boards (id, fen, status) VALUES "
+           "(%llu, '8/8/8/8/8/8/8/8 w - - 0 1', 'ACTIVE') "
+           "ON CONFLICT (id) DO NOTHING;",
+           public_key_hex, public_key_hex, public_key_hex, public_key_hex,
+           (unsigned long long)session_id, (unsigned long long)board_id);
+  T_ASSERT_STATUS_OK(test_db_apply_sql(seed_sql));
+
+  wamble_intents_init(&intents);
+  wamble_set_intent_buffer(&intents);
+  wamble_emit_record_payout_with_canonical(board_id, token, 0.0,
+                                           canonical_points);
+  T_ASSERT_EQ_INT(intents.count, 1);
+  T_ASSERT_EQ_INT(wamble_apply_intents_with_db_checked(
+                      &intents, 0, 0, &selected_bytes, &attempted, &failures),
+                  PERSISTENCE_STATUS_OK);
+  T_ASSERT_EQ_INT(attempted, 1);
+  T_ASSERT_EQ_INT(failures, 0);
+  snprintf(payout_assert_sql, sizeof(payout_assert_sql),
+           "DO $$ DECLARE c INT; BEGIN "
+           "SELECT COUNT(*) INTO c FROM payouts "
+           "WHERE board_id = %llu AND session_id = %llu AND "
+           "points_awarded = 0.0000 AND points_canonical = 9.2500; "
+           "IF c <> 1 THEN RAISE EXCEPTION 'expected payout row, got %%', c; "
+           "END IF; END $$;",
+           (unsigned long long)board_id, (unsigned long long)session_id);
+  T_ASSERT_STATUS_OK(test_db_apply_sql(payout_assert_sql));
+  T_ASSERT_STATUS(wamble_query_get_persistent_player_stats(public_key, &stats),
+                  DB_OK);
+  T_ASSERT(stats.score > 9.24 && stats.score < 9.26);
+
+  wamble_set_intent_buffer(NULL);
+  wamble_intents_free(&intents);
+  return 0;
+}
+
 WAMBLE_TEST(config_db_treatment_scopes_by_profile_source) {
   uint8_t token_alpha[TOKEN_LENGTH] = {0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
                                        0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
@@ -1396,4 +1472,6 @@ WAMBLE_TESTS_ADD_DB_FM(
 WAMBLE_TESTS_ADD_DB_FM(
     config_network_treatment_group_refreshes_after_reassignment, "config");
 WAMBLE_TESTS_ADD_DB_FM(config_db_treatment_scopes_by_profile_source, "config");
+WAMBLE_TESTS_ADD_DB_FM(
+    config_db_record_payout_with_zero_awarded_persists_canonical, "config");
 WAMBLE_TESTS_END()

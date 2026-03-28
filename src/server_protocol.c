@@ -39,6 +39,9 @@ static void publish_treatment_audit_status(int status_code,
                                            const char *profile_name);
 static const char *ctrl_policy_resource(uint8_t ctrl);
 static int compare_cstr_ptrs(const void *a, const void *b);
+static int stats_read_allowed(const uint8_t *token, const char *profile_name,
+                              uint64_t target_session_id,
+                              uint64_t target_identity_id);
 
 static int token_has_any_byte(const uint8_t *token) {
   if (!token)
@@ -56,6 +59,21 @@ static int compare_cstr_ptrs(const void *a, const void *b) {
   const char *l = (lhs && *lhs) ? *lhs : "";
   const char *r = (rhs && *rhs) ? *rhs : "";
   return strcmp(l, r);
+}
+
+static int is_valid_stats_handle(const char *handle) {
+  if (!handle || !handle[0])
+    return 0;
+  size_t len = strlen(handle);
+  if (len < 4 || len > 63)
+    return 0;
+  for (size_t i = 0; i < len; i++) {
+    char c = handle[i];
+    int ok = ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_');
+    if (!ok)
+      return 0;
+  }
+  return 1;
 }
 
 static int ensure_rate_limit_entries(void) {
@@ -673,6 +691,10 @@ static const char *ctrl_policy_resource(uint8_t ctrl) {
     return "profile_tos_data";
   case WAMBLE_CTRL_ACCEPT_PROFILE_TOS:
     return "accept_profile_tos";
+  case WAMBLE_CTRL_GET_ACTIVE_RESERVATIONS:
+    return "get_active_reservations";
+  case WAMBLE_CTRL_ACTIVE_RESERVATIONS_DATA:
+    return "active_reservations_data";
   default:
     return "unknown";
   }
@@ -706,6 +728,29 @@ static int append_ext_string(struct WambleMsg *msg, const char *key,
   field->value_type = WAMBLE_TREATMENT_VALUE_STRING;
   snprintf(field->string_value, sizeof(field->string_value), "%s", value);
   return 0;
+}
+
+static const WambleMessageExtField *
+find_ext_field_by_key(const struct WambleMsg *msg, const char *key) {
+  if (!msg || !key || !key[0])
+    return NULL;
+  for (uint8_t i = 0; i < msg->ext_count; i++) {
+    if (strcmp(msg->ext[i].key, key) == 0)
+      return &msg->ext[i];
+  }
+  return NULL;
+}
+
+static int square_index_from_alg(const char *sq) {
+  if (!sq || sq[0] < 'a' || sq[0] > 'h' || sq[1] < '1' || sq[1] > '8')
+    return -1;
+  return ((int)(sq[1] - '1') * 8) + (int)(sq[0] - 'a');
+}
+
+static uint64_t u64_to_be(uint64_t x) {
+  uint32_t hi = (uint32_t)(x >> 32);
+  uint32_t lo = (uint32_t)(x & 0xffffffffu);
+  return ((uint64_t)htonl(lo) << 32) | htonl(hi);
 }
 
 static int effective_profile_websocket_port(const WambleProfile *profile) {
@@ -765,6 +810,7 @@ static CtrlScope ctrl_scope(uint8_t ctrl) {
   case WAMBLE_CTRL_GET_PROFILE_INFO:
   case WAMBLE_CTRL_GET_PROFILE_TOS:
   case WAMBLE_CTRL_ACCEPT_PROFILE_TOS:
+  case WAMBLE_CTRL_GET_ACTIVE_RESERVATIONS:
   case WAMBLE_CTRL_LOGIN_REQUEST:
   case WAMBLE_CTRL_LOGOUT:
     return CTRL_SCOPE_GLOBAL;
@@ -839,10 +885,13 @@ static uint32_t compute_session_ui_caps(const uint8_t *token,
   }
 
   if (protocol_ctrl_allowed(token, profile_name,
-                            WAMBLE_CTRL_GET_PLAYER_STATS) &&
-      policy_check(token, profile_name, "stats.read", "player", NULL, NULL,
-                   NULL)) {
-    caps |= WAMBLE_SESSION_UI_CAP_STATS;
+                            WAMBLE_CTRL_GET_PLAYER_STATS)) {
+    uint64_t session_id = 0;
+    if (wamble_query_get_session_by_token(token, &session_id) != DB_OK)
+      session_id = 0;
+    if (stats_read_allowed(token, profile_name, session_id, 0)) {
+      caps |= WAMBLE_SESSION_UI_CAP_STATS;
+    }
   }
 
   if (protocol_ctrl_allowed(token, profile_name, WAMBLE_CTRL_GET_LEADERBOARD) &&
@@ -881,17 +930,97 @@ static uint32_t compute_session_ui_caps(const uint8_t *token,
     caps |= WAMBLE_SESSION_UI_CAP_PREDICTION_READ;
   }
 
+  if (policy_check(token, profile_name, "game.mode", "view", NULL, NULL, NULL))
+    caps |= WAMBLE_SESSION_UI_CAP_GAME_MODE_VISIBLE;
+
   return caps;
 }
 
-static void append_session_capability_extensions(struct WambleMsg *msg,
-                                                 const uint8_t *token,
-                                                 const char *profile_name,
-                                                 const WambleBoard *board) {
+typedef enum {
+  POLICY_CTX_NO_MATCH = -1,
+  POLICY_CTX_DENY = 0,
+  POLICY_CTX_ALLOW = 1
+} PolicyContextResult;
+
+static PolicyContextResult resolve_policy_context_result(
+    const uint8_t *token, const char *profile_name, const char *action,
+    const char *resource, const char *context_key, const char *context_value) {
+  WamblePolicyDecision decision = {0};
+  WamblePolicyDecision baseline = {0};
+  DbStatus st = wamble_query_resolve_policy_decision(
+      token, profile_name, action, resource, context_key, context_value,
+      &decision);
+  if (st != DB_OK)
+    return POLICY_CTX_DENY;
+  if (context_key && context_key[0]) {
+    DbStatus base_st = wamble_query_resolve_policy_decision(
+        token, profile_name, action, resource, NULL, NULL, &baseline);
+    if (base_st == DB_OK && decision.rule_id == baseline.rule_id &&
+        decision.allowed == baseline.allowed &&
+        strcmp(decision.effect, baseline.effect) == 0 &&
+        strcmp(decision.reason, baseline.reason) == 0) {
+      return POLICY_CTX_NO_MATCH;
+    }
+  }
+  if (!decision.rule_id && !decision.allowed &&
+      strcmp(decision.reason, "default_deny_no_rule") == 0)
+    return POLICY_CTX_NO_MATCH;
+  return decision.allowed ? POLICY_CTX_ALLOW : POLICY_CTX_DENY;
+}
+
+static int stats_read_allowed(const uint8_t *token, const char *profile_name,
+                              uint64_t target_session_id,
+                              uint64_t target_identity_id) {
+  PolicyContextResult res = POLICY_CTX_NO_MATCH;
+  uint64_t identity_id = target_identity_id;
+  if (identity_id == 0 && target_session_id > 0 &&
+      wamble_query_get_session_global_identity_id(target_session_id,
+                                                  &identity_id) != DB_OK) {
+    identity_id = 0;
+  }
+  if (identity_id > 0) {
+    char tags_csv[512] = {0};
+    if (wamble_query_get_identity_tags_csv(identity_id, tags_csv,
+                                           sizeof(tags_csv)) == DB_OK) {
+      if (!tags_csv[0]) {
+        res = resolve_policy_context_result(token, profile_name, "stats.read",
+                                            "player", "target.identity_tag",
+                                            "none");
+        if (res != POLICY_CTX_NO_MATCH)
+          return res == POLICY_CTX_ALLOW;
+      } else {
+        char tags_work[sizeof(tags_csv)] = {0};
+        snprintf(tags_work, sizeof(tags_work), "%s", tags_csv);
+        char *cursor = tags_work;
+        while (cursor && cursor[0]) {
+          char *sep = strchr(cursor, ',');
+          if (sep)
+            *sep = '\0';
+          if (cursor[0]) {
+            res = resolve_policy_context_result(token, profile_name,
+                                                "stats.read", "player",
+                                                "target.identity_tag", cursor);
+            if (res != POLICY_CTX_NO_MATCH)
+              return res == POLICY_CTX_ALLOW;
+          }
+          cursor = sep ? (sep + 1) : NULL;
+        }
+      }
+    }
+  }
+  res = resolve_policy_context_result(token, profile_name, "stats.read",
+                                      "player", NULL, NULL);
+  return res == POLICY_CTX_ALLOW;
+}
+
+static uint32_t append_session_capability_extensions(struct WambleMsg *msg,
+                                                     const uint8_t *token,
+                                                     const char *profile_name,
+                                                     const WambleBoard *board) {
   const char *prediction_source = "tree";
   uint32_t caps = 0;
   if (!msg || !token || !profile_name || !profile_name[0] || !board)
-    return;
+    return 0;
   caps =
       compute_session_ui_caps(token, profile_name, board, &prediction_source);
   (void)append_ext_int(msg, "session.caps", (int64_t)caps);
@@ -902,6 +1031,30 @@ static void append_session_capability_extensions(struct WambleMsg *msg,
     (void)append_ext_int(msg, "reservation.reserved_at",
                          (int64_t)board->reservation_time);
   }
+  return caps;
+}
+
+static void append_last_move_extensions(struct WambleMsg *msg,
+                                        const uint8_t *token,
+                                        const char *profile_name,
+                                        const WambleBoard *board) {
+  int from_idx = -1;
+  int to_idx = -1;
+  if (!msg || !token || !profile_name || !profile_name[0] || !board)
+    return;
+  if (!board->last_move_uci[0])
+    return;
+
+  if (strnlen(board->last_move_uci, MAX_UCI_LENGTH) >= 4) {
+    from_idx = square_index_from_alg(board->last_move_uci);
+    to_idx = square_index_from_alg(board->last_move_uci + 2);
+  }
+  if (from_idx < 0 || to_idx < 0)
+    return;
+
+  (void)append_ext_string(msg, "last_move.uci", board->last_move_uci);
+  (void)append_ext_int(msg, "last_move.from", (int64_t)from_idx);
+  (void)append_ext_int(msg, "last_move.to", (int64_t)to_idx);
 }
 
 static uint8_t prediction_status_code(const char *status) {
@@ -1010,8 +1163,15 @@ static ServerStatus handle_client_hello(wamble_socket_t sockfd,
   response.seq_num = WAMBLE_PROTO_VERSION;
   write_visible_board_fen(player->token, profile_name, board, response.fen,
                           sizeof(response.fen));
-  append_session_capability_extensions(&response, player->token, profile_name,
-                                       board);
+  {
+    uint32_t session_caps = append_session_capability_extensions(
+        &response, player->token, profile_name, board);
+    if ((session_caps & WAMBLE_SESSION_UI_CAP_GAME_MODE_VISIBLE) != 0 &&
+        board->board.game_mode == GAME_MODE_CHESS960) {
+      response.flags |= WAMBLE_FLAG_BOARD_IS_960;
+    }
+    append_last_move_extensions(&response, player->token, profile_name, board);
+  }
 
   if (send_reliable_default(sockfd, &response, cliaddr) != 0) {
     return SERVER_ERR_SEND_FAILED;
@@ -1108,12 +1268,18 @@ static ServerStatus handle_player_move(wamble_socket_t sockfd,
   response.board_id = next_board->id;
   response.seq_num = 0;
   response.uci_len = 0;
-  if (next_board->board.game_mode == GAME_MODE_CHESS960)
-    response.flags |= WAMBLE_FLAG_BOARD_IS_960;
   write_visible_board_fen(msg->token, profile_name, next_board, response.fen,
                           sizeof(response.fen));
-  append_session_capability_extensions(&response, player->token, profile_name,
-                                       next_board);
+  {
+    uint32_t session_caps = append_session_capability_extensions(
+        &response, player->token, profile_name, next_board);
+    if ((session_caps & WAMBLE_SESSION_UI_CAP_GAME_MODE_VISIBLE) != 0 &&
+        next_board->board.game_mode == GAME_MODE_CHESS960) {
+      response.flags |= WAMBLE_FLAG_BOARD_IS_960;
+    }
+    append_last_move_extensions(&response, player->token, profile_name,
+                                next_board);
+  }
 
   if (send_reliable_default(sockfd, &response, cliaddr) != 0) {
     return SERVER_ERR_SEND_FAILED;
@@ -1302,6 +1468,11 @@ static ServerStatus handle_get_profile_info(wamble_socket_t sockfd,
     resp.profile_info_len = (uint16_t)wrote;
     (void)append_ext_int(&resp, "profile.caps",
                          (int64_t)compute_profile_ui_caps(msg->token, p));
+    (void)append_ext_int(&resp, "profile.tos_available",
+                         (int64_t)((p->tos_text && p->tos_text[0]) ? 1 : 0));
+    (void)append_ext_int(
+        &resp, "profile.tos_accepted",
+        (int64_t)profile_terms_currently_accepted(msg->token, p->name));
     (void)append_ext_int(&resp, "profile.websocket_port", (int64_t)ws_port);
     if (ws_path)
       (void)append_ext_string(&resp, "profile.websocket_path", ws_path);
@@ -1428,6 +1599,100 @@ static ServerStatus send_fragmented_payload(
     }
   }
   return SERVER_OK;
+}
+
+static size_t
+encode_active_reservations_payload(const DbActiveReservationEntry *rows,
+                                   int count, uint8_t *out, size_t out_cap) {
+  if (!out || out_cap < 2)
+    return 0;
+  if (count < 0)
+    count = 0;
+  if (count > 0 && !rows)
+    return 0;
+  if ((size_t)count > (SIZE_MAX - 2u) / 16u)
+    return 0;
+  if (count > (int)UINT16_MAX)
+    count = (int)UINT16_MAX;
+  size_t need = 2 + ((size_t)count * 16);
+  if (need > out_cap)
+    return 0;
+  uint16_t count_be = htons((uint16_t)count);
+  memcpy(out, &count_be, 2);
+  size_t off = 2;
+  for (int i = 0; i < count; i++) {
+    uint64_t board_be = u64_to_be(rows[i].board_id);
+    uint64_t reserved_be = u64_to_be((uint64_t)rows[i].reserved_at);
+    memcpy(out + off, &board_be, 8);
+    off += 8;
+    memcpy(out + off, &reserved_be, 8);
+    off += 8;
+  }
+  return off;
+}
+
+static ServerStatus handle_get_active_reservations(
+    wamble_socket_t sockfd, const struct sockaddr_in *cliaddr,
+    const struct WambleMsg *msg, const char *profile_name) {
+  if (!msg || !cliaddr)
+    return SERVER_ERR_INTERNAL;
+  uint8_t public_key[WAMBLE_PUBLIC_KEY_LENGTH] = {0};
+  int has_identity = 0;
+  uint64_t session_id = 0;
+
+  if (wamble_query_get_session_by_token(msg->token, &session_id) == DB_OK &&
+      session_id > 0 &&
+      wamble_query_get_session_public_key(session_id, public_key,
+                                          &has_identity) == DB_OK &&
+      has_identity) {
+  } else {
+    WamblePlayer *player = get_player_by_token(msg->token);
+    if (player && player->has_persistent_identity) {
+      memcpy(public_key, player->public_key, WAMBLE_PUBLIC_KEY_LENGTH);
+      has_identity = 1;
+    }
+  }
+
+  DbActiveReservationsResult reservations = {0};
+  int encode_count = 0;
+  if (has_identity) {
+    reservations =
+        wamble_query_get_active_reservations_by_public_key(public_key);
+    if (reservations.status != DB_OK) {
+      return SERVER_ERR_INTERNAL;
+    }
+    encode_count = reservations.count;
+  } else {
+    reservations.status = DB_OK;
+    reservations.rows = NULL;
+    reservations.count = 0;
+    encode_count = 0;
+  }
+
+  if (encode_count < 0)
+    encode_count = 0;
+  if (encode_count > (int)UINT16_MAX)
+    encode_count = (int)UINT16_MAX;
+  if ((size_t)encode_count > (SIZE_MAX - 2u) / 16u)
+    return SERVER_ERR_INTERNAL;
+
+  size_t payload_cap = 2 + ((size_t)encode_count * 16);
+  if (payload_cap < 2)
+    payload_cap = 2;
+  uint8_t *payload = (uint8_t *)malloc(payload_cap);
+  if (!payload)
+    return SERVER_ERR_INTERNAL;
+  size_t payload_len = encode_active_reservations_payload(
+      reservations.rows, encode_count, payload, payload_cap);
+  if (payload_len == 0 && encode_count > 0) {
+    free(payload);
+    return SERVER_ERR_INTERNAL;
+  }
+  ServerStatus st = send_fragmented_payload(
+      sockfd, cliaddr, WAMBLE_CTRL_ACTIVE_RESERVATIONS_DATA, msg->token,
+      payload, payload_len, profile_name);
+  free(payload);
+  return st;
 }
 
 static ServerStatus handle_get_profile_tos(wamble_socket_t sockfd,
@@ -1622,8 +1887,12 @@ static ServerStatus handle_login_request(wamble_socket_t sockfd,
     {
       WambleBoard *board = find_board_for_player(player);
       if (board) {
-        append_session_capability_extensions(&response, player->token,
-                                             profile_name, board);
+        uint32_t session_caps = append_session_capability_extensions(
+            &response, player->token, profile_name, board);
+        if ((session_caps & WAMBLE_SESSION_UI_CAP_GAME_MODE_VISIBLE) != 0 &&
+            board->board.game_mode == GAME_MODE_CHESS960) {
+          response.flags |= WAMBLE_FLAG_BOARD_IS_960;
+        }
       }
     }
   } else {
@@ -1716,6 +1985,8 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
       send_ack(sockfd, msg, cliaddr);
     return handle_accept_profile_tos(sockfd, cliaddr, msg, profile_name,
                                      effective_trust_tier);
+  case WAMBLE_CTRL_GET_ACTIVE_RESERVATIONS:
+    return handle_get_active_reservations(sockfd, cliaddr, msg, profile_name);
   case WAMBLE_CTRL_LOGIN_REQUEST:
     return handle_login_request(sockfd, cliaddr, msg, profile_name);
   case WAMBLE_CTRL_LOGOUT:
@@ -1735,7 +2006,7 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
       struct WambleMsg out = {0};
       out.ctrl = WAMBLE_CTRL_ERROR;
       memcpy(out.token, msg->token, TOKEN_LENGTH);
-      out.error_code = WAMBLE_ERR_ACCESS_DENIED;
+      out.error_code = WAMBLE_ERR_SPECTATE_VISIBILITY_DENIED;
       if (send_reliable_default(sockfd, &out, cliaddr) != 0) {
         return SERVER_ERR_SEND_FAILED;
       }
@@ -1746,17 +2017,40 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     int capacity_bypass =
         policy_check(msg->token, profile_name, "spectate.capacity_bypass",
                      "focus", NULL, NULL, NULL);
-    SpectatorRequestStatus res =
-        spectator_handle_request(msg, cliaddr, effective_trust_tier,
-                                 capacity_bypass, &new_state, &focus_id);
+    SpectatorRequestStatus res = spectator_handle_request(
+        msg, cliaddr, effective_trust_tier, capacity_bypass,
+        policy_check(msg->token, profile_name, "game.mode", "view", NULL, NULL,
+                     NULL),
+        &new_state, &focus_id);
     if (!(res == SPECTATOR_OK_FOCUS || res == SPECTATOR_OK_SUMMARY ||
           res == SPECTATOR_OK_STOP)) {
+      uint16_t err_code = WAMBLE_ERR_ACCESS_DENIED;
       publish_server_protocol_status(SERVER_PROTOCOL_STATUS_SPECTATE_DENIED,
                                      profile_name);
+      switch (res) {
+      case SPECTATOR_ERR_VISIBILITY:
+        err_code = WAMBLE_ERR_SPECTATE_VISIBILITY_DENIED;
+        break;
+      case SPECTATOR_ERR_BUSY:
+        err_code = WAMBLE_ERR_SPECTATE_BUSY;
+        break;
+      case SPECTATOR_ERR_FULL:
+        err_code = WAMBLE_ERR_SPECTATE_FULL;
+        break;
+      case SPECTATOR_ERR_FOCUS_DISABLED:
+        err_code = WAMBLE_ERR_ACCESS_DENIED;
+        break;
+      case SPECTATOR_ERR_NOT_AVAILABLE:
+        err_code = WAMBLE_ERR_SPECTATE_NOT_AVAILABLE;
+        break;
+      default:
+        err_code = WAMBLE_ERR_ACCESS_DENIED;
+        break;
+      }
       struct WambleMsg out = {0};
       out.ctrl = WAMBLE_CTRL_ERROR;
       memcpy(out.token, msg->token, TOKEN_LENGTH);
-      out.error_code = WAMBLE_ERR_ACCESS_DENIED;
+      out.error_code = err_code;
       if (send_reliable_default(sockfd, &out, cliaddr) != 0) {
         return SERVER_ERR_SEND_FAILED;
       }
@@ -1769,36 +2063,174 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
       send_ack(sockfd, msg, cliaddr);
     SpectatorState new_state = SPECTATOR_STATE_IDLE;
     uint64_t focus_id = 0;
-    (void)spectator_handle_request(msg, cliaddr, effective_trust_tier, 0,
+    (void)spectator_handle_request(msg, cliaddr, effective_trust_tier, 0, 0,
                                    &new_state, &focus_id);
     return SERVER_OK;
   }
   case WAMBLE_CTRL_GET_PLAYER_STATS: {
-    if (!policy_check(msg->token, profile_name, "stats.read", "player", NULL,
-                      NULL, NULL)) {
+    const WambleMessageExtField *target_sid_ext =
+        find_ext_field_by_key(msg, "stats.target_session_id");
+    const WambleMessageExtField *target_handle_ext =
+        find_ext_field_by_key(msg, "stats.target_handle");
+    const WambleMessageExtField *target_pub_ext =
+        find_ext_field_by_key(msg, "stats.target_public_key");
+    int has_explicit_target = 0;
+    int requester_known = 0;
+    int target_has_identity = 0;
+    uint64_t target_session_id = 0;
+    uint64_t target_identity_id = 0;
+    uint64_t requester_session_id = 0;
+    char target_handle[WAMBLE_MESSAGE_EXT_STRING_MAX] = {0};
+    double score = 0.0;
+    int games_played = 0;
+    int chess960_games_played = 0;
+
+    if (wamble_query_get_session_by_token(msg->token, &requester_session_id) ==
+        DB_OK) {
+      requester_known = 1;
+    }
+
+    target_session_id = requester_session_id;
+    if (target_sid_ext &&
+        target_sid_ext->value_type == WAMBLE_TREATMENT_VALUE_INT &&
+        target_sid_ext->int_value > 0) {
+      has_explicit_target = 1;
+      target_session_id = (uint64_t)target_sid_ext->int_value;
+    } else if (target_handle_ext &&
+               target_handle_ext->value_type == WAMBLE_TREATMENT_VALUE_STRING &&
+               target_handle_ext->string_value[0]) {
+      has_explicit_target = 1;
+      if (!is_valid_stats_handle(target_handle_ext->string_value))
+        return send_policy_denied(sockfd, cliaddr, msg->token, profile_name);
+      if (wamble_query_get_global_identity_id_by_handle(
+              target_handle_ext->string_value, &target_identity_id) != DB_OK ||
+          target_identity_id == 0) {
+        publish_server_protocol_status(SERVER_PROTOCOL_STATUS_UNKNOWN_PLAYER,
+                                       profile_name);
+        return SERVER_ERR_UNKNOWN_PLAYER;
+      }
+      if (wamble_query_get_latest_session_by_global_identity_id(
+              target_identity_id, &target_session_id) != DB_OK ||
+          target_session_id == 0) {
+        publish_server_protocol_status(SERVER_PROTOCOL_STATUS_UNKNOWN_PLAYER,
+                                       profile_name);
+        return SERVER_ERR_UNKNOWN_PLAYER;
+      }
+      snprintf(target_handle, sizeof(target_handle), "%s",
+               target_handle_ext->string_value);
+    } else if (target_pub_ext &&
+               target_pub_ext->value_type == WAMBLE_TREATMENT_VALUE_STRING &&
+               target_pub_ext->string_value[0]) {
       return send_policy_denied(sockfd, cliaddr, msg->token, profile_name);
     }
-    WamblePlayer *player = get_player_by_token(msg->token);
-    if (player) {
-      struct WambleMsg response;
-      memset(&response, 0, sizeof(response));
-      response.ctrl = WAMBLE_CTRL_PLAYER_STATS_DATA;
-      memcpy(response.token, player->token, TOKEN_LENGTH);
-      response.player_stats_score = player->score;
-      response.player_stats_games_played =
-          (player->games_played > 0) ? (uint32_t)player->games_played : 0;
-      response.player_stats_chess960_games_played =
-          (player->chess960_games_played > 0)
-              ? (uint32_t)player->chess960_games_played
-              : 0;
-      if (send_reliable_default(sockfd, &response, cliaddr) != 0) {
-        return SERVER_ERR_SEND_FAILED;
+
+    if (target_session_id > 0 &&
+        wamble_query_get_session_global_identity_id(
+            target_session_id, &target_identity_id) != DB_OK) {
+      target_identity_id = 0;
+    }
+
+    if (!stats_read_allowed(msg->token, profile_name, target_session_id,
+                            target_identity_id))
+      return send_policy_denied(sockfd, cliaddr, msg->token, profile_name);
+
+    if (!requester_known) {
+      WamblePlayer *requester = get_player_by_token(msg->token);
+      if (requester && !has_explicit_target) {
+        struct WambleMsg fallback = {0};
+        fallback.ctrl = WAMBLE_CTRL_PLAYER_STATS_DATA;
+        memcpy(fallback.token, msg->token, TOKEN_LENGTH);
+        fallback.player_stats_score = requester->score;
+        fallback.player_stats_games_played =
+            (requester->games_played > 0) ? (uint32_t)requester->games_played
+                                          : 0;
+        fallback.player_stats_chess960_games_played =
+            (requester->chess960_games_played > 0)
+                ? (uint32_t)requester->chess960_games_played
+                : 0;
+        (void)append_ext_int(&fallback, "stats.target_session_id", 0);
+        (void)append_ext_int(&fallback, "stats.target_has_identity", 0);
+        (void)append_ext_string(&fallback, "stats.target_handle", "");
+        if (send_reliable_default(sockfd, &fallback, cliaddr) != 0)
+          return SERVER_ERR_SEND_FAILED;
+        return SERVER_OK;
       }
+      if (requester && has_explicit_target) {
+        requester_known = 1;
+      } else {
+        publish_server_protocol_status(SERVER_PROTOCOL_STATUS_UNKNOWN_PLAYER,
+                                       profile_name);
+        return SERVER_ERR_UNKNOWN_PLAYER;
+      }
+    }
+
+    {
+      uint8_t target_public_key[32] = {0};
+      DbStatus score_st = DB_ERR_EXEC;
+      DbStatus games_st = DB_ERR_EXEC;
+      DbStatus games960_st = DB_ERR_EXEC;
+      if (wamble_query_get_session_public_key(target_session_id,
+                                              target_public_key,
+                                              &target_has_identity) != DB_OK) {
+        target_has_identity = 0;
+      }
+      if (target_has_identity && target_identity_id > 0) {
+        score_st =
+            wamble_query_get_identity_total_score(target_identity_id, &score);
+        games_st = wamble_query_get_identity_games_played(target_identity_id,
+                                                          &games_played);
+        games960_st = wamble_query_get_identity_chess960_games_played(
+            target_identity_id, &chess960_games_played);
+        if (target_handle[0] == '\0') {
+          (void)wamble_query_get_identity_handle(
+              target_identity_id, target_handle, sizeof(target_handle));
+        }
+      } else {
+        score_st =
+            wamble_query_get_player_total_score(target_session_id, &score);
+        games_st = wamble_query_get_session_games_played(target_session_id,
+                                                         &games_played);
+        games960_st = wamble_query_get_session_chess960_games_played(
+            target_session_id, &chess960_games_played);
+      }
+      if (target_session_id == requester_session_id) {
+        if (score_st == DB_NOT_FOUND)
+          score = 0.0;
+        if (games_st == DB_NOT_FOUND)
+          games_played = 0;
+        if (games960_st == DB_NOT_FOUND)
+          chess960_games_played = 0;
+      }
+      if (!((score_st == DB_OK || (target_session_id == requester_session_id &&
+                                   score_st == DB_NOT_FOUND)) &&
+            (games_st == DB_OK || (target_session_id == requester_session_id &&
+                                   games_st == DB_NOT_FOUND)) &&
+            (games960_st == DB_OK ||
+             (target_session_id == requester_session_id &&
+              games960_st == DB_NOT_FOUND)))) {
+        publish_server_protocol_status(SERVER_PROTOCOL_STATUS_UNKNOWN_PLAYER,
+                                       profile_name);
+        return SERVER_ERR_UNKNOWN_PLAYER;
+      }
+
+      struct WambleMsg response = {0};
+      response.ctrl = WAMBLE_CTRL_PLAYER_STATS_DATA;
+      memcpy(response.token, msg->token, TOKEN_LENGTH);
+      response.player_stats_score = score;
+      response.player_stats_games_played =
+          (games_played > 0) ? (uint32_t)games_played : 0;
+      response.player_stats_chess960_games_played =
+          (chess960_games_played > 0) ? (uint32_t)chess960_games_played : 0;
+      (void)append_ext_int(&response, "stats.target_session_id",
+                           (int64_t)target_session_id);
+      (void)append_ext_int(&response, "stats.target_has_identity",
+                           target_has_identity ? 1 : 0);
+      (void)append_ext_string(&response, "stats.target_handle",
+                              target_has_identity ? target_handle : "");
+      if (send_reliable_default(sockfd, &response, cliaddr) != 0)
+        return SERVER_ERR_SEND_FAILED;
       return SERVER_OK;
     }
-    publish_server_protocol_status(SERVER_PROTOCOL_STATUS_UNKNOWN_PLAYER,
-                                   profile_name);
-    return SERVER_ERR_UNKNOWN_PLAYER;
   }
   case WAMBLE_CTRL_GET_LEADERBOARD: {
     if (!policy_check(msg->token, profile_name, "leaderboard.read", "global",
@@ -1836,6 +2268,9 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
       response.leaderboard[i].score = lb.rows[i].score;
       response.leaderboard[i].rating = lb.rows[i].rating;
       response.leaderboard[i].games_played = lb.rows[i].games_played;
+      response.leaderboard[i].has_identity = lb.rows[i].has_identity;
+      memcpy(response.leaderboard[i].public_key, lb.rows[i].public_key,
+             WAMBLE_PUBLIC_KEY_LENGTH);
     }
     if (send_reliable_default(sockfd, &response, cliaddr) != 0) {
       return SERVER_ERR_SEND_FAILED;

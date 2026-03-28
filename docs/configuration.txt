@@ -86,7 +86,13 @@ Database Connections
   - `exact-uci`: promotion piece must match exactly.
   - `from-to-only`: only the first four UCI characters must match.
 - `prediction-max-pending` (int, 64): Maximum in-flight predictions tracked per
-  board.
+  board and prediction-visibility depth bucket; sessions that share readable
+  prediction context are evaluated against the same pending budget.
+- `prediction-max-per-parent` (int, 1): Maximum pending predictions a single
+  session may submit for the same parent branch on a board.
+- `prediction-enforce-move-duplicate` (int, 1): When non-zero, reject
+  move-identical pending predictions at the same parent branch (subject to
+  read-visibility rules). When `0`, move-identical duplicate checks are disabled.
 - `chess960-interval` (int, -1): Controls automatic Chess960 board creation.
   - `-1`: disabled (all boards are another mode).
   - `0`: enabled; all new boards use chess960.
@@ -214,13 +220,18 @@ Policy Rule Builtins
     `login_failed`, `login_challenge`, `get_player_stats`, `player_stats_data`,
     `get_profile_info`, `profiles_list`, `spectate_stop`, `get_legal_moves`,
     `legal_moves`, `get_leaderboard`, `leaderboard_data`, `submit_prediction`,
-    `get_predictions`, `prediction_data`, `unknown`.
+    `get_predictions`, `prediction_data`, `get_profile_tos`,
+    `profile_tos_data`, `accept_profile_tos`, `get_active_reservations`,
+    `active_reservations_data`, `unknown`.
   - `game.move`: query resources `play`, `legal`.
+  - `game.mode`: query resource `view`.
   - `spectate.access`: query resource `view`; context `mode=summary|focus`.
   - `spectate.capacity_bypass`: query resource `focus`.
   - `rate_limit.bypass`: query resource `request`; context
     `ctrl=<control-resource>`.
-  - `stats.read`: query resource `player`.
+  - `stats.read`: query resource `player`; target policy context should be
+    identity-tag oriented (for example `target.identity_tag=<tag>`), consistent
+    with tag-based policy/treatment segmentation.
   - `leaderboard.read`: query resource `global`.
   - `prediction.write`: query resources `self`, `streak`, `gated`.
     Context includes `board=<board-id>` when available. The resolved

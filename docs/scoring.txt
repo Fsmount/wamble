@@ -19,7 +19,10 @@ Per-Player Share
 - If a session played both sides, halve the total to discourage self-play.
 
 Writes
-- Positive scores are written with `db_async_record_payout()`.
+- Payout persistence records both:
+  - awarded score (post-treatment, floor-at-zero)
+  - canonical score (pre-treatment pot share)
+- Writes use `db_async_record_payout_with_canonical()`.
 - Also bumps the in-memory `player->score` when available.
 
 Return Values

@@ -97,6 +97,12 @@ Tables
   - Primary key: `(global_identity_id, tag)`
   - Indexes: `(tag, global_identity_id)`
 
+- global_identity_handles (shared global DB)
+  - `global_identity_id BIGINT PRIMARY KEY`
+  - `handle VARCHAR(64) NOT NULL UNIQUE`
+  - `created_at TIMESTAMPTZ DEFAULT NOW()`
+  - Indexes: `(handle)`
+
 - global_treatment_groups (shared global DB)
   - `id BIGSERIAL PRIMARY KEY`
   - `group_key VARCHAR(128) NOT NULL`
@@ -199,6 +205,8 @@ Tables
   - `board_id BIGINT NOT NULL REFERENCES boards(id)`
   - `session_id BIGINT NOT NULL REFERENCES sessions(id)`
   - `points_awarded DECIMAL(10,4) NOT NULL`
+  - `points_canonical DECIMAL(10,4) NOT NULL` (canonical pre-treatment share;
+    used for identity-level aggregate stats)
   - `created_at TIMESTAMPTZ DEFAULT NOW()`
   - Index: `idx_payouts_session_id` on `(session_id)`
   - Trigger: `trg_payouts_bump_session_total_score` increments
@@ -244,6 +252,12 @@ Migrations
   columns and board last-mover treatment metadata.
 - 012_profile_board_mode_variants.sql: adds board mode metadata for variants
   (Chess960) via `board_mode_variants`.
+- 013_profile_terms_acceptances.sql: adds per-session profile ToS acceptance
+  records.
+- 014_profile_canonical_payout_points.sql: adds
+  `payouts.points_canonical` and backfills existing rows.
+- 015_global_identity_handles.sql: adds global opaque identity handles used by
+  stats targeting.
 
 Trust and Visibility
 - Client trust resolves from identity-scoped policy only, in deterministic

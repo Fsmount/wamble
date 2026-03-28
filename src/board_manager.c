@@ -13,6 +13,11 @@ static WAMBLE_THREAD_LOCAL int next_board_id_initialized = 0;
 static WAMBLE_THREAD_LOCAL int next_board_id_mutex_initialized = 0;
 static WAMBLE_THREAD_LOCAL wamble_mutex_t board_mutex;
 static WAMBLE_THREAD_LOCAL int board_mutex_initialized = 0;
+static WAMBLE_THREAD_LOCAL ReservationReleaseNotification
+    *reservation_release_notifications;
+static WAMBLE_THREAD_LOCAL int reservation_release_notification_cap = 0;
+static WAMBLE_THREAD_LOCAL int reservation_release_notification_head = 0;
+static WAMBLE_THREAD_LOCAL int reservation_release_notification_count = 0;
 
 #define BOARD_MAP_SIZE (get_config()->max_boards * 2)
 static WAMBLE_THREAD_LOCAL int *board_index_map;
@@ -20,6 +25,7 @@ static WAMBLE_THREAD_LOCAL int *board_index_map;
   "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 #define INITIAL_BOARD_STATUS "DORMANT"
 #define NO_CHESS960_POSITION (-1)
+#define RESERVATION_RELEASE_NOTIFICATION_MIN_CAP 64
 
 static int board_should_be_chess960(uint64_t board_id) {
   int interval = get_config()->chess960_interval;
@@ -138,6 +144,51 @@ static int token_is_zero(const uint8_t *token) {
   return 1;
 }
 
+static int ensure_reservation_release_notification_capacity(int need) {
+  if (need <= 0)
+    return 0;
+  if (reservation_release_notification_cap >= need &&
+      reservation_release_notifications) {
+    return 0;
+  }
+  int new_cap = reservation_release_notification_cap > 0
+                    ? reservation_release_notification_cap
+                    : RESERVATION_RELEASE_NOTIFICATION_MIN_CAP;
+  while (new_cap < need)
+    new_cap *= 2;
+  ReservationReleaseNotification *next =
+      (ReservationReleaseNotification *)calloc((size_t)new_cap, sizeof(*next));
+  if (!next)
+    return -1;
+  for (int i = 0; i < reservation_release_notification_count; i++) {
+    int src = (reservation_release_notification_head + i) %
+              reservation_release_notification_cap;
+    next[i] = reservation_release_notifications[src];
+  }
+  free(reservation_release_notifications);
+  reservation_release_notifications = next;
+  reservation_release_notification_cap = new_cap;
+  reservation_release_notification_head = 0;
+  return 0;
+}
+
+static void
+queue_reservation_release_notification_locked(const uint8_t token[TOKEN_LENGTH],
+                                              uint64_t board_id) {
+  if (!token || token_is_zero(token) || board_id == 0)
+    return;
+  if (ensure_reservation_release_notification_capacity(
+          reservation_release_notification_count + 1) != 0) {
+    return;
+  }
+  int slot = (reservation_release_notification_head +
+              reservation_release_notification_count) %
+             reservation_release_notification_cap;
+  memcpy(reservation_release_notifications[slot].token, token, TOKEN_LENGTH);
+  reservation_release_notifications[slot].board_id = board_id;
+  reservation_release_notification_count++;
+}
+
 void board_manager_tick() {
   if (!board_manager_ready())
     return;
@@ -232,6 +283,13 @@ void board_manager_init(void) {
     board_cached = NULL;
     board_index_map = NULL;
   }
+  if (reservation_release_notifications) {
+    free(reservation_release_notifications);
+    reservation_release_notifications = NULL;
+  }
+  reservation_release_notification_cap = 0;
+  reservation_release_notification_head = 0;
+  reservation_release_notification_count = 0;
   if (board_mutex_initialized) {
     wamble_mutex_destroy(&board_mutex);
     board_mutex_initialized = 0;
@@ -712,6 +770,8 @@ void board_move_played(uint64_t board_id, const uint8_t *player_token,
                                          board->last_mover_treatment_group);
       wamble_emit_remove_reservation(board->id);
       wamble_emit_update_board_reservation_meta(board->id, 0, false);
+      queue_reservation_release_notification_locked(
+          board->reservation_player_token, board->id);
 
       memset(board->reservation_player_token, 0, TOKEN_LENGTH);
       board->reservation_time = 0;
@@ -779,6 +839,8 @@ bool board_is_reserved_for_player(uint64_t board_id,
 }
 
 static void transition_reserved_to_dormant(WambleBoard *board) {
+  queue_reservation_release_notification_locked(board->reservation_player_token,
+                                                board->id);
   board->state = BOARD_STATE_DORMANT;
 
   memset(board->reservation_player_token, 0, TOKEN_LENGTH);
@@ -804,6 +866,29 @@ void board_release_reservation(uint64_t board_id) {
   }
 
   wamble_mutex_unlock(&board_mutex);
+}
+
+int board_collect_reservation_release_notifications(
+    ReservationReleaseNotification *out, int max) {
+  if (!out || max <= 0 || !board_mutex_initialized)
+    return 0;
+  wamble_mutex_lock(&board_mutex);
+  int n = reservation_release_notification_count;
+  if (n > max)
+    n = max;
+  for (int i = 0; i < n; i++) {
+    int src = (reservation_release_notification_head + i) %
+              reservation_release_notification_cap;
+    out[i] = reservation_release_notifications[src];
+  }
+  if (n > 0) {
+    reservation_release_notification_head =
+        (reservation_release_notification_head + n) %
+        reservation_release_notification_cap;
+    reservation_release_notification_count -= n;
+  }
+  wamble_mutex_unlock(&board_mutex);
+  return n;
 }
 
 int board_manager_export(WambleBoard *out, int max, int *out_count,

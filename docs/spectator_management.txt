@@ -24,6 +24,8 @@ Requests
     - `WAMBLE_FLAG_MODE_FILTER_CHESS960` to include Chess960 boards.
     - `WAMBLE_FLAG_MODE_FILTER_STANDARD` to include standard boards.
     - Omitting both flags includes all eligible boards.
+  - If `game.mode` / `view` is not allowed for the session, mode filter flags
+    are ignored.
 - Focus: send `SPECTATE_GAME` with `board_id>0` -> `SPECTATOR_OK_FOCUS` if eligible.
 - Stop: `SPECTATE_STOP` -> `SPECTATOR_OK_STOP`.
 - Low trust or capacity issues return an error (see enum values).
@@ -31,7 +33,9 @@ Requests
 Updates
 - Collected by `spectator_collect_updates()` at the configured rate per mode.
 - Ordering favors recent boards, then a simple attractiveness score.
-- `SPECTATE_UPDATE` sets `WAMBLE_FLAG_BOARD_IS_960` when the updated board is Chess960.
+- `SPECTATE_UPDATE` sets `WAMBLE_FLAG_BOARD_IS_960` only when:
+  - the updated board is Chess960, and
+  - the spectator session is allowed to view game mode (`game.mode` / `view`).
 - If a focused game ends or focus gets disabled, we queue an explicit notice
   (type `SPECTATE_ENDED`) and switch back to summary.
 - If `max-spectators` is reduced to `0`, non-bypass spectators are explicitly
@@ -39,7 +43,7 @@ Updates
 
 Notifications
 - `spectator_collect_notifications()` returns pending notices as
-  `SpectatorUpdate` structs, now including a `notification_type` field.
+  `SpectatorUpdate` structs including a `notification_type` field.
 - Notifications are sent as `SERVER_NOTIFICATION` packets with a typed
   1-byte prefix before the text body.
 - Types used by the spectator system:

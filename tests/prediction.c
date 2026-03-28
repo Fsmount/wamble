@@ -52,6 +52,14 @@ static int prediction_test_prepare_db_runtime(const char *cfg_path,
   return prediction_manager_init() == PREDICTION_MANAGER_OK ? 0 : -1;
 }
 
+static int prediction_test_prepare_db_runtime_with_cfg(const char *cfg_path,
+                                                       const char *cfg,
+                                                       const char *extra_sql) {
+  if (wamble_test_prepare_db(cfg_path, cfg, extra_sql) != 0)
+    return -1;
+  return prediction_manager_init() == PREDICTION_MANAGER_OK ? 0 : -1;
+}
+
 static void prediction_test_teardown(void) {
   db_cleanup();
   wamble_set_query_service(NULL);
@@ -101,7 +109,9 @@ WAMBLE_TEST(prediction_config_loads_prediction_options) {
         "(def prediction-penalty-incorrect 0.25)\n"
         "(def prediction-match-policy \"from-to-only\")\n"
         "(def prediction-view-depth-limit 4)\n"
-        "(def prediction-max-pending 9)\n",
+        "(def prediction-max-pending 9)\n"
+        "(def prediction-max-per-parent 3)\n"
+        "(def prediction-enforce-move-duplicate 0)\n",
         f);
   fclose(f);
 
@@ -117,6 +127,8 @@ WAMBLE_TEST(prediction_config_loads_prediction_options) {
   T_ASSERT(strcmp(cfg->prediction_match_policy, "from-to-only") == 0);
   T_ASSERT_EQ_INT(cfg->prediction_view_depth_limit, 4);
   T_ASSERT_EQ_INT(cfg->prediction_max_pending, 9);
+  T_ASSERT_EQ_INT(cfg->prediction_max_per_parent, 3);
+  T_ASSERT_EQ_INT(cfg->prediction_enforce_move_duplicate, 0);
   return 0;
 }
 
@@ -444,6 +456,128 @@ WAMBLE_TEST(prediction_duplicate_move_policy) {
   return 0;
 }
 
+WAMBLE_TEST(prediction_max_per_parent_is_configurable) {
+  const char *cfg_path = "build/test_prediction_max_per_parent.conf";
+  const char *cfg = "(def prediction-mode 2)\n"
+                    "(def prediction-view-depth-limit 4)\n"
+                    "(def prediction-max-per-parent 2)\n"
+                    "(def prediction-enforce-move-duplicate 0)\n";
+  const char *sql =
+      "INSERT INTO global_policy_rules "
+      "(global_identity_id, action, resource, scope, effect, permission_level, "
+      "reason, source) VALUES "
+      "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+      "(0, 'prediction.write', 'streak', '*', 'allow', 2, 'write', 'test');";
+  uint8_t token[TOKEN_LENGTH];
+  WambleBoard board;
+  uint64_t first_id = 0;
+  uint64_t second_id = 0;
+  uint64_t dup_id = 0;
+
+  if (prediction_test_prepare_db_runtime_with_cfg(cfg_path, cfg, sql) != 0)
+    T_FAIL_SIMPLE("prediction_test_prepare_db_runtime_with_cfg failed");
+
+  prediction_test_fill_token(token, 0xC0);
+  T_ASSERT_STATUS_OK(prediction_test_seed_session(token));
+  T_ASSERT_STATUS_OK(prediction_test_store_board(
+      &board, 145, "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"));
+
+  T_ASSERT_EQ_INT(
+      prediction_submit_with_parent(&board, token, "e2e4", 0, 0, &first_id),
+      PREDICTION_OK);
+  T_ASSERT_EQ_INT(
+      prediction_submit_with_parent(&board, token, "d2d4", 0, 0, &second_id),
+      PREDICTION_OK);
+  T_ASSERT(first_id > 0);
+  T_ASSERT(second_id > 0);
+  T_ASSERT(first_id != second_id);
+
+  T_ASSERT_EQ_INT(
+      prediction_submit_with_parent(&board, token, "c2c4", 0, 0, &dup_id),
+      PREDICTION_ERR_DUPLICATE);
+  T_ASSERT(dup_id == first_id || dup_id == second_id);
+  return 0;
+}
+
+WAMBLE_TEST(prediction_max_pending_is_scoped_by_depth_and_parent) {
+  const char *cfg_path = "build/test_prediction_max_pending_scope.conf";
+  const char *cfg = "(def prediction-mode 2)\n"
+                    "(def prediction-view-depth-limit 4)\n"
+                    "(def prediction-max-pending 1)\n"
+                    "(def prediction-max-per-parent 4)\n";
+  const char *sql =
+      "INSERT INTO global_policy_rules "
+      "(global_identity_id, action, resource, scope, effect, permission_level, "
+      "reason, source) VALUES "
+      "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+      "(0, 'prediction.write', 'streak', '*', 'allow', 2, 'write', 'test');";
+  uint8_t token[TOKEN_LENGTH];
+  WambleBoard board;
+  uint64_t root_id = 0;
+  uint64_t child_id = 0;
+
+  if (prediction_test_prepare_db_runtime_with_cfg(cfg_path, cfg, sql) != 0)
+    T_FAIL_SIMPLE("prediction_test_prepare_db_runtime_with_cfg failed");
+
+  prediction_test_fill_token(token, 0xD0);
+  T_ASSERT_STATUS_OK(prediction_test_seed_session(token));
+  T_ASSERT_STATUS_OK(prediction_test_store_board(
+      &board, 146, "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"));
+
+  T_ASSERT_EQ_INT(
+      prediction_submit_with_parent(&board, token, "e2e4", 0, 0, &root_id),
+      PREDICTION_OK);
+  T_ASSERT(root_id > 0);
+  T_ASSERT_EQ_INT(
+      prediction_submit_with_parent(&board, token, "d2d4", 0, 0, NULL),
+      PREDICTION_ERR_LIMIT);
+  T_ASSERT_EQ_INT(prediction_submit_with_parent(&board, token, "e7e5", root_id,
+                                                0, &child_id),
+                  PREDICTION_OK);
+  T_ASSERT(child_id > 0);
+  T_ASSERT_EQ_INT(
+      prediction_submit_with_parent(&board, token, "c7c5", root_id, 0, NULL),
+      PREDICTION_ERR_LIMIT);
+  return 0;
+}
+
+WAMBLE_TEST(prediction_max_pending_is_shared_for_same_branch_visibility) {
+  const char *cfg_path = "build/test_prediction_max_pending_shared_scope.conf";
+  const char *cfg = "(def prediction-mode 2)\n"
+                    "(def prediction-view-depth-limit 4)\n"
+                    "(def prediction-max-pending 1)\n"
+                    "(def prediction-max-per-parent 4)\n";
+  const char *sql =
+      "INSERT INTO global_policy_rules "
+      "(global_identity_id, action, resource, scope, effect, permission_level, "
+      "reason, source) VALUES "
+      "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+      "(0, 'prediction.write', 'streak', '*', 'allow', 2, 'write', 'test');";
+  uint8_t token_a[TOKEN_LENGTH];
+  uint8_t token_b[TOKEN_LENGTH];
+  WambleBoard board;
+  uint64_t id_a = 0;
+
+  if (prediction_test_prepare_db_runtime_with_cfg(cfg_path, cfg, sql) != 0)
+    T_FAIL_SIMPLE("prediction_test_prepare_db_runtime_with_cfg failed");
+
+  prediction_test_fill_token(token_a, 0xE0);
+  prediction_test_fill_token(token_b, 0xF0);
+  T_ASSERT_STATUS_OK(prediction_test_seed_session(token_a));
+  T_ASSERT_STATUS_OK(prediction_test_seed_session(token_b));
+  T_ASSERT_STATUS_OK(prediction_test_store_board(
+      &board, 147, "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"));
+
+  T_ASSERT_EQ_INT(
+      prediction_submit_with_parent(&board, token_a, "e2e4", 0, 0, &id_a),
+      PREDICTION_OK);
+  T_ASSERT(id_a > 0);
+  T_ASSERT_EQ_INT(
+      prediction_submit_with_parent(&board, token_b, "d2d4", 0, 0, NULL),
+      PREDICTION_ERR_LIMIT);
+  return 0;
+}
+
 WAMBLE_TESTS_BEGIN_NAMED(prediction_tests) {
   WAMBLE_TESTS_ADD_FM(prediction_config_loads_prediction_options, "prediction");
   WAMBLE_TESTS_ADD_DB_EX_SM(prediction_tree_children_advance_target_ply,
@@ -461,5 +595,14 @@ WAMBLE_TESTS_BEGIN_NAMED(prediction_tests) {
   WAMBLE_TESTS_ADD_DB_EX_SM(prediction_duplicate_move_policy,
                             WAMBLE_SUITE_FUNCTIONAL, "prediction", NULL,
                             prediction_test_teardown, 0);
+  WAMBLE_TESTS_ADD_DB_EX_SM(prediction_max_per_parent_is_configurable,
+                            WAMBLE_SUITE_FUNCTIONAL, "prediction", NULL,
+                            prediction_test_teardown, 0);
+  WAMBLE_TESTS_ADD_DB_EX_SM(
+      prediction_max_pending_is_scoped_by_depth_and_parent,
+      WAMBLE_SUITE_FUNCTIONAL, "prediction", NULL, prediction_test_teardown, 0);
+  WAMBLE_TESTS_ADD_DB_EX_SM(
+      prediction_max_pending_is_shared_for_same_branch_visibility,
+      WAMBLE_SUITE_FUNCTIONAL, "prediction", NULL, prediction_test_teardown, 0);
 }
 WAMBLE_TESTS_END()

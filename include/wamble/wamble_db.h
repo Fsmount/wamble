@@ -73,6 +73,10 @@ int db_async_record_game_result(uint64_t board_id, char winning_side,
                                 const char *termination_reason);
 int db_async_record_payout(uint64_t board_id, uint64_t session_id,
                            double points);
+int db_async_record_payout_with_canonical(uint64_t board_id,
+                                          uint64_t session_id,
+                                          double points_awarded,
+                                          double points_canonical);
 int db_async_update_player_rating(uint64_t session_id, double rating);
 
 DbLeaderboardResult db_get_leaderboard(uint64_t requester_session_id,
@@ -128,6 +132,34 @@ typedef struct WambleQueryService {
   DbStatus (*get_session_games_played)(uint64_t session_id, int *out_games);
   DbStatus (*get_session_chess960_games_played)(uint64_t session_id,
                                                 int *out_games);
+  DbStatus (*get_identity_total_score)(uint64_t global_identity_id,
+                                       double *out_total);
+  DbStatus (*get_identity_games_played)(uint64_t global_identity_id,
+                                        int *out_games);
+  DbStatus (*get_identity_chess960_games_played)(uint64_t global_identity_id,
+                                                 int *out_games);
+  DbStatus (*get_session_global_identity_id)(uint64_t session_id,
+                                             uint64_t *out_identity_id);
+  DbStatus (*get_identity_tags_csv)(uint64_t global_identity_id, char *out_csv,
+                                    size_t out_csv_size);
+  DbStatus (*get_identity_handle)(uint64_t global_identity_id, char *out_handle,
+                                  size_t out_handle_size);
+  DbStatus (*get_global_identity_id_by_handle)(const char *handle,
+                                               uint64_t *out_identity_id);
+  DbStatus (*get_session_public_key)(uint64_t session_id,
+                                     uint8_t out_public_key[32],
+                                     int *out_has_identity);
+  DbStatus (*get_latest_session_by_global_identity_id)(
+      uint64_t global_identity_id, uint64_t *out_session_id);
+  DbStatus (*get_latest_session_by_public_key)(
+      const uint8_t public_key[WAMBLE_PUBLIC_KEY_LENGTH],
+      uint64_t *out_session_id);
+  DbStatus (*get_session_token_by_id)(uint64_t session_id,
+                                      uint8_t out_token[TOKEN_LENGTH]);
+  DbStatus (*get_session_treatment_group)(uint64_t session_id, char *out_group,
+                                          size_t out_group_size);
+  DbActiveReservationsResult (*get_active_reservations_by_public_key)(
+      const uint8_t public_key[WAMBLE_PUBLIC_KEY_LENGTH]);
   DbStatus (*get_persistent_player_stats)(
       const uint8_t *public_key, WamblePersistentPlayerStats *out_stats);
   DbLeaderboardResult (*get_leaderboard)(uint64_t requester_session_id,
@@ -231,6 +263,7 @@ typedef struct WamblePersistenceIntent {
       uint64_t board_id;
       uint8_t token[TOKEN_LENGTH];
       double points;
+      double canonical_points;
     } record_payout;
     struct {
       uint8_t token[TOKEN_LENGTH];

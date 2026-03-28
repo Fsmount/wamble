@@ -222,6 +222,8 @@ static int ctrl_is_supported(uint8_t ctrl) {
   case WAMBLE_CTRL_GET_PROFILE_TOS:
   case WAMBLE_CTRL_PROFILE_TOS_DATA:
   case WAMBLE_CTRL_ACCEPT_PROFILE_TOS:
+  case WAMBLE_CTRL_GET_ACTIVE_RESERVATIONS:
+  case WAMBLE_CTRL_ACTIVE_RESERVATIONS_DATA:
     return 1;
   default:
     return 0;
@@ -606,6 +608,21 @@ int network_get_session_treatment_group(const uint8_t *token, char *out_group,
   if (!session->treatment_group_key[0])
     return -1;
   snprintf(out_group, out_group_size, "%s", session->treatment_group_key);
+  return 0;
+}
+
+int network_get_client_addr_by_token(const uint8_t *token,
+                                     struct sockaddr_in *out_addr) {
+  if (!token || !out_addr)
+    return -1;
+  if (!client_sessions)
+    network_init_thread_state();
+  if (!client_sessions)
+    return -1;
+  WambleClientSession *session = find_client_session_by_token(token);
+  if (!session)
+    return -1;
+  *out_addr = session->addr;
   return 0;
 }
 
