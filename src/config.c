@@ -1931,6 +1931,9 @@ static const ConfigVarMap config_map[] = {
               prediction_penalty_incorrect),
     CONF_ITEM("prediction-match-policy", CONF_STRING, prediction_match_policy),
     CONF_ITEM("prediction-max-pending", CONF_INT, prediction_max_pending),
+    CONF_ITEM("prediction-max-per-parent", CONF_INT, prediction_max_per_parent),
+    CONF_ITEM("prediction-enforce-move-duplicate", CONF_INT,
+              prediction_enforce_move_duplicate),
     CONF_ITEM("spectator-summary-mode", CONF_STRING, spectator_summary_mode),
     CONF_ITEM("state-dir", CONF_STRING, state_dir),
     CONF_ITEM("websocket-path", CONF_STRING, websocket_path),
@@ -2031,6 +2034,8 @@ static void config_set_defaults(void) {
   g_config.prediction_gated_percent = 10;
   g_config.prediction_streak_cap = 10;
   g_config.prediction_max_pending = 64;
+  g_config.prediction_max_per_parent = 1;
+  g_config.prediction_enforce_move_duplicate = 1;
   g_config.prediction_view_depth_limit = 2;
   g_config.prediction_base_points = 1.0;
   g_config.prediction_streak_multiplier = 2.0;

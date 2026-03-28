@@ -244,17 +244,21 @@ static ScoringStatus calculate_and_distribute_pot_for_moves_internal(
   for (int i = 0; i < num_contributors; i++) {
     PlayerContribution *contrib = &contributions[i];
     double score = 0.0;
+    double canonical_score = 0.0;
 
     if (total_white_moves > 0) {
-      score += ((double)contrib->white_moves / total_white_moves) * white_pot;
+      canonical_score +=
+          ((double)contrib->white_moves / total_white_moves) * white_pot;
     }
     if (total_black_moves > 0) {
-      score += ((double)contrib->black_moves / total_black_moves) * black_pot;
+      canonical_score +=
+          ((double)contrib->black_moves / total_black_moves) * black_pot;
     }
 
     if (contrib->white_moves > 0 && contrib->black_moves > 0) {
-      score /= 2.0;
+      canonical_score /= 2.0;
     }
+    score = canonical_score;
 
     WamblePlayer *player = get_player_by_token(contrib->player_token);
     if (player) {
@@ -262,8 +266,10 @@ static ScoringStatus calculate_and_distribute_pot_for_moves_internal(
                                           contrib->black_moves, &score);
     }
 
-    if (score > 0.0) {
-      wamble_emit_record_payout(board_id, contrib->player_token, score);
+    if (score > 0.0 || canonical_score > 0.0) {
+      double awarded_score = (score > 0.0) ? score : 0.0;
+      wamble_emit_record_payout_with_canonical(board_id, contrib->player_token,
+                                               awarded_score, canonical_score);
     }
 
     if (player) {

@@ -557,6 +557,8 @@ typedef struct WambleConfig {
   int prediction_gated_percent;
   int prediction_streak_cap;
   int prediction_max_pending;
+  int prediction_max_per_parent;
+  int prediction_enforce_move_duplicate;
   int prediction_view_depth_limit;
   double prediction_base_points;
   double prediction_streak_multiplier;
@@ -1138,6 +1140,8 @@ typedef struct {
   double score;
   double rating;
   uint32_t games_played;
+  uint8_t has_identity;
+  uint8_t public_key[WAMBLE_PUBLIC_KEY_LENGTH];
 } DbLeaderboardEntry;
 
 typedef struct {
@@ -1146,6 +1150,17 @@ typedef struct {
   int count;
   uint32_t self_rank;
 } DbLeaderboardResult;
+
+typedef struct {
+  uint64_t board_id;
+  time_t reserved_at;
+} DbActiveReservationEntry;
+
+typedef struct {
+  DbStatus status;
+  const DbActiveReservationEntry *rows;
+  int count;
+} DbActiveReservationsResult;
 
 #define WAMBLE_CTRL_CLIENT_HELLO 0x01
 #define WAMBLE_CTRL_SERVER_HELLO 0x02
@@ -1186,6 +1201,8 @@ typedef struct {
 #define WAMBLE_CTRL_GET_PROFILE_TOS 0x1E
 #define WAMBLE_CTRL_PROFILE_TOS_DATA 0x1F
 #define WAMBLE_CTRL_ACCEPT_PROFILE_TOS 0x20
+#define WAMBLE_CTRL_GET_ACTIVE_RESERVATIONS 0x21
+#define WAMBLE_CTRL_ACTIVE_RESERVATIONS_DATA 0x22
 
 #define get_bit(square) (1ULL << (square))
 
@@ -1315,6 +1332,10 @@ typedef enum {
 #define WAMBLE_CAP_PROFILE_STATE 0x02
 #define WAMBLE_ERR_UNSUPPORTED_VERSION 1000
 #define WAMBLE_ERR_ACCESS_DENIED 1001
+#define WAMBLE_ERR_SPECTATE_VISIBILITY_DENIED 1002
+#define WAMBLE_ERR_SPECTATE_BUSY 1003
+#define WAMBLE_ERR_SPECTATE_FULL 1004
+#define WAMBLE_ERR_SPECTATE_NOT_AVAILABLE 1005
 
 #define WAMBLE_FLAG_UNRELIABLE 0x80
 #define WAMBLE_FLAG_BOARD_IS_960 0x01
@@ -1366,6 +1387,7 @@ static inline size_t wamble_build_login_signature_message(
 #define WAMBLE_SESSION_UI_CAP_SPECTATE_FOCUS 0x00000040u
 #define WAMBLE_SESSION_UI_CAP_PREDICTION_SUBMIT 0x00000080u
 #define WAMBLE_SESSION_UI_CAP_PREDICTION_READ 0x00000100u
+#define WAMBLE_SESSION_UI_CAP_GAME_MODE_VISIBLE 0x00000200u
 #define WAMBLE_LEADERBOARD_SCORE 1
 #define WAMBLE_LEADERBOARD_RATING 2
 #define WAMBLE_PREDICTION_STATUS_PENDING 0
@@ -1378,6 +1400,7 @@ static inline size_t wamble_build_login_signature_message(
 #define WAMBLE_NOTIFICATION_TYPE_SPECTATE_ENDED 2
 #define WAMBLE_NOTIFICATION_TYPE_MAINTENANCE 3
 #define WAMBLE_NOTIFICATION_TYPE_ANNOUNCEMENT 4
+#define WAMBLE_NOTIFICATION_TYPE_RESERVATION_RELEASED 5
 
 typedef struct {
   uint8_t from;
@@ -1391,6 +1414,8 @@ typedef struct {
   double score;
   double rating;
   uint32_t games_played;
+  uint8_t has_identity;
+  uint8_t public_key[WAMBLE_PUBLIC_KEY_LENGTH];
 } WambleLeaderboardEntry;
 
 typedef struct {
@@ -1404,6 +1429,11 @@ typedef struct {
   uint8_t uci_len;
   char uci[MAX_UCI_LENGTH];
 } WamblePredictionEntry;
+
+typedef struct {
+  uint64_t board_id;
+  uint64_t reserved_at;
+} WambleActiveReservationEntry;
 
 typedef struct {
   char key[WAMBLE_MESSAGE_EXT_KEY_MAX];
@@ -1461,6 +1491,7 @@ struct WambleMsg {
   uint8_t prediction_limit;
   uint8_t prediction_count;
   WamblePredictionEntry predictions[WAMBLE_MAX_PREDICTION_ENTRIES];
+  uint16_t active_reservation_count;
   uint8_t notification_type;
   uint8_t ext_count;
   WambleMessageExtField ext[WAMBLE_MAX_MESSAGE_EXT_FIELDS];
@@ -1482,6 +1513,7 @@ static inline int ctrl_supports_fragment_payload(uint8_t ctrl) {
   case WAMBLE_CTRL_LEADERBOARD_DATA:
   case WAMBLE_CTRL_PREDICTION_DATA:
   case WAMBLE_CTRL_PROFILE_TOS_DATA:
+  case WAMBLE_CTRL_ACTIVE_RESERVATIONS_DATA:
     return 1;
   default:
     return 0;
@@ -1599,6 +1631,11 @@ typedef struct SpectatorUpdate {
   uint8_t notification_type;
 } SpectatorUpdate;
 
+typedef struct ReservationReleaseNotification {
+  uint8_t token[TOKEN_LENGTH];
+  uint64_t board_id;
+} ReservationReleaseNotification;
+
 void network_init_thread_state(void);
 int network_get_session_treatment_group(const uint8_t *token, char *out_group,
                                         size_t out_group_size);
@@ -1607,6 +1644,8 @@ void cleanup_expired_sessions(void);
 int receive_message_packet(const uint8_t *packet, size_t packet_len,
                            struct WambleMsg *msg,
                            const struct sockaddr_in *cliaddr);
+int network_get_client_addr_by_token(const uint8_t *token,
+                                     struct sockaddr_in *out_addr);
 wamble_socket_t create_and_bind_socket(int port);
 int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
                     struct sockaddr_in *cliaddr);
@@ -1651,14 +1690,15 @@ void ws_gateway_flush_outbound(WambleWsGateway *gateway);
 SpectatorInitStatus spectator_manager_init(void);
 void spectator_manager_shutdown(void);
 void spectator_manager_tick(void);
-SpectatorRequestStatus
-spectator_handle_request(const struct WambleMsg *msg,
-                         const struct sockaddr_in *cliaddr, int trust_tier,
-                         int capacity_bypass, SpectatorState *out_state,
-                         uint64_t *out_focus_board_id);
+SpectatorRequestStatus spectator_handle_request(
+    const struct WambleMsg *msg, const struct sockaddr_in *cliaddr,
+    int trust_tier, int capacity_bypass, int game_mode_visible,
+    SpectatorState *out_state, uint64_t *out_focus_board_id);
 void spectator_discard_by_token(const uint8_t *token);
 int spectator_collect_updates(struct SpectatorUpdate *out, int max);
 int spectator_collect_notifications(struct SpectatorUpdate *out, int max);
+int board_collect_reservation_release_notifications(
+    ReservationReleaseNotification *out, int max);
 
 #define WAMBLE_DUP_WINDOW 1024
 
@@ -2040,6 +2080,10 @@ void wamble_emit_link_session_to_pubkey(const uint8_t *token,
 void wamble_emit_unlink_session_identity(const uint8_t *token);
 void wamble_emit_record_payout(uint64_t board_id, const uint8_t *token,
                                double points);
+void wamble_emit_record_payout_with_canonical(uint64_t board_id,
+                                              const uint8_t *token,
+                                              double points,
+                                              double canonical_points);
 void wamble_emit_update_player_rating(const uint8_t *token, double rating);
 void wamble_emit_resolve_prediction(uint64_t board_id, const uint8_t *token,
                                     int move_number, const char *status,
@@ -2087,6 +2131,38 @@ DbStatus wamble_query_get_session_games_played(uint64_t session_id,
                                                int *out_games);
 DbStatus wamble_query_get_session_chess960_games_played(uint64_t session_id,
                                                         int *out_games);
+DbStatus wamble_query_get_identity_total_score(uint64_t global_identity_id,
+                                               double *out_total);
+DbStatus wamble_query_get_identity_games_played(uint64_t global_identity_id,
+                                                int *out_games);
+DbStatus
+wamble_query_get_identity_chess960_games_played(uint64_t global_identity_id,
+                                                int *out_games);
+DbStatus wamble_query_get_session_global_identity_id(uint64_t session_id,
+                                                     uint64_t *out_identity_id);
+DbStatus wamble_query_get_identity_tags_csv(uint64_t global_identity_id,
+                                            char *out_csv, size_t out_csv_size);
+DbStatus wamble_query_get_identity_handle(uint64_t global_identity_id,
+                                          char *out_handle,
+                                          size_t out_handle_size);
+DbStatus
+wamble_query_get_global_identity_id_by_handle(const char *handle,
+                                              uint64_t *out_identity_id);
+DbStatus wamble_query_get_session_public_key(uint64_t session_id,
+                                             uint8_t out_public_key[32],
+                                             int *out_has_identity);
+DbStatus wamble_query_get_latest_session_by_global_identity_id(
+    uint64_t global_identity_id, uint64_t *out_session_id);
+DbStatus wamble_query_get_latest_session_by_public_key(
+    const uint8_t public_key[WAMBLE_PUBLIC_KEY_LENGTH],
+    uint64_t *out_session_id);
+DbStatus wamble_query_get_session_token_by_id(uint64_t session_id,
+                                              uint8_t out_token[TOKEN_LENGTH]);
+DbStatus wamble_query_get_session_treatment_group(uint64_t session_id,
+                                                  char *out_group,
+                                                  size_t out_group_size);
+DbActiveReservationsResult wamble_query_get_active_reservations_by_public_key(
+    const uint8_t public_key[WAMBLE_PUBLIC_KEY_LENGTH]);
 DbStatus wamble_query_get_persistent_player_stats(
     const uint8_t *public_key, WamblePersistentPlayerStats *out_stats);
 DbLeaderboardResult wamble_query_get_leaderboard(uint64_t requester_session_id,

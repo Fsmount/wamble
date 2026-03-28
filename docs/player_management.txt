@@ -30,7 +30,13 @@ Stats
 - Player stats track both:
   - total games played.
   - games played on Chess960 boards.
-- `GET_PLAYER_STATS` / `PLAYER_STATS_DATA` includes the Chess960 game counter in the payload.
+- `GET_PLAYER_STATS` / `PLAYER_STATS_DATA` includes the Chess960 game counter in
+  the payload.
+- `GET_PLAYER_STATS` may target another player via extension fields:
+  - `stats.target_session_id` (`int`).
+  - `stats.target_handle` (`string`, global opaque handle).
+- `PLAYER_STATS_DATA` echoes target metadata via extensions:
+  `stats.target_session_id`, `stats.target_has_identity`, `stats.target_handle`.
 
 Expiration
 - `player_manager_tick()` drops idle entries after `token-expiration` seconds and removes the token from the index.

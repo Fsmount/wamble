@@ -1146,6 +1146,25 @@ static void profile_runtime_send_spectator_updates(RunningProfile *rp) {
   send_spectator_batch(rp->sockfd, events, nnot,
                        WAMBLE_CTRL_SERVER_NOTIFICATION);
   free(events);
+
+  ReservationReleaseNotification *released =
+      (ReservationReleaseNotification *)malloc(sizeof(*released) * (size_t)cap);
+  if (!released)
+    return;
+  int nrel = board_collect_reservation_release_notifications(released, cap);
+  for (int i = 0; i < nrel; i++) {
+    struct sockaddr_in addr;
+    if (network_get_client_addr_by_token(released[i].token, &addr) != 0)
+      continue;
+    struct WambleMsg out = {0};
+    out.ctrl = WAMBLE_CTRL_SERVER_NOTIFICATION;
+    out.flags = WAMBLE_FLAG_UNRELIABLE;
+    out.notification_type = WAMBLE_NOTIFICATION_TYPE_RESERVATION_RELEASED;
+    out.board_id = released[i].board_id;
+    memcpy(out.token, released[i].token, TOKEN_LENGTH);
+    (void)send_unreliable_packet(rp->sockfd, &out, &addr);
+  }
+  free(released);
 }
 
 static int profile_ws_is_enabled(const RunningProfile *rp) {

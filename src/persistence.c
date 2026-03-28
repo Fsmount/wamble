@@ -255,13 +255,21 @@ void wamble_emit_unlink_session_identity(const uint8_t *token) {
 
 void wamble_emit_record_payout(uint64_t board_id, const uint8_t *token,
                                double points) {
-  if (!token || points == 0.0)
+  wamble_emit_record_payout_with_canonical(board_id, token, points, points);
+}
+
+void wamble_emit_record_payout_with_canonical(uint64_t board_id,
+                                              const uint8_t *token,
+                                              double points,
+                                              double canonical_points) {
+  if (!token || (points == 0.0 && canonical_points == 0.0))
     return;
   struct WamblePersistenceIntent it = {0};
   it.type = WAMBLE_INTENT_RECORD_PAYOUT;
   it.as.record_payout.board_id = board_id;
   memcpy(it.as.record_payout.token, token, TOKEN_LENGTH);
   it.as.record_payout.points = points;
+  it.as.record_payout.canonical_points = canonical_points;
   intents_push(it);
 }
 
@@ -429,8 +437,10 @@ static int apply_one_intent_db(const struct WamblePersistenceIntent *it,
     if (resolve_session_id_cached(cache, it->as.unlink_session_identity.token,
                                   &sid) != DB_OK ||
         sid == 0 || !qs || !qs->unlink_session_identity)
-      return -1;
-    return qs->unlink_session_identity(sid);
+      return 0;
+    if (qs->unlink_session_identity(sid) < 0)
+      return 0;
+    return 0;
   }
   case WAMBLE_INTENT_RECORD_PAYOUT: {
     uint64_t sid = 0;
@@ -438,8 +448,9 @@ static int apply_one_intent_db(const struct WamblePersistenceIntent *it,
         resolve_session_id_cached(cache, it->as.record_payout.token, &sid);
     if (st != DB_OK || sid == 0)
       return 0;
-    return db_async_record_payout(it->as.record_payout.board_id, sid,
-                                  it->as.record_payout.points);
+    return db_async_record_payout_with_canonical(
+        it->as.record_payout.board_id, sid, it->as.record_payout.points,
+        it->as.record_payout.canonical_points);
   }
   case WAMBLE_INTENT_UPDATE_PLAYER_RATING: {
     uint64_t sid = 0;

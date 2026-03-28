@@ -70,7 +70,17 @@ WAMBLE_TEST(login_rehydrates_cached_player_from_persistent_stats) {
         "  (SELECT id FROM global_identities\n"
         "   WHERE public_key = decode('808182838485868788898a8b8c8d8e8f"
         "909192939495969798999a9b9c9d9e9f', 'hex')),\n"
-        "  42.5, 7.25, 18);\n",
+        "  42.5, 7.25, 18);\n"
+        "INSERT INTO boards (id, fen, status)\n"
+        "VALUES (777, '8/8/8/8/8/8/8/8 w - - 0 1', 'ARCHIVED')\n"
+        "ON CONFLICT DO NOTHING;\n"
+        "INSERT INTO payouts (board_id, session_id, points_awarded, "
+        "points_canonical)\n"
+        "VALUES (777,\n"
+        "  (SELECT id FROM sessions WHERE token = "
+        "decode('fedcba98765432100123456789abcdef', 'hex')),\n"
+        "  42.5, 42.5)\n"
+        "ON CONFLICT DO NOTHING;\n",
         f);
   fclose(f);
   T_ASSERT_EQ_INT(test_db_apply_sql_file(sql_path), 0);

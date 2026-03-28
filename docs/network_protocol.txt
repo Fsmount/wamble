@@ -70,8 +70,15 @@ Extension Trailer (reserved)
     active reservation. Carried on `SERVER_HELLO`, `BOARD_UPDATE`, and
     `LOGIN_SUCCESS`.
   - `profile.caps` (`int` bitmask): per-profile discovery actions.
+  - `profile.tos_available` (`int`): `1` when the profile currently has ToS
+    text configured, else `0`.
+  - `profile.tos_accepted` (`int`): `1` when the session has already accepted
+    the profile's current ToS revision, else `0`.
   - `profile.reservation_timeout` (`int`): profile-configured reservation
     duration in seconds. Carried on `PROFILE_INFO`.
+  - `last_move.uci` (`string`): last move UCI (for clients allowed to view it).
+  - `last_move.from` (`int`): source square index (`0..63`) for `last_move.uci`.
+  - `last_move.to` (`int`): destination square index (`0..63`) for `last_move.uci`.
 - Current bitmasks:
   - `session.caps`
     - `0x00000001`: attach identity
@@ -83,6 +90,7 @@ Extension Trailer (reserved)
     - `0x00000040`: spectate focus
     - `0x00000080`: prediction submit
     - `0x00000100`: prediction read
+    - `0x00000200`: game-mode metadata visibility (mode flags and mode-specific metadata exposure)
   - `profile.caps`
     - `0x00000001`: join/profile attach
     - `0x00000002`: terms available
@@ -108,6 +116,7 @@ Fragment Payload Envelope (version 1)
   - `LEADERBOARD_DATA`
   - `PREDICTION_DATA`
   - `PROFILE_TOS_DATA`
+  - `ACTIVE_RESERVATIONS_DATA`
 - Fragment wire payload format:
   - `uint8 fragment_version` (`1`)
   - `uint8 hash_algo` (`1` = BLAKE2b-256)
@@ -130,14 +139,17 @@ Control Codes
 - `0x02` SERVER_HELLO (server to client): Response to HELLO.
   - Payload: `char fen[]` (current board state).
   - May include extension fields: `session.caps`, `prediction.source`,
-    `reservation.reserved_at`.
+    `reservation.reserved_at`, `last_move.uci`, `last_move.from`,
+    `last_move.to`.
 - `0x03` PLAYER_MOVE (client to server): Submit a move.
   - Payload: `uint8 uci_len; char uci[uci_len]` (max 6 bytes).
 - `0x04` BOARD_UPDATE (server to client): Board state has changed.
   - Payload: `char fen[]`.
-  - `flags`: server sets `0x01` when the assigned board is Chess960.
+  - `flags`: server sets `0x01` when the assigned board is Chess960 *and*
+    `session.caps` includes game-mode visibility (`0x00000200`).
   - May include extension fields: `session.caps`, `prediction.source`,
-    `reservation.reserved_at`.
+    `reservation.reserved_at`, `last_move.uci`, `last_move.from`,
+    `last_move.to`.
 - `0x05` ACK (bidirectional): Acknowledges a reliable packet.
   - Payload: empty. Header `seq_num` matches the packet being ACKed.
 - `0x06` LIST_PROFILES (client to server): Request available profiles.
@@ -145,6 +157,7 @@ Control Codes
 - `0x07` PROFILE_INFO (server to client): Response to GET_PROFILE_INFO.
   - Payload: `name;port;advertise;visibility` or `NOTFOUND;<name>`.
   - May include extension fields: `profile.caps`,
+    `profile.tos_available`, `profile.tos_accepted`,
     `profile.websocket_port`, `profile.websocket_path`,
     `profile.reservation_timeout`.
 - `0x08` ERROR (server to client): Reports an error.
@@ -152,6 +165,12 @@ Control Codes
   - Error codes:
     - `1000` (`WAMBLE_ERR_UNSUPPORTED_VERSION`): client version too new.
     - `1001` (`WAMBLE_ERR_ACCESS_DENIED`): generic access denied.
+    - `1002` (`WAMBLE_ERR_SPECTATE_VISIBILITY_DENIED`): spectate denied by
+      visibility policy.
+    - `1003` (`WAMBLE_ERR_SPECTATE_BUSY`): session already has active focus.
+    - `1004` (`WAMBLE_ERR_SPECTATE_FULL`): spectator capacity exhausted.
+    - `1005` (`WAMBLE_ERR_SPECTATE_NOT_AVAILABLE`): requested board cannot be
+      spectated in its current state.
   - Reliable by default.
 - `0x09` SERVER_NOTIFICATION (server to client): Typed server-push notification.
   - Payload: `uint8 notification_type; char text[]`.
@@ -169,6 +188,9 @@ Control Codes
       emitted; reserved for future use.
     - `4` (`ANNOUNCEMENT`): profile-level broadcast. Not yet emitted; reserved
       for future use.
+    - `5` (`RESERVATION_RELEASED`): a board previously reserved for this
+      session was released. `board_id` in the packet header identifies the
+      released board.
   - `flags` bits (carried alongside):
     - `0x20` (`SPECTATE_NOTICE_SUMMARY_FALLBACK`): the notification is about a
       spectate focus→summary transition.
@@ -190,6 +212,8 @@ Control Codes
     - `0x02`: include Chess960 boards.
     - `0x04`: include standard boards.
     - Omitting both bits requests an unfiltered summary stream.
+  - If game-mode visibility is denied for the session, mode filter bits are
+    ignored and mode-specific flags are not exposed in updates.
   - Header semantics:
     - `board_id=0` enters summary mode. The server will push per-board
       `SPECTATE_UPDATE` packets for eligible boards (ACTIVE+RESERVED), sorted
@@ -207,7 +231,8 @@ Control Codes
   - Typically sent as unreliable (`flags` high bit set). One packet per board.
   - Payload carries FEN data; `board_id` is always present in the header and
     clients use it to associate updates with boards.
-  - `flags`: server sets `0x01` when the update is for a Chess960 board.
+  - `flags`: server sets `0x01` when the update is for a Chess960 board and
+    the spectator session has game-mode visibility.
 - `0x0D` LOGIN_REQUEST (client to server): Attach persistent identity to an
   existing anonymous session.
   - Two-step payload variants:
@@ -233,14 +258,21 @@ Control Codes
 - `0x10` LOGIN_SUCCESS (server to client): Successful login.
   - Payload: empty.
   - May include extension fields: `session.caps`, `prediction.source`,
-    `reservation.reserved_at`.
+    `reservation.reserved_at`, `last_move.uci`, `last_move.from`,
+    `last_move.to`.
 - `0x11` LOGIN_FAILED (server to client): Failed login.
   - Payload: `uint16 code; uint8 reason_len; char reason[reason_len]`.
 - `0x12` GET_PLAYER_STATS (client to server): Request player statistics.
   - Payload: empty.
+  - Optional extension fields:
+    - `stats.target_session_id` (`int`): read stats for a specific session id.
+    - `stats.target_handle` (`string`): read stats for a persistent identity via global opaque handle.
+    - `stats.target_public_key` (`string`): rejected (`ACCESS_DENIED`).
 - `0x13` PLAYER_STATS_DATA (server to client): Player statistics.
   - Payload: `double score_be; uint32 games_played_be; uint32 chess960_games_played_be`.
   - Note: Rating is tracked separately from score; this payload carries score and game counters.
+  - Extension fields include `stats.target_session_id` and
+    `stats.target_has_identity` (`0|1`), `stats.target_handle` (`string`).
 - `0x14` GET_PROFILE_INFO (client to server): Request info for a specific profile.
   - Payload: `uint8 name_len; char name[name_len]`.
 - `0x15` PROFILES_LIST (server to client): Response to LIST_PROFILES.
@@ -268,7 +300,7 @@ Control Codes
     - `uint8 leaderboard_type`
     - `uint8 count`
     - `uint32 self_rank_be` (0 when requester has no known rank)
-    - `count * struct { uint32 rank_be; uint64 session_id_be; uint64 score_bits_be; uint64 rating_bits_be; uint32 games_played_be; }`
+    - `count * struct { uint32 rank_be; uint64 session_id_be; uint64 score_bits_be; uint64 rating_bits_be; uint32 games_played_be; uint8 has_identity; uint8 public_key[32]; }`
   - `score_bits_be` and `rating_bits_be` are IEEE-754 double bit patterns in big-endian order.
   - Maximum entries per packet: 16.
 - `0x1B` SUBMIT_PREDICTION (client to server): Submit a prediction for the next
@@ -322,6 +354,14 @@ Control Codes
   - Authorization matches `GET_PROFILE_TOS`: discoverable profile or the
     caller's currently bound listener profile.
   - Reliable clients receive an immediate `ACK`; failures return `ERROR`.
+- `0x21` GET_ACTIVE_RESERVATIONS (client to server): Request active board
+  reservations for the caller's persistent identity.
+  - Payload: empty.
+- `0x22` ACTIVE_RESERVATIONS_DATA (server to client): Active reservations list.
+  - Payload:
+    - `uint16 count_be`
+    - `count * struct { uint64 board_id_be; uint64 reserved_at_epoch_be; }`
+  - Sent using the Fragment Payload Envelope (single or multi-chunk).
 
 Reliability
 - Reliable messages are sent with a sequence number (`seq_num`).
@@ -373,6 +413,7 @@ References
 - Move engine: docs/move_engine.txt (PLAYER_MOVE, BOARD_UPDATE, GET_LEGAL_MOVES, LEGAL_MOVES)
 - Profiles runtime: docs/runtime_and_state.txt (LIST_PROFILES, PROFILES_LIST, GET_PROFILE_INFO, PROFILE_INFO)
 - Prediction: docs/prediction.txt (SUBMIT_PREDICTION, GET_PREDICTIONS, PREDICTION_DATA)
+- Boards: docs/board_behaviour.txt (reservation lifecycle and release events)
 
 WebSocket Bridge
 - Endpoint: `ws://<host>:<websocket-port><websocket-path>`

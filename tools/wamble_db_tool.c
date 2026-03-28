@@ -128,6 +128,10 @@ int main(int argc, char **argv) {
              "    EXECUTE 'TRUNCATE TABLE global_identity_tags RESTART "
              "IDENTITY CASCADE'; "
              "  END IF; "
+             "  IF to_regclass('global_identity_handles') IS NOT NULL THEN "
+             "    EXECUTE 'TRUNCATE TABLE global_identity_handles RESTART "
+             "IDENTITY CASCADE'; "
+             "  END IF; "
              "  IF to_regclass('global_treatment_assignment_predicates') IS "
              "NOT NULL THEN "
              "    EXECUTE 'TRUNCATE TABLE "
@@ -174,6 +178,7 @@ int main(int argc, char **argv) {
     exec_file(c, "migrations/011_profile_treatment_groups.sql");
     exec_file(c, "migrations/012_profile_board_mode_variants.sql");
     exec_file(c, "migrations/013_profile_terms_acceptances.sql");
+    exec_file(c, "migrations/014_profile_canonical_payout_points.sql");
   }
   if (do_migrate_global) {
     exec_file(c, "migrations/005_global_identity_trust.sql");
@@ -181,6 +186,7 @@ int main(int argc, char **argv) {
     exec_file(c, "migrations/007_global_policy_runtime_expansion.sql");
     exec_file(c, "migrations/009_global_identity_tags.sql");
     exec_file(c, "migrations/011_global_treatment_groups.sql");
+    exec_file(c, "migrations/015_global_identity_handles.sql");
   }
   if (do_fixture) {
     exec_file(c, "tests/db/fixture.sql");

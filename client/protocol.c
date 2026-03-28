@@ -31,6 +31,8 @@ typedef struct WambleHeader {
 #define WAMBLE_HEADER_SIZE (sizeof(WambleHeader))
 #define WAMBLE_PREDICTION_ENTRY_WIRE_SIZE                                      \
   (8 + 8 + TOKEN_LENGTH + 8 + 2 + 1 + 1 + 1 + MAX_UCI_LENGTH)
+#define WAMBLE_LEADERBOARD_ENTRY_WIRE_SIZE                                     \
+  (4 + 8 + 8 + 8 + 4 + 1 + WAMBLE_PUBLIC_KEY_LENGTH)
 #define WAMBLE_EXT_MAGIC_0 0x57
 #define WAMBLE_EXT_MAGIC_1 0x58
 #define WAMBLE_EXT_VERSION 1
@@ -411,6 +413,7 @@ NetworkStatus wamble_payload_serialize(const struct WambleMsg *msg,
   case WAMBLE_CTRL_CLIENT_GOODBYE:
   case WAMBLE_CTRL_LOGOUT:
   case WAMBLE_CTRL_GET_PLAYER_STATS:
+  case WAMBLE_CTRL_GET_ACTIVE_RESERVATIONS:
   case WAMBLE_CTRL_SPECTATE_STOP:
   case WAMBLE_CTRL_SPECTATE_GAME:
     body_len = 0;
@@ -592,7 +595,8 @@ NetworkStatus wamble_payload_serialize(const struct WambleMsg *msg,
     uint8_t count = msg->leaderboard_count;
     if (count > WAMBLE_MAX_LEADERBOARD_ENTRIES)
       return NET_ERR_INVALID;
-    size_t need = 1 + 1 + 4 + (size_t)count * 32;
+    size_t need =
+        1 + 1 + 4 + (size_t)count * WAMBLE_LEADERBOARD_ENTRY_WIRE_SIZE;
     if (need > payload_capacity)
       return NET_ERR_TRUNCATED;
     payload[0] = msg->leaderboard_type ? msg->leaderboard_type
@@ -624,6 +628,9 @@ NetworkStatus wamble_payload_serialize(const struct WambleMsg *msg,
       offset += 8;
       memcpy(payload + offset, &games_be, 4);
       offset += 4;
+      payload[offset++] = e->has_identity ? 1 : 0;
+      memcpy(payload + offset, e->public_key, WAMBLE_PUBLIC_KEY_LENGTH);
+      offset += WAMBLE_PUBLIC_KEY_LENGTH;
     }
     body_len = need;
     break;
@@ -661,6 +668,22 @@ NetworkStatus wamble_payload_serialize(const struct WambleMsg *msg,
       memcpy(payload + offset, e->uci, MAX_UCI_LENGTH);
       offset += MAX_UCI_LENGTH;
     }
+    body_len = need;
+    break;
+  }
+  case WAMBLE_CTRL_ACTIVE_RESERVATIONS_DATA: {
+    size_t need = msg->fragment_data_len;
+    if (need == 0) {
+      uint16_t count_be = htons(msg->active_reservation_count);
+      if (payload_capacity < 2)
+        return NET_ERR_TRUNCATED;
+      memcpy(payload, &count_be, 2);
+      body_len = 2;
+      break;
+    }
+    if (need > payload_capacity)
+      return NET_ERR_TRUNCATED;
+    memcpy(payload, msg->fragment_data, need);
     body_len = need;
     break;
   }
@@ -719,6 +742,7 @@ static NetworkStatus decode_message_payload(uint8_t ctrl, uint8_t flags,
   case WAMBLE_CTRL_SPECTATE_GAME:
   case WAMBLE_CTRL_SPECTATE_STOP:
   case WAMBLE_CTRL_LOGOUT:
+  case WAMBLE_CTRL_GET_ACTIVE_RESERVATIONS:
     break;
   case WAMBLE_CTRL_LOGIN_CHALLENGE:
     if (payload_len != WAMBLE_LOGIN_CHALLENGE_LENGTH)
@@ -932,7 +956,9 @@ static NetworkStatus decode_message_payload(uint8_t ctrl, uint8_t flags,
     msg->leaderboard_count = payload[1];
     if (msg->leaderboard_count > WAMBLE_MAX_LEADERBOARD_ENTRIES)
       return NET_ERR_INVALID;
-    if (payload_len < 1 + 1 + 4 + (size_t)msg->leaderboard_count * 32)
+    if (payload_len <
+        1 + 1 + 4 +
+            (size_t)msg->leaderboard_count * WAMBLE_LEADERBOARD_ENTRY_WIRE_SIZE)
       return NET_ERR_TRUNCATED;
     {
       uint32_t self_rank_be = 0;
@@ -958,6 +984,9 @@ static NetworkStatus decode_message_payload(uint8_t ctrl, uint8_t flags,
         offset += 8;
         memcpy(&games_be, payload + offset, 4);
         offset += 4;
+        e->has_identity = payload[offset++];
+        memcpy(e->public_key, payload + offset, WAMBLE_PUBLIC_KEY_LENGTH);
+        offset += WAMBLE_PUBLIC_KEY_LENGTH;
         e->rank = ntohl(rank_be);
         e->session_id = net_to_host64(sid_be);
         score_be = net_to_host64(score_be);
@@ -1008,6 +1037,27 @@ static NetworkStatus decode_message_payload(uint8_t ctrl, uint8_t flags,
         e->target_ply = ntohs(ply_be);
         if (e->uci_len > MAX_UCI_LENGTH)
           return NET_ERR_INVALID;
+      }
+    }
+    break;
+  case WAMBLE_CTRL_ACTIVE_RESERVATIONS_DATA:
+    if (payload_len < 2)
+      return NET_ERR_TRUNCATED;
+    {
+      uint16_t count_be = 0;
+      uint16_t count = 0;
+      memcpy(&count_be, payload, 2);
+      count = ntohs(count_be);
+      msg->active_reservation_count = count;
+      if (payload_len < 2 + ((size_t)count * 16))
+        return NET_ERR_TRUNCATED;
+      {
+        size_t copy_len = payload_len;
+        if (copy_len > WAMBLE_FRAGMENT_DATA_MAX)
+          copy_len = WAMBLE_FRAGMENT_DATA_MAX;
+        if (copy_len > 0)
+          memcpy(msg->fragment_data, payload, copy_len);
+        msg->fragment_data_len = (uint16_t)copy_len;
       }
     }
     break;
@@ -1135,6 +1185,13 @@ NetworkStatus wamble_packet_deserialize(const uint8_t *buffer,
         memcpy(msg->profiles_list, msg->fragment_data, preview_copy);
       msg->profiles_list[preview_copy] = '\0';
       msg->profiles_list_len = (uint16_t)preview_copy;
+      break;
+    case WAMBLE_CTRL_ACTIVE_RESERVATIONS_DATA:
+      if (msg->fragment_chunk_index == 0 && msg->fragment_data_len >= 2) {
+        uint16_t count_be = 0;
+        memcpy(&count_be, msg->fragment_data, 2);
+        msg->active_reservation_count = ntohs(count_be);
+      }
       break;
     case WAMBLE_CTRL_ERROR:
     case WAMBLE_CTRL_LOGIN_FAILED:

@@ -43,13 +43,14 @@ Policy
   being allowed to read the tree.
 
 Duplicate Policy
-- Per-player-per-parent duplicate: a session may have at most one pending
-  prediction per parent branch on a board. Predictions are immutable — once
-  submitted, the move cannot be changed. Attempting a second submission at the
-  same parent returns `PREDICTION_ERR_DUPLICATE` with the existing prediction's
-  ID in `out_prediction_id`.
+- Per-player-per-parent duplicate: a session may have at most
+  `prediction-max-per-parent` pending predictions per parent branch on a board
+  (default `1`). Predictions are immutable — once submitted, the move cannot be
+  changed. Attempting to exceed this cap returns `PREDICTION_ERR_DUPLICATE`
+  with one existing prediction ID in `out_prediction_id`.
 - Move-identical duplicate: if another session has already submitted a pending
-  prediction with the same UCI move at the same parent on the same board:
+  prediction with the same UCI move at the same parent on the same board, and
+  `prediction-enforce-move-duplicate != 0`:
   - If the submitting session has prediction read access: rejected with
     `PREDICTION_ERR_DUPLICATE_MOVE` (the session could have seen it).
     The server responds with `PREDICTION_DATA` containing the existing
@@ -74,6 +75,12 @@ Tree Reads
   - `prediction-view-depth-limit`
   - requested depth
   - policy `permission_level` for `prediction.read`
+
+Pending Limit Scope
+- `prediction-max-pending` applies at board/readability-depth scope so sessions
+  sharing visible prediction context are constrained by the same pending budget.
+- Branch-level duplicate controls still apply independently via
+  `prediction-max-per-parent`.
 
 Compatibility
 - Treatment hooks for prediction scoring and gating still use the existing
@@ -102,7 +109,8 @@ References
   `prediction-base-points`, `prediction-streak-multiplier`,
   `prediction-streak-cap`, `prediction-gated-percent`,
   `prediction-penalty-incorrect`, `prediction-match-policy`,
-  `prediction-max-pending`, `prediction-view-depth-limit`.
+  `prediction-max-pending`, `prediction-max-per-parent`,
+  `prediction-enforce-move-duplicate`, `prediction-view-depth-limit`.
 - Protocol (see docs/network_protocol.txt): `SUBMIT_PREDICTION`,
   `GET_PREDICTIONS`, `PREDICTION_DATA`.
   - Prediction failures respond with `PREDICTION_DATA` (count=0), not generic
