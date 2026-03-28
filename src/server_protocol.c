@@ -747,6 +747,190 @@ static int square_index_from_alg(const char *sq) {
   return ((int)(sq[1] - '1') * 8) + (int)(sq[0] - 'a');
 }
 
+static int collect_board_read_treatment_facts(const WambleBoard *board,
+                                              WambleFact *facts,
+                                              int max_facts) {
+  int fact_count = 0;
+  if (!board || !facts || max_facts <= 0)
+    return 0;
+  memset(facts, 0, sizeof(*facts) * (size_t)max_facts);
+  fact_count = wamble_collect_board_treatment_facts(board, facts, max_facts);
+  if (token_has_any_byte(board->last_mover_token) &&
+      fact_count + 2 <= max_facts) {
+    WamblePlayer *prev = get_player_by_token(board->last_mover_token);
+    if (prev) {
+      snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+               "previous_player.rating");
+      facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+      facts[fact_count].double_value = prev->rating;
+      fact_count++;
+
+      snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
+               "previous_player.score");
+      facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+      facts[fact_count].double_value = prev->score;
+      fact_count++;
+    }
+  }
+  return fact_count;
+}
+
+static int parse_move_path_indices(const char *path, int *from_idx,
+                                   int *to_idx) {
+  int from = -1;
+  int to = -1;
+  if (!path || !from_idx || !to_idx)
+    return 0;
+  if (strnlen(path, MAX_UCI_LENGTH) < 4)
+    return 0;
+  from = square_index_from_alg(path);
+  to = square_index_from_alg(path + 2);
+  if (from < 0 || to < 0 || from == to)
+    return 0;
+  *from_idx = from;
+  *to_idx = to;
+  return 1;
+}
+
+static void copy_move_path4(const char *path, char *out, size_t out_size) {
+  if (!out || out_size == 0)
+    return;
+  out[0] = '\0';
+  if (!path || strnlen(path, MAX_UCI_LENGTH) < 4)
+    return;
+  snprintf(out, out_size, "%c%c%c%c", path[0], path[1], path[2], path[3]);
+}
+
+static int display_path_is_board_consistent(const WambleBoard *board,
+                                            int to_idx) {
+  Bitboard occupied = 0ULL;
+  if (!board || to_idx < 0 || to_idx >= 64)
+    return 0;
+  occupied = board->board.occupied[0] | board->board.occupied[1];
+  return ((occupied & (1ULL << (uint64_t)to_idx)) != 0ULL) ? 1 : 0;
+}
+
+static const WambleFact *find_fact_by_key(const WambleFact *facts,
+                                          int fact_count, const char *key) {
+  if (!facts || fact_count <= 0 || !key || !key[0])
+    return NULL;
+  for (int i = 0; i < fact_count; i++) {
+    if (strcmp(facts[i].key, key) == 0)
+      return &facts[i];
+  }
+  return NULL;
+}
+
+static int resolve_last_move_indices(const uint8_t *token,
+                                     const char *profile_name,
+                                     WambleBoard *board, int *from_idx,
+                                     int *to_idx, char *shown_uci,
+                                     size_t shown_uci_size) {
+  WambleFact facts[32];
+  WambleTreatmentAction actions[16];
+  int fact_count = 0;
+  int action_count = 0;
+  int max_age_ms = 0;
+  char type[64] = "factual";
+  char data_path[256] = {0};
+  char data_fact_key[128] = {0};
+  const char *candidate_path = NULL;
+  int candidate_from = -1;
+  int candidate_to = -1;
+  int recognized_non_factual = 0;
+
+  if (!token || !profile_name || !profile_name[0] || !board || !from_idx ||
+      !to_idx || !shown_uci || shown_uci_size == 0) {
+    return 0;
+  }
+  shown_uci[0] = '\0';
+
+  fact_count = collect_board_read_treatment_facts(board, facts, 32);
+  DbStatus treatment_status = wamble_query_resolve_treatment_actions(
+      token, profile_name, "board.read", board->last_mover_treatment_group,
+      facts, fact_count, actions, 16, &action_count);
+  if (treatment_status != DB_OK) {
+    publish_treatment_audit_status(TREATMENT_AUDIT_STATUS_QUERY_FAILED,
+                                   profile_name);
+    return 0;
+  }
+  publish_treatment_audit_status(action_count > 0
+                                     ? TREATMENT_AUDIT_STATUS_TREATED
+                                     : TREATMENT_AUDIT_STATUS_UNTREATED,
+                                 profile_name);
+
+  for (int i = 0; i < action_count; i++) {
+    int ok_num = 0;
+    if (strcmp(actions[i].output_kind, "view") != 0)
+      continue;
+    if (strcmp(actions[i].output_key, "last_move.type") == 0 &&
+        actions[i].value_type == WAMBLE_TREATMENT_VALUE_STRING &&
+        actions[i].string_value[0]) {
+      snprintf(type, sizeof(type), "%s", actions[i].string_value);
+    } else if (strcmp(actions[i].output_key, "last_move.mode") == 0 &&
+               actions[i].value_type == WAMBLE_TREATMENT_VALUE_STRING &&
+               actions[i].string_value[0]) {
+      snprintf(type, sizeof(type), "%s",
+               strcmp(actions[i].string_value, "off") == 0 ? "off" : "factual");
+    } else if (strcmp(actions[i].output_key, "last_move.max_age_ms") == 0) {
+      max_age_ms = (int)wamble_treatment_action_number(&actions[i], &ok_num);
+      if (!ok_num)
+        max_age_ms = 0;
+    } else if ((strcmp(actions[i].output_key, "last_move.data.path") == 0 ||
+                strcmp(actions[i].output_key, "last_move.path") == 0) &&
+               actions[i].value_type == WAMBLE_TREATMENT_VALUE_STRING) {
+      snprintf(data_path, sizeof(data_path), "%s", actions[i].string_value);
+    } else if (strcmp(actions[i].output_key, "last_move.data.fact_key") == 0 &&
+               actions[i].value_type == WAMBLE_TREATMENT_VALUE_STRING) {
+      snprintf(data_fact_key, sizeof(data_fact_key), "%s",
+               actions[i].string_value);
+    }
+  }
+
+  if (max_age_ms > 0 && board->last_move_time > 0) {
+    int64_t now_ms = (int64_t)wamble_now_wall() * 1000;
+    int64_t move_ms = (int64_t)board->last_move_time * 1000;
+    if (now_ms > move_ms && (now_ms - move_ms) > (int64_t)max_age_ms)
+      return 0;
+  }
+
+  if (strcmp(type, "off") == 0)
+    return 0;
+  if (strcmp(type, "factual") == 0) {
+    candidate_path = board->last_move_uci;
+  } else if (strcmp(type, "literal") == 0) {
+    candidate_path = data_path;
+    recognized_non_factual = 1;
+  } else if (strcmp(type, "fact") == 0) {
+    const WambleFact *f = find_fact_by_key(facts, fact_count, data_fact_key);
+    if (f && f->value_type == WAMBLE_TREATMENT_VALUE_STRING)
+      candidate_path = f->string_value;
+    recognized_non_factual = 1;
+  } else {
+    return 0;
+  }
+
+  if (candidate_path &&
+      parse_move_path_indices(candidate_path, &candidate_from, &candidate_to) &&
+      display_path_is_board_consistent(board, candidate_to)) {
+    *from_idx = candidate_from;
+    *to_idx = candidate_to;
+    copy_move_path4(candidate_path, shown_uci, shown_uci_size);
+    return 1;
+  }
+
+  if (recognized_non_factual &&
+      parse_move_path_indices(board->last_move_uci, &candidate_from,
+                              &candidate_to) &&
+      display_path_is_board_consistent(board, candidate_to)) {
+    *from_idx = candidate_from;
+    *to_idx = candidate_to;
+    copy_move_path4(board->last_move_uci, shown_uci, shown_uci_size);
+    return 1;
+  }
+  return 0;
+}
+
 static uint64_t u64_to_be(uint64_t x) {
   uint32_t hi = (uint32_t)(x >> 32);
   uint32_t lo = (uint32_t)(x & 0xffffffffu);
@@ -1037,24 +1221,24 @@ static uint32_t append_session_capability_extensions(struct WambleMsg *msg,
 static void append_last_move_extensions(struct WambleMsg *msg,
                                         const uint8_t *token,
                                         const char *profile_name,
-                                        const WambleBoard *board) {
+                                        WambleBoard *board) {
   int from_idx = -1;
   int to_idx = -1;
+  char shown_uci[MAX_UCI_LENGTH] = {0};
   if (!msg || !token || !profile_name || !profile_name[0] || !board)
     return;
-  if (!board->last_move_uci[0])
+  if (!resolve_last_move_indices(token, profile_name, board, &from_idx, &to_idx,
+                                 shown_uci, sizeof(shown_uci)))
     return;
 
-  if (strnlen(board->last_move_uci, MAX_UCI_LENGTH) >= 4) {
-    from_idx = square_index_from_alg(board->last_move_uci);
-    to_idx = square_index_from_alg(board->last_move_uci + 2);
+  if (strncmp(board->last_move_shown_uci, shown_uci, MAX_UCI_LENGTH) != 0) {
+    snprintf(board->last_move_shown_uci, sizeof(board->last_move_shown_uci),
+             "%s", shown_uci);
   }
-  if (from_idx < 0 || to_idx < 0)
-    return;
 
-  (void)append_ext_string(msg, "last_move.uci", board->last_move_uci);
   (void)append_ext_int(msg, "last_move.from", (int64_t)from_idx);
   (void)append_ext_int(msg, "last_move.to", (int64_t)to_idx);
+  wamble_emit_record_last_move_shown(board->id, token, shown_uci);
 }
 
 static uint8_t prediction_status_code(const char *status) {
@@ -1893,6 +2077,8 @@ static ServerStatus handle_login_request(wamble_socket_t sockfd,
             board->board.game_mode == GAME_MODE_CHESS960) {
           response.flags |= WAMBLE_FLAG_BOARD_IS_960;
         }
+        append_last_move_extensions(&response, player->token, profile_name,
+                                    board);
       }
     }
   } else {

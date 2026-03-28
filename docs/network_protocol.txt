@@ -76,9 +76,10 @@ Extension Trailer (reserved)
     the profile's current ToS revision, else `0`.
   - `profile.reservation_timeout` (`int`): profile-configured reservation
     duration in seconds. Carried on `PROFILE_INFO`.
-  - `last_move.uci` (`string`): last move UCI (for clients allowed to view it).
-  - `last_move.from` (`int`): source square index (`0..63`) for `last_move.uci`.
-  - `last_move.to` (`int`): destination square index (`0..63`) for `last_move.uci`.
+  - `last_move.from` (`int`): source square index (`0..63`) for the emitted
+    display move path.
+  - `last_move.to` (`int`): destination square index (`0..63`) for the emitted
+    display move path.
 - Current bitmasks:
   - `session.caps`
     - `0x00000001`: attach identity
@@ -94,6 +95,17 @@ Extension Trailer (reserved)
   - `profile.caps`
     - `0x00000001`: join/profile attach
     - `0x00000002`: terms available
+
+Last-Move Extension Contract
+- Last-move extension presence is packet-scoped and treatment-resolved. There
+  is no dedicated `session.caps` bit for it.
+- Despite the key name, emitted `last_move.*` metadata is presentation-oriented
+  and may describe a synthetic move path rather than the true recorded move.
+- `last_move.from` and `last_move.to` must either both be present or both be
+  absent.
+- No sentinel or empty `last_move.*` values are emitted. If unavailable or
+  withheld, the keys are omitted entirely.
+- Clients should ignore partial last-move payloads.
 
 Fragment Payload Envelope (version 1)
 - The sender uses this envelope when an eligible control payload does not fit
@@ -139,8 +151,7 @@ Control Codes
 - `0x02` SERVER_HELLO (server to client): Response to HELLO.
   - Payload: `char fen[]` (current board state).
   - May include extension fields: `session.caps`, `prediction.source`,
-    `reservation.reserved_at`, `last_move.uci`, `last_move.from`,
-    `last_move.to`.
+    `reservation.reserved_at`, `last_move.from`, `last_move.to`.
 - `0x03` PLAYER_MOVE (client to server): Submit a move.
   - Payload: `uint8 uci_len; char uci[uci_len]` (max 6 bytes).
 - `0x04` BOARD_UPDATE (server to client): Board state has changed.
@@ -148,8 +159,7 @@ Control Codes
   - `flags`: server sets `0x01` when the assigned board is Chess960 *and*
     `session.caps` includes game-mode visibility (`0x00000200`).
   - May include extension fields: `session.caps`, `prediction.source`,
-    `reservation.reserved_at`, `last_move.uci`, `last_move.from`,
-    `last_move.to`.
+    `reservation.reserved_at`, `last_move.from`, `last_move.to`.
 - `0x05` ACK (bidirectional): Acknowledges a reliable packet.
   - Payload: empty. Header `seq_num` matches the packet being ACKed.
 - `0x06` LIST_PROFILES (client to server): Request available profiles.
@@ -233,6 +243,7 @@ Control Codes
     clients use it to associate updates with boards.
   - `flags`: server sets `0x01` when the update is for a Chess960 board and
     the spectator session has game-mode visibility.
+  - May include extension fields: `last_move.from`, `last_move.to`.
 - `0x0D` LOGIN_REQUEST (client to server): Attach persistent identity to an
   existing anonymous session.
   - Two-step payload variants:
@@ -258,8 +269,7 @@ Control Codes
 - `0x10` LOGIN_SUCCESS (server to client): Successful login.
   - Payload: empty.
   - May include extension fields: `session.caps`, `prediction.source`,
-    `reservation.reserved_at`, `last_move.uci`, `last_move.from`,
-    `last_move.to`.
+    `reservation.reserved_at`, `last_move.from`, `last_move.to`.
 - `0x11` LOGIN_FAILED (server to client): Failed login.
   - Payload: `uint16 code; uint8 reason_len; char reason[reason_len]`.
 - `0x12` GET_PLAYER_STATS (client to server): Request player statistics.

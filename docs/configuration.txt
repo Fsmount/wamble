@@ -268,6 +268,10 @@ Treatment Groups
   - `(treatment-behavior group-key hook-name key value)`
   - `(treatment-meta group-key hook-name key value)`
   - `(treatment-payload group-key ctrl-alias key value)`
+  - `(treatment-visible-fen group-key hook-name fen)`
+  - `(treatment-predictions-from-moves group-key hook-name)`
+  - `(treatment-last-move group-key hook-name type [max-age-ms])`
+  - `(treatment-last-move-data group-key hook-name key value)`
 - `predicate` form:
   - `(match fact-key op value)`
 - Supported ops: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `exists`, `absent`
@@ -278,6 +282,10 @@ Treatment Groups
   - `tag`: persistent `global_identity_tags` upsert
   - `feature`, `context`, `behavior`, `meta`: hook-scoped outputs returned by
     treatment action lookup
+  - `view`: hook-scoped outputs consumed by gameplay/view runtime paths and
+    translated into outbound protocol behavior. Current config only exposes
+    these through specialized DSL helpers such as `treatment-visible-fen`,
+    `treatment-predictions-from-moves`, and `treatment-last-move`.
   - `payload`: ctrl-scoped outputs persisted and queryable server-side.
     `ctrl-alias` accepts symbolic ctrl names (for example `prediction_data`) or
     `*`. Runtime gameplay/view paths do not emit payload outputs directly onto
@@ -292,6 +300,7 @@ Treatment Groups
       `prediction.points.bonus`, `prediction.penalty.multiplier`
   - `prediction.read`
     - behavior: `prediction.view_depth_cap`
+    - view: `prediction.source` (`tree` or `moves`)
   - `scoring.apply`
     - feature: `scoring.disable`
     - behavior: `payout.multiplier`, `payout.bonus`
@@ -301,10 +310,32 @@ Treatment Groups
   - `board.assignment`
     - feature: `board.assignment.disable`
     - behavior: `board.score.multiplier`, `board.score.bonus`
+  - `board.read`
+    - view: `board.fen`
+    - view: `last_move.type` (`off`, `factual`, `literal`, `fact`)
+    - view: `last_move.max_age_ms` (integer; `<= 0` means no expiry)
+    - view: `last_move.data.*` (typed auxiliary data interpreted by `last_move.type`)
   - `trust.resolve`
     - behavior: `trust.tier.set`, `trust.tier.delta`, `trust.tier.min`
   - `<ctrl-alias>` payload scope
     - payload: arbitrary keys with string/int/double/bool values (server-side)
+
+- Specialized gameplay/view helpers:
+  - `(treatment-visible-fen group-key hook-name fen)` materializes a `view`
+    output for `board.fen`.
+  - `(treatment-predictions-from-moves group-key hook-name)` materializes a
+    `view` output for `prediction.source = "moves"`.
+  - `(treatment-last-move group-key hook-name type [max-age-ms])`
+    materializes `view` outputs for `last_move.type` and, when provided,
+    `last_move.max_age_ms`.
+  - `(treatment-last-move-data group-key hook-name key value)` materializes a
+    `view` output at key `last_move.data.<key>`.
+  - `type` must be one of `off`, `factual`, `literal`, or `fact`.
+  - Data shape is intentionally open-ended and deterministic. Runtime resolves
+    only the keys required by the configured `last_move.type`.
+  - For `literal`, use `last_move.data.path` (string coordinate move, e.g. `"e2e4"`).
+  - For `fact`, use `last_move.data.fact_key` (string fact key, e.g. `"history.uci.3"`).
+  - `hook-name` is currently consumed only on `board.read`.
 
 - Runtime fact surface:
   - Gameplay/view treatment hooks use a fixed fact contract documented in
