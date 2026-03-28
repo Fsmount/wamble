@@ -219,6 +219,19 @@ void wamble_emit_update_board_move_meta(uint64_t board_id,
   intents_push(it);
 }
 
+void wamble_emit_record_last_move_shown(uint64_t board_id, const uint8_t *token,
+                                        const char *shown_uci) {
+  if (board_id == 0 || !token || !shown_uci || !shown_uci[0])
+    return;
+  struct WamblePersistenceIntent it = {0};
+  it.type = WAMBLE_INTENT_RECORD_LAST_MOVE_SHOWN;
+  it.as.record_last_move_shown.board_id = board_id;
+  memcpy(it.as.record_last_move_shown.token, token, TOKEN_LENGTH);
+  intent_copy_str(it.as.record_last_move_shown.shown_uci,
+                  sizeof(it.as.record_last_move_shown.shown_uci), shown_uci);
+  intents_push(it);
+}
+
 void wamble_emit_update_board_reservation_meta(uint64_t board_id,
                                                time_t reservation_time,
                                                bool reserved_for_white) {
@@ -514,6 +527,16 @@ static int apply_one_intent_db(const struct WamblePersistenceIntent *it,
         it->as.resolve_prediction.move_number, it->as.resolve_prediction.status,
         it->as.resolve_prediction.points_awarded);
   }
+  case WAMBLE_INTENT_RECORD_LAST_MOVE_SHOWN: {
+    uint64_t sid = 0;
+    DbStatus st = resolve_session_id_cached(
+        cache, it->as.record_last_move_shown.token, &sid);
+    if (st != DB_OK || sid == 0)
+      return 0;
+    return db_async_record_last_move_shown(
+        it->as.record_last_move_shown.board_id, sid,
+        it->as.record_last_move_shown.shown_uci);
+  }
   default:
     return 0;
   }
@@ -601,6 +624,8 @@ intent_payload_estimate_bytes(const struct WamblePersistenceIntent *it) {
     return 16 + TOKEN_LENGTH + MAX_UCI_LENGTH + 4;
   case WAMBLE_INTENT_RESOLVE_PREDICTION:
     return 8 + TOKEN_LENGTH + 4 + STATUS_MAX_LENGTH + 8;
+  case WAMBLE_INTENT_RECORD_LAST_MOVE_SHOWN:
+    return 8 + TOKEN_LENGTH + MAX_UCI_LENGTH;
   default:
     return sizeof(*it);
   }

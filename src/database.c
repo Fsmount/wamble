@@ -504,6 +504,17 @@ static int db_ensure_profile_treatment_schema(void) {
       "ON profile_terms_acceptances(global_identity_id, accepted_at DESC)",
       "ALTER TABLE boards "
       "ADD COLUMN IF NOT EXISTS last_mover_treatment_group VARCHAR(128)",
+      "CREATE TABLE IF NOT EXISTS board_last_move_shown_events ("
+      "  id BIGSERIAL PRIMARY KEY,"
+      "  board_id BIGINT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,"
+      "  session_id BIGINT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,"
+      "  shown_uci VARCHAR(6) NOT NULL,"
+      "  emitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
+      ")",
+      "CREATE INDEX IF NOT EXISTS idx_board_last_move_shown_events_board "
+      "ON board_last_move_shown_events(board_id, emitted_at DESC)",
+      "CREATE INDEX IF NOT EXISTS idx_board_last_move_shown_events_session "
+      "ON board_last_move_shown_events(session_id, emitted_at DESC)",
       "CREATE INDEX IF NOT EXISTS idx_sessions_treatment_group "
       "ON sessions(treatment_group_key)"};
   for (size_t i = 0; i < sizeof(ddl) / sizeof(ddl[0]); i++) {
@@ -3271,7 +3282,7 @@ int db_async_update_board_assignment_time(uint64_t board_id) {
 int db_async_update_board_move_meta(uint64_t board_id,
                                     const char *last_mover_treatment_group) {
   const char *query = "UPDATE boards SET last_move_time = NOW(), "
-                      "last_mover_treatment_group = $2 "
+                      "last_mover_treatment_group = $2, "
                       "WHERE id = $1";
 
   char board_id_str[32];
@@ -3289,6 +3300,28 @@ int db_async_update_board_move_meta(uint64_t board_id,
     return -1;
   }
 
+  PQclear(res);
+  return 0;
+}
+
+int db_async_record_last_move_shown(uint64_t board_id, uint64_t session_id,
+                                    const char *shown_uci) {
+  const char *query = "INSERT INTO board_last_move_shown_events "
+                      "(board_id, session_id, shown_uci) "
+                      "VALUES ($1, $2, $3)";
+  char board_id_str[32];
+  char session_id_str[32];
+  snprintf(board_id_str, sizeof(board_id_str), "%" PRIu64, board_id);
+  snprintf(session_id_str, sizeof(session_id_str), "%" PRIu64, session_id);
+  const char *paramValues[] = {board_id_str, session_id_str, shown_uci};
+  PGresult *res =
+      pq_exec_params_locked(query, 3, NULL, paramValues, NULL, NULL, 0);
+  if (!res)
+    return -1;
+  if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+    PQclear(res);
+    return -1;
+  }
   PQclear(res);
   return 0;
 }
@@ -3337,6 +3370,14 @@ static DbBoardResult db_get_board(uint64_t board_id) {
       "COALESCE(EXTRACT(EPOCH FROM b.last_assignment_time)::bigint, 0), "
       "COALESCE(EXTRACT(EPOCH FROM b.last_move_time)::bigint, 0), "
       "COALESCE(b.last_mover_treatment_group, ''), "
+      "COALESCE((SELECT m.move_uci FROM moves m "
+      "          WHERE m.board_id = b.id "
+      "          ORDER BY m.move_number DESC, m.id DESC "
+      "          LIMIT 1), ''), "
+      "COALESCE((SELECT e.shown_uci FROM board_last_move_shown_events e "
+      "          WHERE e.board_id = b.id "
+      "          ORDER BY e.emitted_at DESC, e.id DESC "
+      "          LIMIT 1), ''), "
       "COALESCE(EXTRACT(EPOCH FROM r.started_at)::bigint, "
       "COALESCE(EXTRACT(EPOCH FROM b.reservation_started_at)::bigint, 0)), "
       "COALESCE(r.reserved_for_white, COALESCE(b.reserved_for_white, FALSE)), "
@@ -3376,10 +3417,14 @@ static DbBoardResult db_get_board(uint64_t board_id) {
   out.last_move_time = (time_t)strtoull(PQgetvalue(res, 0, 4), NULL, 10);
   snprintf(out.last_mover_treatment_group,
            sizeof(out.last_mover_treatment_group), "%s", PQgetvalue(res, 0, 5));
-  out.reservation_time = (time_t)strtoull(PQgetvalue(res, 0, 6), NULL, 10);
+  snprintf(out.last_move_uci, sizeof(out.last_move_uci), "%s",
+           PQgetvalue(res, 0, 6));
+  snprintf(out.last_move_shown_uci, sizeof(out.last_move_shown_uci), "%s",
+           PQgetvalue(res, 0, 7));
+  out.reservation_time = (time_t)strtoull(PQgetvalue(res, 0, 8), NULL, 10);
   out.reserved_for_white =
-      (PQgetvalue(res, 0, 7)[0] == 't' || PQgetvalue(res, 0, 7)[0] == '1');
-  out.mode_variant_id = (int)strtol(PQgetvalue(res, 0, 8), NULL, 10);
+      (PQgetvalue(res, 0, 9)[0] == 't' || PQgetvalue(res, 0, 9)[0] == '1');
+  out.mode_variant_id = (int)strtol(PQgetvalue(res, 0, 10), NULL, 10);
   out.status = DB_OK;
   PQclear(res);
   return out;

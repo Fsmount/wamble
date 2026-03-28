@@ -1016,6 +1016,110 @@ WAMBLE_TEST(config_db_apply_treatment_view_rules) {
   return 0;
 }
 
+WAMBLE_TEST(config_parse_treatment_last_move_dsl) {
+  const char *p = "build/test_config_last_move_dsl.conf";
+  const char *cfg = "(def experiment-enabled 1)\n"
+                    "(treatment-group \"vip\" 20)\n"
+                    "(treatment-default \"vip\")\n"
+                    "(treatment-last-move \"vip\" \"board.read\" \"fact\" "
+                    "15000)\n"
+                    "(treatment-last-move-data \"vip\" \"board.read\" "
+                    "\"fact_key\" \"last_move.uci\")\n";
+  FILE *f = fopen(p, "wb");
+  T_ASSERT(f != NULL);
+  fwrite(cfg, 1, strlen(cfg), f);
+  fclose(f);
+  T_ASSERT_STATUS(config_load(p, NULL, NULL, 0), CONFIG_LOAD_OK);
+
+  int found_type = 0;
+  int found_age = 0;
+  int found_data = 0;
+  for (int i = 0; i < config_treatment_output_count(); i++) {
+    const WambleTreatmentOutputSpec *o = config_treatment_output_get(i);
+    if (!o || !o->output_kind || !o->output_key || !o->hook_name)
+      continue;
+    if (strcmp(o->output_kind, "view") != 0 ||
+        strcmp(o->hook_name, "board.read") != 0)
+      continue;
+    if (strcmp(o->output_key, "last_move.type") == 0 &&
+        o->value.type == WAMBLE_TREATMENT_VALUE_STRING &&
+        o->value.string_value && strcmp(o->value.string_value, "fact") == 0) {
+      found_type = 1;
+    } else if (strcmp(o->output_key, "last_move.max_age_ms") == 0 &&
+               o->value.type == WAMBLE_TREATMENT_VALUE_INT &&
+               o->value.int_value == 15000) {
+      found_age = 1;
+    } else if (strcmp(o->output_key, "last_move.data.fact_key") == 0 &&
+               o->value.type == WAMBLE_TREATMENT_VALUE_STRING &&
+               o->value.string_value &&
+               strcmp(o->value.string_value, "last_move.uci") == 0) {
+      found_data = 1;
+    }
+  }
+  T_ASSERT(found_type);
+  T_ASSERT(found_age);
+  T_ASSERT(found_data);
+  return 0;
+}
+
+WAMBLE_TEST(config_db_apply_treatment_last_move_rules) {
+  uint8_t token[TOKEN_LENGTH] = {0x61, 0x62, 0x63, 0x64, 0x65, 0x66,
+                                 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c,
+                                 0x6d, 0x6e, 0x6f, 0x70};
+  if (config_db_prepare() != 0)
+    T_FAIL_SIMPLE("config_db_prepare failed");
+  const char *cfg_path = "build/test_treatment_last_move_rules.conf";
+  const char *cfg =
+      "(def experiment-enabled 1)\n"
+      "(treatment-group \"vip\" 20)\n"
+      "(treatment-default \"vip\")\n"
+      "(treatment-last-move \"vip\" \"board.read\" \"literal\" 9000)\n"
+      "(treatment-last-move-data \"vip\" \"board.read\" \"path\" \"e2e4\")\n";
+  T_ASSERT_EQ_INT(wamble_test_write_optional_db_config_file(cfg_path, cfg), 0);
+  T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
+  T_ASSERT_STATUS_OK(db_apply_config_treatment_rules("__default__"));
+  T_ASSERT(db_create_session(token, 0) > 0);
+
+  WambleFact facts[2] = {0};
+  snprintf(facts[0].key, sizeof(facts[0].key), "%s", "board.id");
+  facts[0].value_type = WAMBLE_TREATMENT_VALUE_INT;
+  facts[0].int_value = 1;
+  snprintf(facts[1].key, sizeof(facts[1].key), "%s", "last_move.uci");
+  facts[1].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+  snprintf(facts[1].string_value, sizeof(facts[1].string_value), "%s", "d2d4");
+
+  WambleTreatmentAction actions[8];
+  int action_count = 0;
+  T_ASSERT_STATUS(db_resolve_treatment_actions(token, "", "board.read", NULL,
+                                               facts, 2, actions, 8,
+                                               &action_count),
+                  DB_OK);
+  int found_type = 0;
+  int found_age = 0;
+  int found_path = 0;
+  for (int i = 0; i < action_count; i++) {
+    if (strcmp(actions[i].output_kind, "view") != 0)
+      continue;
+    if (strcmp(actions[i].output_key, "last_move.type") == 0 &&
+        actions[i].value_type == WAMBLE_TREATMENT_VALUE_STRING &&
+        strcmp(actions[i].string_value, "literal") == 0) {
+      found_type = 1;
+    } else if (strcmp(actions[i].output_key, "last_move.max_age_ms") == 0 &&
+               actions[i].value_type == WAMBLE_TREATMENT_VALUE_INT &&
+               actions[i].int_value == 9000) {
+      found_age = 1;
+    } else if (strcmp(actions[i].output_key, "last_move.data.path") == 0 &&
+               actions[i].value_type == WAMBLE_TREATMENT_VALUE_STRING &&
+               strcmp(actions[i].string_value, "e2e4") == 0) {
+      found_path = 1;
+    }
+  }
+  T_ASSERT(found_type);
+  T_ASSERT(found_age);
+  T_ASSERT(found_path);
+  return 0;
+}
+
 WAMBLE_TEST(config_db_apply_treatment_payload_rules) {
   uint8_t token[TOKEN_LENGTH] = {0x51, 0x52, 0x53, 0x54, 0x55, 0x56,
                                  0x57, 0x58, 0x59, 0x5a, 0x5b, 0x5c,
@@ -1461,6 +1565,8 @@ WAMBLE_TESTS_ADD_DB_FM(config_db_reset_clears_tag_and_treatment_state,
 WAMBLE_TESTS_ADD_DB_FM(config_db_apply_treatment_rules_and_assign_session,
                        "config");
 WAMBLE_TESTS_ADD_DB_FM(config_db_apply_treatment_view_rules, "config");
+WAMBLE_TESTS_ADD_FM(config_parse_treatment_last_move_dsl, "config");
+WAMBLE_TESTS_ADD_DB_FM(config_db_apply_treatment_last_move_rules, "config");
 WAMBLE_TESTS_ADD_DB_FM(config_db_apply_treatment_payload_rules, "config");
 WAMBLE_TESTS_ADD_DB_FM(
     config_db_apply_treatment_edges_without_snapshot_revision, "config");

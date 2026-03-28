@@ -1709,6 +1709,133 @@ static LispValue *builtin_treatment_visible_fen(LispEnv *env, LispValue *args) {
   return builtin_treatment_view_record(env, args, "board.fen");
 }
 
+static LispValue *builtin_treatment_last_move(LispEnv *env, LispValue *args) {
+  if (!args || args->type != LISP_VALUE_PAIR)
+    return make_value(LISP_VALUE_NIL);
+  WambleTreatmentOutputSpec type_out = {0};
+  type_out.output_kind = wamble_strdup("view");
+  type_out.output_key = wamble_strdup("last_move.type");
+  if (!type_out.output_kind || !type_out.output_key) {
+    treatment_output_clear(&type_out);
+    return make_value(LISP_VALUE_NIL);
+  }
+
+  int have_age = 0;
+  int max_age = 0;
+  char group_key[128] = {0};
+  char hook_name[64] = {0};
+  int idx = 0;
+  for (LispValue *a = args; a && a->type == LISP_VALUE_PAIR;
+       a = a->as.pair.cdr, idx++) {
+    if (idx == 0) {
+      if (eval_string_arg(env, a->as.pair.car, &type_out.group_key) != 0)
+        break;
+    } else if (idx == 1) {
+      if (eval_string_arg(env, a->as.pair.car, &type_out.hook_name) != 0)
+        break;
+    } else if (idx == 2) {
+      if (eval_treatment_value_arg(env, a->as.pair.car, &type_out.value) != 0)
+        break;
+    } else if (idx == 3) {
+      if (eval_int_arg(env, a->as.pair.car, &max_age) != 0)
+        break;
+      have_age = 1;
+    } else {
+      break;
+    }
+  }
+
+  int ok = (idx >= 3 && idx <= 4 && type_out.group_key && type_out.hook_name &&
+            type_out.output_kind && type_out.output_key &&
+            type_out.value.type != WAMBLE_TREATMENT_VALUE_NONE)
+               ? 1
+               : 0;
+  if (ok) {
+    snprintf(group_key, sizeof(group_key), "%s", type_out.group_key);
+    snprintf(hook_name, sizeof(hook_name), "%s", type_out.hook_name);
+  }
+  if (ok && treatment_outputs_append(&type_out) != 0)
+    ok = 0;
+  treatment_output_clear(&type_out);
+  if (!ok)
+    return make_value(LISP_VALUE_NIL);
+
+  if (have_age) {
+    WambleTreatmentOutputSpec age_out = {0};
+    age_out.group_key = wamble_strdup(group_key);
+    age_out.hook_name = wamble_strdup(hook_name);
+    age_out.output_kind = wamble_strdup("view");
+    age_out.output_key = wamble_strdup("last_move.max_age_ms");
+    age_out.value.type = WAMBLE_TREATMENT_VALUE_INT;
+    age_out.value.int_value = (int64_t)max_age;
+    int age_ok = (age_out.group_key && age_out.hook_name &&
+                  age_out.output_kind && age_out.output_key)
+                     ? 1
+                     : 0;
+    if (age_ok && treatment_outputs_append(&age_out) != 0)
+      age_ok = 0;
+    treatment_output_clear(&age_out);
+    if (!age_ok)
+      return make_value(LISP_VALUE_NIL);
+  }
+
+  LispValue *one = make_value(LISP_VALUE_INTEGER);
+  one->as.integer = 1;
+  return one;
+}
+
+static LispValue *builtin_treatment_last_move_data(LispEnv *env,
+                                                   LispValue *args) {
+  if (!args || args->type != LISP_VALUE_PAIR)
+    return make_value(LISP_VALUE_NIL);
+  WambleTreatmentOutputSpec out = {0};
+  out.output_kind = wamble_strdup("view");
+  if (!out.output_kind) {
+    treatment_output_clear(&out);
+    return make_value(LISP_VALUE_NIL);
+  }
+
+  char *data_key = NULL;
+  int idx = 0;
+  for (LispValue *a = args; a && a->type == LISP_VALUE_PAIR;
+       a = a->as.pair.cdr, idx++) {
+    if (idx == 0) {
+      if (eval_string_arg(env, a->as.pair.car, &out.group_key) != 0)
+        break;
+    } else if (idx == 1) {
+      if (eval_string_arg(env, a->as.pair.car, &out.hook_name) != 0)
+        break;
+    } else if (idx == 2) {
+      if (eval_string_arg(env, a->as.pair.car, &data_key) != 0)
+        break;
+    } else if (idx == 3) {
+      if (eval_treatment_value_arg(env, a->as.pair.car, &out.value) != 0)
+        break;
+    } else {
+      break;
+    }
+  }
+  int ok = (idx == 4 && out.group_key && out.hook_name && out.output_kind &&
+            data_key && out.value.type != WAMBLE_TREATMENT_VALUE_NONE)
+               ? 1
+               : 0;
+  if (ok) {
+    char full_key[192];
+    snprintf(full_key, sizeof(full_key), "%s%s", "last_move.data.", data_key);
+    out.output_key = wamble_strdup(full_key);
+    ok = (out.output_key != NULL) ? 1 : 0;
+  }
+  if (ok && treatment_outputs_append(&out) != 0)
+    ok = 0;
+  free(data_key);
+  treatment_output_clear(&out);
+  if (!ok)
+    return make_value(LISP_VALUE_NIL);
+  LispValue *one = make_value(LISP_VALUE_INTEGER);
+  one->as.integer = 1;
+  return one;
+}
+
 static LispValue *builtin_treatment_predictions_from_moves(LispEnv *env,
                                                            LispValue *args) {
   if (!args || args->type != LISP_VALUE_PAIR)
@@ -2140,6 +2267,8 @@ static LispEnv *build_policy_env_from_source(const char *source) {
       {"treatment-meta", builtin_treatment_meta},
       {"treatment-payload", builtin_treatment_payload},
       {"treatment-visible-fen", builtin_treatment_visible_fen},
+      {"treatment-last-move", builtin_treatment_last_move},
+      {"treatment-last-move-data", builtin_treatment_last_move_data},
       {"treatment-predictions-from-moves",
        builtin_treatment_predictions_from_moves},
   };
@@ -2352,6 +2481,8 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
       {"treatment-meta", builtin_treatment_meta},
       {"treatment-payload", builtin_treatment_payload},
       {"treatment-visible-fen", builtin_treatment_visible_fen},
+      {"treatment-last-move", builtin_treatment_last_move},
+      {"treatment-last-move-data", builtin_treatment_last_move_data},
       {"treatment-predictions-from-moves",
        builtin_treatment_predictions_from_moves},
   };
@@ -2410,13 +2541,22 @@ ConfigLoadStatus config_load(const char *filename, const char *profile,
           LispEnv *profile_env = lisp_env_create(env);
           {
             const char *unsupported[] = {
-                "policy-allow",          "policy-deny",
-                "treatment-group",       "treatment-default",
-                "treatment-assign",      "treatment-edge",
-                "treatment-tag",         "treatment-feature",
-                "treatment-context",     "treatment-behavior",
-                "treatment-meta",        "treatment-payload",
-                "treatment-visible-fen", "treatment-predictions-from-moves",
+                "policy-allow",
+                "policy-deny",
+                "treatment-group",
+                "treatment-default",
+                "treatment-assign",
+                "treatment-edge",
+                "treatment-tag",
+                "treatment-feature",
+                "treatment-context",
+                "treatment-behavior",
+                "treatment-meta",
+                "treatment-payload",
+                "treatment-visible-fen",
+                "treatment-last-move",
+                "treatment-last-move-data",
+                "treatment-predictions-from-moves",
             };
             for (size_t u = 0; u < sizeof(unsupported) / sizeof(unsupported[0]);
                  u++) {

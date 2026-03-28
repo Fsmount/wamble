@@ -1093,6 +1093,8 @@ typedef struct {
   DbStatus status;
   char fen[FEN_MAX_LENGTH];
   char status_text[STATUS_MAX_LENGTH];
+  char last_move_uci[MAX_UCI_LENGTH];
+  char last_move_shown_uci[MAX_UCI_LENGTH];
   time_t created_at;
   time_t last_assignment_time;
   time_t last_move_time;
@@ -1743,6 +1745,7 @@ typedef union {
 typedef struct WambleBoard {
   char fen[FEN_MAX_LENGTH];
   char last_move_uci[MAX_UCI_LENGTH];
+  char last_move_shown_uci[MAX_UCI_LENGTH];
   Board board;
   uint64_t id;
   BoardState state;
@@ -2070,6 +2073,8 @@ void wamble_emit_record_game_result(uint64_t board_id, char winning_side,
                                     const char *termination_reason);
 void wamble_emit_update_board_move_meta(uint64_t board_id,
                                         const char *group_key);
+void wamble_emit_record_last_move_shown(uint64_t board_id, const uint8_t *token,
+                                        const char *shown_uci);
 void wamble_emit_update_board_reservation_meta(uint64_t board_id,
                                                time_t reservation_time,
                                                bool reserved_for_white);

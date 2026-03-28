@@ -45,6 +45,8 @@ int db_async_update_board(uint64_t board_id, const char *fen,
 int db_async_update_board_assignment_time(uint64_t board_id);
 int db_async_update_board_move_meta(uint64_t board_id,
                                     const char *last_mover_treatment_group);
+int db_async_record_last_move_shown(uint64_t board_id, uint64_t session_id,
+                                    const char *shown_uci);
 int db_async_update_board_reservation_meta(uint64_t board_id,
                                            time_t reservation_time,
                                            int reserved_for_white);
@@ -209,6 +211,7 @@ typedef enum {
   WAMBLE_INTENT_RESOLVE_PREDICTION = 15,
   WAMBLE_INTENT_UNLINK_SESSION_IDENTITY = 16,
   WAMBLE_INTENT_UPDATE_PLAYER_RATING = 17,
+  WAMBLE_INTENT_RECORD_LAST_MOVE_SHOWN = 18,
 } WambleIntentType;
 
 typedef struct WamblePersistenceIntent {
@@ -279,6 +282,11 @@ typedef struct WamblePersistenceIntent {
       uint64_t board_id;
       char last_mover_treatment_group[128];
     } update_board_move_meta;
+    struct {
+      uint64_t board_id;
+      uint8_t token[TOKEN_LENGTH];
+      char shown_uci[MAX_UCI_LENGTH];
+    } record_last_move_shown;
     struct {
       uint64_t board_id;
       time_t reservation_time;

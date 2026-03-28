@@ -2,8 +2,11 @@ Gameplay/View Treatment Surface
 ===============================
 
 Transport Rule
-- Gameplay/view runtime paths do not inject treatment outputs into outbound
-  protocol packets.
+- Gameplay/view runtime paths do not blindly inject arbitrary treatment outputs
+  into outbound protocol packets.
+- `view` outputs are interpreted by the runtime and may change outbound packet
+  content in narrowly defined ways (for example visible FEN, prediction source,
+  and last-move metadata).
 - `treatment-payload` outputs are server-side data only in gameplay/view
   runtime paths.
 
@@ -31,6 +34,37 @@ Conditional Fact Rules
   `get_player_by_token(token)` resolves.
 - Prediction count keys use board context when provided. Without board context,
   those keys are emitted with value `0`.
+
+Runtime View Outputs
+- `board.read` consumers understand:
+  - `board.fen` (`string`): replacement FEN for the outbound board packet.
+  - `last_move.type` (`string`): `off`, `factual`, `literal`, or `fact`.
+  - `last_move.max_age_ms` (`int`): server-side expiry window for last-move
+    visibility. `<= 0` means no expiry.
+  - `last_move.data.*` (`typed`): type-specific deterministic inputs.
+- `prediction.read` consumers understand:
+  - `prediction.source` (`string`): `tree` or `moves`.
+
+Last-Move Resolution Contract
+- Last-move view outputs are evaluated on `board.read`.
+- Default when no last-move output matches: `last_move.type = factual` with no
+  expiry.
+- Candidate display path resolution order:
+  - type-specific resolver from `last_move.type` + `last_move.data.*`
+  - fallback to factual `last_move.uci` when non-factual resolver fails
+  - otherwise no move-path metadata
+- `off` emits no move-path metadata.
+- `factual`, `literal`, and `fact` emit `last_move.from` and `last_move.to`
+  when the resolved source string parses to a valid coordinate move.
+- An expired move window or a missing/unparseable candidate path emits
+  no `last_move.*` fields.
+- The emitted move path is presentation metadata and is not guaranteed to be
+  the actual move played.
+- Persistence/audit stores emitted presentation explicitly:
+  - `board_last_move_shown_events`: append-only history of emitted shown paths
+    keyed by board and recipient session.
+  - latest shown is inferred from the newest event per board.
+  - Canonical move truth is reconstructed from `moves` history.
 
 Hook-to-Facts Mapping (Exhaustive)
 - `board.assignment`

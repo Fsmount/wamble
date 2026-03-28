@@ -658,7 +658,10 @@ static WambleBoard *load_board_into_cache(uint64_t board_id) {
       (br.created_at > 0) ? br.created_at : wamble_now_wall();
   board->last_assignment_time = br.last_assignment_time;
   board->last_move_time = br.last_move_time;
-  board->last_move_uci[0] = '\0';
+  snprintf(board->last_move_uci, sizeof(board->last_move_uci), "%s",
+           br.last_move_uci);
+  snprintf(board->last_move_shown_uci, sizeof(board->last_move_shown_uci), "%s",
+           br.last_move_shown_uci);
   snprintf(board->last_mover_treatment_group,
            sizeof(board->last_mover_treatment_group), "%s",
            br.last_mover_treatment_group);
@@ -759,8 +762,10 @@ void board_move_played(uint64_t board_id, const uint8_t *player_token,
       if (uci_move) {
         snprintf(board->last_move_uci, sizeof(board->last_move_uci), "%s",
                  uci_move);
+        board->last_move_shown_uci[0] = '\0';
       } else {
         board->last_move_uci[0] = '\0';
+        board->last_move_shown_uci[0] = '\0';
       }
       board->state = BOARD_STATE_ACTIVE;
       board->last_move_time = wamble_now_wall();
@@ -782,8 +787,10 @@ void board_move_played(uint64_t board_id, const uint8_t *player_token,
       if (uci_move) {
         snprintf(board->last_move_uci, sizeof(board->last_move_uci), "%s",
                  uci_move);
+        board->last_move_shown_uci[0] = '\0';
       } else {
         board->last_move_uci[0] = '\0';
+        board->last_move_shown_uci[0] = '\0';
       }
       board->last_move_time = wamble_now_wall();
       wamble_emit_update_board_move_meta(board->id,
@@ -1155,6 +1162,7 @@ static int create_new_board_for_player(WamblePlayer *player) {
   board->last_move_time = now;
   board->creation_time = now;
   board->last_move_uci[0] = '\0';
+  board->last_move_shown_uci[0] = '\0';
   board->last_mover_treatment_group[0] = '\0';
   memset(board->last_mover_token, 0, TOKEN_LENGTH);
 

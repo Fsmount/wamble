@@ -189,6 +189,14 @@ Tables
   - `timestamp TIMESTAMPTZ DEFAULT NOW()`
   - Indexes: `(board_id)`, `(session_id)`
 
+- board_last_move_shown_events
+  - `id BIGSERIAL PRIMARY KEY`
+  - `board_id BIGINT NOT NULL REFERENCES boards(id)`
+  - `session_id BIGINT NOT NULL REFERENCES sessions(id)`
+  - `shown_uci VARCHAR(6) NOT NULL`
+  - `emitted_at TIMESTAMPTZ DEFAULT NOW()`
+  - Indexes: `(board_id, emitted_at DESC)`, `(session_id, emitted_at DESC)`
+
 - reservations
   - `board_id BIGINT PRIMARY KEY REFERENCES boards(id)`
   - `session_id BIGINT NOT NULL REFERENCES sessions(id)`
@@ -258,6 +266,8 @@ Migrations
   `payouts.points_canonical` and backfills existing rows.
 - 015_global_identity_handles.sql: adds global opaque identity handles used by
   stats targeting.
+- 016_profile_last_move_shown.sql: adds append-only emitted shown history table
+  (`board_last_move_shown_events`) and indexes.
 
 Trust and Visibility
 - Client trust resolves from identity-scoped policy only, in deterministic
