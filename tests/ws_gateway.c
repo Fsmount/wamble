@@ -667,6 +667,134 @@ WAMBLE_TEST(ws_server_protocol_discovery_and_fragmented_tos_roundtrip) {
   return 0;
 }
 
+WAMBLE_TEST(ws_server_protocol_profile_terms_acceptance_roundtrip) {
+  const char *cfg_path = "build/test_ws_gateway_terms_accept.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 "
+                    "((def port 19452) (def advertise 1) "
+                    "(def websocket-enabled 1) "
+                    "(def websocket-path \"/ws\") "
+                    "(def tos-text \"profile terms v2\")))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'protocol.ctrl', 'client_hello', '*', 'allow', 0, "
+          "'hello_access', 'test'), "
+          "(0, 'protocol.ctrl', 'get_profile_info', '*', 'allow', 0, "
+          "'profile_info_access', 'test'), "
+          "(0, 'protocol.ctrl', 'get_profile_tos', '*', 'allow', 0, "
+          "'profile_tos_access', 'test'), "
+          "(0, 'protocol.ctrl', 'accept_profile_tos', '*', 'allow', 0, "
+          "'accept_profile_tos_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+
+  int port = 0;
+  T_ASSERT_EQ_INT(ws_start_gateway(&port), 0);
+  T_ASSERT_EQ_INT(ws_connect_and_upgrade(port), 0);
+
+  uint8_t packet[WAMBLE_MAX_PACKET_SIZE];
+  size_t packet_len = 0;
+  struct sockaddr_in cliaddr;
+  struct WambleMsg in = {0};
+  uint8_t opcode = 0;
+  uint8_t frame[WAMBLE_MAX_PACKET_SIZE * 2];
+  size_t frame_len = 0;
+  struct WambleMsg hello_out = {0};
+  uint8_t hello_out_flags = 0;
+  uint8_t client_token[TOKEN_LENGTH];
+
+  struct WambleMsg hello = {0};
+  hello.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  hello.header_version = WAMBLE_PROTO_VERSION;
+  T_ASSERT_EQ_INT(ws_send_msg(&hello, 0), 0);
+  T_ASSERT_EQ_INT(
+      ws_pop_packet_wait(packet, sizeof(packet), &packet_len, &cliaddr, 2000),
+      1);
+  T_ASSERT(receive_message_packet(packet, packet_len, &in, &cliaddr) > 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &in, &cliaddr, 0, "p1"), SERVER_OK);
+  ws_gateway_flush_outbound(g_test_gateway);
+
+  T_ASSERT_CLIENT_STATUS_OK(wamble_client_ws_recv_frame(
+      g_test_client, &opcode, frame, sizeof(frame), &frame_len));
+  T_ASSERT_EQ_INT(opcode, 0x2);
+  T_ASSERT_EQ_INT((int)wamble_packet_deserialize(frame, frame_len, &hello_out,
+                                                 &hello_out_flags),
+                  (int)NET_OK);
+  T_ASSERT_EQ_INT(hello_out.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+  memcpy(client_token, hello_out.token, TOKEN_LENGTH);
+
+  struct WambleMsg missing_info_req = {0};
+  missing_info_req.ctrl = WAMBLE_CTRL_GET_PROFILE_INFO;
+  missing_info_req.header_version = WAMBLE_PROTO_VERSION;
+  missing_info_req.seq_num = 1;
+  memcpy(missing_info_req.token, client_token, TOKEN_LENGTH);
+  memcpy(missing_info_req.profile_name, "missing", 7);
+  missing_info_req.profile_name_len = 7;
+  T_ASSERT_EQ_INT(ws_send_msg(&missing_info_req, 0), 0);
+  T_ASSERT_EQ_INT(
+      ws_pop_packet_wait(packet, sizeof(packet), &packet_len, &cliaddr, 2000),
+      1);
+  memset(&in, 0, sizeof(in));
+  T_ASSERT(receive_message_packet(packet, packet_len, &in, &cliaddr) > 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &in, &cliaddr, 0, "p1"), SERVER_OK);
+  ws_gateway_flush_outbound(g_test_gateway);
+
+  struct WambleMsg tos_req = {0};
+  tos_req.ctrl = WAMBLE_CTRL_GET_PROFILE_TOS;
+  tos_req.header_version = WAMBLE_PROTO_VERSION;
+  tos_req.seq_num = 2;
+  memcpy(tos_req.token, client_token, TOKEN_LENGTH);
+  memcpy(tos_req.profile_name, "p1", 2);
+  tos_req.profile_name_len = 2;
+  T_ASSERT_EQ_INT(ws_send_msg(&tos_req, 0), 0);
+  T_ASSERT_EQ_INT(
+      ws_pop_packet_wait(packet, sizeof(packet), &packet_len, &cliaddr, 2000),
+      1);
+  memset(&in, 0, sizeof(in));
+  T_ASSERT(receive_message_packet(packet, packet_len, &in, &cliaddr) > 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &in, &cliaddr, 0, "p1"), SERVER_OK);
+  ws_gateway_flush_outbound(g_test_gateway);
+
+  struct WambleMsg accept = {0};
+  accept.ctrl = WAMBLE_CTRL_ACCEPT_PROFILE_TOS;
+  accept.header_version = WAMBLE_PROTO_VERSION;
+  accept.seq_num = 3;
+  memcpy(accept.token, client_token, TOKEN_LENGTH);
+  memcpy(accept.profile_name, "p1", 2);
+  accept.profile_name_len = 2;
+  T_ASSERT_EQ_INT(ws_send_msg(&accept, 0), 0);
+  T_ASSERT_EQ_INT(
+      ws_pop_packet_wait(packet, sizeof(packet), &packet_len, &cliaddr, 2000),
+      1);
+  memset(&in, 0, sizeof(in));
+  T_ASSERT(receive_message_packet(packet, packet_len, &in, &cliaddr) > 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &in, &cliaddr, 0, "p1"), SERVER_OK);
+  ws_gateway_flush_outbound(g_test_gateway);
+
+  {
+    WambleProfileTermsAcceptance acceptance = {0};
+    T_ASSERT_EQ_INT(wamble_query_get_latest_profile_terms_acceptance(
+                        accept.token, "p1", &acceptance),
+                    DB_OK);
+    T_ASSERT_STREQ(acceptance.profile_name, "p1");
+    T_ASSERT(acceptance.tos_text != NULL);
+    T_ASSERT_STREQ(acceptance.tos_text, "profile terms v2");
+    wamble_profile_terms_acceptance_clear(&acceptance);
+  }
+
+  wamble_close_socket(srv);
+  return 0;
+}
+
 WAMBLE_TEST(ws_server_protocol_fragmented_profiles_list_roundtrip) {
   char cfg[16384];
   char expected[4096];
@@ -820,6 +948,9 @@ WAMBLE_TESTS_ADD_EX_SM(ws_outbound_batches_multiple_packets_per_frame,
 WAMBLE_TESTS_ADD_DB_EX_SM(
     ws_server_protocol_discovery_and_fragmented_tos_roundtrip,
     WAMBLE_SUITE_FUNCTIONAL, "ws_gateway", ws_test_setup, ws_test_teardown, 0);
+WAMBLE_TESTS_ADD_DB_EX_SM(ws_server_protocol_profile_terms_acceptance_roundtrip,
+                          WAMBLE_SUITE_FUNCTIONAL, "ws_gateway", ws_test_setup,
+                          ws_test_teardown, 0);
 WAMBLE_TESTS_ADD_DB_EX_SM(ws_server_protocol_fragmented_profiles_list_roundtrip,
                           WAMBLE_SUITE_FUNCTIONAL, "ws_gateway", ws_test_setup,
                           ws_test_teardown, 0);
