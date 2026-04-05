@@ -184,21 +184,21 @@ WAMBLE_TEST(client_identity_helpers_are_deterministic) {
 WAMBLE_TEST(client_locale_scaffold_works) {
   char out[64];
   T_ASSERT_STREQ(
-      wamble_client_locale_text(NULL, WAMBLE_CLIENT_TEXT_CREATE_SESSION),
-      "Create Session");
+      wamble_client_locale_text(NULL, WAMBLE_CLIENT_TEXT_ANONYMOUS),
+      "Anonymous");
   T_ASSERT_STREQ(
-      wamble_client_locale_text("en-US", WAMBLE_CLIENT_TEXT_SESSION_READY),
-      "session ready");
+      wamble_client_locale_text("en-US", WAMBLE_CLIENT_TEXT_CREATE_IDENTITY),
+      "Create Identity");
   T_ASSERT_STREQ(
-      wamble_client_locale_text("fr", WAMBLE_CLIENT_TEXT_PUBLIC_KEY_LABEL),
-      "Public Key");
+      wamble_client_locale_text("fr", WAMBLE_CLIENT_TEXT_BACK_TO_PLAY),
+      "Back to play");
   T_ASSERT_STATUS_OK(wamble_client_locale_write(
-      "en", WAMBLE_CLIENT_TEXT_MNEMONIC_LABEL, out, sizeof(out)));
-  T_ASSERT_STREQ(out, "Mnemonic");
+      "en", WAMBLE_CLIENT_TEXT_RESTORE_BUTTON, out, sizeof(out)));
+  T_ASSERT_STREQ(out, "Restore");
   T_ASSERT_STATUS_OK(wamble_client_locale_format(
-      "en", WAMBLE_CLIENT_TEXT_CONNECTED_TO, out, sizeof(out), "loopback"));
-  T_ASSERT_STREQ(out, "connected to loopback");
-  T_ASSERT(wamble_client_locale_write("en", WAMBLE_CLIENT_TEXT_CREATE_SESSION,
+      "en", WAMBLE_CLIENT_TEXT_SPECTATING, out, sizeof(out), "77"));
+  T_ASSERT_STREQ(out, "Spectating #77");
+  T_ASSERT(wamble_client_locale_write("en", WAMBLE_CLIENT_TEXT_ANONYMOUS,
                                       out, 4) != 0);
   return 0;
 }
