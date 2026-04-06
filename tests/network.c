@@ -3826,7 +3826,9 @@ WAMBLE_TEST(server_protocol_get_active_reservations_db_failure_is_internal) {
   T_ASSERT_EQ_INT(join_status, 0);
   T_ASSERT_EQ_INT(restore_status, 0);
   T_ASSERT_EQ_INT(handle_status, SERVER_ERR_INTERNAL);
-  T_ASSERT_EQ_INT(rx_received, 0);
+  T_ASSERT_EQ_INT(rx_received, 1);
+  T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_ERROR);
+  T_ASSERT_EQ_INT(rx.msg.error_code, WAMBLE_ERR_RESERVATIONS_FAILED);
 
   wamble_close_socket(cli);
   wamble_close_socket(srv);
