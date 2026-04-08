@@ -2983,6 +2983,11 @@ WAMBLE_TEST(server_protocol_player_stats_scope_context_is_ignored) {
     self_req.ctrl = WAMBLE_CTRL_GET_PLAYER_STATS;
     self_req.header_version = WAMBLE_PROTO_VERSION;
     memcpy(self_req.token, rx_hello.msg.token, TOKEN_LENGTH);
+    self_req.ext_count = 1;
+    snprintf(self_req.ext[0].key, sizeof(self_req.ext[0].key), "%s",
+             "stats.request_id");
+    self_req.ext[0].value_type = WAMBLE_TREATMENT_VALUE_INT;
+    self_req.ext[0].int_value = 41;
 
     RecvOneCtx rx_self = {.sock = cli};
     wamble_thread_t th_self;
@@ -2994,6 +2999,12 @@ WAMBLE_TEST(server_protocol_player_stats_scope_context_is_ignored) {
     T_ASSERT_EQ_INT(rx_self.received, 1);
     T_ASSERT_EQ_INT(rx_self.msg.ctrl, WAMBLE_CTRL_ERROR);
     T_ASSERT_EQ_INT(rx_self.msg.error_code, WAMBLE_ERR_ACCESS_DENIED);
+    {
+      const WambleMessageExtField *request_id =
+          find_ext_field(&rx_self.msg, "stats.request_id");
+      T_ASSERT(request_id != NULL);
+      T_ASSERT_EQ_INT((int)request_id->int_value, 41);
+    }
   }
 
   {
@@ -3001,11 +3012,15 @@ WAMBLE_TEST(server_protocol_player_stats_scope_context_is_ignored) {
     target_req.ctrl = WAMBLE_CTRL_GET_PLAYER_STATS;
     target_req.header_version = WAMBLE_PROTO_VERSION;
     memcpy(target_req.token, rx_hello.msg.token, TOKEN_LENGTH);
-    target_req.ext_count = 1;
+    target_req.ext_count = 2;
     snprintf(target_req.ext[0].key, sizeof(target_req.ext[0].key), "%s",
-             "stats.target_session_id");
+             "stats.request_id");
     target_req.ext[0].value_type = WAMBLE_TREATMENT_VALUE_INT;
-    target_req.ext[0].int_value = (int64_t)target_session_id;
+    target_req.ext[0].int_value = 42;
+    snprintf(target_req.ext[1].key, sizeof(target_req.ext[1].key), "%s",
+             "stats.target_session_id");
+    target_req.ext[1].value_type = WAMBLE_TREATMENT_VALUE_INT;
+    target_req.ext[1].int_value = (int64_t)target_session_id;
 
     RecvOneCtx rx_target = {.sock = cli};
     wamble_thread_t th_target;
@@ -3017,6 +3032,12 @@ WAMBLE_TEST(server_protocol_player_stats_scope_context_is_ignored) {
     T_ASSERT_EQ_INT(rx_target.received, 1);
     T_ASSERT_EQ_INT(rx_target.msg.ctrl, WAMBLE_CTRL_ERROR);
     T_ASSERT_EQ_INT(rx_target.msg.error_code, WAMBLE_ERR_ACCESS_DENIED);
+    {
+      const WambleMessageExtField *request_id =
+          find_ext_field(&rx_target.msg, "stats.request_id");
+      T_ASSERT(request_id != NULL);
+      T_ASSERT_EQ_INT((int)request_id->int_value, 42);
+    }
   }
 
   wamble_close_socket(cli);
@@ -3430,11 +3451,14 @@ WAMBLE_TEST(server_protocol_player_stats_target_handle_with_tag_policy) {
     req.ctrl = WAMBLE_CTRL_GET_PLAYER_STATS;
     req.header_version = WAMBLE_PROTO_VERSION;
     memcpy(req.token, rx_hello.msg.token, TOKEN_LENGTH);
-    req.ext_count = 1;
-    snprintf(req.ext[0].key, sizeof(req.ext[0].key), "%s",
+    req.ext_count = 2;
+    snprintf(req.ext[0].key, sizeof(req.ext[0].key), "%s", "stats.request_id");
+    req.ext[0].value_type = WAMBLE_TREATMENT_VALUE_INT;
+    req.ext[0].int_value = 77;
+    snprintf(req.ext[1].key, sizeof(req.ext[1].key), "%s",
              "stats.target_handle");
-    req.ext[0].value_type = WAMBLE_TREATMENT_VALUE_STRING;
-    snprintf(req.ext[0].string_value, sizeof(req.ext[0].string_value), "%s",
+    req.ext[1].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+    snprintf(req.ext[1].string_value, sizeof(req.ext[1].string_value), "%s",
              target_handle);
 
     RecvOneCtx rx = {.sock = cli};
@@ -3461,6 +3485,12 @@ WAMBLE_TEST(server_protocol_player_stats_target_handle_with_tag_policy) {
       T_ASSERT_EQ_INT((int)rx.msg.player_stats_games_played, expected_games);
       T_ASSERT_EQ_INT((int)rx.msg.player_stats_chess960_games_played,
                       expected_960_games);
+    }
+    {
+      const WambleMessageExtField *request_id =
+          find_ext_field(&rx.msg, "stats.request_id");
+      T_ASSERT(request_id != NULL);
+      T_ASSERT_EQ_INT((int)request_id->int_value, 77);
     }
     {
       uint64_t target_session_id = 0;

@@ -70,6 +70,7 @@ static const WambleClientLocaleCatalog locale_catalogs[] = {{
         "Back to play",
         "Can't spectate",
         "Loading games...",
+        "No entries yet",
         "No games available for this filter",
         "Illegal move",
         "Moves are disabled",
