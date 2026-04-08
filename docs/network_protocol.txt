@@ -275,13 +275,15 @@ Control Codes
 - `0x12` GET_PLAYER_STATS (client to server): Request player statistics.
   - Payload: empty.
   - Optional extension fields:
+    - `stats.request_id` (`int`): client-generated correlation id echoed by
+      `PLAYER_STATS_DATA` and stats-domain `ERROR` responses.
     - `stats.target_session_id` (`int`): read stats for a specific session id.
     - `stats.target_handle` (`string`): read stats for a persistent identity via global opaque handle.
     - `stats.target_public_key` (`string`): rejected (`ACCESS_DENIED`).
 - `0x13` PLAYER_STATS_DATA (server to client): Player statistics.
   - Payload: `double score_be; uint32 games_played_be; uint32 chess960_games_played_be`.
   - Note: Rating is tracked separately from score; this payload carries score and game counters.
-  - Extension fields include `stats.target_session_id` and
+  - Extension fields include `stats.request_id`, `stats.target_session_id` and
     `stats.target_has_identity` (`0|1`), `stats.target_handle` (`string`).
 - `0x14` GET_PROFILE_INFO (client to server): Request info for a specific profile.
   - Payload: `uint8 name_len; char name[name_len]`.

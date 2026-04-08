@@ -183,9 +183,8 @@ WAMBLE_TEST(client_identity_helpers_are_deterministic) {
 
 WAMBLE_TEST(client_locale_scaffold_works) {
   char out[64];
-  T_ASSERT_STREQ(
-      wamble_client_locale_text(NULL, WAMBLE_CLIENT_TEXT_ANONYMOUS),
-      "Anonymous");
+  T_ASSERT_STREQ(wamble_client_locale_text(NULL, WAMBLE_CLIENT_TEXT_ANONYMOUS),
+                 "Anonymous");
   T_ASSERT_STREQ(
       wamble_client_locale_text("en-US", WAMBLE_CLIENT_TEXT_CREATE_IDENTITY),
       "Create Identity");
@@ -198,8 +197,8 @@ WAMBLE_TEST(client_locale_scaffold_works) {
   T_ASSERT_STATUS_OK(wamble_client_locale_format(
       "en", WAMBLE_CLIENT_TEXT_SPECTATING, out, sizeof(out), "77"));
   T_ASSERT_STREQ(out, "Spectating #77");
-  T_ASSERT(wamble_client_locale_write("en", WAMBLE_CLIENT_TEXT_ANONYMOUS,
-                                      out, 4) != 0);
+  T_ASSERT(wamble_client_locale_write("en", WAMBLE_CLIENT_TEXT_ANONYMOUS, out,
+                                      4) != 0);
   return 0;
 }
 
