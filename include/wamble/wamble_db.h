@@ -82,7 +82,8 @@ int db_async_record_payout_with_canonical(uint64_t board_id,
 int db_async_update_player_rating(uint64_t session_id, double rating);
 
 DbLeaderboardResult db_get_leaderboard(uint64_t requester_session_id,
-                                       uint8_t leaderboard_type, int limit);
+                                       uint8_t leaderboard_type, int limit,
+                                       int offset);
 
 void db_expire_reservations(void);
 
@@ -165,7 +166,8 @@ typedef struct WambleQueryService {
   DbStatus (*get_persistent_player_stats)(
       const uint8_t *public_key, WamblePersistentPlayerStats *out_stats);
   DbLeaderboardResult (*get_leaderboard)(uint64_t requester_session_id,
-                                         uint8_t leaderboard_type, int limit);
+                                         uint8_t leaderboard_type, int limit,
+                                         int offset);
   DbMovesResult (*get_moves_for_board)(uint64_t board_id);
   DbPredictionsResult (*get_pending_predictions)(void);
   DbStatus (*create_prediction)(uint64_t board_id, uint64_t session_id,

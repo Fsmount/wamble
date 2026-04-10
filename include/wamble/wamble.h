@@ -1056,6 +1056,7 @@ static inline void wamble_log(int level, const char *file, int line,
 #define WAMBLE_LOGIN_SIGNATURE_LENGTH 64
 #define WAMBLE_LOGIN_CHALLENGE_LENGTH 32
 #define WAMBLE_MAX_PAYLOAD 1200
+#define WAMBLE_MESSAGE_EXT_STRING_MAX 256
 #define WAMBLE_HEADER_WIRE_SIZE (1 + 1 + 1 + 1 + TOKEN_LENGTH + 8 + 4 + 2)
 #define WAMBLE_MAX_PACKET_SIZE (WAMBLE_HEADER_WIRE_SIZE + WAMBLE_MAX_PAYLOAD)
 #define WAMBLE_FRAGMENT_HASH_LENGTH 32
@@ -1144,6 +1145,7 @@ typedef struct {
   uint32_t games_played;
   uint8_t has_identity;
   uint8_t public_key[WAMBLE_PUBLIC_KEY_LENGTH];
+  char *handle;
 } DbLeaderboardEntry;
 
 typedef struct {
@@ -1151,6 +1153,9 @@ typedef struct {
   const DbLeaderboardEntry *rows;
   int count;
   uint32_t self_rank;
+  int self_in_rows;
+  DbLeaderboardEntry self;
+  uint32_t total_count;
 } DbLeaderboardResult;
 
 typedef struct {
@@ -1384,9 +1389,8 @@ static inline size_t wamble_build_login_signature_message(
 #define WAMBLE_MAX_LEGAL_MOVES 218
 #define WAMBLE_MAX_LEADERBOARD_ENTRIES 16
 #define WAMBLE_MAX_PREDICTION_ENTRIES 16
-#define WAMBLE_MAX_MESSAGE_EXT_FIELDS 8
+#define WAMBLE_MAX_MESSAGE_EXT_FIELDS 12
 #define WAMBLE_MESSAGE_EXT_KEY_MAX 64
-#define WAMBLE_MESSAGE_EXT_STRING_MAX 256
 #define WAMBLE_PROFILE_UI_CAP_JOIN 0x00000001u
 #define WAMBLE_PROFILE_UI_CAP_TOS 0x00000002u
 #define WAMBLE_SESSION_UI_CAP_ATTACH_IDENTITY 0x00000001u
@@ -1427,6 +1431,7 @@ typedef struct {
   uint32_t games_played;
   uint8_t has_identity;
   uint8_t public_key[WAMBLE_PUBLIC_KEY_LENGTH];
+  char *handle;
 } WambleLeaderboardEntry;
 
 typedef struct {
@@ -1507,6 +1512,38 @@ struct WambleMsg {
   uint8_t ext_count;
   WambleMessageExtField ext[WAMBLE_MAX_MESSAGE_EXT_FIELDS];
 };
+
+static inline void
+wamble_leaderboard_entry_release(WambleLeaderboardEntry *entry) {
+  if (!entry)
+    return;
+  free(entry->handle);
+  entry->handle = NULL;
+}
+
+static inline int
+wamble_leaderboard_entry_set_handle(WambleLeaderboardEntry *entry,
+                                    const char *handle) {
+  char *dup = NULL;
+  if (!entry)
+    return -1;
+  if (handle && handle[0]) {
+    dup = wamble_strdup(handle);
+    if (!dup)
+      return -1;
+  }
+  free(entry->handle);
+  entry->handle = dup;
+  return 0;
+}
+
+static inline void wamble_msg_release_dynamic(struct WambleMsg *msg) {
+  if (!msg)
+    return;
+  for (int i = 0; i < WAMBLE_MAX_LEADERBOARD_ENTRIES; i++) {
+    wamble_leaderboard_entry_release(&msg->leaderboard[i]);
+  }
+}
 
 static inline int ctrl_supports_fragment_payload(uint8_t ctrl) {
   switch (ctrl) {
@@ -2181,7 +2218,7 @@ DbStatus wamble_query_get_persistent_player_stats(
     const uint8_t *public_key, WamblePersistentPlayerStats *out_stats);
 DbLeaderboardResult wamble_query_get_leaderboard(uint64_t requester_session_id,
                                                  uint8_t leaderboard_type,
-                                                 int limit);
+                                                 int limit, int offset);
 DbStatus
 wamble_query_get_session_treatment_assignment(const uint8_t *token,
                                               WambleTreatmentAssignment *out);

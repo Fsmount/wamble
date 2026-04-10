@@ -54,6 +54,8 @@ static DbStatus db_get_identity_tags_csv(uint64_t global_identity_id,
 static DbStatus db_get_identity_handle(uint64_t global_identity_id,
                                        char *out_handle,
                                        size_t out_handle_size);
+static DbStatus db_get_identity_handle_alloc(uint64_t global_identity_id,
+                                             char **out_handle);
 static DbStatus db_get_global_identity_id_by_handle(const char *handle,
                                                     uint64_t *out_identity_id);
 static DbStatus db_get_session_public_key(uint64_t session_id,
@@ -2703,11 +2705,12 @@ DbStatus wamble_query_get_persistent_player_stats(
 
 DbLeaderboardResult wamble_query_get_leaderboard(uint64_t requester_session_id,
                                                  uint8_t leaderboard_type,
-                                                 int limit) {
+                                                 int limit, int offset) {
   const WambleQueryService *qs = get_query_service();
   if (!qs || !qs->get_leaderboard)
     return query_leaderboard_error();
-  return qs->get_leaderboard(requester_session_id, leaderboard_type, limit);
+  return qs->get_leaderboard(requester_session_id, leaderboard_type, limit,
+                             offset);
 }
 
 DbStatus
@@ -4350,12 +4353,11 @@ static DbStatus db_get_identity_tags_csv(uint64_t global_identity_id,
   return DB_OK;
 }
 
-static DbStatus db_get_identity_handle(uint64_t global_identity_id,
-                                       char *out_handle,
-                                       size_t out_handle_size) {
-  if (!out_handle || out_handle_size == 0 || global_identity_id == 0)
+static DbStatus db_get_identity_handle_alloc(uint64_t global_identity_id,
+                                             char **out_handle) {
+  if (!out_handle || global_identity_id == 0)
     return DB_ERR_BAD_DATA;
-  out_handle[0] = '\0';
+  *out_handle = NULL;
   if (db_ensure_global_identity_handle_schema() != 0)
     return DB_ERR_EXEC;
 
@@ -4374,9 +4376,9 @@ static DbStatus db_get_identity_handle(uint64_t global_identity_id,
     return DB_ERR_EXEC;
   }
   if (PQntuples(res) > 0) {
-    snprintf(out_handle, out_handle_size, "%s", PQgetvalue(res, 0, 0));
+    *out_handle = wamble_strdup(PQgetvalue(res, 0, 0));
     PQclear(res);
-    return DB_OK;
+    return *out_handle ? DB_OK : DB_ERR_EXEC;
   }
   PQclear(res);
 
@@ -4420,13 +4422,29 @@ static DbStatus db_get_identity_handle(uint64_t global_identity_id,
       return DB_ERR_EXEC;
     }
     if (PQntuples(res) > 0) {
-      snprintf(out_handle, out_handle_size, "%s", PQgetvalue(res, 0, 0));
+      *out_handle = wamble_strdup(PQgetvalue(res, 0, 0));
       PQclear(res);
-      return DB_OK;
+      return *out_handle ? DB_OK : DB_ERR_EXEC;
     }
     PQclear(res);
   }
   return DB_ERR_EXEC;
+}
+
+static DbStatus db_get_identity_handle(uint64_t global_identity_id,
+                                       char *out_handle,
+                                       size_t out_handle_size) {
+  char *allocated = NULL;
+  DbStatus st;
+  if (!out_handle || out_handle_size == 0 || global_identity_id == 0)
+    return DB_ERR_BAD_DATA;
+  out_handle[0] = '\0';
+  st = db_get_identity_handle_alloc(global_identity_id, &allocated);
+  if (st != DB_OK)
+    return st;
+  snprintf(out_handle, out_handle_size, "%s", allocated ? allocated : "");
+  free(allocated);
+  return DB_OK;
 }
 
 static DbStatus db_get_global_identity_id_by_handle(const char *handle,
@@ -4759,10 +4777,18 @@ db_get_persistent_player_stats(const uint8_t *public_key,
 }
 
 DbLeaderboardResult db_get_leaderboard(uint64_t requester_session_id,
-                                       uint8_t leaderboard_type, int limit) {
+                                       uint8_t leaderboard_type, int limit,
+                                       int offset) {
   static WAMBLE_THREAD_LOCAL DbLeaderboardEntry
       rows[WAMBLE_MAX_LEADERBOARD_ENTRIES];
+  static WAMBLE_THREAD_LOCAL char *self_handle;
   DbLeaderboardResult out = {0};
+  for (int i = 0; i < WAMBLE_MAX_LEADERBOARD_ENTRIES; i++) {
+    free(rows[i].handle);
+    rows[i].handle = NULL;
+  }
+  free(self_handle);
+  self_handle = NULL;
   out.status = DB_ERR_EXEC;
   out.rows = rows;
   out.count = 0;
@@ -4773,24 +4799,36 @@ DbLeaderboardResult db_get_leaderboard(uint64_t requester_session_id,
     effective_limit = 10;
   if (effective_limit > WAMBLE_MAX_LEADERBOARD_ENTRIES)
     effective_limit = WAMBLE_MAX_LEADERBOARD_ENTRIES;
+  int effective_offset = offset;
+  if (effective_offset < 0)
+    effective_offset = 0;
 
   uint8_t effective_type = leaderboard_type;
   if (effective_type != WAMBLE_LEADERBOARD_RATING)
     effective_type = WAMBLE_LEADERBOARD_SCORE;
+  if (db_ensure_global_identity_handle_schema() != 0) {
+    out.status = DB_ERR_EXEC;
+    return out;
+  }
 
   char limit_str[16];
+  char offset_str[16];
   snprintf(limit_str, sizeof(limit_str), "%d", effective_limit);
+  snprintf(offset_str, sizeof(offset_str), "%d", effective_offset);
   const char *top_query = NULL;
   const char *rank_query = NULL;
   if (effective_type == WAMBLE_LEADERBOARD_RATING) {
     top_query =
         "SELECT s.id, s.total_score, COALESCE(p.rating, 0), s.games_played, "
         "CASE WHEN p.public_key IS NULL THEN '' ELSE ENCODE(p.public_key, "
-        "'hex') END "
+        "'hex') END, "
+        "COALESCE(gh.handle, '') "
         "FROM sessions s "
         "LEFT JOIN players p ON p.id = s.player_id "
+        "LEFT JOIN global_identity_handles gh "
+        "ON gh.global_identity_id = s.global_identity_id "
         "ORDER BY COALESCE(p.rating, 0) DESC, s.total_score DESC, s.id ASC "
-        "LIMIT $1";
+        "LIMIT $1 OFFSET $2";
     rank_query =
         "SELECT rank_pos FROM ("
         "  SELECT s.id, ROW_NUMBER() OVER ("
@@ -4803,11 +4841,14 @@ DbLeaderboardResult db_get_leaderboard(uint64_t requester_session_id,
     top_query =
         "SELECT s.id, s.total_score, COALESCE(p.rating, 0), s.games_played, "
         "CASE WHEN p.public_key IS NULL THEN '' ELSE ENCODE(p.public_key, "
-        "'hex') END "
+        "'hex') END, "
+        "COALESCE(gh.handle, '') "
         "FROM sessions s "
         "LEFT JOIN players p ON p.id = s.player_id "
+        "LEFT JOIN global_identity_handles gh "
+        "ON gh.global_identity_id = s.global_identity_id "
         "ORDER BY s.total_score DESC, COALESCE(p.rating, 0) DESC, s.id ASC "
-        "LIMIT $1";
+        "LIMIT $1 OFFSET $2";
     rank_query =
         "SELECT rank_pos FROM ("
         "  SELECT s.id, ROW_NUMBER() OVER ("
@@ -4817,9 +4858,9 @@ DbLeaderboardResult db_get_leaderboard(uint64_t requester_session_id,
         "  LEFT JOIN players p ON p.id = s.player_id"
         ") ranked WHERE id = $1";
   }
-  const char *top_params[] = {limit_str};
+  const char *top_params[] = {limit_str, offset_str};
   PGresult *res =
-      pq_exec_params_locked(top_query, 1, NULL, top_params, NULL, NULL, 0);
+      pq_exec_params_locked(top_query, 2, NULL, top_params, NULL, NULL, 0);
   if (!res) {
     out.status = DB_ERR_CONN;
     return out;
@@ -4834,13 +4875,14 @@ DbLeaderboardResult db_get_leaderboard(uint64_t requester_session_id,
   if (n > WAMBLE_MAX_LEADERBOARD_ENTRIES)
     n = WAMBLE_MAX_LEADERBOARD_ENTRIES;
   for (int i = 0; i < n; i++) {
-    rows[i].rank = (uint32_t)(i + 1);
+    rows[i].rank = (uint32_t)(effective_offset + i + 1);
     rows[i].session_id = strtoull(PQgetvalue(res, i, 0), NULL, 10);
     rows[i].score = strtod(PQgetvalue(res, i, 1), NULL);
     rows[i].rating = strtod(PQgetvalue(res, i, 2), NULL);
     rows[i].games_played = (uint32_t)strtoul(PQgetvalue(res, i, 3), NULL, 10);
     rows[i].has_identity = 0;
     memset(rows[i].public_key, 0, WAMBLE_PUBLIC_KEY_LENGTH);
+    rows[i].handle = NULL;
     {
       const char *pub_hex = PQgetvalue(res, i, 4);
       if (pub_hex && pub_hex[0]) {
@@ -4848,11 +4890,48 @@ DbLeaderboardResult db_get_leaderboard(uint64_t requester_session_id,
         rows[i].has_identity = 1;
       }
     }
+    if (rows[i].has_identity) {
+      const char *handle = PQgetvalue(res, i, 5);
+      if (handle && handle[0])
+        rows[i].handle = wamble_strdup(handle);
+    }
   }
   out.count = n;
   PQclear(res);
 
+  out.self_in_rows = 0;
   if (requester_session_id > 0) {
+    for (int i = 0; i < out.count; i++) {
+      if (rows[i].session_id == requester_session_id) {
+        out.self_in_rows = 1;
+        out.self = rows[i];
+        out.self_rank = rows[i].rank;
+        break;
+      }
+    }
+  }
+
+  if (n < effective_limit) {
+    out.total_count = (uint32_t)(effective_offset + n);
+  } else {
+    PGresult *cnt_res = pq_exec_params_locked("SELECT COUNT(*) FROM sessions",
+                                              0, NULL, NULL, NULL, NULL, 0);
+    if (!cnt_res) {
+      out.status = DB_ERR_CONN;
+      return out;
+    }
+    if (PQresultStatus(cnt_res) != PGRES_TUPLES_OK) {
+      PQclear(cnt_res);
+      out.status = DB_ERR_EXEC;
+      return out;
+    }
+    if (PQntuples(cnt_res) > 0) {
+      out.total_count = (uint32_t)strtoul(PQgetvalue(cnt_res, 0, 0), NULL, 10);
+    }
+    PQclear(cnt_res);
+  }
+
+  if (!out.self_in_rows && requester_session_id > 0) {
     char sid_str[32];
     snprintf(sid_str, sizeof(sid_str), "%" PRIu64, requester_session_id);
     const char *rank_params[] = {sid_str};
@@ -4871,6 +4950,49 @@ DbLeaderboardResult db_get_leaderboard(uint64_t requester_session_id,
       out.self_rank = (uint32_t)strtoul(PQgetvalue(rank_res, 0, 0), NULL, 10);
     }
     PQclear(rank_res);
+  }
+  if (!out.self_in_rows && requester_session_id > 0 && out.self_rank > 0) {
+    char sid_str[32];
+    snprintf(sid_str, sizeof(sid_str), "%" PRIu64, requester_session_id);
+    const char *self_params[] = {sid_str};
+    const char *self_query =
+        "SELECT s.id, s.total_score, COALESCE(p.rating, 0), s.games_played, "
+        "CASE WHEN p.public_key IS NULL THEN '' ELSE ENCODE(p.public_key, "
+        "'hex') END, COALESCE(gh.handle, '') "
+        "FROM sessions s LEFT JOIN players p ON p.id = s.player_id "
+        "LEFT JOIN global_identity_handles gh "
+        "ON gh.global_identity_id = s.global_identity_id "
+        "WHERE s.id = $1";
+    PGresult *self_res =
+        pq_exec_params_locked(self_query, 1, NULL, self_params, NULL, NULL, 0);
+    if (!self_res) {
+      out.status = DB_ERR_CONN;
+      return out;
+    }
+    if (PQresultStatus(self_res) != PGRES_TUPLES_OK) {
+      PQclear(self_res);
+      out.status = DB_ERR_EXEC;
+      return out;
+    }
+    if (PQntuples(self_res) > 0) {
+      DbLeaderboardEntry *e = &out.self;
+      memset(e, 0, sizeof(*e));
+      e->rank = out.self_rank;
+      e->session_id = strtoull(PQgetvalue(self_res, 0, 0), NULL, 10);
+      e->score = strtod(PQgetvalue(self_res, 0, 1), NULL);
+      e->rating = strtod(PQgetvalue(self_res, 0, 2), NULL);
+      e->games_played = (uint32_t)strtoul(PQgetvalue(self_res, 0, 3), NULL, 10);
+      e->handle = NULL;
+      const char *pub_hex = PQgetvalue(self_res, 0, 4);
+      if (pub_hex && pub_hex[0]) {
+        hex_to_bytes(pub_hex, e->public_key, WAMBLE_PUBLIC_KEY_LENGTH);
+        e->has_identity = 1;
+        if (PQgetvalue(self_res, 0, 5)[0])
+          self_handle = wamble_strdup(PQgetvalue(self_res, 0, 5));
+        e->handle = self_handle;
+      }
+    }
+    PQclear(self_res);
   }
 
   out.status = DB_OK;
