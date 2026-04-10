@@ -31,8 +31,8 @@ typedef struct WambleHeader {
 #define WAMBLE_HEADER_SIZE (sizeof(WambleHeader))
 #define WAMBLE_PREDICTION_ENTRY_WIRE_SIZE                                      \
   (8 + 8 + TOKEN_LENGTH + 8 + 2 + 1 + 1 + 1 + MAX_UCI_LENGTH)
-#define WAMBLE_LEADERBOARD_ENTRY_WIRE_SIZE                                     \
-  (4 + 8 + 8 + 8 + 4 + 1 + WAMBLE_PUBLIC_KEY_LENGTH)
+#define WAMBLE_LEADERBOARD_ENTRY_WIRE_BASE_SIZE                                \
+  (4 + 8 + 8 + 8 + 4 + 1 + WAMBLE_PUBLIC_KEY_LENGTH + 2)
 #define WAMBLE_EXT_MAGIC_0 0x57
 #define WAMBLE_EXT_MAGIC_1 0x58
 #define WAMBLE_EXT_VERSION 1
@@ -244,6 +244,23 @@ static NetworkStatus decode_msg_extensions(const uint8_t *payload,
   msg->ext_count = parsed;
   *out_base_len = body_start;
   return NET_OK;
+}
+
+int wamble_client_payload_decode_extensions(const uint8_t *payload,
+                                            size_t payload_len,
+                                            struct WambleMsg *msg_out,
+                                            size_t *base_len) {
+  if (!payload || !msg_out || !base_len)
+    return -1;
+  msg_out->ext_count = 0;
+  *base_len = payload_len;
+  if (payload_len < 4 || payload[payload_len - 4] != WAMBLE_EXT_MAGIC_0 ||
+      payload[payload_len - 3] != WAMBLE_EXT_MAGIC_1) {
+    return 1;
+  }
+  NetworkStatus status =
+      decode_msg_extensions(payload, payload_len, msg_out, base_len);
+  return status == NET_OK ? 0 : -1;
 }
 
 static NetworkStatus encode_fragment_payload(const struct WambleMsg *msg,
@@ -459,6 +476,7 @@ NetworkStatus wamble_payload_serialize(const struct WambleMsg *msg,
   }
   case WAMBLE_CTRL_SERVER_HELLO:
   case WAMBLE_CTRL_BOARD_UPDATE:
+  case WAMBLE_CTRL_LOGIN_SUCCESS:
   case WAMBLE_CTRL_SPECTATE_UPDATE: {
     size_t len = strnlen(msg->fen, FEN_MAX_LENGTH);
     if (len > payload_capacity)
@@ -595,8 +613,18 @@ NetworkStatus wamble_payload_serialize(const struct WambleMsg *msg,
     uint8_t count = msg->leaderboard_count;
     if (count > WAMBLE_MAX_LEADERBOARD_ENTRIES)
       return NET_ERR_INVALID;
-    size_t need =
-        1 + 1 + 4 + (size_t)count * WAMBLE_LEADERBOARD_ENTRY_WIRE_SIZE;
+    size_t need = 1 + 1 + 4;
+    for (uint8_t i = 0; i < count; i++) {
+      size_t handle_len =
+          msg->leaderboard[i].handle ? strlen(msg->leaderboard[i].handle) : 0;
+      if (handle_len > UINT16_MAX)
+        return NET_ERR_INVALID;
+      if (need >
+          SIZE_MAX - WAMBLE_LEADERBOARD_ENTRY_WIRE_BASE_SIZE - handle_len) {
+        return NET_ERR_TRUNCATED;
+      }
+      need += WAMBLE_LEADERBOARD_ENTRY_WIRE_BASE_SIZE + handle_len;
+    }
     if (need > payload_capacity)
       return NET_ERR_TRUNCATED;
     payload[0] = msg->leaderboard_type ? msg->leaderboard_type
@@ -631,6 +659,16 @@ NetworkStatus wamble_payload_serialize(const struct WambleMsg *msg,
       payload[offset++] = e->has_identity ? 1 : 0;
       memcpy(payload + offset, e->public_key, WAMBLE_PUBLIC_KEY_LENGTH);
       offset += WAMBLE_PUBLIC_KEY_LENGTH;
+      {
+        size_t handle_len = e->handle ? strlen(e->handle) : 0;
+        uint16_t handle_len_be = htons((uint16_t)handle_len);
+        memcpy(payload + offset, &handle_len_be, 2);
+        offset += 2;
+        if (handle_len) {
+          memcpy(payload + offset, e->handle, handle_len);
+          offset += handle_len;
+        }
+      }
     }
     body_len = need;
     break;
@@ -794,6 +832,7 @@ static NetworkStatus decode_message_payload(uint8_t ctrl, uint8_t flags,
     break;
   case WAMBLE_CTRL_SERVER_HELLO:
   case WAMBLE_CTRL_BOARD_UPDATE:
+  case WAMBLE_CTRL_LOGIN_SUCCESS:
   case WAMBLE_CTRL_SPECTATE_UPDATE:
   case WAMBLE_CTRL_ERROR:
     if (ctrl == WAMBLE_CTRL_ERROR) {
@@ -956,10 +995,6 @@ static NetworkStatus decode_message_payload(uint8_t ctrl, uint8_t flags,
     msg->leaderboard_count = payload[1];
     if (msg->leaderboard_count > WAMBLE_MAX_LEADERBOARD_ENTRIES)
       return NET_ERR_INVALID;
-    if (payload_len <
-        1 + 1 + 4 +
-            (size_t)msg->leaderboard_count * WAMBLE_LEADERBOARD_ENTRY_WIRE_SIZE)
-      return NET_ERR_TRUNCATED;
     {
       uint32_t self_rank_be = 0;
       memcpy(&self_rank_be, payload + 2, 4);
@@ -974,6 +1009,10 @@ static NetworkStatus decode_message_payload(uint8_t ctrl, uint8_t flags,
         uint64_t score_be = 0;
         uint64_t rating_be = 0;
         uint32_t games_be = 0;
+        uint16_t handle_len_be = 0;
+        size_t raw_handle_len = 0;
+        if (payload_len - offset < WAMBLE_LEADERBOARD_ENTRY_WIRE_BASE_SIZE)
+          return NET_ERR_TRUNCATED;
         memcpy(&rank_be, payload + offset, 4);
         offset += 4;
         memcpy(&sid_be, payload + offset, 8);
@@ -987,6 +1026,22 @@ static NetworkStatus decode_message_payload(uint8_t ctrl, uint8_t flags,
         e->has_identity = payload[offset++];
         memcpy(e->public_key, payload + offset, WAMBLE_PUBLIC_KEY_LENGTH);
         offset += WAMBLE_PUBLIC_KEY_LENGTH;
+        memcpy(&handle_len_be, payload + offset, 2);
+        offset += 2;
+        raw_handle_len = (size_t)ntohs(handle_len_be);
+        if (raw_handle_len > payload_len - offset)
+          return NET_ERR_TRUNCATED;
+        if (raw_handle_len > 0) {
+          char *handle = (char *)malloc(raw_handle_len + 1);
+          if (!handle)
+            return NET_ERR_IO;
+          memcpy(handle, payload + offset, raw_handle_len);
+          handle[raw_handle_len] = '\0';
+          e->handle = handle;
+        } else {
+          e->handle = NULL;
+        }
+        offset += raw_handle_len;
         e->rank = ntohl(rank_be);
         e->session_id = net_to_host64(sid_be);
         score_be = net_to_host64(score_be);
@@ -1167,6 +1222,7 @@ NetworkStatus wamble_packet_deserialize(const uint8_t *buffer,
     switch (hdr.ctrl) {
     case WAMBLE_CTRL_SERVER_HELLO:
     case WAMBLE_CTRL_BOARD_UPDATE:
+    case WAMBLE_CTRL_LOGIN_SUCCESS:
     case WAMBLE_CTRL_SERVER_NOTIFICATION:
     case WAMBLE_CTRL_SPECTATE_UPDATE:
       if (preview_copy)

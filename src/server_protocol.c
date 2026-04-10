@@ -715,6 +715,21 @@ static int append_ext_int(struct WambleMsg *msg, const char *key,
   return 0;
 }
 
+static int append_ext_double(struct WambleMsg *msg, const char *key,
+                             double value) {
+  WambleMessageExtField *field = NULL;
+  if (!msg || !key || !key[0] ||
+      msg->ext_count >= WAMBLE_MAX_MESSAGE_EXT_FIELDS) {
+    return -1;
+  }
+  field = &msg->ext[msg->ext_count++];
+  memset(field, 0, sizeof(*field));
+  snprintf(field->key, sizeof(field->key), "%s", key);
+  field->value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
+  field->double_value = value;
+  return 0;
+}
+
 static int append_ext_string(struct WambleMsg *msg, const char *key,
                              const char *value) {
   WambleMessageExtField *field = NULL;
@@ -730,19 +745,73 @@ static int append_ext_string(struct WambleMsg *msg, const char *key,
   return 0;
 }
 
+static int append_request_seq_ext(struct WambleMsg *msg, uint32_t request_seq) {
+  if (!msg || request_seq == 0)
+    return -1;
+  return append_ext_int(msg, "request.seq_num", (int64_t)request_seq);
+}
+
+static int append_error_blocking_ext(struct WambleMsg *msg) {
+  if (!msg)
+    return -1;
+  return append_ext_int(msg, "error.blocking", 1);
+}
+
+static ServerStatus
+send_error_terminal_ex(wamble_socket_t sockfd,
+                       const struct sockaddr_in *cliaddr, const uint8_t *token,
+                       uint64_t board_id, uint16_t err_code, const char *reason,
+                       const char *ext_key, int64_t ext_value, int blocking) {
+  struct WambleMsg err = {0};
+  err.ctrl = WAMBLE_CTRL_ERROR;
+  memcpy(err.token, token, TOKEN_LENGTH);
+  err.board_id = board_id;
+  err.error_code = err_code;
+  if (reason && reason[0])
+    snprintf(err.error_reason, sizeof(err.error_reason), "%s", reason);
+  if (ext_key && ext_key[0] && ext_value > 0)
+    (void)append_ext_int(&err, ext_key, ext_value);
+  if (blocking)
+    (void)append_error_blocking_ext(&err);
+  if (send_reliable_default(sockfd, &err, cliaddr) != 0)
+    return SERVER_ERR_SEND_FAILED;
+  return SERVER_ERR_INTERNAL;
+}
+
+static ServerStatus send_error_terminal_with_status(
+    wamble_socket_t sockfd, const struct sockaddr_in *cliaddr,
+    const uint8_t *token, uint64_t board_id, uint16_t err_code,
+    const char *reason, const char *ext_key, int64_t ext_value, int blocking,
+    ServerStatus status_if_sent) {
+  ServerStatus st =
+      send_error_terminal_ex(sockfd, cliaddr, token, board_id, err_code, reason,
+                             ext_key, ext_value, blocking);
+  if (st == SERVER_ERR_SEND_FAILED)
+    return st;
+  return status_if_sent;
+}
+
 static ServerStatus send_error_terminal(wamble_socket_t sockfd,
                                         const struct sockaddr_in *cliaddr,
                                         const uint8_t *token, uint16_t err_code,
                                         const char *reason, const char *ext_key,
                                         int64_t ext_value) {
+  return send_error_terminal_ex(sockfd, cliaddr, token, 0, err_code, reason,
+                                ext_key, ext_value, 0);
+}
+
+static ServerStatus
+send_error_terminal_for_request(wamble_socket_t sockfd,
+                                const struct sockaddr_in *cliaddr,
+                                const uint8_t *token, uint32_t request_seq,
+                                uint16_t err_code, const char *reason) {
   struct WambleMsg err = {0};
   err.ctrl = WAMBLE_CTRL_ERROR;
   memcpy(err.token, token, TOKEN_LENGTH);
   err.error_code = err_code;
   if (reason && reason[0])
     snprintf(err.error_reason, sizeof(err.error_reason), "%s", reason);
-  if (ext_key && ext_key[0] && ext_value > 0)
-    (void)append_ext_int(&err, ext_key, ext_value);
+  (void)append_request_seq_ext(&err, request_seq);
   if (send_reliable_default(sockfd, &err, cliaddr) != 0)
     return SERVER_ERR_SEND_FAILED;
   return SERVER_ERR_INTERNAL;
@@ -757,6 +826,92 @@ find_ext_field_by_key(const struct WambleMsg *msg, const char *key) {
       return &msg->ext[i];
   }
   return NULL;
+}
+
+static int effective_profile_websocket_port(const WambleProfile *profile);
+static const char *
+effective_profile_websocket_path(const WambleProfile *profile);
+static int profile_terms_currently_accepted(const uint8_t *token,
+                                            const char *profile_name);
+static uint32_t compute_profile_ui_caps(const uint8_t *token,
+                                        const WambleProfile *p);
+static uint32_t append_session_capability_extensions(struct WambleMsg *msg,
+                                                     const uint8_t *token,
+                                                     const char *profile_name,
+                                                     const WambleBoard *board);
+
+static void fill_profile_info_response(struct WambleMsg *resp,
+                                       const uint8_t *token, const char *name,
+                                       const char *bound_profile_name,
+                                       int effective_trust_tier) {
+  const WambleProfile *p = NULL;
+  int wrote = 0;
+  if (!resp || !token || !name)
+    return;
+  resp->ctrl = WAMBLE_CTRL_PROFILE_INFO;
+  memcpy(resp->token, token, TOKEN_LENGTH);
+  p = config_find_profile(name);
+  if (p && profile_terms_route_allowed(token, p, name, bound_profile_name,
+                                       effective_trust_tier)) {
+    int ws_port = effective_profile_websocket_port(p);
+    const char *ws_path = effective_profile_websocket_path(p);
+    wrote = snprintf(resp->profile_info, FEN_MAX_LENGTH, "%s;%d;%d;%d", p->name,
+                     p->config.port, p->advertise, p->visibility);
+    if (wrote < 0)
+      wrote = 0;
+    if (wrote >= FEN_MAX_LENGTH)
+      wrote = FEN_MAX_LENGTH - 1;
+    resp->profile_info_len = (uint16_t)wrote;
+    (void)append_ext_int(resp, "profile.caps",
+                         (int64_t)compute_profile_ui_caps(token, p));
+    (void)append_ext_int(resp, "profile.tos_available",
+                         (int64_t)((p->tos_text && p->tos_text[0]) ? 1 : 0));
+    (void)append_ext_int(
+        resp, "profile.tos_accepted",
+        (int64_t)profile_terms_currently_accepted(token, p->name));
+    (void)append_ext_int(resp, "profile.websocket_port", (int64_t)ws_port);
+    if (ws_path)
+      (void)append_ext_string(resp, "profile.websocket_path", ws_path);
+    (void)append_ext_int(resp, "profile.reservation_timeout",
+                         (int64_t)p->config.reservation_timeout);
+  } else {
+    publish_server_protocol_status(
+        p ? SERVER_PROTOCOL_STATUS_PROFILE_INFO_HIDDEN
+          : SERVER_PROTOCOL_STATUS_PROFILE_INFO_NOT_FOUND,
+        name);
+    wrote =
+        snprintf(resp->profile_info, FEN_MAX_LENGTH, "NOTFOUND;%.80s", name);
+    if (wrote < 0)
+      wrote = 0;
+    if (wrote >= FEN_MAX_LENGTH)
+      wrote = FEN_MAX_LENGTH - 1;
+    resp->profile_info_len = (uint16_t)wrote;
+  }
+}
+
+static void append_profile_session_snapshot(struct WambleMsg *resp,
+                                            const uint8_t *token,
+                                            const char *profile_name) {
+  WamblePlayer *player = NULL;
+  WambleBoard *board = NULL;
+  uint32_t session_caps = 0;
+  if (!resp || !token || !profile_name || !profile_name[0])
+    return;
+  player = get_player_by_token(token);
+  if (!player)
+    return;
+  board = find_board_for_player(player);
+  if (!board)
+    return;
+  session_caps =
+      append_session_capability_extensions(resp, token, profile_name, board);
+  resp->board_id = board->id;
+  write_visible_board_fen(token, profile_name, board, resp->fen,
+                          sizeof(resp->fen));
+  if ((session_caps & WAMBLE_SESSION_UI_CAP_GAME_MODE_VISIBLE) != 0 &&
+      board->board.game_mode == GAME_MODE_CHESS960) {
+    resp->flags |= WAMBLE_FLAG_BOARD_IS_960;
+  }
 }
 
 static int square_index_from_alg(const char *sq) {
@@ -1063,6 +1218,7 @@ static uint32_t compute_session_ui_caps(const uint8_t *token,
   uint32_t caps = 0;
   int spectate_proto = 0;
   int prediction_read_proto = 0;
+  WamblePlayer *player = NULL;
 
   if (out_prediction_source)
     *out_prediction_source = "tree";
@@ -1071,7 +1227,9 @@ static uint32_t compute_session_ui_caps(const uint8_t *token,
   if (!profile_terms_currently_accepted(token, profile_name))
     return 0;
 
-  if (protocol_ctrl_allowed(token, profile_name, WAMBLE_CTRL_LOGIN_REQUEST))
+  player = get_player_by_token(token);
+  if ((player && !player->has_persistent_identity) ||
+      protocol_ctrl_allowed(token, profile_name, WAMBLE_CTRL_LOGIN_REQUEST))
     caps |= WAMBLE_SESSION_UI_CAP_ATTACH_IDENTITY;
   if (protocol_ctrl_allowed(token, profile_name, WAMBLE_CTRL_LOGOUT))
     caps |= WAMBLE_SESSION_UI_CAP_LOGOUT;
@@ -1330,6 +1488,7 @@ static ServerStatus handle_client_hello(wamble_socket_t sockfd,
     snprintf(err.error_reason, sizeof(err.error_reason),
              "upgrade required (client=%u server=%u)", client_version,
              WAMBLE_PROTO_VERSION);
+    (void)append_error_blocking_ext(&err);
     (void)send_reliable_default(sockfd, &err, cliaddr);
     return SERVER_ERR_UNSUPPORTED_VERSION;
   }
@@ -1355,9 +1514,9 @@ static ServerStatus handle_client_hello(wamble_socket_t sockfd,
   if (!board) {
     publish_server_protocol_status(SERVER_PROTOCOL_STATUS_UNKNOWN_BOARD,
                                    profile_name);
-    return send_error_terminal(sockfd, cliaddr, msg->token,
-                               WAMBLE_ERR_UNKNOWN_BOARD,
-                               "no board available for assignment", NULL, 0);
+    return send_error_terminal_ex(
+        sockfd, cliaddr, msg->token, 0, WAMBLE_ERR_UNKNOWN_BOARD,
+        "no board available for assignment", NULL, 0, 1);
   }
 
   struct WambleMsg response = {0};
@@ -1426,18 +1585,18 @@ static ServerStatus handle_player_move(wamble_socket_t sockfd,
   if (!player) {
     publish_server_protocol_status(SERVER_PROTOCOL_STATUS_UNKNOWN_PLAYER,
                                    profile_name);
-    return send_error_terminal(sockfd, cliaddr, msg->token,
-                               WAMBLE_ERR_UNKNOWN_PLAYER, "unknown player",
-                               NULL, 0);
+    return send_error_terminal_ex(sockfd, cliaddr, msg->token, msg->board_id,
+                                  WAMBLE_ERR_UNKNOWN_PLAYER, "unknown player",
+                                  NULL, 0, 1);
   }
 
   WambleBoard *board = get_board_by_id(msg->board_id);
   if (!board) {
     publish_server_protocol_status(SERVER_PROTOCOL_STATUS_UNKNOWN_BOARD,
                                    profile_name);
-    return send_error_terminal(sockfd, cliaddr, msg->token,
-                               WAMBLE_ERR_UNKNOWN_BOARD, "unknown board", NULL,
-                               0);
+    return send_error_terminal_ex(sockfd, cliaddr, msg->token, msg->board_id,
+                                  WAMBLE_ERR_UNKNOWN_BOARD, "unknown board",
+                                  NULL, 0, 1);
   }
 
   char uci_move[MAX_UCI_LENGTH + 1];
@@ -1668,45 +1827,9 @@ static ServerStatus handle_get_profile_info(wamble_socket_t sockfd,
     memcpy(name, msg->profile_name, (size_t)nlen);
   name[nlen] = '\0';
 
-  const WambleProfile *p = config_find_profile(name);
   struct WambleMsg resp = {0};
-  resp.ctrl = WAMBLE_CTRL_PROFILE_INFO;
-  memcpy(resp.token, msg->token, TOKEN_LENGTH);
-  if (p && profile_discovery_allowed(msg->token, p, effective_trust_tier)) {
-    int ws_port = effective_profile_websocket_port(p);
-    const char *ws_path = effective_profile_websocket_path(p);
-    int wrote = snprintf(resp.profile_info, FEN_MAX_LENGTH, "%s;%d;%d;%d",
-                         p->name, p->config.port, p->advertise, p->visibility);
-    if (wrote < 0)
-      wrote = 0;
-    if (wrote >= FEN_MAX_LENGTH)
-      wrote = FEN_MAX_LENGTH - 1;
-    resp.profile_info_len = (uint16_t)wrote;
-    (void)append_ext_int(&resp, "profile.caps",
-                         (int64_t)compute_profile_ui_caps(msg->token, p));
-    (void)append_ext_int(&resp, "profile.tos_available",
-                         (int64_t)((p->tos_text && p->tos_text[0]) ? 1 : 0));
-    (void)append_ext_int(
-        &resp, "profile.tos_accepted",
-        (int64_t)profile_terms_currently_accepted(msg->token, p->name));
-    (void)append_ext_int(&resp, "profile.websocket_port", (int64_t)ws_port);
-    if (ws_path)
-      (void)append_ext_string(&resp, "profile.websocket_path", ws_path);
-    (void)append_ext_int(&resp, "profile.reservation_timeout",
-                         (int64_t)p->config.reservation_timeout);
-  } else {
-    publish_server_protocol_status(
-        p ? SERVER_PROTOCOL_STATUS_PROFILE_INFO_HIDDEN
-          : SERVER_PROTOCOL_STATUS_PROFILE_INFO_NOT_FOUND,
-        name);
-    int wrote =
-        snprintf(resp.profile_info, FEN_MAX_LENGTH, "NOTFOUND;%.80s", name);
-    if (wrote < 0)
-      wrote = 0;
-    if (wrote >= FEN_MAX_LENGTH)
-      wrote = FEN_MAX_LENGTH - 1;
-    resp.profile_info_len = (uint16_t)wrote;
-  }
+  fill_profile_info_response(&resp, msg->token, name, NULL,
+                             effective_trust_tier);
   if (send_reliable_default(sockfd, &resp, cliaddr) != 0) {
     return SERVER_ERR_SEND_FAILED;
   }
@@ -1815,6 +1938,88 @@ static ServerStatus send_fragmented_payload(
     }
   }
   return SERVER_OK;
+}
+
+static ServerStatus send_profile_tos_payload(
+    wamble_socket_t sockfd, const struct sockaddr_in *cliaddr,
+    const uint8_t token[TOKEN_LENGTH], const uint8_t *payload,
+    size_t payload_len, const char *profile_name, uint32_t request_seq) {
+  enum {
+    WAMBLE_EXT_MAGIC_0_LOCAL = 0x57,
+    WAMBLE_EXT_MAGIC_1_LOCAL = 0x58,
+    WAMBLE_EXT_VERSION_LOCAL = 1
+  };
+  const char *ext_key = "profile.name";
+  const char *request_key = "request.seq_num";
+  size_t key_len = strnlen(ext_key, WAMBLE_MESSAGE_EXT_KEY_MAX);
+  size_t request_key_len = strnlen(request_key, WAMBLE_MESSAGE_EXT_KEY_MAX);
+  size_t value_len = strnlen(profile_name ? profile_name : "",
+                             WAMBLE_MESSAGE_EXT_STRING_MAX - 1);
+  size_t ext_body_len = 0;
+  size_t total_len = 0;
+  uint8_t *encoded = NULL;
+  ServerStatus status = SERVER_ERR_INTERNAL;
+
+  if (!cliaddr || !token || (!payload && payload_len > 0) || key_len == 0 ||
+      key_len > 255 || request_key_len == 0 || request_key_len > 255) {
+    publish_server_protocol_status(
+        SERVER_PROTOCOL_STATUS_FRAGMENTATION_PREPARE_FAILED, profile_name);
+    return SERVER_ERR_INTERNAL;
+  }
+  if (payload_len > SIZE_MAX - 2u - 1u - key_len - 1u - 2u - value_len - 1u -
+                        request_key_len - 1u - 8u - 4u) {
+    publish_server_protocol_status(
+        SERVER_PROTOCOL_STATUS_FRAGMENTATION_PREPARE_FAILED, profile_name);
+    return SERVER_ERR_INTERNAL;
+  }
+
+  ext_body_len =
+      2u + 1u + key_len + 1u + 2u + value_len + 1u + request_key_len + 1u + 8u;
+  total_len = payload_len + ext_body_len + 4u;
+  encoded = (uint8_t *)malloc(total_len);
+  if (!encoded) {
+    publish_server_protocol_status(
+        SERVER_PROTOCOL_STATUS_FRAGMENTATION_PREPARE_FAILED, profile_name);
+    return SERVER_ERR_INTERNAL;
+  }
+
+  if (payload_len)
+    memcpy(encoded, payload, payload_len);
+  {
+    size_t off = payload_len;
+    uint16_t value_len_be = htons((uint16_t)value_len);
+    uint16_t ext_body_len_be = htons((uint16_t)ext_body_len);
+    encoded[off++] = WAMBLE_EXT_VERSION_LOCAL;
+    encoded[off++] = 2;
+    encoded[off++] = (uint8_t)key_len;
+    memcpy(encoded + off, ext_key, key_len);
+    off += key_len;
+    encoded[off++] = (uint8_t)WAMBLE_TREATMENT_VALUE_STRING;
+    memcpy(encoded + off, &value_len_be, sizeof(value_len_be));
+    off += sizeof(value_len_be);
+    if (value_len) {
+      memcpy(encoded + off, profile_name, value_len);
+      off += value_len;
+    }
+    encoded[off++] = (uint8_t)request_key_len;
+    memcpy(encoded + off, request_key, request_key_len);
+    off += request_key_len;
+    encoded[off++] = (uint8_t)WAMBLE_TREATMENT_VALUE_INT;
+    {
+      uint64_t request_seq_be = u64_to_be((uint64_t)request_seq);
+      memcpy(encoded + off, &request_seq_be, sizeof(request_seq_be));
+      off += sizeof(request_seq_be);
+    }
+    encoded[off++] = WAMBLE_EXT_MAGIC_0_LOCAL;
+    encoded[off++] = WAMBLE_EXT_MAGIC_1_LOCAL;
+    memcpy(encoded + off, &ext_body_len_be, sizeof(ext_body_len_be));
+  }
+
+  status =
+      send_fragmented_payload(sockfd, cliaddr, WAMBLE_CTRL_PROFILE_TOS_DATA,
+                              token, encoded, total_len, profile_name);
+  free(encoded);
+  return status;
 }
 
 static size_t
@@ -1957,9 +2162,9 @@ static ServerStatus handle_get_profile_tos(wamble_socket_t sockfd,
              name, effective_trust_tier, tos_len);
     publish_server_protocol_status_detail(
         SERVER_PROTOCOL_STATUS_PROFILE_TOS_SERVED, name, detail);
-    return send_fragmented_payload(sockfd, cliaddr,
-                                   WAMBLE_CTRL_PROFILE_TOS_DATA, msg->token,
-                                   (const uint8_t *)tos, (size_t)tos_len, name);
+    return send_profile_tos_payload(sockfd, cliaddr, msg->token,
+                                    (const uint8_t *)tos, (size_t)tos_len, name,
+                                    msg->seq_num);
   } else {
     publish_server_protocol_status(
         p ? SERVER_PROTOCOL_STATUS_PROFILE_INFO_HIDDEN
@@ -1979,9 +2184,9 @@ static ServerStatus handle_get_profile_tos(wamble_socket_t sockfd,
       publish_server_protocol_status_detail(
           SERVER_PROTOCOL_STATUS_PROFILE_TOS_FALLBACK, name, detail);
     }
-    return send_fragmented_payload(
-        sockfd, cliaddr, WAMBLE_CTRL_PROFILE_TOS_DATA, msg->token,
-        (const uint8_t *)fallback, (size_t)wrote, name);
+    return send_profile_tos_payload(sockfd, cliaddr, msg->token,
+                                    (const uint8_t *)fallback, (size_t)wrote,
+                                    name, msg->seq_num);
   }
 }
 
@@ -2008,7 +2213,9 @@ static ServerStatus handle_accept_profile_tos(wamble_socket_t sockfd,
       !name[0]) {
     publish_server_protocol_status(
         SERVER_PROTOCOL_STATUS_PROFILE_TOS_ACCEPT_FAILED, profile_name);
-    return send_policy_denied(sockfd, cliaddr, msg->token, profile_name);
+    return send_error_terminal_for_request(
+        sockfd, cliaddr, msg->token, msg->seq_num, WAMBLE_ERR_ACCESS_DENIED,
+        "access denied");
   }
 
   const WambleProfile *p = config_find_profile(name);
@@ -2018,7 +2225,9 @@ static ServerStatus handle_accept_profile_tos(wamble_socket_t sockfd,
       !p->tos_text || !p->tos_text[0]) {
     publish_server_protocol_status(
         SERVER_PROTOCOL_STATUS_PROFILE_TOS_ACCEPT_FAILED, name);
-    return send_policy_denied(sockfd, cliaddr, msg->token, name);
+    return send_error_terminal_for_request(
+        sockfd, cliaddr, msg->token, msg->seq_num, WAMBLE_ERR_ACCESS_DENIED,
+        "access denied");
   }
 
   uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH] = {0};
@@ -2036,6 +2245,7 @@ static ServerStatus handle_accept_profile_tos(wamble_socket_t sockfd,
     out.error_code = WAMBLE_ERR_ACCESS_DENIED;
     snprintf(out.error_reason, sizeof(out.error_reason),
              "failed to persist terms acceptance");
+    (void)append_request_seq_ext(&out, msg->seq_num);
     if (send_reliable_default(sockfd, &out, cliaddr) != 0)
       return SERVER_ERR_SEND_FAILED;
     return SERVER_ERR_INTERNAL;
@@ -2048,6 +2258,17 @@ static ServerStatus handle_accept_profile_tos(wamble_socket_t sockfd,
              effective_trust_tier, (unsigned long long)acceptance_id);
     publish_server_protocol_status_detail(
         SERVER_PROTOCOL_STATUS_PROFILE_TOS_ACCEPTED, name, detail);
+  }
+  {
+    struct WambleMsg response = {0};
+    fill_profile_info_response(&response, msg->token, name, profile_name,
+                               effective_trust_tier);
+    (void)append_request_seq_ext(&response, msg->seq_num);
+    if (profile_name && profile_name[0] && strcmp(name, profile_name) == 0) {
+      append_profile_session_snapshot(&response, msg->token, profile_name);
+    }
+    if (send_reliable_default(sockfd, &response, cliaddr) != 0)
+      return SERVER_ERR_SEND_FAILED;
   }
   return SERVER_OK;
 }
@@ -2117,15 +2338,10 @@ static ServerStatus handle_login_request(wamble_socket_t sockfd,
                                    profile_name);
     response.ctrl = WAMBLE_CTRL_LOGIN_SUCCESS;
     memcpy(response.token, player->token, TOKEN_LENGTH);
+    append_profile_session_snapshot(&response, player->token, profile_name);
     {
       WambleBoard *board = find_board_for_player(player);
       if (board) {
-        uint32_t session_caps = append_session_capability_extensions(
-            &response, player->token, profile_name, board);
-        if ((session_caps & WAMBLE_SESSION_UI_CAP_GAME_MODE_VISIBLE) != 0 &&
-            board->board.game_mode == GAME_MODE_CHESS960) {
-          response.flags |= WAMBLE_FLAG_BOARD_IS_960;
-        }
         append_last_move_extensions(&response, player->token, profile_name,
                                     board);
       }
@@ -2177,8 +2393,10 @@ static ServerStatus enforce_message_access_policies(
     }
   }
 
-  if (msg->ctrl != WAMBLE_CTRL_ACK && profile_name && profile_name[0] &&
-      ctrl_scope(msg->ctrl) == CTRL_SCOPE_PROFILE &&
+  if (msg->ctrl != WAMBLE_CTRL_ACK &&
+      msg->ctrl != WAMBLE_CTRL_GET_PROFILE_TOS &&
+      msg->ctrl != WAMBLE_CTRL_ACCEPT_PROFILE_TOS && profile_name &&
+      profile_name[0] && ctrl_scope(msg->ctrl) == CTRL_SCOPE_PROFILE &&
       !profile_terms_currently_accepted(msg->token, profile_name)) {
     return send_terms_required(sockfd, cliaddr, msg->token, profile_name);
   }
@@ -2216,8 +2434,6 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     return handle_get_profile_tos(sockfd, cliaddr, msg, profile_name,
                                   effective_trust_tier);
   case WAMBLE_CTRL_ACCEPT_PROFILE_TOS:
-    if ((msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0)
-      send_ack(sockfd, msg, cliaddr);
     return handle_accept_profile_tos(sockfd, cliaddr, msg, profile_name,
                                      effective_trust_tier);
   case WAMBLE_CTRL_GET_ACTIVE_RESERVATIONS:
@@ -2345,9 +2561,10 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
                target_handle_ext->string_value[0]) {
       has_explicit_target = 1;
       if (!is_valid_stats_handle(target_handle_ext->string_value))
-        return send_error_terminal(
-            sockfd, cliaddr, msg->token, WAMBLE_ERR_ACCESS_DENIED,
-            "invalid stats handle", "stats.request_id", stats_request_id);
+        return send_error_terminal_with_status(
+            sockfd, cliaddr, msg->token, 0, WAMBLE_ERR_ACCESS_DENIED,
+            "invalid stats handle", "stats.request_id", stats_request_id, 0,
+            SERVER_ERR_FORBIDDEN);
       if (wamble_query_get_global_identity_id_by_handle(
               target_handle_ext->string_value, &target_identity_id) != DB_OK ||
           target_identity_id == 0) {
@@ -2372,10 +2589,10 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     } else if (target_pub_ext &&
                target_pub_ext->value_type == WAMBLE_TREATMENT_VALUE_STRING &&
                target_pub_ext->string_value[0]) {
-      return send_error_terminal(sockfd, cliaddr, msg->token,
-                                 WAMBLE_ERR_ACCESS_DENIED,
-                                 "stats public key target denied",
-                                 "stats.request_id", stats_request_id);
+      return send_error_terminal_with_status(
+          sockfd, cliaddr, msg->token, 0, WAMBLE_ERR_ACCESS_DENIED,
+          "stats public key target denied", "stats.request_id",
+          stats_request_id, 0, SERVER_ERR_FORBIDDEN);
     }
 
     if (target_session_id > 0 &&
@@ -2386,9 +2603,10 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
 
     if (!stats_read_allowed(msg->token, profile_name, target_session_id,
                             target_identity_id))
-      return send_error_terminal(sockfd, cliaddr, msg->token,
-                                 WAMBLE_ERR_ACCESS_DENIED, "stats read denied",
-                                 "stats.request_id", stats_request_id);
+      return send_error_terminal_with_status(
+          sockfd, cliaddr, msg->token, 0, WAMBLE_ERR_ACCESS_DENIED,
+          "stats read denied", "stats.request_id", stats_request_id, 0,
+          SERVER_ERR_FORBIDDEN);
 
     if (!requester_known) {
       WamblePlayer *requester = get_player_by_token(msg->token);
@@ -2418,10 +2636,10 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
       } else {
         publish_server_protocol_status(SERVER_PROTOCOL_STATUS_UNKNOWN_PLAYER,
                                        profile_name);
-        return send_error_terminal(sockfd, cliaddr, msg->token,
-                                   WAMBLE_ERR_UNKNOWN_PLAYER,
-                                   "requester session not found",
-                                   "stats.request_id", stats_request_id);
+        return send_error_terminal_ex(sockfd, cliaddr, msg->token, 0,
+                                      WAMBLE_ERR_UNKNOWN_PLAYER,
+                                      "requester session not found",
+                                      "stats.request_id", stats_request_id, 1);
       }
     }
 
@@ -2498,6 +2716,8 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     }
   }
   case WAMBLE_CTRL_GET_LEADERBOARD: {
+    int64_t page_index_ext = 0;
+    const WambleMessageExtField *page_index_field = NULL;
     if (!policy_check(msg->token, profile_name, "leaderboard.read", "global",
                       NULL, NULL, NULL)) {
       return send_policy_denied(sockfd, cliaddr, msg->token, profile_name);
@@ -2508,13 +2728,21 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     uint64_t requester_session_id = 0;
     if (wamble_query_get_session_by_token(msg->token, &requester_session_id) !=
         DB_OK) {
-      return send_error_terminal(sockfd, cliaddr, msg->token,
-                                 WAMBLE_ERR_UNKNOWN_PLAYER,
-                                 "requester session not found", NULL, 0);
+      return send_error_terminal_ex(sockfd, cliaddr, msg->token, 0,
+                                    WAMBLE_ERR_UNKNOWN_PLAYER,
+                                    "requester session not found", NULL, 0, 1);
     }
     int limit = msg->leaderboard_limit ? (int)msg->leaderboard_limit : 10;
-    DbLeaderboardResult lb =
-        wamble_query_get_leaderboard(requester_session_id, lb_type, limit);
+    page_index_field = find_ext_field_by_key(msg, "leaderboard.page_index");
+    if (page_index_field &&
+        page_index_field->value_type == WAMBLE_TREATMENT_VALUE_INT) {
+      page_index_ext = page_index_field->int_value;
+    }
+    if (page_index_ext < 0)
+      page_index_ext = 0;
+    int offset = (int)page_index_ext * limit;
+    DbLeaderboardResult lb = wamble_query_get_leaderboard(
+        requester_session_id, lb_type, limit, offset);
     if (lb.status != DB_OK) {
       return send_error_terminal(sockfd, cliaddr, msg->token,
                                  WAMBLE_ERR_LEADERBOARD_FAILED,
@@ -2540,6 +2768,36 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
       response.leaderboard[i].has_identity = lb.rows[i].has_identity;
       memcpy(response.leaderboard[i].public_key, lb.rows[i].public_key,
              WAMBLE_PUBLIC_KEY_LENGTH);
+      response.leaderboard[i].handle = lb.rows[i].handle;
+    }
+    (void)append_ext_int(&response, "leaderboard.total_count",
+                         (int64_t)lb.total_count);
+    (void)append_ext_int(&response, "leaderboard.page_index", page_index_ext);
+    (void)append_ext_int(&response, "leaderboard.page_size", limit);
+    if (!lb.self_in_rows && lb.self_rank > 0) {
+      (void)append_ext_int(&response, "leaderboard.self.rank",
+                           (int64_t)lb.self.rank);
+      (void)append_ext_int(&response, "leaderboard.self.session_id",
+                           (int64_t)lb.self.session_id);
+      (void)append_ext_double(&response, "leaderboard.self.score",
+                              lb.self.score);
+      (void)append_ext_double(&response, "leaderboard.self.rating",
+                              lb.self.rating);
+      (void)append_ext_int(&response, "leaderboard.self.games_played",
+                           (int64_t)lb.self.games_played);
+      (void)append_ext_int(&response, "leaderboard.self.has_identity",
+                           lb.self.has_identity ? 1 : 0);
+      if (lb.self.has_identity) {
+        char pub_hex[WAMBLE_PUBLIC_KEY_LENGTH * 2 + 1];
+        static const char hex[] = "0123456789abcdef";
+        for (int i = 0; i < WAMBLE_PUBLIC_KEY_LENGTH; i++) {
+          pub_hex[i * 2] = hex[(lb.self.public_key[i] >> 4) & 0xF];
+          pub_hex[i * 2 + 1] = hex[lb.self.public_key[i] & 0xF];
+        }
+        pub_hex[WAMBLE_PUBLIC_KEY_LENGTH * 2] = '\0';
+        (void)append_ext_string(&response, "leaderboard.self.public_key",
+                                pub_hex);
+      }
     }
     if (send_reliable_default(sockfd, &response, cliaddr) != 0) {
       return SERVER_ERR_SEND_FAILED;
@@ -2559,18 +2817,18 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     if (!player) {
       publish_server_protocol_status(SERVER_PROTOCOL_STATUS_UNKNOWN_PLAYER,
                                      profile_name);
-      return send_error_terminal(sockfd, cliaddr, msg->token,
-                                 WAMBLE_ERR_UNKNOWN_PLAYER, "unknown player",
-                                 NULL, 0);
+      return send_error_terminal_ex(sockfd, cliaddr, msg->token, msg->board_id,
+                                    WAMBLE_ERR_UNKNOWN_PLAYER, "unknown player",
+                                    NULL, 0, 1);
     }
 
     WambleBoard *board = get_board_by_id(msg->board_id);
     if (!board) {
       publish_server_protocol_status(SERVER_PROTOCOL_STATUS_UNKNOWN_BOARD,
                                      profile_name);
-      return send_error_terminal(sockfd, cliaddr, msg->token,
-                                 WAMBLE_ERR_UNKNOWN_BOARD, "unknown board",
-                                 NULL, 0);
+      return send_error_terminal_ex(sockfd, cliaddr, msg->token, msg->board_id,
+                                    WAMBLE_ERR_UNKNOWN_BOARD, "unknown board",
+                                    NULL, 0, 1);
     }
 
     struct WambleMsg response = {0};

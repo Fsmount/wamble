@@ -240,6 +240,11 @@ int wamble_client_generate_mnemonic_seed(
     uint8_t out_public_key[WAMBLE_PUBLIC_KEY_LENGTH],
     uint8_t out_secret_key[64]);
 
+int wamble_client_payload_decode_extensions(const uint8_t *payload,
+                                            size_t payload_len,
+                                            struct WambleMsg *msg_out,
+                                            size_t *base_len);
+
 const char *wamble_client_locale_text(const char *locale,
                                       WambleClientTextId id);
 int wamble_client_locale_write(const char *locale, WambleClientTextId id,

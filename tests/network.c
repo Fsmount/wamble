@@ -197,6 +197,32 @@ static const WambleMessageExtField *find_ext_field(const struct WambleMsg *msg,
   return NULL;
 }
 
+static int parse_payload_string_ext(const uint8_t *payload, size_t payload_len,
+                                    const char *key, size_t *out_base_len,
+                                    char *out_value,
+                                    size_t out_value_capacity) {
+  struct WambleMsg tmp;
+  int rc;
+  uint8_t i;
+  if (!payload || !key || !*key || !out_base_len || !out_value ||
+      out_value_capacity == 0)
+    return 0;
+  out_value[0] = '\0';
+  memset(&tmp, 0, sizeof(tmp));
+  rc = wamble_client_payload_decode_extensions(payload, payload_len, &tmp,
+                                               out_base_len);
+  if (rc != 0)
+    return 0;
+  for (i = 0; i < tmp.ext_count; i++) {
+    if (tmp.ext[i].value_type == WAMBLE_TREATMENT_VALUE_STRING &&
+        strcmp(tmp.ext[i].key, key) == 0) {
+      snprintf(out_value, out_value_capacity, "%s", tmp.ext[i].string_value);
+      return 1;
+    }
+  }
+  return 0;
+}
+
 WAMBLE_TEST(spectate_update_roundtrip) {
   config_load(NULL, NULL, NULL, 0);
   wamble_socket_t srv = create_and_bind_socket(0);
@@ -353,6 +379,7 @@ WAMBLE_TEST(leaderboard_data_roundtrip) {
   out.leaderboard[0].has_identity = 1;
   for (int i = 0; i < WAMBLE_PUBLIC_KEY_LENGTH; i++)
     out.leaderboard[0].public_key[i] = (uint8_t)(0x40 + i);
+  out.leaderboard[0].handle = "h_alpha123456";
   out.leaderboard[1].rank = 2;
   out.leaderboard[1].session_id = 102;
   out.leaderboard[1].score = 120.0;
@@ -377,7 +404,9 @@ WAMBLE_TEST(leaderboard_data_roundtrip) {
   T_ASSERT(memcmp(ctx.msg.leaderboard[0].public_key,
                   out.leaderboard[0].public_key,
                   WAMBLE_PUBLIC_KEY_LENGTH) == 0);
+  T_ASSERT_STREQ(ctx.msg.leaderboard[0].handle, "h_alpha123456");
   T_ASSERT_EQ_INT((int)ctx.msg.leaderboard[1].has_identity, 0);
+  T_ASSERT(ctx.msg.leaderboard[1].handle == NULL);
 
   wamble_close_socket(cli);
   wamble_close_socket(srv);
@@ -428,6 +457,7 @@ WAMBLE_TEST(leaderboard_data_score_type_roundtrip_without_fragment_marker) {
   out.leaderboard[1].has_identity = 1;
   for (int i = 0; i < WAMBLE_PUBLIC_KEY_LENGTH; i++)
     out.leaderboard[1].public_key[i] = (uint8_t)(0x80 + i);
+  out.leaderboard[1].handle = "h_beta654321";
 
   T_ASSERT_STATUS_OK(send_unreliable_packet(srv, &out, &cliaddr));
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
@@ -448,6 +478,7 @@ WAMBLE_TEST(leaderboard_data_score_type_roundtrip_without_fragment_marker) {
   T_ASSERT(memcmp(ctx.msg.leaderboard[1].public_key,
                   out.leaderboard[1].public_key,
                   WAMBLE_PUBLIC_KEY_LENGTH) == 0);
+  T_ASSERT_STREQ(ctx.msg.leaderboard[1].handle, "h_beta654321");
 
   wamble_close_socket(cli);
   wamble_close_socket(srv);
@@ -2526,17 +2557,34 @@ WAMBLE_TEST(server_protocol_accept_profile_tos_persists_terms) {
   struct WambleMsg accept = {0};
   accept.ctrl = WAMBLE_CTRL_ACCEPT_PROFILE_TOS;
   accept.header_version = WAMBLE_PROTO_VERSION;
+  accept.seq_num = 101;
   memcpy(accept.token, rx_hello.msg.token, TOKEN_LENGTH);
   memcpy(accept.profile_name, "p1", 2);
   accept.profile_name_len = 2;
 
-  RecvOneCtx rx_ack = {.sock = cli};
-  wamble_thread_t th_ack;
-  T_ASSERT(wamble_thread_create(&th_ack, recv_one_thread, &rx_ack) == 0);
+  RecvOneCtx rx_accept = {.sock = cli};
+  wamble_thread_t th_accept;
+  T_ASSERT(wamble_thread_create(&th_accept, recv_one_and_ack_thread,
+                                &rx_accept) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &accept, &cliaddr, 0, "p1"), SERVER_OK);
-  T_ASSERT_STATUS_OK(wamble_thread_join(th_ack, NULL));
-  T_ASSERT_EQ_INT(rx_ack.received, 1);
-  T_ASSERT_EQ_INT(rx_ack.msg.ctrl, WAMBLE_CTRL_ACK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_accept, NULL));
+  T_ASSERT_EQ_INT(rx_accept.received, 1);
+  T_ASSERT_EQ_INT(rx_accept.msg.ctrl, WAMBLE_CTRL_PROFILE_INFO);
+  {
+    const WambleMessageExtField *request_seq =
+        find_ext_field(&rx_accept.msg, "request.seq_num");
+    const WambleMessageExtField *tos_accepted =
+        find_ext_field(&rx_accept.msg, "profile.tos_accepted");
+    const WambleMessageExtField *session_caps =
+        find_ext_field(&rx_accept.msg, "session.caps");
+    T_ASSERT(request_seq != NULL);
+    T_ASSERT(tos_accepted != NULL);
+    T_ASSERT(session_caps != NULL);
+    T_ASSERT_EQ_INT((int)request_seq->int_value, (int)accept.seq_num);
+    T_ASSERT_EQ_INT((int)tos_accepted->int_value, 1);
+    T_ASSERT(rx_accept.msg.board_id > 0);
+    T_ASSERT(session_caps->int_value > 0);
+  }
 
   {
     WambleProfileTermsAcceptance acceptance = {0};
@@ -2619,30 +2667,51 @@ WAMBLE_TEST(server_protocol_terms_routes_allow_hidden_bound_profile) {
   memcpy(tos_req.profile_name, "p1", 2);
   tos_req.profile_name_len = 2;
 
-  RecvOneCtx rx_tos = {.sock = cli};
+  RecvTosFragmentsCtx rx_tos = {.sock = cli};
   wamble_thread_t th_tos;
-  T_ASSERT(wamble_thread_create(&th_tos, recv_one_and_ack_thread, &rx_tos) ==
-           0);
+  T_ASSERT(wamble_thread_create(&th_tos, recv_tos_fragments_and_ack_thread,
+                                &rx_tos) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &tos_req, &cliaddr, 0, "p1"), SERVER_OK);
   T_ASSERT_STATUS_OK(wamble_thread_join(th_tos, NULL));
   T_ASSERT_EQ_INT(rx_tos.received, 1);
-  T_ASSERT_EQ_INT(rx_tos.msg.ctrl, WAMBLE_CTRL_PROFILE_TOS_DATA);
-  T_ASSERT_STREQ(rx_tos.msg.profile_info, "private profile terms");
+  T_ASSERT_EQ_INT(rx_tos.expected_chunks, 1);
+  {
+    char echoed_profile[PROFILE_NAME_MAX_LENGTH];
+    size_t base_len = 0;
+    T_ASSERT(parse_payload_string_ext(rx_tos.assembled, rx_tos.assembled_len,
+                                      "profile.name", &base_len, echoed_profile,
+                                      sizeof(echoed_profile)));
+    T_ASSERT_EQ_INT((int)base_len, (int)strlen("private profile terms"));
+    T_ASSERT(memcmp(rx_tos.assembled, "private profile terms", base_len) == 0);
+    T_ASSERT_STREQ(echoed_profile, "p1");
+  }
 
   struct WambleMsg accept = {0};
   accept.ctrl = WAMBLE_CTRL_ACCEPT_PROFILE_TOS;
   accept.header_version = WAMBLE_PROTO_VERSION;
+  accept.seq_num = 102;
   memcpy(accept.token, rx_hello.msg.token, TOKEN_LENGTH);
   memcpy(accept.profile_name, "p1", 2);
   accept.profile_name_len = 2;
 
-  RecvOneCtx rx_ack = {.sock = cli};
-  wamble_thread_t th_ack;
-  T_ASSERT(wamble_thread_create(&th_ack, recv_one_thread, &rx_ack) == 0);
+  RecvOneCtx rx_accept = {.sock = cli};
+  wamble_thread_t th_accept;
+  T_ASSERT(wamble_thread_create(&th_accept, recv_one_and_ack_thread,
+                                &rx_accept) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &accept, &cliaddr, 0, "p1"), SERVER_OK);
-  T_ASSERT_STATUS_OK(wamble_thread_join(th_ack, NULL));
-  T_ASSERT_EQ_INT(rx_ack.received, 1);
-  T_ASSERT_EQ_INT(rx_ack.msg.ctrl, WAMBLE_CTRL_ACK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_accept, NULL));
+  T_ASSERT_EQ_INT(rx_accept.received, 1);
+  T_ASSERT_EQ_INT(rx_accept.msg.ctrl, WAMBLE_CTRL_PROFILE_INFO);
+  {
+    const WambleMessageExtField *request_seq =
+        find_ext_field(&rx_accept.msg, "request.seq_num");
+    const WambleMessageExtField *tos_accepted =
+        find_ext_field(&rx_accept.msg, "profile.tos_accepted");
+    T_ASSERT(request_seq != NULL);
+    T_ASSERT(tos_accepted != NULL);
+    T_ASSERT_EQ_INT((int)request_seq->int_value, (int)accept.seq_num);
+    T_ASSERT_EQ_INT((int)tos_accepted->int_value, 1);
+  }
 
   {
     WambleProfileTermsAcceptance acceptance = {0};
@@ -2746,17 +2815,33 @@ WAMBLE_TEST(
   struct WambleMsg accept = {0};
   accept.ctrl = WAMBLE_CTRL_ACCEPT_PROFILE_TOS;
   accept.header_version = WAMBLE_PROTO_VERSION;
+  accept.seq_num = 103;
   memcpy(accept.token, rx_hello.msg.token, TOKEN_LENGTH);
   memcpy(accept.profile_name, "p1", 2);
   accept.profile_name_len = 2;
 
-  RecvOneCtx rx_ack = {.sock = cli};
-  wamble_thread_t th_ack;
-  T_ASSERT(wamble_thread_create(&th_ack, recv_one_thread, &rx_ack) == 0);
+  RecvOneCtx rx_accept = {.sock = cli};
+  wamble_thread_t th_accept;
+  T_ASSERT(wamble_thread_create(&th_accept, recv_one_and_ack_thread,
+                                &rx_accept) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &accept, &cliaddr, 0, "p1"), SERVER_OK);
-  T_ASSERT_STATUS_OK(wamble_thread_join(th_ack, NULL));
-  T_ASSERT_EQ_INT(rx_ack.received, 1);
-  T_ASSERT_EQ_INT(rx_ack.msg.ctrl, WAMBLE_CTRL_ACK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_accept, NULL));
+  T_ASSERT_EQ_INT(rx_accept.received, 1);
+  T_ASSERT_EQ_INT(rx_accept.msg.ctrl, WAMBLE_CTRL_PROFILE_INFO);
+  {
+    const WambleMessageExtField *request_seq =
+        find_ext_field(&rx_accept.msg, "request.seq_num");
+    const WambleMessageExtField *tos_accepted =
+        find_ext_field(&rx_accept.msg, "profile.tos_accepted");
+    const WambleMessageExtField *caps =
+        find_ext_field(&rx_accept.msg, "session.caps");
+    T_ASSERT(request_seq != NULL);
+    T_ASSERT(tos_accepted != NULL);
+    T_ASSERT(caps != NULL);
+    T_ASSERT_EQ_INT((int)request_seq->int_value, (int)accept.seq_num);
+    T_ASSERT_EQ_INT((int)tos_accepted->int_value, 1);
+    T_ASSERT(caps->int_value != 0);
+  }
 
   struct WambleMsg hello_after = {0};
   hello_after.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
@@ -3123,6 +3208,124 @@ WAMBLE_TEST(server_protocol_player_stats_self_read_does_not_create_session) {
     uint64_t sid = 0;
     T_ASSERT_EQ_INT(wamble_query_get_session_by_token(rx_hello.msg.token, &sid),
                     DB_NOT_FOUND);
+  }
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(server_protocol_error_blocking_ext_marks_fatal_session_only) {
+  const char *cfg_path = "build/test_network_error_blocking_ext.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19424) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'client_hello', '*', 'allow', 0, "
+          "'hello_access', 'test'), "
+          "(0, 'protocol.ctrl', 'get_player_stats', '*', 'allow', 0, "
+          "'stats_ctrl_access', 'test'), "
+          "(0, 'protocol.ctrl', 'get_leaderboard', '*', 'allow', 0, "
+          "'leaderboard_ctrl_access', 'test'), "
+          "(0, 'stats.read', 'player', '*', 'allow', 0, 'stats_access', "
+          "'test'), "
+          "(0, 'leaderboard.read', 'global', '*', 'allow', 0, "
+          "'leaderboard_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  struct WambleMsg hello = {0};
+  hello.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  hello.header_version = WAMBLE_PROTO_VERSION;
+
+  RecvOneCtx rx_hello = {.sock = cli};
+  wamble_thread_t th_hello;
+  T_ASSERT(
+      wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
+  T_ASSERT_EQ_INT(rx_hello.received, 1);
+  T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+
+  {
+    struct WambleMsg req = {0};
+    req.ctrl = WAMBLE_CTRL_GET_LEADERBOARD;
+    req.header_version = WAMBLE_PROTO_VERSION;
+    memcpy(req.token, rx_hello.msg.token, TOKEN_LENGTH);
+
+    RecvOneCtx rx = {.sock = cli};
+    wamble_thread_t th;
+    T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
+    T_ASSERT_EQ_INT(handle_message(srv, &req, &cliaddr, 0, "p1"),
+                    SERVER_ERR_INTERNAL);
+    T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+    T_ASSERT_EQ_INT(rx.received, 1);
+    T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_ERROR);
+    T_ASSERT_EQ_INT(rx.msg.error_code, WAMBLE_ERR_UNKNOWN_PLAYER);
+    {
+      const WambleMessageExtField *blocking =
+          find_ext_field(&rx.msg, "error.blocking");
+      T_ASSERT(blocking != NULL);
+      T_ASSERT_EQ_INT((int)blocking->int_value, 1);
+    }
+  }
+
+  {
+    struct WambleMsg req = {0};
+    req.ctrl = WAMBLE_CTRL_GET_PLAYER_STATS;
+    req.header_version = WAMBLE_PROTO_VERSION;
+    memcpy(req.token, rx_hello.msg.token, TOKEN_LENGTH);
+    req.ext_count = 2;
+    snprintf(req.ext[0].key, sizeof(req.ext[0].key), "%s", "stats.request_id");
+    req.ext[0].value_type = WAMBLE_TREATMENT_VALUE_INT;
+    req.ext[0].int_value = 88;
+    snprintf(req.ext[1].key, sizeof(req.ext[1].key), "%s",
+             "stats.target_handle");
+    req.ext[1].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+    snprintf(req.ext[1].string_value, sizeof(req.ext[1].string_value), "%s",
+             "h_missing999");
+
+    RecvOneCtx rx = {.sock = cli};
+    wamble_thread_t th;
+    T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
+    T_ASSERT_EQ_INT(handle_message(srv, &req, &cliaddr, 0, "p1"),
+                    SERVER_ERR_INTERNAL);
+    T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+    T_ASSERT_EQ_INT(rx.received, 1);
+    T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_ERROR);
+    T_ASSERT_EQ_INT(rx.msg.error_code, WAMBLE_ERR_UNKNOWN_PLAYER);
+    {
+      const WambleMessageExtField *request_id =
+          find_ext_field(&rx.msg, "stats.request_id");
+      const WambleMessageExtField *blocking =
+          find_ext_field(&rx.msg, "error.blocking");
+      T_ASSERT(request_id != NULL);
+      T_ASSERT_EQ_INT((int)request_id->int_value, 88);
+      T_ASSERT(blocking == NULL);
+    }
   }
 
   wamble_close_socket(cli);
@@ -3929,18 +4132,30 @@ WAMBLE_TEST(server_protocol_accept_profile_tos_long_profile_name_persists) {
   struct WambleMsg accept = {0};
   accept.ctrl = WAMBLE_CTRL_ACCEPT_PROFILE_TOS;
   accept.header_version = WAMBLE_PROTO_VERSION;
+  accept.seq_num = 104;
   memcpy(accept.token, rx_hello.msg.token, TOKEN_LENGTH);
   memcpy(accept.profile_name, profile_name, profile_name_len);
   accept.profile_name_len = (uint8_t)profile_name_len;
 
-  RecvOneCtx rx_ack = {.sock = cli};
-  wamble_thread_t th_ack;
-  T_ASSERT(wamble_thread_create(&th_ack, recv_one_thread, &rx_ack) == 0);
+  RecvOneCtx rx_accept = {.sock = cli};
+  wamble_thread_t th_accept;
+  T_ASSERT(wamble_thread_create(&th_accept, recv_one_and_ack_thread,
+                                &rx_accept) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &accept, &cliaddr, 0, profile_name),
                   SERVER_OK);
-  T_ASSERT_STATUS_OK(wamble_thread_join(th_ack, NULL));
-  T_ASSERT_EQ_INT(rx_ack.received, 1);
-  T_ASSERT_EQ_INT(rx_ack.msg.ctrl, WAMBLE_CTRL_ACK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_accept, NULL));
+  T_ASSERT_EQ_INT(rx_accept.received, 1);
+  T_ASSERT_EQ_INT(rx_accept.msg.ctrl, WAMBLE_CTRL_PROFILE_INFO);
+  {
+    const WambleMessageExtField *request_seq =
+        find_ext_field(&rx_accept.msg, "request.seq_num");
+    const WambleMessageExtField *tos_accepted =
+        find_ext_field(&rx_accept.msg, "profile.tos_accepted");
+    T_ASSERT(request_seq != NULL);
+    T_ASSERT(tos_accepted != NULL);
+    T_ASSERT_EQ_INT((int)request_seq->int_value, (int)accept.seq_num);
+    T_ASSERT_EQ_INT((int)tos_accepted->int_value, 1);
+  }
 
   {
     WambleProfileTermsAcceptance acceptance = {0};
@@ -4072,7 +4287,12 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
   {
     const WambleMessageExtField *caps =
         find_ext_field(&rx_ok.msg, "session.caps");
+    const WambleMessageExtField *reserved_at =
+        find_ext_field(&rx_ok.msg, "reservation.reserved_at");
     T_ASSERT(caps != NULL);
+    T_ASSERT(reserved_at != NULL);
+    T_ASSERT(rx_ok.msg.board_id > 0);
+    T_ASSERT(rx_ok.msg.fen[0] != '\0');
     T_ASSERT((caps->int_value & WAMBLE_SESSION_UI_CAP_ATTACH_IDENTITY) != 0);
     T_ASSERT(find_ext_field(&rx_ok.msg, "trust.tier") == NULL);
   }
@@ -4154,12 +4374,20 @@ WAMBLE_TEST(server_protocol_profile_tos_fragmented_with_hash) {
   T_ASSERT_EQ_INT(rx.received, 1);
   T_ASSERT(rx.expected_chunks > 1);
   T_ASSERT_EQ_INT(rx.chunk_count, rx.expected_chunks);
-  T_ASSERT_EQ_INT((int)rx.total_len, (int)strlen(tos_text));
-  T_ASSERT_EQ_INT((int)rx.assembled_len, (int)strlen(tos_text));
-  T_ASSERT(memcmp(rx.assembled, tos_text, strlen(tos_text)) == 0);
+  {
+    char echoed_profile[PROFILE_NAME_MAX_LENGTH];
+    size_t base_len = 0;
+    T_ASSERT(parse_payload_string_ext(rx.assembled, rx.assembled_len,
+                                      "profile.name", &base_len, echoed_profile,
+                                      sizeof(echoed_profile)));
+    T_ASSERT_EQ_INT((int)base_len, (int)strlen(tos_text));
+    T_ASSERT_EQ_INT((int)rx.total_len, (int)rx.assembled_len);
+    T_ASSERT(memcmp(rx.assembled, tos_text, strlen(tos_text)) == 0);
+    T_ASSERT_STREQ(echoed_profile, "p1");
+  }
   uint8_t computed_hash[WAMBLE_FRAGMENT_HASH_LENGTH] = {0};
-  crypto_blake2b(computed_hash, WAMBLE_FRAGMENT_HASH_LENGTH,
-                 (const uint8_t *)tos_text, strlen(tos_text));
+  crypto_blake2b(computed_hash, WAMBLE_FRAGMENT_HASH_LENGTH, rx.assembled,
+                 rx.assembled_len);
   T_ASSERT_EQ_INT((int)rx.hash_algo, WAMBLE_FRAGMENT_HASH_BLAKE2B_256);
   T_ASSERT(rx.transfer_id != 0);
   T_ASSERT(memcmp(computed_hash, rx.hash, WAMBLE_FRAGMENT_HASH_LENGTH) == 0);
@@ -4324,6 +4552,9 @@ WAMBLE_TESTS_ADD_DB_SM(server_protocol_player_stats_scope_context_is_ignored,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
     server_protocol_player_stats_self_read_does_not_create_session,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_error_blocking_ext_marks_fatal_session_only,
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
     server_protocol_player_stats_caps_follow_contextual_policy,
