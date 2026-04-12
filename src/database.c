@@ -4650,10 +4650,14 @@ static DbActiveReservationsResult db_get_active_reservations_by_public_key(
   const char *query =
       "SELECT r.board_id, "
       "COALESCE(EXTRACT(EPOCH FROM r.started_at)::bigint, "
-      "         EXTRACT(EPOCH FROM b.reservation_started_at)::bigint, 0) "
+      "         EXTRACT(EPOCH FROM b.reservation_started_at)::bigint, 0), "
+      "COALESCE(EXTRACT(EPOCH FROM r.expires_at)::bigint, 0), "
+      "COALESCE(gr.profile_key, '') "
       "FROM reservations r "
       "JOIN sessions s ON s.id = r.session_id "
       "JOIN players p ON p.id = s.player_id "
+      "LEFT JOIN global_runtime_config_revisions gr "
+      "       ON gr.id = s.config_revision_id "
       "LEFT JOIN boards b ON b.id = r.board_id "
       "WHERE p.public_key = decode($1, 'hex') "
       "  AND r.expires_at > NOW() "
@@ -4687,10 +4691,21 @@ static DbActiveReservationsResult db_get_active_reservations_by_public_key(
     tls_active_reservations_cap = count;
   }
   for (int i = 0; i < count; i++) {
+    const char *profile_name = PQgetvalue(res, i, 3);
     tls_active_reservations[i].board_id =
         strtoull(PQgetvalue(res, i, 0), NULL, 10);
     tls_active_reservations[i].reserved_at =
         (time_t)strtoull(PQgetvalue(res, i, 1), NULL, 10);
+    tls_active_reservations[i].expires_at =
+        (time_t)strtoull(PQgetvalue(res, i, 2), NULL, 10);
+    snprintf(tls_active_reservations[i].profile_name,
+             sizeof(tls_active_reservations[i].profile_name), "%s",
+             profile_name ? profile_name : "");
+    tls_active_reservations[i].available =
+        (tls_active_reservations[i].profile_name[0] &&
+         config_find_profile(tls_active_reservations[i].profile_name) != NULL)
+            ? 1
+            : 0;
   }
   PQclear(res);
   out.status = DB_OK;

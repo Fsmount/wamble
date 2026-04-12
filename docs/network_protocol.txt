@@ -372,7 +372,14 @@ Control Codes
 - `0x22` ACTIVE_RESERVATIONS_DATA (server to client): Active reservations list.
   - Payload:
     - `uint16 count_be`
-    - `count * struct { uint64 board_id_be; uint64 reserved_at_epoch_be; }`
+    - `count * struct {`
+      `uint64 board_id_be;`
+      `uint64 reserved_at_epoch_be;`
+      `uint64 expires_at_epoch_be;`
+      `uint8 profile_available;`
+      `uint8 profile_name_len;`
+      `char profile_name[profile_name_len];`
+      `}`
   - Sent using the Fragment Payload Envelope (single or multi-chunk).
 
 Reliability

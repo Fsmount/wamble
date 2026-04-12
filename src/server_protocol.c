@@ -1104,12 +1104,6 @@ static int resolve_last_move_indices(const uint8_t *token,
   return 0;
 }
 
-static uint64_t u64_to_be(uint64_t x) {
-  uint32_t hi = (uint32_t)(x >> 32);
-  uint32_t lo = (uint32_t)(x & 0xffffffffu);
-  return ((uint64_t)htonl(lo) << 32) | htonl(hi);
-}
-
 static int effective_profile_websocket_port(const WambleProfile *profile) {
   if (!profile || profile->config.websocket_enabled == 0)
     return 0;
@@ -2006,7 +2000,7 @@ static ServerStatus send_profile_tos_payload(
     off += request_key_len;
     encoded[off++] = (uint8_t)WAMBLE_TREATMENT_VALUE_INT;
     {
-      uint64_t request_seq_be = u64_to_be((uint64_t)request_seq);
+      uint64_t request_seq_be = wamble_host_to_net64((uint64_t)request_seq);
       memcpy(encoded + off, &request_seq_be, sizeof(request_seq_be));
       off += sizeof(request_seq_be);
     }
@@ -2025,29 +2019,47 @@ static ServerStatus send_profile_tos_payload(
 static size_t
 encode_active_reservations_payload(const DbActiveReservationEntry *rows,
                                    int count, uint8_t *out, size_t out_cap) {
-  if (!out || out_cap < 2)
-    return 0;
+  size_t need = 2;
   if (count < 0)
     count = 0;
   if (count > 0 && !rows)
     return 0;
-  if ((size_t)count > (SIZE_MAX - 2u) / 16u)
-    return 0;
   if (count > (int)UINT16_MAX)
     count = (int)UINT16_MAX;
-  size_t need = 2 + ((size_t)count * 16);
+  for (int i = 0; i < count; i++) {
+    size_t profile_len = strnlen(rows[i].profile_name, PROFILE_NAME_MAX_LENGTH);
+    if (profile_len > UINT8_MAX)
+      profile_len = UINT8_MAX;
+    if (need > SIZE_MAX - (26u + profile_len))
+      return 0;
+    need += 26u + profile_len;
+  }
+  if (!out)
+    return need;
   if (need > out_cap)
     return 0;
   uint16_t count_be = htons((uint16_t)count);
   memcpy(out, &count_be, 2);
   size_t off = 2;
   for (int i = 0; i < count; i++) {
-    uint64_t board_be = u64_to_be(rows[i].board_id);
-    uint64_t reserved_be = u64_to_be((uint64_t)rows[i].reserved_at);
+    uint64_t board_be = wamble_host_to_net64(rows[i].board_id);
+    uint64_t reserved_be = wamble_host_to_net64((uint64_t)rows[i].reserved_at);
+    uint64_t expires_be = wamble_host_to_net64((uint64_t)rows[i].expires_at);
+    size_t profile_len = strnlen(rows[i].profile_name, PROFILE_NAME_MAX_LENGTH);
+    if (profile_len > UINT8_MAX)
+      profile_len = UINT8_MAX;
     memcpy(out + off, &board_be, 8);
     off += 8;
     memcpy(out + off, &reserved_be, 8);
     off += 8;
+    memcpy(out + off, &expires_be, 8);
+    off += 8;
+    out[off++] = rows[i].available ? 1u : 0u;
+    out[off++] = (uint8_t)profile_len;
+    if (profile_len > 0) {
+      memcpy(out + off, rows[i].profile_name, profile_len);
+      off += profile_len;
+    }
   }
   return off;
 }
@@ -2106,14 +2118,13 @@ static ServerStatus handle_get_active_reservations(
     encode_count = 0;
   if (encode_count > (int)UINT16_MAX)
     encode_count = (int)UINT16_MAX;
-  if ((size_t)encode_count > (SIZE_MAX - 2u) / 16u)
+  size_t payload_cap = encode_active_reservations_payload(
+      reservations.rows, encode_count, NULL, 0);
+  if (payload_cap == 0) {
     return send_error_terminal(sockfd, cliaddr, msg->token,
                                WAMBLE_ERR_RESERVATIONS_FAILED,
                                "reservations payload overflow", NULL, 0);
-
-  size_t payload_cap = 2 + ((size_t)encode_count * 16);
-  if (payload_cap < 2)
-    payload_cap = 2;
+  }
   uint8_t *payload = (uint8_t *)malloc(payload_cap);
   if (!payload)
     return send_error_terminal(sockfd, cliaddr, msg->token, WAMBLE_ERR_INTERNAL,
