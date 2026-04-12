@@ -40,23 +40,6 @@ typedef struct WambleHeader {
 static const char base64url_chars[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-static inline uint64_t host_to_net64(uint64_t x) { return x; }
-static inline uint64_t net_to_host64(uint64_t x) { return x; }
-#else
-static inline uint64_t host_to_net64(uint64_t x) {
-  uint32_t hi = (uint32_t)(x >> 32);
-  uint32_t lo = (uint32_t)(x & 0xffffffffu);
-  return ((uint64_t)htonl(lo) << 32) | htonl(hi);
-}
-
-static inline uint64_t net_to_host64(uint64_t x) {
-  uint32_t hi = (uint32_t)(x >> 32);
-  uint32_t lo = (uint32_t)(x & 0xffffffffu);
-  return ((uint64_t)ntohl(lo) << 32) | ntohl(hi);
-}
-#endif
-
 static NetworkStatus encode_msg_extensions(const struct WambleMsg *msg,
                                            uint8_t *dst, size_t cap,
                                            size_t *out_len) {
@@ -110,7 +93,7 @@ static NetworkStatus encode_msg_extensions(const struct WambleMsg *msg,
       if (off + 8 > cap)
         return NET_ERR_TRUNCATED;
       {
-        uint64_t ibe = host_to_net64((uint64_t)field->int_value);
+        uint64_t ibe = wamble_host_to_net64((uint64_t)field->int_value);
         memcpy(dst + off, &ibe, 8);
       }
       off += 8;
@@ -120,7 +103,7 @@ static NetworkStatus encode_msg_extensions(const struct WambleMsg *msg,
       {
         uint64_t bits = 0;
         memcpy(&bits, &field->double_value, sizeof(bits));
-        bits = host_to_net64(bits);
+        bits = wamble_host_to_net64(bits);
         memcpy(dst + off, &bits, 8);
       }
       off += 8;
@@ -216,7 +199,7 @@ static NetworkStatus decode_msg_extensions(const uint8_t *payload,
       {
         uint64_t ibe = 0;
         memcpy(&ibe, p, 8);
-        field->int_value = (int64_t)net_to_host64(ibe);
+        field->int_value = (int64_t)wamble_net_to_host64(ibe);
       }
       p += 8;
     } else if (field->value_type == WAMBLE_TREATMENT_VALUE_DOUBLE) {
@@ -225,7 +208,7 @@ static NetworkStatus decode_msg_extensions(const uint8_t *payload,
       {
         uint64_t bits = 0;
         memcpy(&bits, p, 8);
-        bits = net_to_host64(bits);
+        bits = wamble_net_to_host64(bits);
         memcpy(&field->double_value, &bits, sizeof(bits));
       }
       p += 8;
@@ -468,7 +451,7 @@ NetworkStatus wamble_payload_serialize(const struct WambleMsg *msg,
     if (msg->uci_len)
       memcpy(&payload[1], msg->uci, msg->uci_len);
     {
-      uint64_t parent_be = host_to_net64(msg->prediction_parent_id);
+      uint64_t parent_be = wamble_host_to_net64(msg->prediction_parent_id);
       memcpy(&payload[1 + msg->uci_len], &parent_be, 8);
     }
     body_len = need;
@@ -601,7 +584,7 @@ NetworkStatus wamble_payload_serialize(const struct WambleMsg *msg,
       uint32_t gp_be = htonl(msg->player_stats_games_played);
       uint32_t c960_be = htonl(msg->player_stats_chess960_games_played);
       memcpy(&bits, &msg->player_stats_score, sizeof(double));
-      be = host_to_net64(bits);
+      be = wamble_host_to_net64(bits);
       for (int i = 0; i < 8; i++)
         payload[i] = (uint8_t)((be >> (8 * (7 - i))) & 0xFF);
       memcpy(payload + 8, &gp_be, 4);
@@ -638,14 +621,14 @@ NetworkStatus wamble_payload_serialize(const struct WambleMsg *msg,
     for (uint8_t i = 0; i < count; i++) {
       const WambleLeaderboardEntry *e = &msg->leaderboard[i];
       uint32_t rank_be = htonl(e->rank);
-      uint64_t sid_be = host_to_net64(e->session_id);
+      uint64_t sid_be = wamble_host_to_net64(e->session_id);
       uint64_t score_bits = 0;
       uint64_t rating_bits = 0;
       uint32_t games_be = htonl(e->games_played);
       memcpy(&score_bits, &e->score, sizeof(double));
       memcpy(&rating_bits, &e->rating, sizeof(double));
-      score_bits = host_to_net64(score_bits);
-      rating_bits = host_to_net64(rating_bits);
+      score_bits = wamble_host_to_net64(score_bits);
+      rating_bits = wamble_host_to_net64(rating_bits);
       memcpy(payload + offset, &rank_be, 4);
       offset += 4;
       memcpy(payload + offset, &sid_be, 8);
@@ -684,12 +667,12 @@ NetworkStatus wamble_payload_serialize(const struct WambleMsg *msg,
     size_t offset = 1;
     for (uint8_t i = 0; i < count; i++) {
       const WamblePredictionEntry *e = &msg->predictions[i];
-      uint64_t id_be = host_to_net64(e->id);
-      uint64_t parent_be = host_to_net64(e->parent_id);
+      uint64_t id_be = wamble_host_to_net64(e->id);
+      uint64_t parent_be = wamble_host_to_net64(e->parent_id);
       uint64_t points_bits = 0;
       uint16_t ply_be = htons(e->target_ply);
       memcpy(&points_bits, &e->points_awarded, sizeof(double));
-      points_bits = host_to_net64(points_bits);
+      points_bits = wamble_host_to_net64(points_bits);
       memcpy(payload + offset, &id_be, 8);
       offset += 8;
       memcpy(payload + offset, &parent_be, 8);
@@ -827,7 +810,7 @@ static NetworkStatus decode_message_payload(uint8_t ctrl, uint8_t flags,
     {
       uint64_t parent_be = 0;
       memcpy(&parent_be, &payload[1 + msg->uci_len], 8);
-      msg->prediction_parent_id = net_to_host64(parent_be);
+      msg->prediction_parent_id = wamble_net_to_host64(parent_be);
     }
     break;
   case WAMBLE_CTRL_SERVER_HELLO:
@@ -941,7 +924,7 @@ static NetworkStatus decode_message_payload(uint8_t ctrl, uint8_t flags,
       double score = 0.0;
       for (int i = 0; i < 8; i++)
         be = (be << 8) | payload[i];
-      host = net_to_host64(be);
+      host = wamble_net_to_host64(be);
       memcpy(&score, &host, sizeof(double));
       msg->player_stats_score = score;
       if (payload_len >= 12) {
@@ -1043,9 +1026,9 @@ static NetworkStatus decode_message_payload(uint8_t ctrl, uint8_t flags,
         }
         offset += raw_handle_len;
         e->rank = ntohl(rank_be);
-        e->session_id = net_to_host64(sid_be);
-        score_be = net_to_host64(score_be);
-        rating_be = net_to_host64(rating_be);
+        e->session_id = wamble_net_to_host64(sid_be);
+        score_be = wamble_net_to_host64(score_be);
+        rating_be = wamble_net_to_host64(rating_be);
         memcpy(&e->score, &score_be, sizeof(double));
         memcpy(&e->rating, &rating_be, sizeof(double));
         e->games_played = ntohl(games_be);
@@ -1085,9 +1068,9 @@ static NetworkStatus decode_message_payload(uint8_t ctrl, uint8_t flags,
         e->uci_len = payload[offset++];
         memcpy(e->uci, payload + offset, MAX_UCI_LENGTH);
         offset += MAX_UCI_LENGTH;
-        e->id = net_to_host64(id_be);
-        e->parent_id = net_to_host64(parent_be);
-        points_be = net_to_host64(points_be);
+        e->id = wamble_net_to_host64(id_be);
+        e->parent_id = wamble_net_to_host64(parent_be);
+        points_be = wamble_net_to_host64(points_be);
         memcpy(&e->points_awarded, &points_be, sizeof(double));
         e->target_ply = ntohs(ply_be);
         if (e->uci_len > MAX_UCI_LENGTH)
@@ -1101,11 +1084,20 @@ static NetworkStatus decode_message_payload(uint8_t ctrl, uint8_t flags,
     {
       uint16_t count_be = 0;
       uint16_t count = 0;
+      size_t off = 2;
       memcpy(&count_be, payload, 2);
       count = ntohs(count_be);
       msg->active_reservation_count = count;
-      if (payload_len < 2 + ((size_t)count * 16))
-        return NET_ERR_TRUNCATED;
+      for (uint16_t i = 0; i < count; i++) {
+        uint8_t profile_len = 0;
+        if (payload_len - off < 26u)
+          return NET_ERR_TRUNCATED;
+        off += 25u;
+        profile_len = payload[off++];
+        if (payload_len - off < (size_t)profile_len)
+          return NET_ERR_TRUNCATED;
+        off += (size_t)profile_len;
+      }
       {
         size_t copy_len = payload_len;
         if (copy_len > WAMBLE_FRAGMENT_DATA_MAX)
@@ -1148,7 +1140,7 @@ NetworkStatus wamble_packet_serialize(const struct WambleMsg *msg,
   hdr.version =
       (msg->header_version != 0) ? msg->header_version : WAMBLE_PROTO_VERSION;
   memcpy(hdr.token, msg->token, TOKEN_LENGTH);
-  hdr.board_id = host_to_net64(msg->board_id);
+  hdr.board_id = wamble_host_to_net64(msg->board_id);
   hdr.seq_num = htonl(msg->seq_num);
 
   uint8_t payload[WAMBLE_MAX_PAYLOAD];
@@ -1192,7 +1184,7 @@ NetworkStatus wamble_packet_deserialize(const uint8_t *buffer,
   msg->ctrl = hdr.ctrl;
   msg->flags = hdr.flags;
   memcpy(msg->token, hdr.token, TOKEN_LENGTH);
-  msg->board_id = net_to_host64(hdr.board_id);
+  msg->board_id = wamble_net_to_host64(hdr.board_id);
   msg->seq_num = ntohl(hdr.seq_num);
   msg->header_version = hdr.version;
   if (out_flags)

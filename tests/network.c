@@ -7,16 +7,9 @@
 void crypto_blake2b(uint8_t *hash, size_t hash_size, const uint8_t *msg,
                     size_t msg_size);
 
-static uint64_t test_net_to_host64(uint64_t x) {
-  uint32_t hi = (uint32_t)(x >> 32);
-  uint32_t lo = (uint32_t)(x & 0xffffffffu);
-  return ((uint64_t)ntohl(lo) << 32) | ntohl(hi);
-}
-
-static uint64_t test_host_to_net64(uint64_t x) {
-  uint32_t hi = (uint32_t)(x >> 32);
-  uint32_t lo = (uint32_t)(x & 0xffffffffu);
-  return ((uint64_t)htonl(lo) << 32) | htonl(hi);
+static void write_be_u64(uint8_t out[8], uint64_t v) {
+  uint64_t be = wamble_host_to_net64(v);
+  memcpy(out, &be, sizeof(be));
 }
 
 WAMBLE_TEST(token_base64url_roundtrip) {
@@ -1144,21 +1137,35 @@ WAMBLE_TEST(active_reservations_data_roundtrip) {
     out.token[i] = (uint8_t)(0x6a + i);
   {
     uint16_t count_be = htons(2);
-    uint64_t board0_be = test_host_to_net64(101);
-    uint64_t reserved0_be = test_host_to_net64(1700000000ULL);
-    uint64_t board1_be = test_host_to_net64(202);
-    uint64_t reserved1_be = test_host_to_net64(1700000015ULL);
+    size_t off = 0;
     memcpy(out.fragment_data, &count_be, 2);
-    memcpy(out.fragment_data + 2, &board0_be, 8);
-    memcpy(out.fragment_data + 10, &reserved0_be, 8);
-    memcpy(out.fragment_data + 18, &board1_be, 8);
-    memcpy(out.fragment_data + 26, &reserved1_be, 8);
-    out.fragment_data_len = 34;
+    off = 2;
+    write_be_u64(out.fragment_data + off, 101);
+    off += 8;
+    write_be_u64(out.fragment_data + off, 1700000000ULL);
+    off += 8;
+    write_be_u64(out.fragment_data + off, 1700000100ULL);
+    off += 8;
+    out.fragment_data[off++] = 1;
+    out.fragment_data[off++] = 2;
+    memcpy(out.fragment_data + off, "p1", 2);
+    off += 2;
+    write_be_u64(out.fragment_data + off, 202);
+    off += 8;
+    write_be_u64(out.fragment_data + off, 1700000015ULL);
+    off += 8;
+    write_be_u64(out.fragment_data + off, 1700000200ULL);
+    off += 8;
+    out.fragment_data[off++] = 0;
+    out.fragment_data[off++] = 4;
+    memcpy(out.fragment_data + off, "open", 4);
+    off += 4;
+    out.fragment_data_len = (uint16_t)off;
     out.fragment_version = WAMBLE_FRAGMENT_VERSION;
     out.fragment_hash_algo = WAMBLE_FRAGMENT_HASH_BLAKE2B_256;
     out.fragment_chunk_index = 0;
     out.fragment_chunk_count = 1;
-    out.fragment_total_len = 34;
+    out.fragment_total_len = out.fragment_data_len;
     out.fragment_transfer_id = 1;
   }
 
@@ -1168,14 +1175,24 @@ WAMBLE_TEST(active_reservations_data_roundtrip) {
   T_ASSERT_EQ_INT(ctx.received, 1);
   T_ASSERT_EQ_INT(ctx.msg.ctrl, WAMBLE_CTRL_ACTIVE_RESERVATIONS_DATA);
   T_ASSERT_EQ_INT((int)ctx.msg.active_reservation_count, 2);
-  T_ASSERT_EQ_INT((int)ctx.msg.fragment_data_len, 34);
+  T_ASSERT_EQ_INT((int)ctx.msg.fragment_data_len, 60);
   {
     uint64_t board0_be = 0;
     uint64_t reserved0_be = 0;
+    uint64_t expires0_be = 0;
+    uint8_t available0 = 0;
+    uint8_t profile_len0 = 0;
     memcpy(&board0_be, ctx.msg.fragment_data + 2, 8);
     memcpy(&reserved0_be, ctx.msg.fragment_data + 10, 8);
-    T_ASSERT_EQ_INT((int)test_net_to_host64(board0_be), 101);
-    T_ASSERT_EQ_INT((int)test_net_to_host64(reserved0_be), 1700000000);
+    memcpy(&expires0_be, ctx.msg.fragment_data + 18, 8);
+    available0 = ctx.msg.fragment_data[26];
+    profile_len0 = ctx.msg.fragment_data[27];
+    T_ASSERT_EQ_INT((int)wamble_net_to_host64(board0_be), 101);
+    T_ASSERT_EQ_INT((int)wamble_net_to_host64(reserved0_be), 1700000000);
+    T_ASSERT_EQ_INT((int)wamble_net_to_host64(expires0_be), 1700000100);
+    T_ASSERT_EQ_INT((int)available0, 1);
+    T_ASSERT_EQ_INT((int)profile_len0, 2);
+    T_ASSERT(memcmp(ctx.msg.fragment_data + 28, "p1", 2) == 0);
   }
 
   wamble_close_socket(cli);
@@ -3823,14 +3840,24 @@ WAMBLE_TEST(server_protocol_get_active_reservations_identity_query) {
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
   T_ASSERT_EQ_INT(rx.received, 1);
   T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_ACTIVE_RESERVATIONS_DATA);
-  T_ASSERT(rx.msg.fragment_data_len >= 18);
+  T_ASSERT(rx.msg.fragment_data_len >= 30);
   {
     uint16_t count_be = 0;
     uint64_t board_be = 0;
+    uint64_t expires_be = 0;
+    uint8_t available = 0;
+    uint8_t profile_len = 0;
     memcpy(&count_be, rx.msg.fragment_data, 2);
     memcpy(&board_be, rx.msg.fragment_data + 2, 8);
+    memcpy(&expires_be, rx.msg.fragment_data + 18, 8);
+    available = rx.msg.fragment_data[26];
+    profile_len = rx.msg.fragment_data[27];
     T_ASSERT_EQ_INT((int)ntohs(count_be), 1);
-    T_ASSERT_EQ_INT((int)test_net_to_host64(board_be), 777);
+    T_ASSERT_EQ_INT((int)wamble_net_to_host64(board_be), 777);
+    T_ASSERT(wamble_net_to_host64(expires_be) > 0);
+    T_ASSERT_EQ_INT((int)available, 1);
+    T_ASSERT_EQ_INT((int)profile_len, 2);
+    T_ASSERT(memcmp(rx.msg.fragment_data + 28, "p1", 2) == 0);
   }
   wamble_close_socket(cli);
   wamble_close_socket(srv);

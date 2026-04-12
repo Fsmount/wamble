@@ -61,6 +61,22 @@
 #define WAMBLE_WEAK __attribute__((weak))
 #endif
 
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+static inline uint64_t wamble_host_to_net64(uint64_t x) { return x; }
+static inline uint64_t wamble_net_to_host64(uint64_t x) { return x; }
+#else
+static inline uint64_t wamble_host_to_net64(uint64_t x) {
+  uint32_t hi = (uint32_t)(x >> 32);
+  uint32_t lo = (uint32_t)(x & 0xffffffffu);
+  return ((uint64_t)htonl(lo) << 32) | htonl(hi);
+}
+
+static inline uint64_t wamble_net_to_host64(uint64_t x) {
+  uint32_t hi = (uint32_t)(x >> 32);
+  uint32_t lo = (uint32_t)(x & 0xffffffffu);
+  return ((uint64_t)ntohl(lo) << 32) | ntohl(hi);
+}
+#endif
 #ifdef WAMBLE_PLATFORM_WINDOWS
 #define wamble_getpid() GetCurrentProcessId()
 #elif defined(WAMBLE_PLATFORM_WASM)
@@ -1161,6 +1177,9 @@ typedef struct {
 typedef struct {
   uint64_t board_id;
   time_t reserved_at;
+  time_t expires_at;
+  uint8_t available;
+  char profile_name[PROFILE_NAME_MAX_LENGTH];
 } DbActiveReservationEntry;
 
 typedef struct {
