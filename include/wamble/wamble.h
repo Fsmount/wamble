@@ -1696,6 +1696,7 @@ typedef struct SpectatorUpdate {
   struct sockaddr_in addr;
   uint8_t flags;
   uint8_t notification_type;
+  uint64_t summary_generation;
 } SpectatorUpdate;
 
 typedef struct ReservationReleaseNotification {
