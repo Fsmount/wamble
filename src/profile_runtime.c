@@ -1128,6 +1128,14 @@ static void send_spectator_batch(wamble_socket_t sockfd,
       memcpy(out.fen, events[i].fen, __len);
       out.fen[__len] = '\0';
     }
+    if (ctrl == WAMBLE_CTRL_SPECTATE_UPDATE &&
+        events[i].summary_generation > 0) {
+      out.ext_count = 1;
+      snprintf(out.ext[0].key, sizeof(out.ext[0].key), "%s",
+               "spectate.summary_generation");
+      out.ext[0].value_type = WAMBLE_TREATMENT_VALUE_INT;
+      out.ext[0].int_value = (int64_t)events[i].summary_generation;
+    }
     (void)send_unreliable_packet(sockfd, &out, &events[i].addr);
   }
 }

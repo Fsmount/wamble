@@ -51,9 +51,14 @@ WAMBLE_TEST(spectator_summary_and_focus_flow) {
   SpectatorUpdate updates[16];
   int count = spectator_collect_updates(updates, 16);
   int saw_summary = 0;
+  int saw_summary_generation = 0;
   int saw_focus = 0;
   for (int i = 0; i < count; i++) {
-    if (tokens_equal(updates[i].token, summary_token))
+    if (tokens_equal(updates[i].token, summary_token) &&
+        updates[i].summary_generation > 0)
+      saw_summary_generation = 1;
+    if (tokens_equal(updates[i].token, summary_token) &&
+        updates[i].board_id > 0)
       saw_summary = 1;
     if (tokens_equal(updates[i].token, focus_token) &&
         updates[i].board_id == active_id) {
@@ -61,7 +66,97 @@ WAMBLE_TEST(spectator_summary_and_focus_flow) {
     }
   }
   T_ASSERT(saw_summary);
+  T_ASSERT(saw_summary_generation);
   T_ASSERT(saw_focus);
+
+  spectator_manager_shutdown();
+  return 0;
+}
+
+WAMBLE_TEST(spectator_summary_updates_emit_full_snapshots) {
+  char msg[128];
+  T_ASSERT_STATUS(config_load(NULL, NULL, msg, sizeof(msg)),
+                  CONFIG_LOAD_DEFAULTS);
+  spectator_manager_init();
+  board_manager_init();
+  player_manager_init();
+
+  WamblePlayer *player_a = create_new_player();
+  WamblePlayer *player_b = create_new_player();
+  T_ASSERT(player_a != NULL);
+  T_ASSERT(player_b != NULL);
+  WambleBoard *board_a = find_board_for_player(player_a);
+  WambleBoard *board_b = find_board_for_player(player_b);
+  T_ASSERT(board_a != NULL);
+  T_ASSERT(board_b != NULL);
+  board_move_played(board_a->id, NULL, NULL);
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons((uint16_t)get_config()->port);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+  uint8_t token[TOKEN_LENGTH] = {9};
+  struct WambleMsg summary = {0};
+  SpectatorState state = SPECTATOR_STATE_IDLE;
+  uint64_t focus = 0;
+  summary.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  memcpy(summary.token, token, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(
+      spectator_handle_request(&summary, &addr, 0, 0, 1, &state, &focus),
+      SPECTATOR_OK_SUMMARY);
+
+  SpectatorUpdate updates[32];
+  int count = spectator_collect_updates(updates, 32);
+  uint64_t gen0 = 0;
+  int board_count0 = 0;
+  for (int i = 0; i < count; i++) {
+    if (!tokens_equal(updates[i].token, token))
+      continue;
+    if (updates[i].summary_generation > 0)
+      gen0 = updates[i].summary_generation;
+    if (updates[i].board_id > 0)
+      board_count0++;
+  }
+  T_ASSERT(gen0 > 0);
+  T_ASSERT(board_count0 >= 2);
+
+  board_release_reservation(board_b->id);
+  spectator_manager_tick();
+  wamble_sleep_ms(2);
+
+  WambleConfig cfg = *get_config();
+  cfg.spectator_summary_hz = 1000;
+  wamble_config_push(&cfg);
+  count = spectator_collect_updates(updates, 32);
+  wamble_config_pop();
+
+  uint64_t gen1 = 0;
+  int saw_reset_marker = 0;
+  int board_count1 = 0;
+  int saw_board_a = 0;
+  int saw_board_b = 0;
+  for (int i = 0; i < count; i++) {
+    if (!tokens_equal(updates[i].token, token))
+      continue;
+    if (updates[i].summary_generation > 0)
+      gen1 = updates[i].summary_generation;
+    if (updates[i].summary_generation > 0 && updates[i].board_id == 0 &&
+        updates[i].fen[0] == '\0')
+      saw_reset_marker = 1;
+    if (updates[i].board_id == board_a->id)
+      saw_board_a = 1;
+    if (updates[i].board_id == board_b->id)
+      saw_board_b = 1;
+    if (updates[i].board_id > 0)
+      board_count1++;
+  }
+  T_ASSERT(gen1 > gen0);
+  T_ASSERT(saw_reset_marker);
+  T_ASSERT(board_count1 >= 1);
+  T_ASSERT(saw_board_a);
+  T_ASSERT(!saw_board_b);
 
   spectator_manager_shutdown();
   return 0;
@@ -350,6 +445,8 @@ WAMBLE_TEST(spectator_mode_filters_ignored_without_game_mode_visibility) {
 
 WAMBLE_TESTS_BEGIN_NAMED(spectator_tests) {
   WAMBLE_TESTS_ADD_FM(spectator_summary_and_focus_flow, "spectator");
+  WAMBLE_TESTS_ADD_FM(spectator_summary_updates_emit_full_snapshots,
+                      "spectator");
   WAMBLE_TESTS_ADD_FM(spectator_visibility_and_capacity, "spectator");
   WAMBLE_TESTS_ADD_FM(spectator_notifications_use_structured_flags,
                       "spectator");

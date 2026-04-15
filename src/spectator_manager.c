@@ -10,7 +10,6 @@ typedef struct SpectatorEntry {
   uint64_t focus_board_id;
   double last_summary_sent;
   double last_focus_sent;
-  time_t last_summary_wall;
   double last_activity;
   int has_pending_notice;
   uint8_t pending_notice_flags;
@@ -28,6 +27,7 @@ static int spectators_count;
 static int spectators_capacity;
 static wamble_mutex_t spectators_mutex;
 static int rr_index = 0;
+static uint64_t summary_generation_counter = 0;
 
 static WambleBoard **summary_cache = NULL;
 static int summary_cache_count = 0;
@@ -287,7 +287,6 @@ static SpectatorEntry *ensure_spectator(const struct sockaddr_in *addr,
   e->state = SPECTATOR_STATE_IDLE;
   e->last_summary_sent = 0.0;
   e->last_focus_sent = 0.0;
-  e->last_summary_wall = 0;
   e->last_activity = monotonic_seconds();
   e->has_pending_notice = 0;
   e->pending_notice_flags = 0;
@@ -416,7 +415,6 @@ void spectator_manager_tick(void) {
         e->focus_board_id = 0;
         e->last_focus_sent = 0.0;
         e->capacity_bypass = 0;
-        e->last_summary_wall = 0;
       } else {
         WambleBoard *b = get_board_by_id(e->focus_board_id);
         if (!b || !is_board_eligible(b)) {
@@ -440,14 +438,13 @@ void spectator_manager_tick(void) {
           e->focus_board_id = 0;
           e->last_focus_sent = 0.0;
           e->capacity_bypass = 0;
-          e->last_summary_wall = 0;
         }
       }
     }
 
     if (e->state == SPECTATOR_STATE_SUMMARY && cfg->spectator_summary_hz <= 0) {
       if (e->last_summary_sent == 0.0)
-        e->last_summary_sent = now, e->last_summary_wall = wamble_now_wall();
+        e->last_summary_sent = now;
     }
     if (e->state == SPECTATOR_STATE_FOCUS && cfg->spectator_focus_hz <= 0) {
 
@@ -474,7 +471,6 @@ void spectator_manager_tick(void) {
       e->focus_board_id = 0;
       e->last_focus_sent = 0.0;
       e->capacity_bypass = 0;
-      e->last_summary_wall = 0;
     }
 
     if (write_idx != read_idx) {
@@ -507,6 +503,7 @@ int spectator_collect_notifications(struct SpectatorUpdate *out, int max) {
     u->addr = e->addr;
     u->flags = e->pending_notice_flags;
     u->notification_type = e->pending_notice_type;
+    u->summary_generation = 0;
     e->has_pending_notice = 0;
     e->pending_notice_flags = 0;
     e->pending_notice_type = WAMBLE_NOTIFICATION_TYPE_GENERIC;
@@ -542,7 +539,6 @@ SpectatorRequestStatus spectator_handle_request(
       e->pending_notice[0] = '\0';
       e->capacity_bypass = 0;
       e->game_mode_visible = 0;
-      e->last_summary_wall = 0;
       break;
     }
     if (out_state)
@@ -585,7 +581,6 @@ SpectatorRequestStatus spectator_handle_request(
       e->focus_board_id = 0;
       e->last_summary_sent = 0.0;
       e->capacity_bypass = 0;
-      e->last_summary_wall = 0;
       e->game_mode_filter = 0;
       if (e->game_mode_visible) {
         if (msg->flags & WAMBLE_FLAG_MODE_FILTER_CHESS960)
@@ -656,22 +651,24 @@ void spectator_discard_by_token(const uint8_t *token) {
 
 static void fill_summary_now(SpectatorEntry *e, SpectatorUpdate *out,
                              int out_cap, int *out_count) {
-  int use_changes = 0;
-  if (get_config()->spectator_summary_mode &&
-      strcmp(get_config()->spectator_summary_mode, "changes") == 0) {
-    use_changes = 1;
+  uint64_t generation = 0;
+  if (!e || !out || !out_count || out_cap <= 0)
+    return;
+  generation = ++summary_generation_counter;
+  if (*out_count < out_cap) {
+    SpectatorUpdate *reset = &out[*out_count];
+    memset(reset, 0, sizeof(*reset));
+    memcpy(reset->token, e->token, TOKEN_LENGTH);
+    reset->addr = e->addr;
+    reset->flags = WAMBLE_FLAG_UNRELIABLE;
+    reset->summary_generation = generation;
+    (*out_count)++;
   }
-
-  time_t since = e->last_summary_wall;
 
   for (int i = 0; i < summary_cache_count; i++) {
     if (*out_count >= out_cap)
       break;
     WambleBoard *b = summary_cache[i];
-    if (use_changes) {
-      if (since != 0 && b->last_move_time <= since)
-        continue;
-    }
     GameMode board_game_mode = b->board.game_mode;
     if (e->game_mode_filter != 0 &&
         !(e->game_mode_filter & (1u << board_game_mode)))
@@ -682,6 +679,7 @@ static void fill_summary_now(SpectatorEntry *e, SpectatorUpdate *out,
     spectator_write_visible_fen(e->token, b, u->fen, sizeof(u->fen));
     u->addr = e->addr;
     u->flags = WAMBLE_FLAG_UNRELIABLE;
+    u->summary_generation = generation;
     if (e->game_mode_visible && board_game_mode == GAME_MODE_CHESS960)
       u->flags |= WAMBLE_FLAG_BOARD_IS_960;
     (*out_count)++;
@@ -722,7 +720,6 @@ int spectator_collect_updates(struct SpectatorUpdate *out, int max) {
       if (due) {
         fill_summary_now(e, out, max, &out_count);
         e->last_summary_sent = now;
-        e->last_summary_wall = wamble_now_wall();
       }
     } else if (e->state == SPECTATOR_STATE_FOCUS) {
       int due =
@@ -738,6 +735,7 @@ int spectator_collect_updates(struct SpectatorUpdate *out, int max) {
             spectator_write_visible_fen(e->token, b, u->fen, sizeof(u->fen));
             u->addr = e->addr;
             u->flags = WAMBLE_FLAG_UNRELIABLE;
+            u->summary_generation = 0;
             if (e->game_mode_visible &&
                 b->board.game_mode == GAME_MODE_CHESS960)
               u->flags |= WAMBLE_FLAG_BOARD_IS_960;
