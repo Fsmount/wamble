@@ -61,6 +61,25 @@
 #define WAMBLE_WEAK __attribute__((weak))
 #endif
 
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define WAMBLE_ALIGNOF(type) _Alignof(type)
+#define WAMBLE_STATIC_ASSERT(name, expr) _Static_assert((expr), #name)
+#else
+#define WAMBLE_ALIGNOF(type)                                                   \
+  offsetof(                                                                    \
+      struct {                                                                 \
+        char c;                                                                \
+        type value;                                                            \
+      },                                                                       \
+      value)
+#define WAMBLE_STATIC_ASSERT3(name, line, expr)                                \
+  typedef char name##line[(expr) ? 1 : -1]
+#define WAMBLE_STATIC_ASSERT2(name, line, expr)                                \
+  WAMBLE_STATIC_ASSERT3(name, line, expr)
+#define WAMBLE_STATIC_ASSERT(name, expr)                                       \
+  WAMBLE_STATIC_ASSERT2(name, __LINE__, expr)
+#endif
+
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
 static inline uint64_t wamble_host_to_net64(uint64_t x) { return x; }
 static inline uint64_t wamble_net_to_host64(uint64_t x) { return x; }
@@ -1479,6 +1498,92 @@ typedef struct {
   int bool_value;
 } WambleMessageExtField;
 
+typedef struct {
+  uint8_t uci_len;
+  char uci[MAX_UCI_LENGTH];
+  uint8_t profile_name_len;
+  char profile_name[PROFILE_NAME_MAX_LENGTH];
+  uint16_t profile_info_len;
+  char profile_info[FEN_MAX_LENGTH];
+} WambleMsgTextFields;
+
+#pragma pack(push, 1)
+typedef struct {
+  uint8_t fragment_version;
+  uint8_t fragment_hash_algo;
+  uint16_t fragment_chunk_index;
+  uint16_t fragment_chunk_count;
+  uint8_t reserved[2];
+  uint32_t fragment_total_len;
+  uint32_t fragment_transfer_id;
+  uint8_t fragment_hash[WAMBLE_FRAGMENT_HASH_LENGTH];
+  uint16_t fragment_data_len;
+  uint8_t fragment_data[WAMBLE_FRAGMENT_DATA_MAX];
+} WambleMsgFragmentPayload;
+#pragma pack(pop)
+
+typedef struct {
+  uint16_t profiles_list_len;
+  char profiles_list[FEN_MAX_LENGTH];
+  char fen[FEN_MAX_LENGTH];
+  uint16_t error_code;
+  char error_reason[FEN_MAX_LENGTH];
+} WambleMsgViewFields;
+
+typedef struct {
+  uint8_t public_key[WAMBLE_PUBLIC_KEY_LENGTH];
+  uint8_t signature[WAMBLE_LOGIN_SIGNATURE_LENGTH];
+  uint8_t challenge[WAMBLE_LOGIN_CHALLENGE_LENGTH];
+  uint8_t has_signature;
+} WambleMsgLoginPayload;
+
+typedef struct {
+  double score;
+  uint32_t games_played;
+  uint32_t chess960_games_played;
+} WambleMsgPlayerStatsPayload;
+
+typedef struct {
+  uint8_t square;
+  uint8_t count;
+  WambleNetMove entries[WAMBLE_MAX_LEGAL_MOVES];
+} WambleMsgLegalMovesPayload;
+
+typedef struct {
+  WambleMsgPlayerStatsPayload player_stats;
+  WambleMsgLegalMovesPayload legal_moves;
+} WambleMsgStatsFields;
+
+typedef struct {
+  uint8_t type;
+  uint8_t limit;
+  uint8_t count;
+  uint32_t self_rank;
+  WambleLeaderboardEntry entries[WAMBLE_MAX_LEADERBOARD_ENTRIES];
+} WambleMsgLeaderboardPayload;
+
+typedef struct {
+  uint64_t parent_id;
+  uint8_t depth;
+  uint8_t limit;
+  uint8_t count;
+  uint8_t reserved[5];
+  WamblePredictionEntry entries[WAMBLE_MAX_PREDICTION_ENTRIES];
+} WambleMsgPredictionPayload;
+
+#pragma pack(push, 1)
+typedef struct {
+  uint16_t active_count;
+  uint8_t notification_type;
+} WambleMsgSessionPayload;
+#pragma pack(pop)
+
+typedef struct {
+  uint8_t count;
+  uint8_t reserved[4];
+  WambleMessageExtField fields[WAMBLE_MAX_MESSAGE_EXT_FIELDS];
+} WambleMsgExtensions;
+
 struct WambleMsg {
   uint8_t ctrl;
   uint8_t flags;
@@ -1486,51 +1591,33 @@ struct WambleMsg {
   uint8_t token[TOKEN_LENGTH];
   uint64_t board_id;
   uint32_t seq_num;
-  uint8_t uci_len;
-  char uci[MAX_UCI_LENGTH];
-  uint8_t profile_name_len;
-  char profile_name[PROFILE_NAME_MAX_LENGTH];
-  uint16_t profile_info_len;
-  char profile_info[FEN_MAX_LENGTH];
-  uint8_t fragment_version;
-  uint8_t fragment_hash_algo;
-  uint16_t fragment_chunk_index;
-  uint16_t fragment_chunk_count;
-  uint32_t fragment_total_len;
-  uint32_t fragment_transfer_id;
-  uint8_t fragment_hash[WAMBLE_FRAGMENT_HASH_LENGTH];
-  uint16_t fragment_data_len;
-  uint8_t fragment_data[WAMBLE_FRAGMENT_DATA_MAX];
-  uint16_t profiles_list_len;
-  char profiles_list[FEN_MAX_LENGTH];
-  char fen[FEN_MAX_LENGTH];
-  uint16_t error_code;
-  char error_reason[FEN_MAX_LENGTH];
-  uint8_t login_pubkey[WAMBLE_PUBLIC_KEY_LENGTH];
-  uint8_t login_signature[WAMBLE_LOGIN_SIGNATURE_LENGTH];
-  uint8_t login_challenge[WAMBLE_LOGIN_CHALLENGE_LENGTH];
-  uint8_t login_has_signature;
-  double player_stats_score;
-  uint32_t player_stats_games_played;
-  uint32_t player_stats_chess960_games_played;
-  uint8_t move_square;
-  uint8_t move_count;
-  WambleNetMove moves[WAMBLE_MAX_LEGAL_MOVES];
-  uint8_t leaderboard_type;
-  uint8_t leaderboard_limit;
-  uint8_t leaderboard_count;
-  uint32_t leaderboard_self_rank;
-  WambleLeaderboardEntry leaderboard[WAMBLE_MAX_LEADERBOARD_ENTRIES];
-  uint64_t prediction_parent_id;
-  uint8_t prediction_depth;
-  uint8_t prediction_limit;
-  uint8_t prediction_count;
-  WamblePredictionEntry predictions[WAMBLE_MAX_PREDICTION_ENTRIES];
-  uint16_t active_reservation_count;
-  uint8_t notification_type;
-  uint8_t ext_count;
-  WambleMessageExtField ext[WAMBLE_MAX_MESSAGE_EXT_FIELDS];
+  WambleMsgTextFields text;
+  WambleMsgFragmentPayload fragment;
+  WambleMsgViewFields view;
+  WambleMsgLoginPayload login;
+  WambleMsgStatsFields stats;
+  WambleMsgLeaderboardPayload leaderboard_payload;
+  WambleMsgPredictionPayload prediction;
+  WambleMsgSessionPayload session;
+  WambleMsgExtensions extensions;
 };
+
+WAMBLE_STATIC_ASSERT(wamble_prediction_entries_are_aligned,
+                     offsetof(WambleMsgPredictionPayload, entries) %
+                             WAMBLE_ALIGNOF(WamblePredictionEntry) ==
+                         0);
+WAMBLE_STATIC_ASSERT(wamble_extension_fields_are_aligned,
+                     offsetof(WambleMsgExtensions, fields) %
+                             WAMBLE_ALIGNOF(WambleMessageExtField) ==
+                         0);
+WAMBLE_STATIC_ASSERT(wamble_msg_prediction_payload_is_aligned,
+                     offsetof(struct WambleMsg, prediction) %
+                             WAMBLE_ALIGNOF(WamblePredictionEntry) ==
+                         0);
+WAMBLE_STATIC_ASSERT(wamble_msg_extensions_payload_is_aligned,
+                     offsetof(struct WambleMsg, extensions) %
+                             WAMBLE_ALIGNOF(WambleMessageExtField) ==
+                         0);
 
 static inline void
 wamble_leaderboard_entry_release(WambleLeaderboardEntry *entry) {
@@ -1560,8 +1647,53 @@ static inline void wamble_msg_release_dynamic(struct WambleMsg *msg) {
   if (!msg)
     return;
   for (int i = 0; i < WAMBLE_MAX_LEADERBOARD_ENTRIES; i++) {
-    wamble_leaderboard_entry_release(&msg->leaderboard[i]);
+    wamble_leaderboard_entry_release(&msg->leaderboard_payload.entries[i]);
   }
+}
+
+static inline const WambleMessageExtField *
+wamble_msg_ext_find(const struct WambleMsg *msg, const char *key) {
+  if (!msg || !key || !key[0])
+    return NULL;
+  for (uint8_t i = 0; i < msg->extensions.count; i++) {
+    const WambleMessageExtField *field = &msg->extensions.fields[i];
+    if (strcmp(field->key, key) == 0)
+      return field;
+  }
+  return NULL;
+}
+
+static inline int wamble_msg_ext_read_int(const struct WambleMsg *msg,
+                                          const char *key, int64_t *out_value) {
+  const WambleMessageExtField *field = wamble_msg_ext_find(msg, key);
+  if (!field || field->value_type != WAMBLE_TREATMENT_VALUE_INT || !out_value)
+    return 0;
+  *out_value = field->int_value;
+  return 1;
+}
+
+static inline int wamble_msg_ext_read_double(const struct WambleMsg *msg,
+                                             const char *key,
+                                             double *out_value) {
+  const WambleMessageExtField *field = wamble_msg_ext_find(msg, key);
+  if (!field || field->value_type != WAMBLE_TREATMENT_VALUE_DOUBLE ||
+      !out_value) {
+    return 0;
+  }
+  *out_value = field->double_value;
+  return 1;
+}
+
+static inline int wamble_msg_ext_read_string(const struct WambleMsg *msg,
+                                             const char *key,
+                                             const char **out_value) {
+  const WambleMessageExtField *field = wamble_msg_ext_find(msg, key);
+  if (!field || field->value_type != WAMBLE_TREATMENT_VALUE_STRING ||
+      !out_value) {
+    return 0;
+  }
+  *out_value = field->string_value;
+  return 1;
 }
 
 static inline int ctrl_supports_fragment_payload(uint8_t ctrl) {
@@ -1590,9 +1722,10 @@ static inline int ctrl_supports_fragment_payload(uint8_t ctrl) {
 static inline int msg_uses_fragment_payload(const struct WambleMsg *msg) {
   if (!msg)
     return 0;
-  return (msg->fragment_version == WAMBLE_FRAGMENT_VERSION) ||
-         (msg->fragment_chunk_count > 0) || (msg->fragment_total_len > 0) ||
-         (msg->fragment_data_len > 0);
+  return (msg->fragment.fragment_version == WAMBLE_FRAGMENT_VERSION) ||
+         (msg->fragment.fragment_chunk_count > 0) ||
+         (msg->fragment.fragment_total_len > 0) ||
+         (msg->fragment.fragment_data_len > 0);
 }
 
 NetworkStatus wamble_payload_serialize(const struct WambleMsg *msg,
