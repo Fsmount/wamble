@@ -148,9 +148,9 @@ static const WambleMessageExtField *
 ws_find_ext_field(const struct WambleMsg *msg, const char *key) {
   if (!msg || !key)
     return NULL;
-  for (uint8_t i = 0; i < msg->ext_count; i++) {
-    if (strcmp(msg->ext[i].key, key) == 0)
-      return &msg->ext[i];
+  for (uint8_t i = 0; i < msg->extensions.count; i++) {
+    if (strcmp(msg->extensions.fields[i].key, key) == 0)
+      return &msg->extensions.fields[i];
   }
   return NULL;
 }
@@ -282,7 +282,7 @@ WAMBLE_TEST(ws_binary_roundtrip_and_coalesced_first_frame) {
   struct WambleMsg out = {0};
   out.ctrl = WAMBLE_CTRL_SERVER_NOTIFICATION;
   memcpy(out.token, in.token, TOKEN_LENGTH);
-  snprintf(out.fen, sizeof(out.fen), "server-msg");
+  snprintf(out.view.fen, sizeof(out.view.fen), "server-msg");
   out.seq_num = 99;
 
   uint8_t out_packet[WAMBLE_MAX_PACKET_SIZE];
@@ -374,7 +374,7 @@ WAMBLE_TEST(ws_reliable_send_skips_ack_retry_for_ws) {
   struct WambleMsg out = {0};
   out.ctrl = WAMBLE_CTRL_SERVER_NOTIFICATION;
   memcpy(out.token, bootstrap.token, TOKEN_LENGTH);
-  snprintf(out.fen, sizeof(out.fen), "ws-reliable");
+  snprintf(out.view.fen, sizeof(out.view.fen), "ws-reliable");
 
   uint64_t start_ms = wamble_now_mono_millis();
   T_ASSERT_EQ_INT(
@@ -430,12 +430,12 @@ WAMBLE_TEST(ws_outbound_batches_multiple_packets_per_frame) {
   struct WambleMsg out_a = {0};
   out_a.ctrl = WAMBLE_CTRL_SERVER_NOTIFICATION;
   memcpy(out_a.token, bootstrap.token, TOKEN_LENGTH);
-  snprintf(out_a.fen, sizeof(out_a.fen), "batch-a");
+  snprintf(out_a.view.fen, sizeof(out_a.view.fen), "batch-a");
 
   struct WambleMsg out_b = {0};
   out_b.ctrl = WAMBLE_CTRL_SERVER_NOTIFICATION;
   memcpy(out_b.token, bootstrap.token, TOKEN_LENGTH);
-  snprintf(out_b.fen, sizeof(out_b.fen), "batch-b");
+  snprintf(out_b.view.fen, sizeof(out_b.view.fen), "batch-b");
 
   T_ASSERT_EQ_INT(send_unreliable_packet(WAMBLE_INVALID_SOCKET, &out_a, &src),
                   0);
@@ -470,8 +470,8 @@ WAMBLE_TEST(ws_outbound_batches_multiple_packets_per_frame) {
   T_ASSERT_EQ_INT(
       (int)wamble_packet_deserialize(frame + p1_len, p2_len, &dec_b, &flags_b),
       (int)NET_OK);
-  T_ASSERT(strcmp(dec_a.fen, "batch-a") == 0);
-  T_ASSERT(strcmp(dec_b.fen, "batch-b") == 0);
+  T_ASSERT(strcmp(dec_a.view.fen, "batch-a") == 0);
+  T_ASSERT(strcmp(dec_b.view.fen, "batch-b") == 0);
 
   return 0;
 }
@@ -576,15 +576,15 @@ WAMBLE_TEST(ws_server_protocol_discovery_and_fragmented_tos_roundtrip) {
         (int)wamble_packet_deserialize(frame, frame_len, &out, &out_flags),
         (int)NET_OK);
     T_ASSERT_EQ_INT(out.ctrl, WAMBLE_CTRL_PROFILES_LIST);
-    T_ASSERT_STREQ(out.profiles_list, "open");
+    T_ASSERT_STREQ(out.view.profiles_list, "open");
 
     struct WambleMsg info_req = {0};
     info_req.ctrl = WAMBLE_CTRL_GET_PROFILE_INFO;
     info_req.header_version = WAMBLE_PROTO_VERSION;
     info_req.seq_num = 2;
     memcpy(info_req.token, out.token, TOKEN_LENGTH);
-    memcpy(info_req.profile_name, "open", 4);
-    info_req.profile_name_len = 4;
+    memcpy(info_req.text.profile_name, "open", 4);
+    info_req.text.profile_name_len = 4;
     T_ASSERT_EQ_INT(ws_send_msg(&info_req, 0), 0);
 
     T_ASSERT_EQ_INT(
@@ -603,7 +603,7 @@ WAMBLE_TEST(ws_server_protocol_discovery_and_fragmented_tos_roundtrip) {
         (int)wamble_packet_deserialize(frame, frame_len, &out, &out_flags),
         (int)NET_OK);
     T_ASSERT_EQ_INT(out.ctrl, WAMBLE_CTRL_PROFILE_INFO);
-    T_ASSERT_STREQ(out.profile_info, "open;19431;1;0");
+    T_ASSERT_STREQ(out.text.profile_info, "open;19431;1;0");
     {
       const WambleMessageExtField *ws_path =
           ws_find_ext_field(&out, "profile.websocket_path");
@@ -617,8 +617,8 @@ WAMBLE_TEST(ws_server_protocol_discovery_and_fragmented_tos_roundtrip) {
     tos_req.header_version = WAMBLE_PROTO_VERSION;
     tos_req.seq_num = 3;
     memcpy(tos_req.token, out.token, TOKEN_LENGTH);
-    memcpy(tos_req.profile_name, "open", 4);
-    tos_req.profile_name_len = 4;
+    memcpy(tos_req.text.profile_name, "open", 4);
+    tos_req.text.profile_name_len = 4;
     T_ASSERT_EQ_INT(ws_send_msg(&tos_req, 0), 0);
   }
 
@@ -737,8 +737,8 @@ WAMBLE_TEST(ws_server_protocol_profile_terms_acceptance_roundtrip) {
   missing_info_req.header_version = WAMBLE_PROTO_VERSION;
   missing_info_req.seq_num = 1;
   memcpy(missing_info_req.token, client_token, TOKEN_LENGTH);
-  memcpy(missing_info_req.profile_name, "missing", 7);
-  missing_info_req.profile_name_len = 7;
+  memcpy(missing_info_req.text.profile_name, "missing", 7);
+  missing_info_req.text.profile_name_len = 7;
   T_ASSERT_EQ_INT(ws_send_msg(&missing_info_req, 0), 0);
   T_ASSERT_EQ_INT(
       ws_pop_packet_wait(packet, sizeof(packet), &packet_len, &cliaddr, 2000),
@@ -753,8 +753,8 @@ WAMBLE_TEST(ws_server_protocol_profile_terms_acceptance_roundtrip) {
   tos_req.header_version = WAMBLE_PROTO_VERSION;
   tos_req.seq_num = 2;
   memcpy(tos_req.token, client_token, TOKEN_LENGTH);
-  memcpy(tos_req.profile_name, "p1", 2);
-  tos_req.profile_name_len = 2;
+  memcpy(tos_req.text.profile_name, "p1", 2);
+  tos_req.text.profile_name_len = 2;
   T_ASSERT_EQ_INT(ws_send_msg(&tos_req, 0), 0);
   T_ASSERT_EQ_INT(
       ws_pop_packet_wait(packet, sizeof(packet), &packet_len, &cliaddr, 2000),
@@ -769,8 +769,8 @@ WAMBLE_TEST(ws_server_protocol_profile_terms_acceptance_roundtrip) {
   accept.header_version = WAMBLE_PROTO_VERSION;
   accept.seq_num = 3;
   memcpy(accept.token, client_token, TOKEN_LENGTH);
-  memcpy(accept.profile_name, "p1", 2);
-  accept.profile_name_len = 2;
+  memcpy(accept.text.profile_name, "p1", 2);
+  accept.text.profile_name_len = 2;
   T_ASSERT_EQ_INT(ws_send_msg(&accept, 0), 0);
   T_ASSERT_EQ_INT(
       ws_pop_packet_wait(packet, sizeof(packet), &packet_len, &cliaddr, 2000),

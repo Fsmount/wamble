@@ -320,15 +320,15 @@ static int reassembly_fragment_shape_valid(const struct WambleMsg *msg,
                                            size_t *out_len) {
   if (!msg || !out_offset || !out_len)
     return 0;
-  if (msg->fragment_chunk_count == 0 ||
-      msg->fragment_chunk_index >= msg->fragment_chunk_count)
+  if (msg->fragment.fragment_chunk_count == 0 ||
+      msg->fragment.fragment_chunk_index >= msg->fragment.fragment_chunk_count)
     return 0;
-  if (msg->fragment_data_len > WAMBLE_FRAGMENT_DATA_MAX)
+  if (msg->fragment.fragment_data_len > WAMBLE_FRAGMENT_DATA_MAX)
     return 0;
-  size_t total_len = (size_t)msg->fragment_total_len;
-  size_t offset =
-      (size_t)msg->fragment_chunk_index * (size_t)WAMBLE_FRAGMENT_DATA_MAX;
-  size_t len = (size_t)msg->fragment_data_len;
+  size_t total_len = (size_t)msg->fragment.fragment_total_len;
+  size_t offset = (size_t)msg->fragment.fragment_chunk_index *
+                  (size_t)WAMBLE_FRAGMENT_DATA_MAX;
+  size_t len = (size_t)msg->fragment.fragment_data_len;
   if (offset > total_len)
     return 0;
   if (len > total_len - offset)
@@ -347,8 +347,8 @@ static int reassembly_begin_transfer(WambleFragmentReassembly *reassembly,
                                      const struct WambleMsg *msg) {
   if (!reassembly || !msg)
     return -1;
-  size_t total_len = (size_t)msg->fragment_total_len;
-  size_t chunk_count = (size_t)msg->fragment_chunk_count;
+  size_t total_len = (size_t)msg->fragment.fragment_total_len;
+  size_t chunk_count = (size_t)msg->fragment.fragment_chunk_count;
   if (reassembly_ensure_capacity(&reassembly->data, &reassembly->data_capacity,
                                  total_len, 0) != 0) {
     return -1;
@@ -362,12 +362,12 @@ static int reassembly_begin_transfer(WambleFragmentReassembly *reassembly,
   memset(reassembly->chunk_seen, 0, chunk_count);
   reassembly->active = 1;
   reassembly->ctrl = msg->ctrl;
-  reassembly->hash_algo = msg->fragment_hash_algo;
-  reassembly->chunk_count = msg->fragment_chunk_count;
+  reassembly->hash_algo = msg->fragment.fragment_hash_algo;
+  reassembly->chunk_count = msg->fragment.fragment_chunk_count;
   reassembly->received_chunks = 0;
-  reassembly->total_len = msg->fragment_total_len;
-  reassembly->transfer_id = msg->fragment_transfer_id;
-  memcpy(reassembly->expected_hash, msg->fragment_hash,
+  reassembly->total_len = msg->fragment.fragment_total_len;
+  reassembly->transfer_id = msg->fragment.fragment_transfer_id;
+  memcpy(reassembly->expected_hash, msg->fragment.fragment_hash,
          WAMBLE_FRAGMENT_HASH_LENGTH);
   reassembly->integrity = WAMBLE_FRAGMENT_INTEGRITY_UNKNOWN;
   return 0;
@@ -444,9 +444,9 @@ wamble_fragment_reassembly_push(WambleFragmentReassembly *reassembly,
     return WAMBLE_FRAGMENT_REASSEMBLY_ERR_INVALID;
   if (!ctrl_supports_fragment_payload(msg->ctrl))
     return WAMBLE_FRAGMENT_REASSEMBLY_IGNORED;
-  if (msg->fragment_version != WAMBLE_FRAGMENT_VERSION)
+  if (msg->fragment.fragment_version != WAMBLE_FRAGMENT_VERSION)
     return WAMBLE_FRAGMENT_REASSEMBLY_IGNORED;
-  if (msg->fragment_hash_algo != WAMBLE_FRAGMENT_HASH_BLAKE2B_256)
+  if (msg->fragment.fragment_hash_algo != WAMBLE_FRAGMENT_HASH_BLAKE2B_256)
     return WAMBLE_FRAGMENT_REASSEMBLY_ERR_INVALID;
 
   size_t offset = 0;
@@ -454,27 +454,28 @@ wamble_fragment_reassembly_push(WambleFragmentReassembly *reassembly,
   if (!reassembly_fragment_shape_valid(msg, &offset, &len))
     return WAMBLE_FRAGMENT_REASSEMBLY_ERR_INVALID;
 
-  int same_transfer = reassembly->active && reassembly->ctrl == msg->ctrl &&
-                      reassembly->hash_algo == msg->fragment_hash_algo &&
-                      reassembly->chunk_count == msg->fragment_chunk_count &&
-                      reassembly->total_len == msg->fragment_total_len &&
-                      reassembly->transfer_id == msg->fragment_transfer_id &&
-                      memcmp(reassembly->expected_hash, msg->fragment_hash,
-                             WAMBLE_FRAGMENT_HASH_LENGTH) == 0;
+  int same_transfer =
+      reassembly->active && reassembly->ctrl == msg->ctrl &&
+      reassembly->hash_algo == msg->fragment.fragment_hash_algo &&
+      reassembly->chunk_count == msg->fragment.fragment_chunk_count &&
+      reassembly->total_len == msg->fragment.fragment_total_len &&
+      reassembly->transfer_id == msg->fragment.fragment_transfer_id &&
+      memcmp(reassembly->expected_hash, msg->fragment.fragment_hash,
+             WAMBLE_FRAGMENT_HASH_LENGTH) == 0;
   if (!same_transfer) {
     if (reassembly_begin_transfer(reassembly, msg) != 0)
       return WAMBLE_FRAGMENT_REASSEMBLY_ERR_NOMEM;
   }
 
-  uint16_t idx = msg->fragment_chunk_index;
+  uint16_t idx = msg->fragment.fragment_chunk_index;
   if (reassembly->chunk_seen[idx]) {
-    if (len &&
-        memcmp(reassembly->data + offset, msg->fragment_data, len) != 0) {
+    if (len && memcmp(reassembly->data + offset, msg->fragment.fragment_data,
+                      len) != 0) {
       return WAMBLE_FRAGMENT_REASSEMBLY_ERR_INVALID;
     }
   } else {
     if (len)
-      memcpy(reassembly->data + offset, msg->fragment_data, len);
+      memcpy(reassembly->data + offset, msg->fragment.fragment_data, len);
     reassembly->chunk_seen[idx] = 1;
     reassembly->received_chunks++;
   }
@@ -756,7 +757,7 @@ static int receive_message_from_packet_impl(const uint8_t *packet,
 
   if (!ctrl_is_supported(msg->ctrl))
     return -1;
-  if (msg->uci_len > MAX_UCI_LENGTH)
+  if (msg->text.uci_len > MAX_UCI_LENGTH)
     return -1;
 
   int token_valid = token_has_any_byte(msg->token);
@@ -838,9 +839,9 @@ void send_ack(wamble_socket_t sockfd, const struct WambleMsg *msg,
   memcpy(ack_msg.token, msg->token, TOKEN_LENGTH);
   ack_msg.board_id = msg->board_id;
   ack_msg.seq_num = msg->seq_num;
-  ack_msg.uci_len = 0;
-  memset(ack_msg.uci, 0, MAX_UCI_LENGTH);
-  memset(ack_msg.fen, 0, FEN_MAX_LENGTH);
+  ack_msg.text.uci_len = 0;
+  memset(ack_msg.text.uci, 0, MAX_UCI_LENGTH);
+  memset(ack_msg.view.fen, 0, FEN_MAX_LENGTH);
 
   uint8_t send_buffer[WAMBLE_MAX_PACKET_SIZE];
   size_t serialized_size = 0;
@@ -1030,16 +1031,17 @@ int send_reliable_payload_bytes(wamble_socket_t sockfd, uint8_t ctrl,
       fragment.header_version = WAMBLE_PROTO_VERSION;
       memcpy(fragment.token, effective_token, TOKEN_LENGTH);
       fragment.board_id = board_id;
-      fragment.fragment_version = WAMBLE_FRAGMENT_VERSION;
-      fragment.fragment_hash_algo = WAMBLE_FRAGMENT_HASH_BLAKE2B_256;
-      fragment.fragment_chunk_index = chunk_index;
-      fragment.fragment_chunk_count = chunk_count;
-      fragment.fragment_total_len = (uint32_t)payload_len;
-      fragment.fragment_transfer_id = transfer_id;
-      memcpy(fragment.fragment_hash, payload_hash, WAMBLE_FRAGMENT_HASH_LENGTH);
-      fragment.fragment_data_len = (uint16_t)chunk_len;
+      fragment.fragment.fragment_version = WAMBLE_FRAGMENT_VERSION;
+      fragment.fragment.fragment_hash_algo = WAMBLE_FRAGMENT_HASH_BLAKE2B_256;
+      fragment.fragment.fragment_chunk_index = chunk_index;
+      fragment.fragment.fragment_chunk_count = chunk_count;
+      fragment.fragment.fragment_total_len = (uint32_t)payload_len;
+      fragment.fragment.fragment_transfer_id = transfer_id;
+      memcpy(fragment.fragment.fragment_hash, payload_hash,
+             WAMBLE_FRAGMENT_HASH_LENGTH);
+      fragment.fragment.fragment_data_len = (uint16_t)chunk_len;
       if (chunk_len)
-        memcpy(fragment.fragment_data, payload + offset, chunk_len);
+        memcpy(fragment.fragment.fragment_data, payload + offset, chunk_len);
       if (send_reliable_message(sockfd, &fragment, cliaddr, timeout_ms,
                                 max_retries) != 0) {
         return -1;
@@ -1114,16 +1116,17 @@ static int send_fragmented_reliable_payload(wamble_socket_t sockfd,
     fragment.header_version = source_msg->header_version;
     memcpy(fragment.token, source_msg->token, TOKEN_LENGTH);
     fragment.board_id = source_msg->board_id;
-    fragment.fragment_version = WAMBLE_FRAGMENT_VERSION;
-    fragment.fragment_hash_algo = WAMBLE_FRAGMENT_HASH_BLAKE2B_256;
-    fragment.fragment_chunk_index = chunk_index;
-    fragment.fragment_chunk_count = chunk_count;
-    fragment.fragment_total_len = (uint32_t)full_len;
-    fragment.fragment_transfer_id = transfer_id;
-    memcpy(fragment.fragment_hash, payload_hash, WAMBLE_FRAGMENT_HASH_LENGTH);
-    fragment.fragment_data_len = (uint16_t)chunk_len;
+    fragment.fragment.fragment_version = WAMBLE_FRAGMENT_VERSION;
+    fragment.fragment.fragment_hash_algo = WAMBLE_FRAGMENT_HASH_BLAKE2B_256;
+    fragment.fragment.fragment_chunk_index = chunk_index;
+    fragment.fragment.fragment_chunk_count = chunk_count;
+    fragment.fragment.fragment_total_len = (uint32_t)full_len;
+    fragment.fragment.fragment_transfer_id = transfer_id;
+    memcpy(fragment.fragment.fragment_hash, payload_hash,
+           WAMBLE_FRAGMENT_HASH_LENGTH);
+    fragment.fragment.fragment_data_len = (uint16_t)chunk_len;
     if (chunk_len) {
-      memcpy(fragment.fragment_data, full_payload + offset, chunk_len);
+      memcpy(fragment.fragment.fragment_data, full_payload + offset, chunk_len);
     }
 
     if (send_reliable_message(sockfd, &fragment, cliaddr, timeout_ms,
@@ -1185,16 +1188,17 @@ send_fragmented_unreliable_payload(wamble_socket_t sockfd,
     fragment.header_version = source_msg->header_version;
     memcpy(fragment.token, source_msg->token, TOKEN_LENGTH);
     fragment.board_id = source_msg->board_id;
-    fragment.fragment_version = WAMBLE_FRAGMENT_VERSION;
-    fragment.fragment_hash_algo = WAMBLE_FRAGMENT_HASH_BLAKE2B_256;
-    fragment.fragment_chunk_index = chunk_index;
-    fragment.fragment_chunk_count = chunk_count;
-    fragment.fragment_total_len = (uint32_t)full_len;
-    fragment.fragment_transfer_id = transfer_id;
-    memcpy(fragment.fragment_hash, payload_hash, WAMBLE_FRAGMENT_HASH_LENGTH);
-    fragment.fragment_data_len = (uint16_t)chunk_len;
+    fragment.fragment.fragment_version = WAMBLE_FRAGMENT_VERSION;
+    fragment.fragment.fragment_hash_algo = WAMBLE_FRAGMENT_HASH_BLAKE2B_256;
+    fragment.fragment.fragment_chunk_index = chunk_index;
+    fragment.fragment.fragment_chunk_count = chunk_count;
+    fragment.fragment.fragment_total_len = (uint32_t)full_len;
+    fragment.fragment.fragment_transfer_id = transfer_id;
+    memcpy(fragment.fragment.fragment_hash, payload_hash,
+           WAMBLE_FRAGMENT_HASH_LENGTH);
+    fragment.fragment.fragment_data_len = (uint16_t)chunk_len;
     if (chunk_len) {
-      memcpy(fragment.fragment_data, full_payload + offset, chunk_len);
+      memcpy(fragment.fragment.fragment_data, full_payload + offset, chunk_len);
     }
 
     if (send_unreliable_packet(sockfd, &fragment, cliaddr) != 0) {
