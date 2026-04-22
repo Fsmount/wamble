@@ -1142,6 +1142,25 @@ static void send_spectator_batch(wamble_socket_t sockfd,
   }
 }
 
+static void profile_runtime_send_reliable_spectate_transition(
+    wamble_socket_t sockfd, const SpectatorUpdate *notice) {
+  if (!notice ||
+      notice->notification_type != WAMBLE_NOTIFICATION_TYPE_SPECTATE_ENDED) {
+    return;
+  }
+
+  if (notice->flags & WAMBLE_FLAG_SPECTATE_NOTICE_STOPPED) {
+    (void)send_reliable_spectate_state_sync(sockfd, notice->token,
+                                            &notice->addr);
+    return;
+  }
+
+  if (notice->flags & WAMBLE_FLAG_SPECTATE_NOTICE_SUMMARY_FALLBACK) {
+    (void)send_reliable_spectate_state_sync(sockfd, notice->token,
+                                            &notice->addr);
+  }
+}
+
 static void profile_runtime_send_spectator_updates(RunningProfile *rp) {
   int cap = get_config()->max_client_sessions;
   if (cap < 1)
@@ -1150,13 +1169,15 @@ static void profile_runtime_send_spectator_updates(RunningProfile *rp) {
       (SpectatorUpdate *)malloc(sizeof(SpectatorUpdate) * (size_t)cap);
   if (!events)
     return;
-  int nupd = spectator_collect_updates(events, cap);
-  send_spectator_batch(rp->sockfd, events, nupd, WAMBLE_CTRL_SPECTATE_UPDATE);
   int nnot = spectator_collect_notifications(events, cap);
+  for (int i = 0; i < nnot; i++) {
+    profile_runtime_send_reliable_spectate_transition(rp->sockfd, &events[i]);
+  }
   send_spectator_batch(rp->sockfd, events, nnot,
                        WAMBLE_CTRL_SERVER_NOTIFICATION);
+  int nupd = spectator_collect_updates(events, cap);
+  send_spectator_batch(rp->sockfd, events, nupd, WAMBLE_CTRL_SPECTATE_UPDATE);
   free(events);
-
   ReservationReleaseNotification *released =
       (ReservationReleaseNotification *)malloc(sizeof(*released) * (size_t)cap);
   if (!released)

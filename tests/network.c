@@ -3027,6 +3027,264 @@ WAMBLE_TEST(server_protocol_spectate_denial_reports_capacity_full_error_code) {
   return 0;
 }
 
+WAMBLE_TEST(server_protocol_spectate_summary_returns_reliable_snapshot) {
+  const char *cfg_path = "build/test_network_spectate_summary_snapshot.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(def spectator-summary-hz 0)\n"
+                    "(defprofile p1 ((def port 19424) (def advertise 1)))\n"
+                    "(defprofile p2 ((def port 19425) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'client_hello', '*', 'allow', 0, "
+          "'hello_access', 'test'), "
+          "(0, 'protocol.ctrl', 'spectate_game', '*', 'allow', 0, "
+          "'spectate_game_access', 'test'), "
+          "(0, 'protocol.ctrl', 'spectate_stop', '*', 'allow', 0, "
+          "'spectate_stop_access', 'test'), "
+          "(0, 'spectate.access', 'view', '*', 'allow', 0, "
+          "'spectate_view_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  T_ASSERT_STATUS_OK(wamble_net_init());
+  int started = 0;
+  T_ASSERT_EQ_INT(start_profile_listeners(&started), PROFILE_START_OK);
+  T_ASSERT_EQ_INT(started, 2);
+  wamble_sleep_ms(50);
+
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in dst;
+  memset(&dst, 0, sizeof(dst));
+  dst.sin_family = AF_INET;
+  dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  dst.sin_port = htons(19424);
+
+  struct WambleMsg hello = {0};
+  hello.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  hello.header_version = WAMBLE_PROTO_VERSION;
+  hello.flags = WAMBLE_FLAG_UNRELIABLE;
+  hello.token[0] = 0x51;
+  T_ASSERT_STATUS_OK(send_unreliable_packet(cli, &hello, &dst));
+
+  struct WambleMsg rx = {0};
+  struct sockaddr_in from;
+  int board_id = 0;
+  {
+    fd_set rfds;
+    struct timeval tv;
+    FD_ZERO(&rfds);
+    FD_SET(cli, &rfds);
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+    T_ASSERT(select(0, &rfds, NULL, NULL, &tv) > 0);
+#else
+    T_ASSERT(select(cli + 1, &rfds, NULL, NULL, &tv) > 0);
+#endif
+    T_ASSERT(receive_message(cli, &rx, &from) > 0);
+    T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+    board_id = (int)rx.board_id;
+    send_ack(cli, &rx, &from);
+  }
+  T_ASSERT(board_id > 0);
+
+  struct WambleMsg req = {0};
+  req.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  req.header_version = WAMBLE_PROTO_VERSION;
+  req.flags = WAMBLE_FLAG_UNRELIABLE;
+  req.token[0] = 0x61;
+  req.board_id = 0;
+  T_ASSERT_STATUS_OK(send_unreliable_packet(cli, &req, &dst));
+
+  int saw_state = 0;
+  int saw_reset = 0;
+  int quiet_polls = 0;
+  while (quiet_polls < 3 && !(saw_state && saw_reset)) {
+    fd_set rfds;
+    struct timeval tv;
+    FD_ZERO(&rfds);
+    FD_SET(cli, &rfds);
+    tv.tv_sec = 0;
+    tv.tv_usec = 250 * 1000;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+    int ready = select(0, &rfds, NULL, NULL, &tv);
+#else
+    int ready = select(cli + 1, &rfds, NULL, NULL, &tv);
+#endif
+    if (ready <= 0) {
+      quiet_polls++;
+      continue;
+    }
+    quiet_polls = 0;
+    T_ASSERT(receive_message(cli, &rx, &from) > 0);
+    T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SPECTATE_UPDATE);
+    T_ASSERT((rx.flags & WAMBLE_FLAG_UNRELIABLE) == 0);
+    send_ack(cli, &rx, &from);
+    const WambleMessageExtField *state = find_ext_field(&rx, "spectate.state");
+    if (state && state->value_type == WAMBLE_TREATMENT_VALUE_STRING &&
+        strcmp(state->string_value, "summary") == 0) {
+      saw_state = 1;
+    }
+    if (wamble_msg_ext_find(&rx, "spectate.summary_generation") &&
+        rx.board_id == 0 && rx.view.fen[0] == '\0') {
+      saw_reset = 1;
+    }
+  }
+  T_ASSERT(saw_state);
+  T_ASSERT(saw_reset);
+
+  stop_profile_listeners();
+  wamble_net_cleanup();
+  wamble_close_socket(cli);
+  return 0;
+}
+
+WAMBLE_TEST(server_protocol_spectate_stop_returns_reliable_idle_packet) {
+  const char *cfg_path = "build/test_network_spectate_stop_packet.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19424) (def advertise 1)))\n"
+                    "(defprofile p2 ((def port 19425) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'client_hello', '*', 'allow', 0, "
+          "'hello_access', 'test'), "
+          "(0, 'protocol.ctrl', 'spectate_game', '*', 'allow', 0, "
+          "'spectate_game_access', 'test'), "
+          "(0, 'protocol.ctrl', 'spectate_stop', '*', 'allow', 0, "
+          "'spectate_stop_access', 'test'), "
+          "(0, 'spectate.access', 'view', '*', 'allow', 0, "
+          "'spectate_view_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  T_ASSERT_STATUS_OK(wamble_net_init());
+  int started = 0;
+  T_ASSERT_EQ_INT(start_profile_listeners(&started), PROFILE_START_OK);
+  T_ASSERT_EQ_INT(started, 2);
+  wamble_sleep_ms(50);
+
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in dst;
+  memset(&dst, 0, sizeof(dst));
+  dst.sin_family = AF_INET;
+  dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  dst.sin_port = htons(19424);
+
+  struct WambleMsg hello = {0};
+  struct WambleMsg rx = {0};
+  struct sockaddr_in from;
+  hello.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  hello.header_version = WAMBLE_PROTO_VERSION;
+  hello.flags = WAMBLE_FLAG_UNRELIABLE;
+  hello.token[0] = 0x52;
+  T_ASSERT_STATUS_OK(send_unreliable_packet(cli, &hello, &dst));
+
+  {
+    fd_set rfds;
+    struct timeval tv;
+    FD_ZERO(&rfds);
+    FD_SET(cli, &rfds);
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+    T_ASSERT(select(0, &rfds, NULL, NULL, &tv) > 0);
+#else
+    T_ASSERT(select(cli + 1, &rfds, NULL, NULL, &tv) > 0);
+#endif
+    T_ASSERT(receive_message(cli, &rx, &from) > 0);
+    T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+    send_ack(cli, &rx, &from);
+  }
+
+  struct WambleMsg req = {0};
+  req.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  req.header_version = WAMBLE_PROTO_VERSION;
+  req.flags = WAMBLE_FLAG_UNRELIABLE;
+  req.token[0] = 0x62;
+  req.board_id = rx.board_id;
+  T_ASSERT_STATUS_OK(send_unreliable_packet(cli, &req, &dst));
+
+  {
+    fd_set rfds;
+    struct timeval tv;
+    FD_ZERO(&rfds);
+    FD_SET(cli, &rfds);
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+    T_ASSERT(select(0, &rfds, NULL, NULL, &tv) > 0);
+#else
+    T_ASSERT(select(cli + 1, &rfds, NULL, NULL, &tv) > 0);
+#endif
+    T_ASSERT(receive_message(cli, &rx, &from) > 0);
+    T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SPECTATE_UPDATE);
+    send_ack(cli, &rx, &from);
+  }
+
+  struct WambleMsg stop = {0};
+  stop.ctrl = WAMBLE_CTRL_SPECTATE_STOP;
+  stop.header_version = WAMBLE_PROTO_VERSION;
+  stop.flags = WAMBLE_FLAG_UNRELIABLE;
+  stop.token[0] = 0x62;
+  T_ASSERT_STATUS_OK(send_unreliable_packet(cli, &stop, &dst));
+
+  {
+    fd_set rfds;
+    struct timeval tv;
+    FD_ZERO(&rfds);
+    FD_SET(cli, &rfds);
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+    T_ASSERT(select(0, &rfds, NULL, NULL, &tv) > 0);
+#else
+    T_ASSERT(select(cli + 1, &rfds, NULL, NULL, &tv) > 0);
+#endif
+    T_ASSERT(receive_message(cli, &rx, &from) > 0);
+    T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SPECTATE_UPDATE);
+    T_ASSERT((rx.flags & WAMBLE_FLAG_UNRELIABLE) == 0);
+    T_ASSERT_EQ_INT((int)rx.board_id, 0);
+    send_ack(cli, &rx, &from);
+  }
+  {
+    const WambleMessageExtField *state = find_ext_field(&rx, "spectate.state");
+    T_ASSERT(state != NULL);
+    T_ASSERT_EQ_INT(state->value_type, WAMBLE_TREATMENT_VALUE_STRING);
+    T_ASSERT(strcmp(state->string_value, "idle") == 0);
+  }
+
+  stop_profile_listeners();
+  wamble_net_cleanup();
+  wamble_close_socket(cli);
+  return 0;
+}
+
 WAMBLE_TEST(server_protocol_player_stats_scope_context_is_ignored) {
   const char *cfg_path = "build/test_network_player_stats_scope_policy.conf";
   const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
@@ -4607,6 +4865,12 @@ WAMBLE_TESTS_ADD_DB_SM(
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
     server_protocol_spectate_denial_reports_capacity_full_error_code,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_spectate_summary_returns_reliable_snapshot,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_spectate_stop_returns_reliable_idle_packet,
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(server_protocol_player_stats_scope_context_is_ignored,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
