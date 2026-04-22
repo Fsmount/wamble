@@ -1122,19 +1122,21 @@ static void send_spectator_batch(wamble_socket_t sockfd,
     out.board_id = events[i].board_id;
     out.seq_num = 0;
     out.flags = (uint8_t)(events[i].flags | WAMBLE_FLAG_UNRELIABLE);
-    out.notification_type = events[i].notification_type;
+    out.session.notification_type = events[i].notification_type;
     {
       size_t __len = strnlen(events[i].fen, FEN_MAX_LENGTH - 1);
-      memcpy(out.fen, events[i].fen, __len);
-      out.fen[__len] = '\0';
+      memcpy(out.view.fen, events[i].fen, __len);
+      out.view.fen[__len] = '\0';
     }
     if (ctrl == WAMBLE_CTRL_SPECTATE_UPDATE &&
         events[i].summary_generation > 0) {
-      out.ext_count = 1;
-      snprintf(out.ext[0].key, sizeof(out.ext[0].key), "%s",
+      out.extensions.count = 1;
+      snprintf(out.extensions.fields[0].key,
+               sizeof(out.extensions.fields[0].key), "%s",
                "spectate.summary_generation");
-      out.ext[0].value_type = WAMBLE_TREATMENT_VALUE_INT;
-      out.ext[0].int_value = (int64_t)events[i].summary_generation;
+      out.extensions.fields[0].value_type = WAMBLE_TREATMENT_VALUE_INT;
+      out.extensions.fields[0].int_value =
+          (int64_t)events[i].summary_generation;
     }
     (void)send_unreliable_packet(sockfd, &out, &events[i].addr);
   }
@@ -1167,7 +1169,8 @@ static void profile_runtime_send_spectator_updates(RunningProfile *rp) {
     struct WambleMsg out = {0};
     out.ctrl = WAMBLE_CTRL_SERVER_NOTIFICATION;
     out.flags = WAMBLE_FLAG_UNRELIABLE;
-    out.notification_type = WAMBLE_NOTIFICATION_TYPE_RESERVATION_RELEASED;
+    out.session.notification_type =
+        WAMBLE_NOTIFICATION_TYPE_RESERVATION_RELEASED;
     out.board_id = released[i].board_id;
     memcpy(out.token, released[i].token, TOKEN_LENGTH);
     (void)send_unreliable_packet(rp->sockfd, &out, &addr);
