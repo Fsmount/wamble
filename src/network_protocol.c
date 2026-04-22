@@ -1242,6 +1242,98 @@ int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
       serialized_size, cliaddr, timeout_ms, max_retries);
 }
 
+static int send_reliable_spectate_state_update(
+    wamble_socket_t sockfd, const uint8_t *token,
+    const struct sockaddr_in *cliaddr, SpectatorState state,
+    const SpectatorUpdate *event) {
+  struct WambleMsg out = {0};
+  out.ctrl = WAMBLE_CTRL_SPECTATE_UPDATE;
+  if (token)
+    memcpy(out.token, token, TOKEN_LENGTH);
+  if (event) {
+    out.board_id = event->board_id;
+    out.flags = (uint8_t)(event->flags & ~WAMBLE_FLAG_UNRELIABLE);
+    snprintf(out.view.fen, sizeof(out.view.fen), "%s", event->fen);
+  }
+  out.extensions.count = 1;
+  snprintf(out.extensions.fields[0].key, sizeof(out.extensions.fields[0].key),
+           "%s", "spectate.state");
+  out.extensions.fields[0].value_type = WAMBLE_TREATMENT_VALUE_STRING;
+  snprintf(out.extensions.fields[0].string_value,
+           sizeof(out.extensions.fields[0].string_value), "%s",
+           state == SPECTATOR_STATE_FOCUS
+               ? "focus"
+               : (state == SPECTATOR_STATE_SUMMARY ? "summary" : "idle"));
+  if (event && event->summary_generation > 0 &&
+      out.extensions.count < WAMBLE_MAX_MESSAGE_EXT_FIELDS) {
+    uint8_t idx = out.extensions.count++;
+    snprintf(out.extensions.fields[idx].key,
+             sizeof(out.extensions.fields[idx].key), "%s",
+             "spectate.summary_generation");
+    out.extensions.fields[idx].value_type = WAMBLE_TREATMENT_VALUE_INT;
+    out.extensions.fields[idx].int_value = (int64_t)event->summary_generation;
+  }
+  return send_reliable_message(sockfd, &out, cliaddr, get_config()->timeout_ms,
+                               get_config()->max_retries);
+}
+
+static int send_reliable_spectate_state_snapshot(
+    wamble_socket_t sockfd, const uint8_t *token,
+    const struct sockaddr_in *cliaddr, SpectatorState state) {
+  int cap = get_config()->max_boards + 2;
+  if (cap < 1)
+    cap = 1;
+
+  SpectatorUpdate *events =
+      (SpectatorUpdate *)calloc((size_t)cap, sizeof(*events));
+  if (!events)
+    return -1;
+
+  int count = spectator_collect_state_snapshot(token, events, cap);
+  int rc = 0;
+  if (count <= 0) {
+    rc = send_reliable_spectate_state_update(sockfd, token, cliaddr, state,
+                                             NULL);
+  } else {
+    for (int i = 0; i < count; i++) {
+      if (send_reliable_spectate_state_update(sockfd, token, cliaddr, state,
+                                              &events[i]) != 0) {
+        rc = -1;
+        break;
+      }
+    }
+  }
+
+  free(events);
+  return rc;
+}
+
+static int resolve_spectate_state_sync(SpectatorState *out_state,
+                                       uint64_t *out_focus_board_id,
+                                       const uint8_t *token) {
+  if (!out_state || !out_focus_board_id || !token)
+    return -1;
+  *out_state = SPECTATOR_STATE_IDLE;
+  *out_focus_board_id = 0;
+  if (spectator_get_state_by_token(token, out_state, out_focus_board_id) == 0)
+    return 0;
+  return 0;
+}
+
+int send_reliable_spectate_state_sync(wamble_socket_t sockfd,
+                                      const uint8_t *token,
+                                      const struct sockaddr_in *cliaddr) {
+  SpectatorState state = SPECTATOR_STATE_IDLE;
+  uint64_t focus_board_id = 0;
+  if (resolve_spectate_state_sync(&state, &focus_board_id, token) != 0)
+    return -1;
+  (void)focus_board_id;
+  if (state == SPECTATOR_STATE_IDLE)
+    return send_reliable_spectate_state_update(sockfd, token, cliaddr, state,
+                                               NULL);
+  return send_reliable_spectate_state_snapshot(sockfd, token, cliaddr, state);
+}
+
 int send_unreliable_packet(wamble_socket_t sockfd, const struct WambleMsg *msg,
                            const struct sockaddr_in *cliaddr) {
   if (!msg || !cliaddr)

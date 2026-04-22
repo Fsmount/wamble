@@ -443,6 +443,69 @@ WAMBLE_TEST(spectator_mode_filters_ignored_without_game_mode_visibility) {
   return 0;
 }
 
+WAMBLE_TEST(spectator_reconnect_reuses_existing_entry) {
+  char msg[128];
+  T_ASSERT_STATUS(config_load(NULL, NULL, msg, sizeof(msg)),
+                  CONFIG_LOAD_DEFAULTS);
+  spectator_manager_init();
+  board_manager_init();
+  player_manager_init();
+
+  WamblePlayer *player = create_new_player();
+  T_ASSERT(player != NULL);
+  WambleBoard *board = find_board_for_player(player);
+  T_ASSERT(board != NULL);
+  uint64_t active_id = board->id;
+  board_move_played(board->id, NULL, NULL);
+
+  struct sockaddr_in addr_a;
+  memset(&addr_a, 0, sizeof(addr_a));
+  addr_a.sin_family = AF_INET;
+  addr_a.sin_port = htons((uint16_t)get_config()->port);
+  addr_a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+  struct sockaddr_in addr_b = addr_a;
+  addr_b.sin_port = htons((uint16_t)(get_config()->port + 1));
+
+  uint8_t token[TOKEN_LENGTH] = {11};
+  struct WambleMsg focus = {0};
+  focus.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  focus.board_id = active_id;
+  memcpy(focus.token, token, TOKEN_LENGTH);
+
+  SpectatorState state = SPECTATOR_STATE_IDLE;
+  uint64_t focus_id = 0;
+  T_ASSERT_EQ_INT(
+      spectator_handle_request(&focus, &addr_a, 0, 0, 1, &state, &focus_id),
+      SPECTATOR_OK_FOCUS);
+
+  SpectatorUpdate updates[8];
+  int count = spectator_collect_updates(updates, 8);
+  T_ASSERT_EQ_INT(count, 1);
+  T_ASSERT_EQ_INT((int)updates[0].addr.sin_port, (int)addr_a.sin_port);
+
+  T_ASSERT_EQ_INT(
+      spectator_handle_request(&focus, &addr_b, 0, 0, 1, &state, &focus_id),
+      SPECTATOR_OK_FOCUS);
+
+  count = spectator_collect_updates(updates, 8);
+  T_ASSERT_EQ_INT(count, 1);
+  T_ASSERT_EQ_INT((int)updates[0].addr.sin_port, (int)addr_b.sin_port);
+
+  struct WambleMsg stop = {0};
+  stop.ctrl = WAMBLE_CTRL_SPECTATE_STOP;
+  memcpy(stop.token, token, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(
+      spectator_handle_request(&stop, &addr_b, 0, 0, 0, &state, &focus_id),
+      SPECTATOR_OK_STOP);
+
+  count = spectator_collect_updates(updates, 8);
+  T_ASSERT_EQ_INT(count, 0);
+
+  spectator_manager_shutdown();
+  return 0;
+}
+
 WAMBLE_TESTS_BEGIN_NAMED(spectator_tests) {
   WAMBLE_TESTS_ADD_FM(spectator_summary_and_focus_flow, "spectator");
   WAMBLE_TESTS_ADD_FM(spectator_summary_updates_emit_full_snapshots,
@@ -454,5 +517,6 @@ WAMBLE_TESTS_BEGIN_NAMED(spectator_tests) {
                       "spectator");
   WAMBLE_TESTS_ADD_FM(
       spectator_mode_filters_ignored_without_game_mode_visibility, "spectator");
+  WAMBLE_TESTS_ADD_FM(spectator_reconnect_reuses_existing_entry, "spectator");
 }
 WAMBLE_TESTS_END()

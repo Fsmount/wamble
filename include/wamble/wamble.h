@@ -1867,6 +1867,9 @@ int send_reliable_payload_bytes(wamble_socket_t sockfd, uint8_t ctrl,
                                 const struct sockaddr_in *cliaddr,
                                 int timeout_ms, int max_retries,
                                 int force_fragment);
+int send_reliable_spectate_state_sync(wamble_socket_t sockfd,
+                                      const uint8_t *token,
+                                      const struct sockaddr_in *cliaddr);
 int send_unreliable_packet(wamble_socket_t sockfd, const struct WambleMsg *msg,
                            const struct sockaddr_in *cliaddr);
 int wamble_socket_bound_port(wamble_socket_t sock);
@@ -1895,7 +1898,11 @@ SpectatorRequestStatus spectator_handle_request(
     const struct WambleMsg *msg, const struct sockaddr_in *cliaddr,
     int trust_tier, int capacity_bypass, int game_mode_visible,
     SpectatorState *out_state, uint64_t *out_focus_board_id);
+int spectator_get_state_by_token(const uint8_t *token, SpectatorState *out_state,
+                                 uint64_t *out_focus_board_id);
 void spectator_discard_by_token(const uint8_t *token);
+int spectator_collect_state_snapshot(const uint8_t *token,
+                                     struct SpectatorUpdate *out, int max);
 int spectator_collect_updates(struct SpectatorUpdate *out, int max);
 int spectator_collect_notifications(struct SpectatorUpdate *out, int max);
 int board_collect_reservation_release_notifications(

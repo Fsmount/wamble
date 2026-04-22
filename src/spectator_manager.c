@@ -39,6 +39,10 @@ static int cmp_boards(const void *a, const void *b);
 static int spectator_current_port(void);
 static int spectator_count_for_port_locked(int owner_port);
 static int spectator_active_count_for_port_locked(int owner_port);
+static int fill_focus_now(SpectatorEntry *e, SpectatorUpdate *out, int out_cap,
+                          int *out_count);
+static void fill_summary_now(SpectatorEntry *e, SpectatorUpdate *out,
+                             int out_cap, int *out_count);
 
 static int token_has_any_byte(const uint8_t *token) {
   if (!token)
@@ -264,6 +268,17 @@ static SpectatorEntry *ensure_spectator(const struct sockaddr_in *addr,
       return &spectators[i];
     }
   }
+  if (token_has_any_byte(token)) {
+    for (int i = 0; i < spectators_count; i++) {
+      if (memcmp(spectators[i].token, token, TOKEN_LENGTH) != 0 ||
+          spectators[i].owner_port != owner_port) {
+        continue;
+      }
+      spectators[i].addr = *addr;
+      spectators[i].trust = trust;
+      return &spectators[i];
+    }
+  }
   if (spectator_count_for_port_locked(owner_port) >=
       get_config()->max_client_sessions) {
     return NULL;
@@ -454,19 +469,17 @@ void spectator_manager_tick(void) {
 
     if (max_focus == 0 && e->state != SPECTATOR_STATE_IDLE &&
         !e->capacity_bypass) {
-      if (!e->has_pending_notice) {
-        e->has_pending_notice = 1;
-        e->pending_notice_flags = WAMBLE_FLAG_SPECTATE_NOTICE_STOPPED;
-        e->pending_notice_type = WAMBLE_NOTIFICATION_TYPE_SPECTATE_ENDED;
-        e->pending_notice_board_id = e->focus_board_id;
-        snprintf(e->pending_notice, sizeof(e->pending_notice),
-                 "spectating stopped; max-spectators is 0");
-        WambleRuntimeStatus runtime_status = {
-            WAMBLE_RUNTIME_STATUS_PROFILE_ADMIN,
-            PROFILE_ADMIN_STATUS_SPECTATOR_STOPPED_BY_ZERO_CAP};
-        wamble_runtime_event_publish(runtime_status,
-                                     wamble_runtime_profile_key(), NULL);
-      }
+      e->has_pending_notice = 1;
+      e->pending_notice_flags = WAMBLE_FLAG_SPECTATE_NOTICE_STOPPED;
+      e->pending_notice_type = WAMBLE_NOTIFICATION_TYPE_SPECTATE_ENDED;
+      e->pending_notice_board_id = e->focus_board_id;
+      snprintf(e->pending_notice, sizeof(e->pending_notice),
+               "spectating stopped; max-spectators is 0");
+      WambleRuntimeStatus runtime_status = {
+          WAMBLE_RUNTIME_STATUS_PROFILE_ADMIN,
+          PROFILE_ADMIN_STATUS_SPECTATOR_STOPPED_BY_ZERO_CAP};
+      wamble_runtime_event_publish(runtime_status, wamble_runtime_profile_key(),
+                                   NULL);
       e->state = SPECTATOR_STATE_IDLE;
       e->focus_board_id = 0;
       e->last_focus_sent = 0.0;
@@ -524,14 +537,21 @@ SpectatorRequestStatus spectator_handle_request(
     for (int i = 0; i < spectators_count; i++) {
       SpectatorEntry *e = &spectators[i];
       if (memcmp(e->token, msg->token, TOKEN_LENGTH) != 0 ||
-          e->addr.sin_addr.s_addr != cliaddr->sin_addr.s_addr ||
-          e->addr.sin_port != cliaddr->sin_port ||
           e->owner_port != owner_port) {
         continue;
       }
+      if (!token_has_any_byte(msg->token) &&
+          (e->addr.sin_addr.s_addr != cliaddr->sin_addr.s_addr ||
+           e->addr.sin_port != cliaddr->sin_port)) {
+        continue;
+      }
+      e->addr = *cliaddr;
+      e->trust = trust_tier;
       e->state = SPECTATOR_STATE_IDLE;
       e->focus_board_id = 0;
       e->last_focus_sent = 0.0;
+      e->last_summary_sent = 0.0;
+      e->last_activity = monotonic_seconds();
       e->has_pending_notice = 0;
       e->pending_notice_flags = 0;
       e->pending_notice_type = WAMBLE_NOTIFICATION_TYPE_GENERIC;
@@ -631,6 +651,83 @@ SpectatorRequestStatus spectator_handle_request(
   return rc;
 }
 
+int spectator_get_state_by_token(const uint8_t *token, SpectatorState *out_state,
+                                 uint64_t *out_focus_board_id) {
+  int owner_port = 0;
+  if (!token || !out_state || !out_focus_board_id)
+    return -1;
+  owner_port = spectator_current_port();
+  wamble_mutex_lock(&spectators_mutex);
+  for (int i = 0; i < spectators_count; i++) {
+    SpectatorEntry *e = &spectators[i];
+    if (memcmp(e->token, token, TOKEN_LENGTH) != 0 ||
+        e->owner_port != owner_port) {
+      continue;
+    }
+    *out_state = e->state;
+    *out_focus_board_id = e->focus_board_id;
+    wamble_mutex_unlock(&spectators_mutex);
+    return 0;
+  }
+  wamble_mutex_unlock(&spectators_mutex);
+  return -1;
+}
+
+int spectator_collect_state_snapshot(const uint8_t *token, SpectatorUpdate *out,
+                                     int max) {
+  if (!token || !out || max <= 0)
+    return 0;
+  const WambleConfig *cfg = get_config();
+  if (!cfg)
+    return 0;
+
+  wamble_mutex_lock(&spectators_mutex);
+  if (summary_cache_built_wall == 0) {
+    rebuild_summary_cache_locked(cfg->max_boards);
+  }
+
+  int port = spectator_current_port();
+  double now = monotonic_seconds();
+  int out_count = 0;
+  for (int i = 0; i < spectators_count; i++) {
+    SpectatorEntry *e = &spectators[i];
+    if (e->owner_port != port || memcmp(e->token, token, TOKEN_LENGTH) != 0) {
+      continue;
+    }
+    if (e->state == SPECTATOR_STATE_SUMMARY) {
+      fill_summary_now(e, out, max, &out_count);
+      e->last_summary_sent = now;
+    } else if (e->state == SPECTATOR_STATE_FOCUS) {
+      (void)fill_focus_now(e, out, max, &out_count);
+      e->last_focus_sent = now;
+    }
+    break;
+  }
+  wamble_mutex_unlock(&spectators_mutex);
+  return out_count;
+}
+
+static int fill_focus_now(SpectatorEntry *e, SpectatorUpdate *out, int out_cap,
+                          int *out_count) {
+  if (!e || !out || !out_count || *out_count >= out_cap)
+    return 0;
+  WambleBoard *b = get_board_by_id(e->focus_board_id);
+  if (!b || !is_board_eligible(b))
+    return 0;
+
+  SpectatorUpdate *u = &out[*out_count];
+  memset(u, 0, sizeof(*u));
+  memcpy(u->token, e->token, TOKEN_LENGTH);
+  u->board_id = b->id;
+  spectator_write_visible_fen(e->token, b, u->fen, sizeof(u->fen));
+  u->addr = e->addr;
+  u->flags = WAMBLE_FLAG_UNRELIABLE;
+  if (e->game_mode_visible && b->board.game_mode == GAME_MODE_CHESS960)
+    u->flags |= WAMBLE_FLAG_BOARD_IS_960;
+  (*out_count)++;
+  return 1;
+}
+
 void spectator_discard_by_token(const uint8_t *token) {
   if (!token || !spectators)
     return;
@@ -726,22 +823,7 @@ int spectator_collect_updates(struct SpectatorUpdate *out, int max) {
           (e->last_focus_sent == 0.0) ||
           (foc_interval > 0.0 && (now - e->last_focus_sent) >= foc_interval);
       if (due) {
-        if (out_count < max) {
-          WambleBoard *b = get_board_by_id(e->focus_board_id);
-          if (b && is_board_eligible(b)) {
-            SpectatorUpdate *u = &out[out_count];
-            memcpy(u->token, e->token, TOKEN_LENGTH);
-            u->board_id = b->id;
-            spectator_write_visible_fen(e->token, b, u->fen, sizeof(u->fen));
-            u->addr = e->addr;
-            u->flags = WAMBLE_FLAG_UNRELIABLE;
-            u->summary_generation = 0;
-            if (e->game_mode_visible &&
-                b->board.game_mode == GAME_MODE_CHESS960)
-              u->flags |= WAMBLE_FLAG_BOARD_IS_960;
-            out_count++;
-          }
-        }
+        (void)fill_focus_now(e, out, max, &out_count);
         e->last_focus_sent = now;
       }
     }

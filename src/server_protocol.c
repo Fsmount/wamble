@@ -2539,6 +2539,9 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
       }
       return SERVER_ERR_SPECTATOR;
     }
+    if (send_reliable_spectate_state_sync(sockfd, msg->token, cliaddr) != 0) {
+      return SERVER_ERR_SEND_FAILED;
+    }
     return SERVER_OK;
   }
   case WAMBLE_CTRL_SPECTATE_STOP: {
@@ -2548,6 +2551,9 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     uint64_t focus_id = 0;
     (void)spectator_handle_request(msg, cliaddr, effective_trust_tier, 0, 0,
                                    &new_state, &focus_id);
+    if (send_reliable_spectate_state_sync(sockfd, msg->token, cliaddr) != 0) {
+      return SERVER_ERR_SEND_FAILED;
+    }
     return SERVER_OK;
   }
   case WAMBLE_CTRL_GET_PLAYER_STATS: {
