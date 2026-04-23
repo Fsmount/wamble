@@ -65,6 +65,21 @@ Extension Trailer (reserved)
 - Current capability metadata keys:
   - `session.caps` (`int` bitmask): server-advertised UI/session actions.
   - `prediction.source` (`string`): `tree` or `moves` for prediction reads.
+    Emitted when the session has prediction read capability.
+  - `prediction.max_pending` (`int`): authoritative pending-submission cap for
+    the session on the referenced board, derived from `prediction-max-pending`
+    config and current treatment. Emitted on `SERVER_HELLO`, `BOARD_UPDATE`,
+    and `LOGIN_SUCCESS` when the session has prediction submit capability.
+    Clients must use this value rather than a compile-time default.
+  - `prediction.request_kind` (`string`): `submit` on `PREDICTION_DATA`
+    returned for `SUBMIT_PREDICTION`, `tree` on `PREDICTION_DATA` returned for
+    `GET_PREDICTIONS`. Authoritative discriminator for the two response
+    shapes.
+  - `prediction.submit_status` (`int`): outcome code for `SUBMIT_PREDICTION`,
+    present only when `prediction.request_kind=submit`. Values:
+    `1=created`, `2=duplicate`, `3=duplicate_move`, `4=rejected_invalid`,
+    `5=rejected_limit`, `6=rejected_not_allowed`, `7=rejected_not_found`,
+    `8=rejected_disabled`.
   - `reservation.reserved_at` (`int`): wall-clock Unix epoch seconds when the
     current board reservation was created. Only present when the board has an
     active reservation. Carried on `SERVER_HELLO`, `BOARD_UPDATE`, and
@@ -151,7 +166,8 @@ Control Codes
 - `0x02` SERVER_HELLO (server to client): Response to HELLO.
   - Payload: `char fen[]` (current board state).
   - May include extension fields: `session.caps`, `prediction.source`,
-    `reservation.reserved_at`, `last_move.from`, `last_move.to`.
+    `prediction.max_pending`, `reservation.reserved_at`, `last_move.from`,
+    `last_move.to`.
 - `0x03` PLAYER_MOVE (client to server): Submit a move.
   - Payload: `uint8 uci_len; char uci[uci_len]` (max 6 bytes).
 - `0x04` BOARD_UPDATE (server to client): Board state has changed.
@@ -159,7 +175,8 @@ Control Codes
   - `flags`: server sets `0x01` when the assigned board is Chess960 *and*
     `session.caps` includes game-mode visibility (`0x00000200`).
   - May include extension fields: `session.caps`, `prediction.source`,
-    `reservation.reserved_at`, `last_move.from`, `last_move.to`.
+    `prediction.max_pending`, `reservation.reserved_at`, `last_move.from`,
+    `last_move.to`.
 - `0x05` ACK (bidirectional): Acknowledges a reliable packet.
   - Payload: empty. Header `seq_num` matches the packet being ACKed.
 - `0x06` LIST_PROFILES (client to server): Request available profiles.
@@ -281,7 +298,8 @@ Control Codes
 - `0x10` LOGIN_SUCCESS (server to client): Successful login.
   - Payload: empty.
   - May include extension fields: `session.caps`, `prediction.source`,
-    `reservation.reserved_at`, `last_move.from`, `last_move.to`.
+    `prediction.max_pending`, `reservation.reserved_at`, `last_move.from`,
+    `last_move.to`.
 - `0x11` LOGIN_FAILED (server to client): Failed login.
   - Payload: `uint16 code; uint8 reason_len; char reason[reason_len]`.
 - `0x12` GET_PLAYER_STATS (client to server): Request player statistics.
@@ -355,13 +373,23 @@ Control Codes
   - `status`: `0=pending`, `1=correct`, `2=incorrect`, `3=expired`.
   - `points_bits_be` is an IEEE-754 double bit pattern in big-endian order.
   - Maximum entries per packet: 16.
+  - Every PREDICTION_DATA packet carries `prediction.request_kind`
+    (`submit` or `tree`). Submit responses additionally carry
+    `prediction.submit_status`; tree responses never do. Clients must
+    discriminate submit vs tree responses via `request_kind`, not local
+    sequence tracking or payload parsing.
+  - Successful submit: `count=1` with the created row read back from the
+    persisted submit result (not re-derived from a depth-limited tree read),
+    `prediction.submit_status=1`.
   - Failure states: prediction failures (access denied, duplicate, invalid
     request) are returned as PREDICTION_DATA with `count=0` rather than a
     generic ERROR. On duplicate (PREDICTION_ERR_DUPLICATE or
     PREDICTION_ERR_DUPLICATE_MOVE) when the submitter has prediction read
     access, the server returns PREDICTION_DATA with `count=1` containing the
-    existing prediction row. This follows the inline domain response pattern
-    used elsewhere in the protocol (LOGIN_FAILED, LEGAL_MOVES count=0, etc.).
+    existing prediction row and `prediction.submit_status=2` (same session)
+    or `3` (same UCI from another session). This follows the inline domain
+    response pattern used elsewhere in the protocol (LOGIN_FAILED,
+    LEGAL_MOVES count=0, etc.).
 - `0x1E` GET_PROFILE_TOS (client to server): Request ToS text for a profile.
   - Payload: `uint8 name_len; char name[name_len]`.
   - Authorization: profile must be discoverable by the requesting session's

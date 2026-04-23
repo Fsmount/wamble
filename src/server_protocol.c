@@ -845,6 +845,64 @@ static int append_error_blocking_ext(struct WambleMsg *msg) {
   return append_ext_int(msg, "error.blocking", 1);
 }
 
+typedef enum {
+  PREDICTION_RESPONSE_KIND_TREE = 0,
+  PREDICTION_RESPONSE_KIND_SUBMIT = 1
+} PredictionResponseKind;
+
+typedef enum {
+  PREDICTION_SUBMIT_STATUS_NONE = 0,
+  PREDICTION_SUBMIT_STATUS_CREATED = 1,
+  PREDICTION_SUBMIT_STATUS_DUPLICATE = 2,
+  PREDICTION_SUBMIT_STATUS_DUPLICATE_MOVE = 3,
+  PREDICTION_SUBMIT_STATUS_REJECTED_INVALID = 4,
+  PREDICTION_SUBMIT_STATUS_REJECTED_LIMIT = 5,
+  PREDICTION_SUBMIT_STATUS_REJECTED_NOT_ALLOWED = 6,
+  PREDICTION_SUBMIT_STATUS_REJECTED_NOT_FOUND = 7,
+  PREDICTION_SUBMIT_STATUS_REJECTED_DISABLED = 8
+} PredictionSubmitStatusCode;
+
+static int
+append_prediction_response_metadata(struct WambleMsg *msg,
+                                    PredictionResponseKind kind,
+                                    PredictionSubmitStatusCode submit_status) {
+  if (!msg)
+    return -1;
+  if (append_ext_string(
+          msg, "prediction.request_kind",
+          kind == PREDICTION_RESPONSE_KIND_SUBMIT ? "submit" : "tree") != 0) {
+    return -1;
+  }
+  if (kind == PREDICTION_RESPONSE_KIND_SUBMIT) {
+    return append_ext_int(msg, "prediction.submit_status",
+                          (int64_t)submit_status);
+  }
+  return 0;
+}
+
+static PredictionSubmitStatusCode
+prediction_submit_status_code(PredictionStatus st) {
+  switch (st) {
+  case PREDICTION_OK:
+    return PREDICTION_SUBMIT_STATUS_CREATED;
+  case PREDICTION_ERR_DUPLICATE:
+    return PREDICTION_SUBMIT_STATUS_DUPLICATE;
+  case PREDICTION_ERR_DUPLICATE_MOVE:
+    return PREDICTION_SUBMIT_STATUS_DUPLICATE_MOVE;
+  case PREDICTION_ERR_LIMIT:
+    return PREDICTION_SUBMIT_STATUS_REJECTED_LIMIT;
+  case PREDICTION_ERR_NOT_ALLOWED:
+    return PREDICTION_SUBMIT_STATUS_REJECTED_NOT_ALLOWED;
+  case PREDICTION_ERR_NOT_FOUND:
+    return PREDICTION_SUBMIT_STATUS_REJECTED_NOT_FOUND;
+  case PREDICTION_ERR_DISABLED:
+    return PREDICTION_SUBMIT_STATUS_REJECTED_DISABLED;
+  case PREDICTION_ERR_INVALID:
+  default:
+    return PREDICTION_SUBMIT_STATUS_REJECTED_INVALID;
+  }
+}
+
 static ServerStatus
 send_error_terminal_ex(wamble_socket_t sockfd,
                        const struct sockaddr_in *cliaddr, const uint8_t *token,
@@ -1489,6 +1547,11 @@ static uint32_t append_session_capability_extensions(struct WambleMsg *msg,
   if ((caps & WAMBLE_SESSION_UI_CAP_PREDICTION_READ) != 0) {
     (void)append_ext_string(msg, "prediction.source", prediction_source);
   }
+  if ((caps & WAMBLE_SESSION_UI_CAP_PREDICTION_SUBMIT) != 0) {
+    (void)append_ext_int(
+        msg, "prediction.max_pending",
+        (int64_t)prediction_max_pending_for_player(board, token));
+  }
   if (board->reservation_time > 0) {
     (void)append_ext_int(msg, "reservation.reserved_at",
                          (int64_t)board->reservation_time);
@@ -1552,7 +1615,9 @@ static void fill_prediction_entry(WamblePredictionEntry *dst,
 static ServerStatus
 send_prediction_rows(wamble_socket_t sockfd, const struct sockaddr_in *cliaddr,
                      const uint8_t *token, uint64_t board_id,
-                     const WamblePredictionView *rows, int count) {
+                     const WamblePredictionView *rows, int count,
+                     PredictionResponseKind kind,
+                     PredictionSubmitStatusCode submit_status) {
   struct WambleMsg response = {0};
   response.ctrl = WAMBLE_CTRL_PREDICTION_DATA;
   memcpy(response.token, token, TOKEN_LENGTH);
@@ -1565,6 +1630,7 @@ send_prediction_rows(wamble_socket_t sockfd, const struct sockaddr_in *cliaddr,
   for (int i = 0; i < count; i++) {
     fill_prediction_entry(&response.prediction.entries[i], &rows[i]);
   }
+  (void)append_prediction_response_metadata(&response, kind, submit_status);
   if (send_reliable_default(sockfd, &response, cliaddr) != 0) {
     return SERVER_ERR_SEND_FAILED;
   }
@@ -1764,28 +1830,28 @@ static ServerStatus handle_submit_prediction(wamble_socket_t sockfd,
       WamblePredictionView dup_view;
       if (prediction_get_view_by_id(prediction_id, &dup_view) ==
           PREDICTION_OK) {
-        return send_prediction_rows(sockfd, cliaddr, msg->token, board->id,
-                                    &dup_view, 1);
+        return send_prediction_rows(
+            sockfd, cliaddr, msg->token, board->id, &dup_view, 1,
+            PREDICTION_RESPONSE_KIND_SUBMIT, prediction_submit_status_code(st));
       }
     }
-    return send_prediction_rows(sockfd, cliaddr, msg->token, board->id, NULL,
-                                0);
+    return send_prediction_rows(sockfd, cliaddr, msg->token, board->id, NULL, 0,
+                                PREDICTION_RESPONSE_KIND_SUBMIT,
+                                prediction_submit_status_code(st));
   }
 
-  WamblePredictionView rows[WAMBLE_MAX_PREDICTION_ENTRIES];
-  int count = 0;
-  if (prediction_collect_tree(
-          board->id, msg->token, 0, get_config()->prediction_view_depth_limit,
-          rows, WAMBLE_MAX_PREDICTION_ENTRIES, &count) != PREDICTION_OK) {
-    count = 0;
+  WamblePredictionView created_view = {0};
+  if (prediction_get_view_by_id(prediction_id, &created_view) !=
+      PREDICTION_OK) {
+    publish_server_protocol_status(SERVER_PROTOCOL_STATUS_PREDICTION_REJECTED,
+                                   profile_name);
+    return send_prediction_rows(sockfd, cliaddr, msg->token, board->id, NULL, 0,
+                                PREDICTION_RESPONSE_KIND_SUBMIT,
+                                PREDICTION_SUBMIT_STATUS_REJECTED_INVALID);
   }
-  for (int i = 0; i < count; i++) {
-    if (rows[i].id == prediction_id) {
-      return send_prediction_rows(sockfd, cliaddr, msg->token, board->id,
-                                  &rows[i], 1);
-    }
-  }
-  return send_prediction_rows(sockfd, cliaddr, msg->token, board->id, NULL, 0);
+  return send_prediction_rows(sockfd, cliaddr, msg->token, board->id,
+                              &created_view, 1, PREDICTION_RESPONSE_KIND_SUBMIT,
+                              PREDICTION_SUBMIT_STATUS_CREATED);
 }
 
 static ServerStatus handle_get_predictions(wamble_socket_t sockfd,
@@ -1816,7 +1882,8 @@ static ServerStatus handle_get_predictions(wamble_socket_t sockfd,
                                "prediction read failed", NULL, 0);
   }
   return send_prediction_rows(sockfd, cliaddr, msg->token, msg->board_id, rows,
-                              count);
+                              count, PREDICTION_RESPONSE_KIND_TREE,
+                              PREDICTION_SUBMIT_STATUS_NONE);
 }
 
 static ServerStatus handle_list_profiles(wamble_socket_t sockfd,
