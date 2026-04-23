@@ -3,7 +3,8 @@ Wamble Spectator Management
 
 Overview
 - Lets a session watch games in two modes: a rotating summary or a single focused board.
-- Uses `SPECTATE_UPDATE` packets over UDP (usually unreliable).
+- Uses `SPECTATE_UPDATE` packets over UDP for both reliable state snapshots and
+  usually unreliable live refreshes.
 
 States
 - `IDLE`: not watching.
@@ -26,9 +27,19 @@ Requests
     - Omitting both flags includes all eligible boards.
   - If `game.mode` / `view` is not allowed for the session, mode filter flags
     are ignored.
+  - Terminal response: reliable summary snapshot made of one or more
+    `SPECTATE_UPDATE` packets with `spectate.state=summary`, including a
+    reset packet (`board_id=0`, empty `fen`) carrying
+    `spectate.summary_generation`.
 - Focus: send `SPECTATE_GAME` with `board_id>0` -> `SPECTATOR_OK_FOCUS` if eligible.
+  - Terminal response: reliable `SPECTATE_UPDATE` snapshot with
+    `spectate.state=focus`.
 - Stop: `SPECTATE_STOP` -> `SPECTATOR_OK_STOP`.
+  - Terminal response: reliable `SPECTATE_UPDATE` snapshot with
+    `spectate.state=idle`.
 - Low trust or capacity issues return an error (see enum values).
+- For reliable spectate requests, the terminal `SPECTATE_UPDATE` or denial
+  `ERROR` is sent before the request-level `ACK`.
 
 Updates
 - Collected by `spectator_collect_updates()` at the configured rate per mode.
@@ -40,6 +51,8 @@ Updates
   (type `SPECTATE_ENDED`) and switch back to summary.
 - If `max-spectators` is reduced to `0`, non-bypass spectators are explicitly
   stopped (type `SPECTATE_ENDED`) rather than silently left active.
+- State-changing notices are paired with a reliable `SPECTATE_UPDATE` sync so
+  the client has one authoritative post-transition state packet.
 
 Notifications
 - `spectator_collect_notifications()` returns pending notices as

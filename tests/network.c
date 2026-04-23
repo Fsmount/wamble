@@ -39,6 +39,21 @@ typedef struct {
   int received;
 } RecvOneCtx;
 
+typedef struct {
+  wamble_socket_t sockfd;
+  struct WambleMsg msg;
+  struct sockaddr_in cliaddr;
+  int trust_tier;
+  const char *profile_name;
+  ServerStatus status;
+} HandleMessageCtx;
+
+typedef struct {
+  wamble_socket_t srv;
+  wamble_socket_t cli;
+  struct sockaddr_in cliaddr;
+} UdpLoopbackPair;
+
 static void *recv_one_thread(void *arg) {
   RecvOneCtx *c = arg;
   fd_set rfds;
@@ -77,6 +92,83 @@ static void *recv_one_and_ack_thread(void *arg) {
     send_ack(c->sock, &c->msg, &c->from);
   }
   return NULL;
+}
+
+static void *handle_message_thread(void *arg) {
+  HandleMessageCtx *ctx = arg;
+  ctx->status = handle_message(ctx->sockfd, &ctx->msg, &ctx->cliaddr,
+                               ctx->trust_tier, ctx->profile_name);
+  return NULL;
+}
+
+static int recv_message_with_timeout(wamble_socket_t sock,
+                                     struct WambleMsg *msg,
+                                     struct sockaddr_in *from, int timeout_ms) {
+  fd_set rfds;
+  struct timeval tv;
+  FD_ZERO(&rfds);
+  FD_SET(sock, &rfds);
+  tv.tv_sec = timeout_ms / 1000;
+  tv.tv_usec = (timeout_ms % 1000) * 1000;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+  int ready = select(0, &rfds, NULL, NULL, &tv);
+#else
+  int ready = select(sock + 1, &rfds, NULL, NULL, &tv);
+#endif
+  if (ready <= 0)
+    return ready;
+  return receive_message(sock, msg, from);
+}
+
+static int init_udp_loopback_pair(UdpLoopbackPair *pair) {
+  struct sockaddr_in bindaddr;
+  wamble_socklen_t slen;
+
+  T_ASSERT(pair != NULL);
+  memset(pair, 0, sizeof(*pair));
+  pair->srv = create_and_bind_socket(0);
+  T_ASSERT(pair->srv != WAMBLE_INVALID_SOCKET);
+  pair->cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(pair->cli != WAMBLE_INVALID_SOCKET);
+
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(
+      bind(pair->cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  slen = (wamble_socklen_t)sizeof(pair->cliaddr);
+  T_ASSERT_STATUS_OK(
+      getsockname(pair->cli, (struct sockaddr *)&pair->cliaddr, &slen));
+  return 0;
+}
+
+static void cleanup_udp_loopback_pair(UdpLoopbackPair *pair) {
+  if (!pair)
+    return;
+  if (pair->cli != WAMBLE_INVALID_SOCKET)
+    wamble_close_socket(pair->cli);
+  if (pair->srv != WAMBLE_INVALID_SOCKET)
+    wamble_close_socket(pair->srv);
+  pair->cli = WAMBLE_INVALID_SOCKET;
+  pair->srv = WAMBLE_INVALID_SOCKET;
+}
+
+static int ack_terminal_and_expect_request_ack(wamble_socket_t cli,
+                                               const struct WambleMsg *terminal,
+                                               const struct sockaddr_in *from,
+                                               uint32_t request_seq) {
+  struct WambleMsg rx = {0};
+  struct sockaddr_in ack_from;
+
+  T_ASSERT(terminal != NULL);
+  T_ASSERT(from != NULL);
+  send_ack(cli, terminal, from);
+  T_ASSERT(recv_message_with_timeout(cli, &rx, &ack_from, 1000) > 0);
+  T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_ACK);
+  T_ASSERT_EQ_INT((int)rx.seq_num, (int)request_seq);
+  return 0;
 }
 
 typedef struct {
@@ -3117,6 +3209,130 @@ WAMBLE_TEST(server_protocol_spectate_denial_reports_capacity_full_error_code) {
   return 0;
 }
 
+WAMBLE_TEST(server_protocol_reliable_spectate_focus_sends_terminal_before_ack) {
+  const char *cfg_path = "build/test_network_spectate_focus_order.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19424) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'spectate_game', '*', 'allow', 0, "
+          "'spectate_game_access', 'test'), "
+          "(0, 'protocol.ctrl', 'spectate_stop', '*', 'allow', 0, "
+          "'spectate_stop_access', 'test'), "
+          "(0, 'spectate.access', 'view', '*', 'allow', 0, "
+          "'spectate_view_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+  spectator_manager_init();
+
+  WamblePlayer *player = create_new_player();
+  T_ASSERT(player != NULL);
+  WambleBoard *board = find_board_for_player(player);
+  T_ASSERT(board != NULL);
+
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
+
+  HandleMessageCtx ctx = {0};
+  ctx.sockfd = pair.srv;
+  ctx.cliaddr = pair.cliaddr;
+  ctx.trust_tier = 0;
+  ctx.profile_name = "p1";
+  ctx.msg.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  ctx.msg.header_version = WAMBLE_PROTO_VERSION;
+  ctx.msg.seq_num = 401;
+  ctx.msg.board_id = board->id;
+  ctx.msg.token[0] = 0x81;
+
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, handle_message_thread, &ctx) == 0);
+
+  struct WambleMsg rx = {0};
+  struct sockaddr_in from;
+  T_ASSERT(recv_message_with_timeout(pair.cli, &rx, &from, 1000) > 0);
+  T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SPECTATE_UPDATE);
+  T_ASSERT((rx.flags & WAMBLE_FLAG_UNRELIABLE) == 0);
+  {
+    const WambleMessageExtField *state = find_ext_field(&rx, "spectate.state");
+    T_ASSERT(state != NULL);
+    T_ASSERT_EQ_INT(state->value_type, WAMBLE_TREATMENT_VALUE_STRING);
+    T_ASSERT(strcmp(state->string_value, "focus") == 0);
+  }
+  T_ASSERT_STATUS_OK(ack_terminal_and_expect_request_ack(pair.cli, &rx, &from,
+                                                         ctx.msg.seq_num));
+
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  T_ASSERT_EQ_INT(ctx.status, SERVER_OK);
+
+  spectator_manager_shutdown();
+  cleanup_udp_loopback_pair(&pair);
+  return 0;
+}
+
+WAMBLE_TEST(
+    server_protocol_reliable_spectate_denial_sends_terminal_before_ack) {
+  const char *cfg_path = "build/test_network_spectate_denial_order.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(def max-spectators 0)\n"
+                    "(defprofile p1 ((def port 19424) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'spectate_game', '*', 'allow', 0, "
+          "'spectate_game_access', 'test'), "
+          "(0, 'protocol.ctrl', 'spectate_stop', '*', 'allow', 0, "
+          "'spectate_stop_access', 'test'), "
+          "(0, 'spectate.access', 'view', '*', 'allow', 0, "
+          "'spectate_view_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+  spectator_manager_init();
+
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
+
+  HandleMessageCtx ctx = {0};
+  ctx.sockfd = pair.srv;
+  ctx.cliaddr = pair.cliaddr;
+  ctx.trust_tier = 0;
+  ctx.profile_name = "p1";
+  ctx.msg.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  ctx.msg.header_version = WAMBLE_PROTO_VERSION;
+  ctx.msg.seq_num = 402;
+  ctx.msg.token[0] = 0x82;
+
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, handle_message_thread, &ctx) == 0);
+
+  struct WambleMsg rx = {0};
+  struct sockaddr_in from;
+  T_ASSERT(recv_message_with_timeout(pair.cli, &rx, &from, 1000) > 0);
+  T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_ERROR);
+  T_ASSERT_EQ_INT(rx.view.error_code, WAMBLE_ERR_SPECTATE_FULL);
+  T_ASSERT_STATUS_OK(ack_terminal_and_expect_request_ack(pair.cli, &rx, &from,
+                                                         ctx.msg.seq_num));
+
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  T_ASSERT_EQ_INT(ctx.status, SERVER_ERR_SPECTATOR);
+
+  spectator_manager_shutdown();
+  cleanup_udp_loopback_pair(&pair);
+  return 0;
+}
+
 WAMBLE_TEST(server_protocol_spectate_summary_returns_reliable_snapshot) {
   const char *cfg_path = "build/test_network_spectate_summary_snapshot.conf";
   const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
@@ -3239,6 +3455,84 @@ WAMBLE_TEST(server_protocol_spectate_summary_returns_reliable_snapshot) {
   stop_profile_listeners();
   wamble_net_cleanup();
   wamble_close_socket(cli);
+  return 0;
+}
+
+WAMBLE_TEST(server_protocol_reliable_spectate_stop_sends_terminal_before_ack) {
+  const char *cfg_path = "build/test_network_spectate_stop_order.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19424) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'spectate_game', '*', 'allow', 0, "
+          "'spectate_game_access', 'test'), "
+          "(0, 'protocol.ctrl', 'spectate_stop', '*', 'allow', 0, "
+          "'spectate_stop_access', 'test'), "
+          "(0, 'spectate.access', 'view', '*', 'allow', 0, "
+          "'spectate_view_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+  spectator_manager_init();
+
+  WamblePlayer *player = create_new_player();
+  T_ASSERT(player != NULL);
+  WambleBoard *board = find_board_for_player(player);
+  T_ASSERT(board != NULL);
+
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
+
+  {
+    struct WambleMsg focus = {0};
+    SpectatorState state = SPECTATOR_STATE_IDLE;
+    uint64_t focus_id = 0;
+    focus.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+    focus.board_id = board->id;
+    focus.token[0] = 0x83;
+    T_ASSERT_EQ_INT(spectator_handle_request(&focus, &pair.cliaddr, 0, 0, 0,
+                                             &state, &focus_id),
+                    SPECTATOR_OK_FOCUS);
+  }
+
+  HandleMessageCtx ctx = {0};
+  ctx.sockfd = pair.srv;
+  ctx.cliaddr = pair.cliaddr;
+  ctx.trust_tier = 0;
+  ctx.profile_name = "p1";
+  ctx.msg.ctrl = WAMBLE_CTRL_SPECTATE_STOP;
+  ctx.msg.header_version = WAMBLE_PROTO_VERSION;
+  ctx.msg.seq_num = 403;
+  ctx.msg.token[0] = 0x83;
+
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, handle_message_thread, &ctx) == 0);
+
+  struct WambleMsg rx = {0};
+  struct sockaddr_in from;
+  T_ASSERT(recv_message_with_timeout(pair.cli, &rx, &from, 1000) > 0);
+  T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SPECTATE_UPDATE);
+  T_ASSERT_EQ_INT((int)rx.board_id, 0);
+  {
+    const WambleMessageExtField *state = find_ext_field(&rx, "spectate.state");
+    T_ASSERT(state != NULL);
+    T_ASSERT_EQ_INT(state->value_type, WAMBLE_TREATMENT_VALUE_STRING);
+    T_ASSERT(strcmp(state->string_value, "idle") == 0);
+  }
+  T_ASSERT_STATUS_OK(ack_terminal_and_expect_request_ack(pair.cli, &rx, &from,
+                                                         ctx.msg.seq_num));
+
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  T_ASSERT_EQ_INT(ctx.status, SERVER_OK);
+
+  spectator_manager_shutdown();
+  cleanup_udp_loopback_pair(&pair);
   return 0;
 }
 
@@ -5069,7 +5363,16 @@ WAMBLE_TESTS_ADD_DB_SM(
     server_protocol_spectate_denial_reports_capacity_full_error_code,
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_reliable_spectate_focus_sends_terminal_before_ack,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_reliable_spectate_denial_sends_terminal_before_ack,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
     server_protocol_spectate_summary_returns_reliable_snapshot,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_reliable_spectate_stop_sends_terminal_before_ack,
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
     server_protocol_spectate_stop_returns_reliable_idle_packet,
