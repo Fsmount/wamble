@@ -225,25 +225,37 @@ Control Codes
   - If game-mode visibility is denied for the session, mode filter bits are
     ignored and mode-specific flags are not exposed in updates.
   - Header semantics:
-    - `board_id=0` enters summary mode. The server will push per-board
+    - `board_id=0` enters summary mode. The terminal result is a reliable
+      summary snapshot: one or more `SPECTATE_UPDATE` packets carrying
+      `spectate.state=summary`, including a summary-reset packet
+      (`board_id=0`, empty `fen`) with `spectate.summary_generation`. After
+      that, the server pushes periodic mostly-unreliable per-board
       `SPECTATE_UPDATE` packets for eligible boards (ACTIVE+RESERVED), sorted
-      by recency and attractiveness. Immediate unreliable updates are sent on
-      entry, followed by periodic updates at `spectate-summary-hz`.
-    - `board_id>0` focuses a specific board. The server will push
-      `SPECTATE_UPDATE` packets for that board only. Immediate unreliable
-      update is sent on entry, followed by periodic updates at
-      `spectate-focus-hz`.
+      by recency and attractiveness, at `spectate-summary-hz`.
+    - `board_id>0` focuses a specific board. The terminal result is a reliable
+      `SPECTATE_UPDATE` snapshot with `spectate.state=focus` for that board.
+      After that, the server pushes periodic mostly-unreliable
+      `SPECTATE_UPDATE` packets for that board at `spectate-focus-hz`.
+  - Reliable-request ordering: the terminal `SPECTATE_UPDATE` or denial
+    `ERROR` is sent before the request's wire-level `ACK`.
 - `0x16` SPECTATE_STOP (client to server): Stop spectating.
-  - Payload: empty. Server acknowledges. Puts session in `IDLE` state.
+  - Payload: empty.
+  - Terminal result: reliable `SPECTATE_UPDATE` with `spectate.state=idle`.
+  - Reliable-request ordering: the idle `SPECTATE_UPDATE` is sent before the
+    request's wire-level `ACK`.
 - `0x0C` SPECTATE_UPDATE (server to client): Board update for spectators.
   - Header: `board_id` identifies the board for this update (authoritative).
   - Payload: `char fen[]`.
-  - Typically sent as unreliable (`flags` high bit set). One packet per board.
+  - Used for both reliable state snapshots and periodic unreliable board
+    refreshes.
+  - Typically periodic updates are sent as unreliable (`flags` high bit set).
+    One packet per board.
   - Payload carries FEN data; `board_id` is always present in the header and
     clients use it to associate updates with boards.
   - `flags`: server sets `0x01` when the update is for a Chess960 board and
     the spectator session has game-mode visibility.
-  - May include extension fields: `last_move.from`, `last_move.to`.
+  - May include extension fields: `spectate.state`,
+    `spectate.summary_generation`, `last_move.from`, `last_move.to`.
 - `0x0D` LOGIN_REQUEST (client to server): Attach persistent identity to an
   existing anonymous session.
   - Two-step payload variants:
@@ -365,7 +377,8 @@ Control Codes
   - Payload: `uint8 name_len; char name[name_len]`.
   - Authorization matches `GET_PROFILE_TOS`: discoverable profile or the
     caller's currently bound listener profile.
-  - Reliable clients receive an immediate `ACK`; failures return `ERROR`.
+- Reliable clients currently receive an immediate `ACK`; failures return
+  `ERROR`.
 - `0x21` GET_ACTIVE_RESERVATIONS (client to server): Request active board
   reservations for the caller's persistent identity.
   - Payload: empty.

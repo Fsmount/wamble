@@ -227,6 +227,18 @@ static int send_reliable_default(wamble_socket_t sockfd,
                                cfg->max_retries);
 }
 
+static ServerStatus finish_request_after_terminal_send(
+    wamble_socket_t sockfd, const struct WambleMsg *request,
+    const struct sockaddr_in *cliaddr, ServerStatus status_if_sent) {
+  if (status_if_sent == SERVER_ERR_SEND_FAILED)
+    return status_if_sent;
+  if (!request || !cliaddr)
+    return status_if_sent;
+  if ((request->flags & WAMBLE_FLAG_UNRELIABLE) == 0)
+    send_ack(sockfd, request, cliaddr);
+  return status_if_sent;
+}
+
 static void append_board_snapshot(struct WambleMsg *out, const uint8_t *token,
                                   const char *profile_name, WambleBoard *board,
                                   uint8_t ctrl) {
@@ -2592,8 +2604,6 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
       send_ack(sockfd, msg, cliaddr);
     return handle_logout(msg, profile_name);
   case WAMBLE_CTRL_SPECTATE_GAME: {
-    if ((msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0)
-      send_ack(sockfd, msg, cliaddr);
     const char *spectate_mode = (msg->board_id == 0) ? "summary" : "focus";
     WamblePolicyDecision decision;
     memset(&decision, 0, sizeof(decision));
@@ -2608,7 +2618,8 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
       if (send_reliable_default(sockfd, &out, cliaddr) != 0) {
         return SERVER_ERR_SEND_FAILED;
       }
-      return SERVER_ERR_FORBIDDEN;
+      return finish_request_after_terminal_send(sockfd, msg, cliaddr,
+                                                SERVER_ERR_FORBIDDEN);
     }
     SpectatorState new_state = SPECTATOR_STATE_IDLE;
     uint64_t focus_id = 0;
@@ -2652,16 +2663,15 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
       if (send_reliable_default(sockfd, &out, cliaddr) != 0) {
         return SERVER_ERR_SEND_FAILED;
       }
-      return SERVER_ERR_SPECTATOR;
+      return finish_request_after_terminal_send(sockfd, msg, cliaddr,
+                                                SERVER_ERR_SPECTATOR);
     }
     if (send_reliable_spectate_state_sync(sockfd, msg->token, cliaddr) != 0) {
       return SERVER_ERR_SEND_FAILED;
     }
-    return SERVER_OK;
+    return finish_request_after_terminal_send(sockfd, msg, cliaddr, SERVER_OK);
   }
   case WAMBLE_CTRL_SPECTATE_STOP: {
-    if ((msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0)
-      send_ack(sockfd, msg, cliaddr);
     SpectatorState new_state = SPECTATOR_STATE_IDLE;
     uint64_t focus_id = 0;
     (void)spectator_handle_request(msg, cliaddr, effective_trust_tier, 0, 0,
@@ -2669,7 +2679,7 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     if (send_reliable_spectate_state_sync(sockfd, msg->token, cliaddr) != 0) {
       return SERVER_ERR_SEND_FAILED;
     }
-    return SERVER_OK;
+    return finish_request_after_terminal_send(sockfd, msg, cliaddr, SERVER_OK);
   }
   case WAMBLE_CTRL_GET_PLAYER_STATS: {
     const WambleMessageExtField *target_sid_ext =
