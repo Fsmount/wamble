@@ -651,7 +651,8 @@ SpectatorRequestStatus spectator_handle_request(
   return rc;
 }
 
-int spectator_get_state_by_token(const uint8_t *token, SpectatorState *out_state,
+int spectator_get_state_by_token(const uint8_t *token,
+                                 SpectatorState *out_state,
                                  uint64_t *out_focus_board_id) {
   int owner_port = 0;
   if (!token || !out_state || !out_focus_board_id)

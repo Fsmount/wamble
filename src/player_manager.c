@@ -410,6 +410,7 @@ WamblePlayer *attach_persistent_identity(const uint8_t *token,
     apply_persistent_player_stats(player, &stats);
   wamble_emit_link_session_to_pubkey(player->token, public_key);
   wamble_mutex_unlock(&player_mutex);
+  (void)board_emit_persistent_reservation_for_token(token);
   return player;
 }
 

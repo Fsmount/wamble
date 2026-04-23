@@ -154,6 +154,57 @@ WAMBLE_TEST(logout_clears_persistent_identity_and_emits_unlink_intent) {
   return 0;
 }
 
+WAMBLE_TEST(persistent_login_emits_reservation_for_existing_reserved_board) {
+  const char *cfg_path = "build/test_player_manager_attach_reservation.conf";
+  char db_cfg[1024];
+  uint8_t public_key[32];
+  WambleIntentBuffer intents = {0};
+
+  if (test_db_apply_migrations(NULL) != 0)
+    T_FAIL_SIMPLE("test_db_apply_migrations failed");
+  if (test_db_reset(NULL) != 0)
+    T_FAIL_SIMPLE("test_db_reset failed");
+  if (wamble_test_db_config_lines(db_cfg, sizeof(db_cfg)) != 0)
+    T_FAIL_SIMPLE("wamble_test_db_config_lines failed");
+
+  FILE *f = fopen(cfg_path, "wb");
+  T_ASSERT(f != NULL);
+  fwrite(db_cfg, 1, strlen(db_cfg), f);
+  fclose(f);
+
+  T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
+  T_ASSERT_EQ_INT(db_init(NULL), 0);
+  wamble_set_query_service(wamble_get_db_query_service());
+  player_manager_init();
+  board_manager_init();
+
+  wamble_intents_init(&intents);
+  wamble_set_intent_buffer(&intents);
+
+  for (int i = 0; i < 32; i++)
+    public_key[i] = (uint8_t)(0x60 + i);
+
+  WamblePlayer *player = create_new_player();
+  T_ASSERT(player != NULL);
+  WambleBoard *board = find_board_for_player(player);
+  T_ASSERT(board != NULL);
+  T_ASSERT(board_is_reserved_for_player(board->id, player->token));
+
+  wamble_intents_clear(&intents);
+  T_ASSERT(attach_persistent_identity(player->token, public_key) != NULL);
+  T_ASSERT_EQ_INT(intents.count, 2);
+  T_ASSERT_EQ_INT(intents.items[0].type, WAMBLE_INTENT_LINK_SESSION_TO_PUBKEY);
+  T_ASSERT_EQ_INT(intents.items[1].type, WAMBLE_INTENT_CREATE_RESERVATION);
+  T_ASSERT_EQ_INT((int)intents.items[1].as.create_reservation.board_id,
+                  (int)board->id);
+  T_ASSERT(tokens_equal(intents.items[1].as.create_reservation.token,
+                        player->token));
+
+  wamble_set_intent_buffer(NULL);
+  wamble_intents_free(&intents);
+  return 0;
+}
+
 WAMBLE_TESTS_BEGIN_NAMED(wamble_register_tests_player_manager)
 WAMBLE_TESTS_ADD_FM(player_pool_capacity_limit, "player_manager");
 WAMBLE_TESTS_ADD_FM(player_token_expiration_removes_entry, "player_manager");
@@ -161,5 +212,8 @@ WAMBLE_TESTS_ADD_DB_FM(login_rehydrates_cached_player_from_persistent_stats,
                        "player_manager");
 WAMBLE_TESTS_ADD_DB_FM(
     logout_clears_persistent_identity_and_emits_unlink_intent,
+    "player_manager");
+WAMBLE_TESTS_ADD_DB_FM(
+    persistent_login_emits_reservation_for_existing_reserved_board,
     "player_manager");
 WAMBLE_TESTS_END()
