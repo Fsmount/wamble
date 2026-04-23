@@ -1187,14 +1187,7 @@ static void profile_runtime_send_spectator_updates(RunningProfile *rp) {
     struct sockaddr_in addr;
     if (network_get_client_addr_by_token(released[i].token, &addr) != 0)
       continue;
-    struct WambleMsg out = {0};
-    out.ctrl = WAMBLE_CTRL_SERVER_NOTIFICATION;
-    out.flags = WAMBLE_FLAG_UNRELIABLE;
-    out.session.notification_type =
-        WAMBLE_NOTIFICATION_TYPE_RESERVATION_RELEASED;
-    out.board_id = released[i].board_id;
-    memcpy(out.token, released[i].token, TOKEN_LENGTH);
-    (void)send_unreliable_packet(rp->sockfd, &out, &addr);
+    (void)send_reliable_board_state_sync(rp->sockfd, released[i].token, &addr);
   }
   free(released);
 }

@@ -699,6 +699,13 @@ int network_get_client_addr_by_token(const uint8_t *token,
   return 0;
 }
 
+void network_bind_client_token(const struct sockaddr_in *addr,
+                               const uint8_t *token) {
+  if (!addr || !token || !token_has_any_byte(token))
+    return;
+  update_client_session(addr, token, 0);
+}
+
 wamble_socket_t create_and_bind_socket(int port) {
   wamble_socket_t sockfd;
   struct sockaddr_in servaddr;

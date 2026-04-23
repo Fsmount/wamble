@@ -625,11 +625,58 @@ static void apply_reservation_to_board(WambleBoard *board,
   wamble_emit_update_board_reservation_meta(board->id, now,
                                             board->reserved_for_white);
 
-  if (player->has_persistent_identity) {
+  if (player->has_persistent_identity)
     wamble_emit_create_reservation(board->id, player->token,
                                    get_config()->reservation_timeout,
                                    board->reserved_for_white);
+}
+
+static WambleBoard *
+find_reserved_board_for_token_locked(const uint8_t *player_token) {
+  if (!player_token || token_is_zero(player_token))
+    return NULL;
+  for (int i = 0; i < num_cached_boards; i++) {
+    WambleBoard *board = &board_cached[i];
+    if (board->state != BOARD_STATE_RESERVED)
+      continue;
+    if (tokens_equal(board->reservation_player_token, player_token))
+      return board;
   }
+  return NULL;
+}
+
+static int snapshot_active_reservation_for_token_locked(
+    const uint8_t *player_token, WambleBoard **out_board,
+    DbActiveReservationEntry *out_entry) {
+  WambleBoard *board = NULL;
+  if (!player_token || token_is_zero(player_token))
+    return 0;
+  board = find_reserved_board_for_token_locked(player_token);
+  if (!board)
+    return 0;
+  if (out_board)
+    *out_board = board;
+  if (out_entry) {
+    memset(out_entry, 0, sizeof(*out_entry));
+    out_entry->board_id = board->id;
+    out_entry->reserved_at = board->reservation_time;
+    out_entry->expires_at =
+        board->reservation_time + get_config()->reservation_timeout;
+    out_entry->available = 1;
+  }
+  return board ? 1 : 0;
+}
+
+int board_fill_active_reservation_for_token(const uint8_t *player_token,
+                                            DbActiveReservationEntry *out) {
+  int found = 0;
+  if (!board_manager_ready() || !out)
+    return 0;
+  memset(out, 0, sizeof(*out));
+  wamble_mutex_lock(&board_mutex);
+  found = snapshot_active_reservation_for_token_locked(player_token, NULL, out);
+  wamble_mutex_unlock(&board_mutex);
+  return found;
 }
 
 static WambleBoard *load_board_into_cache(uint64_t board_id) {
@@ -775,9 +822,6 @@ void board_move_played(uint64_t board_id, const uint8_t *player_token,
                                          board->last_mover_treatment_group);
       wamble_emit_remove_reservation(board->id);
       wamble_emit_update_board_reservation_meta(board->id, 0, false);
-      queue_reservation_release_notification_locked(
-          board->reservation_player_token, board->id);
-
       memset(board->reservation_player_token, 0, TOKEN_LENGTH);
       board->reservation_time = 0;
       board->reserved_for_white = false;
@@ -873,6 +917,24 @@ void board_release_reservation(uint64_t board_id) {
   }
 
   wamble_mutex_unlock(&board_mutex);
+}
+
+int board_emit_persistent_reservation_for_token(const uint8_t *player_token) {
+  WambleBoard *board = NULL;
+  if (!board_manager_ready() || !player_token || token_is_zero(player_token))
+    return 0;
+  wamble_mutex_lock(&board_mutex);
+  (void)snapshot_active_reservation_for_token_locked(player_token, &board,
+                                                     NULL);
+  if (board) {
+    wamble_emit_create_reservation(board->id, board->reservation_player_token,
+                                   get_config()->reservation_timeout,
+                                   board->reserved_for_white);
+    wamble_mutex_unlock(&board_mutex);
+    return 1;
+  }
+  wamble_mutex_unlock(&board_mutex);
+  return 0;
 }
 
 int board_collect_reservation_release_notifications(
@@ -1077,6 +1139,13 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
   }
 
   wamble_mutex_lock(&board_mutex);
+
+  WambleBoard *existing_reserved =
+      find_reserved_board_for_token_locked(player->token);
+  if (existing_reserved) {
+    wamble_mutex_unlock(&board_mutex);
+    return existing_reserved;
+  }
 
   int eligible_capacity = get_config()->max_boards * 2;
   if (eligible_capacity <= 0) {

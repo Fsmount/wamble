@@ -1847,6 +1847,8 @@ int receive_message_packet(const uint8_t *packet, size_t packet_len,
                            const struct sockaddr_in *cliaddr);
 int network_get_client_addr_by_token(const uint8_t *token,
                                      struct sockaddr_in *out_addr);
+void network_bind_client_token(const struct sockaddr_in *addr,
+                               const uint8_t *token);
 wamble_socket_t create_and_bind_socket(int port);
 int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
                     struct sockaddr_in *cliaddr);
@@ -1870,6 +1872,8 @@ int send_reliable_payload_bytes(wamble_socket_t sockfd, uint8_t ctrl,
 int send_reliable_spectate_state_sync(wamble_socket_t sockfd,
                                       const uint8_t *token,
                                       const struct sockaddr_in *cliaddr);
+int send_reliable_board_state_sync(wamble_socket_t sockfd, const uint8_t *token,
+                                   const struct sockaddr_in *cliaddr);
 int send_unreliable_packet(wamble_socket_t sockfd, const struct WambleMsg *msg,
                            const struct sockaddr_in *cliaddr);
 int wamble_socket_bound_port(wamble_socket_t sock);
@@ -1898,7 +1902,8 @@ SpectatorRequestStatus spectator_handle_request(
     const struct WambleMsg *msg, const struct sockaddr_in *cliaddr,
     int trust_tier, int capacity_bypass, int game_mode_visible,
     SpectatorState *out_state, uint64_t *out_focus_board_id);
-int spectator_get_state_by_token(const uint8_t *token, SpectatorState *out_state,
+int spectator_get_state_by_token(const uint8_t *token,
+                                 SpectatorState *out_state,
                                  uint64_t *out_focus_board_id);
 void spectator_discard_by_token(const uint8_t *token);
 int spectator_collect_state_snapshot(const uint8_t *token,
@@ -2208,6 +2213,9 @@ void board_game_completed(uint64_t board_id, GameResult result);
 bool board_is_reserved_for_player(uint64_t board_id,
                                   const uint8_t *player_token);
 void board_release_reservation(uint64_t board_id);
+int board_emit_persistent_reservation_for_token(const uint8_t *player_token);
+int board_fill_active_reservation_for_token(const uint8_t *player_token,
+                                            DbActiveReservationEntry *out);
 void update_player_ratings(WambleBoard *board);
 WambleBoard *get_board_by_id(uint64_t board_id);
 int board_manager_export(WambleBoard *out, int max, int *out_count,

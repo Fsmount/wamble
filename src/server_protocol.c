@@ -42,6 +42,18 @@ static int compare_cstr_ptrs(const void *a, const void *b);
 static int stats_read_allowed(const uint8_t *token, const char *profile_name,
                               uint64_t target_session_id,
                               uint64_t target_identity_id);
+static void write_visible_board_fen(const uint8_t *token,
+                                    const char *profile_name,
+                                    const WambleBoard *board, char *out_fen,
+                                    size_t out_fen_size);
+static uint32_t append_session_capability_extensions(struct WambleMsg *msg,
+                                                     const uint8_t *token,
+                                                     const char *profile_name,
+                                                     const WambleBoard *board);
+static void append_last_move_extensions(struct WambleMsg *msg,
+                                        const uint8_t *token,
+                                        const char *profile_name,
+                                        WambleBoard *board);
 
 static int token_has_any_byte(const uint8_t *token) {
   if (!token)
@@ -213,6 +225,70 @@ static int send_reliable_default(wamble_socket_t sockfd,
   const WambleConfig *cfg = get_config();
   return send_reliable_message(sockfd, msg, cliaddr, cfg->timeout_ms,
                                cfg->max_retries);
+}
+
+static void append_board_snapshot(struct WambleMsg *out, const uint8_t *token,
+                                  const char *profile_name, WambleBoard *board,
+                                  uint8_t ctrl) {
+  uint32_t session_caps = 0;
+  if (!out || !token || !profile_name || !profile_name[0] || !board)
+    return;
+  out->ctrl = ctrl;
+  out->board_id = board->id;
+  write_visible_board_fen(token, profile_name, board, out->view.fen,
+                          sizeof(out->view.fen));
+  session_caps =
+      append_session_capability_extensions(out, token, profile_name, board);
+  if ((session_caps & WAMBLE_SESSION_UI_CAP_GAME_MODE_VISIBLE) != 0 &&
+      board->board.game_mode == GAME_MODE_CHESS960) {
+    out->flags |= WAMBLE_FLAG_BOARD_IS_960;
+  }
+  append_last_move_extensions(out, token, profile_name, board);
+}
+
+static int build_board_state_sync_message(struct WambleMsg *out,
+                                          const uint8_t *token,
+                                          const char *profile_name) {
+  WamblePlayer *player = NULL;
+  WambleBoard *board = NULL;
+  if (!out || !token || !profile_name || !profile_name[0])
+    return -1;
+  player = get_player_by_token(token);
+  if (!player)
+    return -1;
+  board = find_board_for_player(player);
+  if (!board)
+    return -1;
+
+  memset(out, 0, sizeof(*out));
+  memcpy(out->token, player->token, TOKEN_LENGTH);
+  append_board_snapshot(out, player->token, profile_name, board,
+                        WAMBLE_CTRL_BOARD_UPDATE);
+  return 0;
+}
+
+static int send_reliable_board_state_error(wamble_socket_t sockfd,
+                                           const uint8_t *token,
+                                           const struct sockaddr_in *cliaddr) {
+  struct WambleMsg err = {0};
+  WamblePlayer *player = get_player_by_token(token);
+  err.ctrl = WAMBLE_CTRL_ERROR;
+  memcpy(err.token, token, TOKEN_LENGTH);
+  err.view.error_code =
+      player ? WAMBLE_ERR_UNKNOWN_BOARD : WAMBLE_ERR_UNKNOWN_PLAYER;
+  snprintf(err.view.error_reason, sizeof(err.view.error_reason), "%s",
+           player ? "no board available for assignment" : "unknown player");
+  return send_reliable_default(sockfd, &err, cliaddr);
+}
+
+int send_reliable_board_state_sync(wamble_socket_t sockfd, const uint8_t *token,
+                                   const struct sockaddr_in *cliaddr) {
+  struct WambleMsg out = {0};
+  if (build_board_state_sync_message(&out, token,
+                                     wamble_runtime_profile_key()) != 0) {
+    return send_reliable_board_state_error(sockfd, token, cliaddr);
+  }
+  return send_reliable_default(sockfd, &out, cliaddr);
 }
 
 static int policy_check(const uint8_t *token, const char *profile_name,
@@ -1534,23 +1610,13 @@ static ServerStatus handle_client_hello(wamble_socket_t sockfd,
   }
 
   struct WambleMsg response = {0};
-  response.ctrl = WAMBLE_CTRL_SERVER_HELLO;
   response.flags = negotiated_caps;
   response.header_version = WAMBLE_PROTO_VERSION;
   memcpy(response.token, player->token, TOKEN_LENGTH);
-  response.board_id = board->id;
   response.seq_num = WAMBLE_PROTO_VERSION;
-  write_visible_board_fen(player->token, profile_name, board, response.view.fen,
-                          sizeof(response.view.fen));
-  {
-    uint32_t session_caps = append_session_capability_extensions(
-        &response, player->token, profile_name, board);
-    if ((session_caps & WAMBLE_SESSION_UI_CAP_GAME_MODE_VISIBLE) != 0 &&
-        board->board.game_mode == GAME_MODE_CHESS960) {
-      response.flags |= WAMBLE_FLAG_BOARD_IS_960;
-    }
-    append_last_move_extensions(&response, player->token, profile_name, board);
-  }
+  append_board_snapshot(&response, player->token, profile_name, board,
+                        WAMBLE_CTRL_SERVER_HELLO);
+  network_bind_client_token(cliaddr, player->token);
 
   if (send_reliable_default(sockfd, &response, cliaddr) != 0) {
     return SERVER_ERR_SEND_FAILED;
@@ -1643,33 +1709,11 @@ static ServerStatus handle_player_move(wamble_socket_t sockfd,
     board_game_completed(board->id, board->result);
   }
 
-  WambleBoard *next_board = find_board_for_player(player);
-  if (!next_board) {
+  if (!find_board_for_player(player)) {
     return send_error_terminal(sockfd, cliaddr, msg->token, WAMBLE_ERR_INTERNAL,
                                "no replacement board after move", NULL, 0);
   }
-
-  struct WambleMsg response;
-  memset(&response, 0, sizeof(response));
-  response.ctrl = WAMBLE_CTRL_BOARD_UPDATE;
-  memcpy(response.token, player->token, TOKEN_LENGTH);
-  response.board_id = next_board->id;
-  response.seq_num = 0;
-  response.text.uci_len = 0;
-  write_visible_board_fen(msg->token, profile_name, next_board,
-                          response.view.fen, sizeof(response.view.fen));
-  {
-    uint32_t session_caps = append_session_capability_extensions(
-        &response, player->token, profile_name, next_board);
-    if ((session_caps & WAMBLE_SESSION_UI_CAP_GAME_MODE_VISIBLE) != 0 &&
-        next_board->board.game_mode == GAME_MODE_CHESS960) {
-      response.flags |= WAMBLE_FLAG_BOARD_IS_960;
-    }
-    append_last_move_extensions(&response, player->token, profile_name,
-                                next_board);
-  }
-
-  if (send_reliable_default(sockfd, &response, cliaddr) != 0) {
+  if (send_reliable_board_state_sync(sockfd, player->token, cliaddr) != 0) {
     return SERVER_ERR_SEND_FAILED;
   }
 
@@ -2085,6 +2129,50 @@ encode_active_reservations_payload(const DbActiveReservationEntry *rows,
   return off;
 }
 
+static int reservation_rows_contain_board(const DbActiveReservationEntry *rows,
+                                          int count, uint64_t board_id) {
+  if (!rows || count <= 0 || board_id == 0)
+    return 0;
+  for (int i = 0; i < count; i++) {
+    if (rows[i].board_id == board_id)
+      return 1;
+  }
+  return 0;
+}
+
+static int merge_live_reservation_row(const uint8_t *token,
+                                      const char *profile_name,
+                                      const DbActiveReservationEntry *rows,
+                                      int *inout_count,
+                                      DbActiveReservationEntry **out_rows) {
+  DbActiveReservationEntry live_row = {0};
+  DbActiveReservationEntry *merged_rows = NULL;
+  int merged_count = 0;
+
+  if (!token || !inout_count || *inout_count < 0 || !out_rows)
+    return -1;
+  *out_rows = NULL;
+  if (!board_fill_active_reservation_for_token(token, &live_row))
+    return 0;
+  if (reservation_rows_contain_board(rows, *inout_count, live_row.board_id))
+    return 0;
+
+  snprintf(live_row.profile_name, sizeof(live_row.profile_name), "%s",
+           profile_name ? profile_name : "");
+  merged_count = *inout_count > 0 ? (*inout_count + 1) : 1;
+  merged_rows = (DbActiveReservationEntry *)malloc(sizeof(*merged_rows) *
+                                                   (size_t)merged_count);
+  if (!merged_rows)
+    return -1;
+  if (*inout_count > 0 && rows) {
+    memcpy(merged_rows, rows, sizeof(*merged_rows) * (size_t)(*inout_count));
+  }
+  merged_rows[merged_count - 1] = live_row;
+  *inout_count = merged_count;
+  *out_rows = merged_rows;
+  return 1;
+}
+
 static ServerStatus handle_get_active_reservations(
     wamble_socket_t sockfd, const struct sockaddr_in *cliaddr,
     const struct WambleMsg *msg, const char *profile_name) {
@@ -2092,6 +2180,7 @@ static ServerStatus handle_get_active_reservations(
     return SERVER_ERR_INTERNAL;
   uint8_t public_key[WAMBLE_PUBLIC_KEY_LENGTH] = {0};
   int has_identity = 0;
+  WamblePlayer *player = NULL;
   uint64_t session_id = 0;
   DbStatus session_st =
       wamble_query_get_session_by_token(msg->token, &session_id);
@@ -2110,7 +2199,7 @@ static ServerStatus handle_get_active_reservations(
     }
   }
   if (!has_identity) {
-    WamblePlayer *player = get_player_by_token(msg->token);
+    player = get_player_by_token(msg->token);
     if (player && player->has_persistent_identity) {
       memcpy(public_key, player->public_key, WAMBLE_PUBLIC_KEY_LENGTH);
       has_identity = 1;
@@ -2119,6 +2208,8 @@ static ServerStatus handle_get_active_reservations(
 
   DbActiveReservationsResult reservations = {0};
   int encode_count = 0;
+  const DbActiveReservationEntry *encode_rows = NULL;
+  DbActiveReservationEntry *merged_rows = NULL;
   if (has_identity) {
     reservations =
         wamble_query_get_active_reservations_by_public_key(public_key);
@@ -2135,24 +2226,47 @@ static ServerStatus handle_get_active_reservations(
     encode_count = 0;
   }
 
+  encode_rows = reservations.rows;
+  if (has_identity) {
+    if (!player)
+      player = get_player_by_token(msg->token);
+    if (player && player->has_persistent_identity) {
+      int merge_rc = merge_live_reservation_row(msg->token, profile_name,
+                                                reservations.rows,
+                                                &encode_count, &merged_rows);
+      if (merge_rc < 0) {
+        return send_error_terminal(sockfd, cliaddr, msg->token,
+                                   WAMBLE_ERR_INTERNAL,
+                                   "reservations alloc failed", NULL, 0);
+      }
+      if (merge_rc > 0) {
+        encode_rows = merged_rows;
+      }
+    }
+  }
+
   if (encode_count < 0)
     encode_count = 0;
   if (encode_count > (int)UINT16_MAX)
     encode_count = (int)UINT16_MAX;
-  size_t payload_cap = encode_active_reservations_payload(
-      reservations.rows, encode_count, NULL, 0);
+  size_t payload_cap =
+      encode_active_reservations_payload(encode_rows, encode_count, NULL, 0);
   if (payload_cap == 0) {
+    free(merged_rows);
     return send_error_terminal(sockfd, cliaddr, msg->token,
                                WAMBLE_ERR_RESERVATIONS_FAILED,
                                "reservations payload overflow", NULL, 0);
   }
   uint8_t *payload = (uint8_t *)malloc(payload_cap);
-  if (!payload)
+  if (!payload) {
+    free(merged_rows);
     return send_error_terminal(sockfd, cliaddr, msg->token, WAMBLE_ERR_INTERNAL,
                                "reservations alloc failed", NULL, 0);
+  }
   size_t payload_len = encode_active_reservations_payload(
-      reservations.rows, encode_count, payload, payload_cap);
+      encode_rows, encode_count, payload, payload_cap);
   if (payload_len == 0 && encode_count > 0) {
+    free(merged_rows);
     free(payload);
     return send_error_terminal(sockfd, cliaddr, msg->token,
                                WAMBLE_ERR_RESERVATIONS_FAILED,
@@ -2161,6 +2275,7 @@ static ServerStatus handle_get_active_reservations(
   ServerStatus st = send_fragmented_payload(
       sockfd, cliaddr, WAMBLE_CTRL_ACTIVE_RESERVATIONS_DATA, msg->token,
       payload, payload_len, profile_name);
+  free(merged_rows);
   free(payload);
   return st;
 }

@@ -2417,6 +2417,96 @@ WAMBLE_TEST(server_protocol_client_hello_advertises_session_caps) {
   return 0;
 }
 
+WAMBLE_TEST(server_protocol_client_hello_reuses_existing_reserved_board) {
+  const char *cfg_path = "build/test_network_client_hello_reuse_board.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(def reservation-timeout 120)\n"
+                    "(defprofile p1 ((def port 19421) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 2, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'client_hello', '*', 'allow', 0, "
+          "'hello_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  struct WambleMsg hello = {0};
+  hello.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  hello.header_version = WAMBLE_PROTO_VERSION;
+  hello.token[0] = 0x51;
+
+  RecvOneCtx rx1 = {.sock = cli};
+  wamble_thread_t th1;
+  T_ASSERT(wamble_thread_create(&th1, recv_one_and_ack_thread, &rx1) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th1, NULL));
+  T_ASSERT_EQ_INT(rx1.received, 1);
+  T_ASSERT_EQ_INT(rx1.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+
+  uint64_t board_id_1 = rx1.msg.board_id;
+  WambleBoard *board_1 = get_board_by_id(board_id_1);
+  T_ASSERT(board_1 != NULL);
+  time_t reserved_at_1 = board_1->reservation_time;
+  T_ASSERT(board_is_reserved_for_player(board_id_1, rx1.msg.token));
+  const WambleMessageExtField *reserved_at_ext_1 =
+      find_ext_field(&rx1.msg, "reservation.reserved_at");
+  T_ASSERT(reserved_at_ext_1 != NULL);
+  T_ASSERT_EQ_INT(reserved_at_ext_1->value_type, WAMBLE_TREATMENT_VALUE_INT);
+
+  struct WambleMsg hello_again = {0};
+  hello_again.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  hello_again.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(hello_again.token, rx1.msg.token, TOKEN_LENGTH);
+
+  RecvOneCtx rx2 = {.sock = cli};
+  wamble_thread_t th2;
+  T_ASSERT(wamble_thread_create(&th2, recv_one_and_ack_thread, &rx2) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &hello_again, &cliaddr, 0, "p1"),
+                  SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th2, NULL));
+  T_ASSERT_EQ_INT(rx2.received, 1);
+  T_ASSERT_EQ_INT(rx2.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+  T_ASSERT(tokens_equal(rx1.msg.token, rx2.msg.token));
+  T_ASSERT_EQ_INT((int)rx2.msg.board_id, (int)board_id_1);
+  T_ASSERT(board_is_reserved_for_player(rx2.msg.board_id, rx2.msg.token));
+
+  WambleBoard *board_2 = get_board_by_id(rx2.msg.board_id);
+  T_ASSERT(board_2 != NULL);
+  T_ASSERT_EQ_INT((int)board_2->reservation_time, (int)reserved_at_1);
+  const WambleMessageExtField *reserved_at_ext_2 =
+      find_ext_field(&rx2.msg, "reservation.reserved_at");
+  T_ASSERT(reserved_at_ext_2 != NULL);
+  T_ASSERT_EQ_INT(reserved_at_ext_2->value_type, WAMBLE_TREATMENT_VALUE_INT);
+  T_ASSERT_EQ_INT((int)reserved_at_ext_2->int_value,
+                  (int)reserved_at_ext_1->int_value);
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
 WAMBLE_TEST(server_protocol_profile_info_advertises_profile_caps) {
   const char *cfg_path = "build/test_network_profile_info_caps.conf";
   const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
@@ -4136,6 +4226,114 @@ WAMBLE_TEST(server_protocol_get_active_reservations_identity_query) {
     uint16_t count_be = 0;
     uint64_t board_be = 0;
     uint64_t expires_be = 0;
+    uint64_t live_board_be = 0;
+    uint64_t live_expires_be = 0;
+    uint8_t available = 0;
+    uint8_t profile_len = 0;
+    uint8_t live_available = 0;
+    uint8_t live_profile_len = 0;
+    memcpy(&count_be, rx.msg.fragment.fragment_data, 2);
+    memcpy(&board_be, rx.msg.fragment.fragment_data + 2, 8);
+    memcpy(&expires_be, rx.msg.fragment.fragment_data + 18, 8);
+    available = rx.msg.fragment.fragment_data[26];
+    profile_len = rx.msg.fragment.fragment_data[27];
+    memcpy(&live_board_be, rx.msg.fragment.fragment_data + 28, 8);
+    memcpy(&live_expires_be, rx.msg.fragment.fragment_data + 44, 8);
+    live_available = rx.msg.fragment.fragment_data[52];
+    live_profile_len = rx.msg.fragment.fragment_data[53];
+    T_ASSERT_EQ_INT((int)ntohs(count_be), 2);
+    T_ASSERT_EQ_INT((int)wamble_net_to_host64(board_be), 777);
+    T_ASSERT(wamble_net_to_host64(expires_be) > 0);
+    T_ASSERT_EQ_INT((int)available, 0);
+    T_ASSERT_EQ_INT((int)profile_len, 0);
+    T_ASSERT_EQ_INT((int)wamble_net_to_host64(live_board_be),
+                    (int)rx_hello.msg.board_id);
+    T_ASSERT(wamble_net_to_host64(live_expires_be) > 0);
+    T_ASSERT_EQ_INT((int)live_available, 1);
+    T_ASSERT_EQ_INT((int)live_profile_len, 2);
+    T_ASSERT(memcmp(rx.msg.fragment.fragment_data + 54, "p1", 2) == 0);
+  }
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(
+    server_protocol_get_active_reservations_includes_live_attached_board) {
+  const char *cfg_path =
+      "build/test_network_get_active_reservations_live_attach.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(def reservation-timeout 120)\n"
+                    "(defprofile p1 ((def port 19426) (def advertise 1)))\n";
+  const uint8_t target_pub[WAMBLE_PUBLIC_KEY_LENGTH] = {
+      0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b,
+      0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36,
+      0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40};
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'client_hello', '*', 'allow', 0, "
+          "'hello_access', 'test'), "
+          "(0, 'protocol.ctrl', 'get_active_reservations', '*', 'allow', 0, "
+          "'reservations_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  struct WambleMsg hello = {0};
+  hello.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  hello.header_version = WAMBLE_PROTO_VERSION;
+  RecvOneCtx rx_hello = {.sock = cli};
+  wamble_thread_t th_hello;
+  T_ASSERT(
+      wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
+  T_ASSERT_EQ_INT(rx_hello.received, 1);
+  T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+  T_ASSERT(
+      board_is_reserved_for_player(rx_hello.msg.board_id, rx_hello.msg.token));
+
+  T_ASSERT(attach_persistent_identity(rx_hello.msg.token, target_pub) != NULL);
+
+  struct WambleMsg req = {0};
+  req.ctrl = WAMBLE_CTRL_GET_ACTIVE_RESERVATIONS;
+  req.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(req.token, rx_hello.msg.token, TOKEN_LENGTH);
+
+  RecvOneCtx rx = {.sock = cli};
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &req, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  T_ASSERT_EQ_INT(rx.received, 1);
+  T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_ACTIVE_RESERVATIONS_DATA);
+  T_ASSERT(rx.msg.fragment.fragment_data_len >= 30);
+  {
+    uint16_t count_be = 0;
+    uint64_t board_be = 0;
+    uint64_t expires_be = 0;
     uint8_t available = 0;
     uint8_t profile_len = 0;
     memcpy(&count_be, rx.msg.fragment.fragment_data, 2);
@@ -4144,12 +4342,13 @@ WAMBLE_TEST(server_protocol_get_active_reservations_identity_query) {
     available = rx.msg.fragment.fragment_data[26];
     profile_len = rx.msg.fragment.fragment_data[27];
     T_ASSERT_EQ_INT((int)ntohs(count_be), 1);
-    T_ASSERT_EQ_INT((int)wamble_net_to_host64(board_be), 777);
+    T_ASSERT_EQ_INT((int)wamble_net_to_host64(board_be), rx_hello.msg.board_id);
     T_ASSERT(wamble_net_to_host64(expires_be) > 0);
     T_ASSERT_EQ_INT((int)available, 1);
     T_ASSERT_EQ_INT((int)profile_len, 2);
     T_ASSERT(memcmp(rx.msg.fragment.fragment_data + 28, "p1", 2) == 0);
   }
+
   wamble_close_socket(cli);
   wamble_close_socket(srv);
   return 0;
@@ -4263,9 +4462,9 @@ WAMBLE_TEST(server_protocol_get_active_reservations_caps_payload_count) {
   {
     uint16_t count_be = 0;
     memcpy(&count_be, rx.msg.fragment.fragment_data, 2);
-    T_ASSERT_EQ_INT((int)ntohs(count_be), 40);
+    T_ASSERT_EQ_INT((int)ntohs(count_be), 41);
   }
-  T_ASSERT_EQ_INT((int)rx.msg.session.active_count, 40);
+  T_ASSERT_EQ_INT((int)rx.msg.session.active_count, 41);
 
   wamble_close_socket(cli);
   wamble_close_socket(srv);
@@ -4848,6 +5047,9 @@ WAMBLE_TESTS_ADD_DB_SM(server_protocol_client_hello_requires_policy,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(server_protocol_client_hello_advertises_session_caps,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_client_hello_reuses_existing_reserved_board,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(server_protocol_profile_info_advertises_profile_caps,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
@@ -4888,6 +5090,9 @@ WAMBLE_TESTS_ADD_DB_SM(
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(server_protocol_get_active_reservations_identity_query,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_get_active_reservations_includes_live_attached_board,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
     server_protocol_get_active_reservations_caps_payload_count,
     WAMBLE_SUITE_FUNCTIONAL, "network");
