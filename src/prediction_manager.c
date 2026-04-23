@@ -1092,6 +1092,20 @@ PredictionStatus prediction_get_view_by_id(uint64_t prediction_id,
   return PREDICTION_OK;
 }
 
+int prediction_max_pending_for_player(const WambleBoard *board,
+                                      const uint8_t *player_token) {
+  int max_pending = get_config()->prediction_max_pending;
+  if (max_pending < 1)
+    max_pending = 1;
+  if (!board || !player_token || !g_prediction_mutex_ready)
+    return max_pending;
+  wamble_mutex_lock(&g_prediction_mutex);
+  max_pending =
+      prediction_treatment_max_pending_locked(player_token, board, max_pending);
+  wamble_mutex_unlock(&g_prediction_mutex);
+  return max_pending;
+}
+
 static void prediction_clear_board(uint64_t board_id) {
   if (!g_prediction_mutex_ready)
     return;

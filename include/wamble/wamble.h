@@ -2262,6 +2262,8 @@ PredictionStatus prediction_collect_tree(uint64_t board_id,
                                          int *out_count);
 PredictionStatus prediction_get_view_by_id(uint64_t prediction_id,
                                            WamblePredictionView *out);
+int prediction_max_pending_for_player(const WambleBoard *board,
+                                      const uint8_t *player_token);
 int prediction_get_runtime_counts(uint64_t board_id, const uint8_t *token,
                                   int *out_pending_count,
                                   int *out_failed_count);

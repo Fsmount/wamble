@@ -2509,6 +2509,73 @@ WAMBLE_TEST(server_protocol_client_hello_advertises_session_caps) {
   return 0;
 }
 
+WAMBLE_TEST(server_protocol_client_hello_advertises_prediction_limits) {
+  const char *cfg_path = "build/test_network_client_hello_prediction_caps.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(def prediction-mode 2)\n"
+                    "(def prediction-max-pending 7)\n"
+                    "(defprofile p1 ((def port 19427) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 2, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'client_hello', '*', 'allow', 0, "
+          "'hello_access', 'test'), "
+          "(0, 'protocol.ctrl', 'get_predictions', '*', 'allow', 0, "
+          "'prediction_read_proto', 'test'), "
+          "(0, 'protocol.ctrl', 'submit_prediction', '*', 'allow', 0, "
+          "'prediction_submit_proto', 'test'), "
+          "(0, 'prediction.write', 'streak', '*', 'allow', 2, 'write', "
+          "'test'), "
+          "(0, 'prediction.read', 'tree', '*', 'allow', 2, 'read', 'test');") !=
+      0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  T_ASSERT_EQ_INT(prediction_manager_init(), PREDICTION_MANAGER_OK);
+  player_manager_init();
+  board_manager_init();
+
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
+
+  struct WambleMsg hello = {0};
+  hello.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  hello.header_version = WAMBLE_PROTO_VERSION;
+  hello.seq_num = 8;
+  hello.token[0] = 0x55;
+
+  RecvOneCtx rx = {.sock = pair.cli};
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
+
+  T_ASSERT_EQ_INT(handle_message(pair.srv, &hello, &pair.cliaddr, 0, "p1"),
+                  SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  T_ASSERT_EQ_INT(rx.received, 1);
+  T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+
+  {
+    const WambleMessageExtField *caps = find_ext_field(&rx.msg, "session.caps");
+    const WambleMessageExtField *source =
+        find_ext_field(&rx.msg, "prediction.source");
+    const WambleMessageExtField *max_pending =
+        find_ext_field(&rx.msg, "prediction.max_pending");
+    T_ASSERT(caps != NULL);
+    T_ASSERT(source != NULL);
+    T_ASSERT(max_pending != NULL);
+    T_ASSERT((caps->int_value & WAMBLE_SESSION_UI_CAP_PREDICTION_SUBMIT) != 0);
+    T_ASSERT((caps->int_value & WAMBLE_SESSION_UI_CAP_PREDICTION_READ) != 0);
+    T_ASSERT_STREQ(source->string_value, "tree");
+    T_ASSERT_EQ_INT((int)max_pending->int_value, 7);
+  }
+
+  cleanup_udp_loopback_pair(&pair);
+  return 0;
+}
+
 WAMBLE_TEST(server_protocol_client_hello_reuses_existing_reserved_board) {
   const char *cfg_path = "build/test_network_client_hello_reuse_board.conf";
   const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
@@ -4985,6 +5052,8 @@ WAMBLE_TEST(server_protocol_accept_profile_tos_long_profile_name_persists) {
 WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
   const char *cfg_path = "build/test_network_login_ed25519.conf";
   const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(def prediction-mode 2)\n"
+                    "(def prediction-max-pending 7)\n"
                     "(defprofile p1 ((def port 19424) (def advertise 1)))\n";
   if (wamble_test_prepare_db(
           cfg_path, cfg,
@@ -4993,10 +5062,19 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
           "permission_level, reason, source) VALUES "
           "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
           "(0, 'protocol.ctrl', 'login_request', '*', 'allow', 0, "
-          "'login_access', 'test');") != 0) {
+          "'login_access', 'test'), "
+          "(0, 'protocol.ctrl', 'get_predictions', '*', 'allow', 0, "
+          "'prediction_read_proto', 'test'), "
+          "(0, 'protocol.ctrl', 'submit_prediction', '*', 'allow', 0, "
+          "'prediction_submit_proto', 'test'), "
+          "(0, 'prediction.write', 'streak', '*', 'allow', 2, 'write', "
+          "'test'), "
+          "(0, 'prediction.read', 'tree', '*', 'allow', 2, 'read', 'test');") !=
+      0) {
     T_FAIL_SIMPLE("wamble_test_prepare_db failed");
   }
 
+  T_ASSERT_EQ_INT(prediction_manager_init(), PREDICTION_MANAGER_OK);
   player_manager_init();
   board_manager_init();
 
@@ -5100,11 +5178,21 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
         find_ext_field(&rx_ok.msg, "session.caps");
     const WambleMessageExtField *reserved_at =
         find_ext_field(&rx_ok.msg, "reservation.reserved_at");
+    const WambleMessageExtField *prediction_source =
+        find_ext_field(&rx_ok.msg, "prediction.source");
+    const WambleMessageExtField *prediction_max_pending =
+        find_ext_field(&rx_ok.msg, "prediction.max_pending");
     T_ASSERT(caps != NULL);
     T_ASSERT(reserved_at != NULL);
+    T_ASSERT(prediction_source != NULL);
+    T_ASSERT(prediction_max_pending != NULL);
     T_ASSERT(rx_ok.msg.board_id > 0);
     T_ASSERT(rx_ok.msg.view.fen[0] != '\0');
     T_ASSERT((caps->int_value & WAMBLE_SESSION_UI_CAP_ATTACH_IDENTITY) != 0);
+    T_ASSERT((caps->int_value & WAMBLE_SESSION_UI_CAP_PREDICTION_SUBMIT) != 0);
+    T_ASSERT((caps->int_value & WAMBLE_SESSION_UI_CAP_PREDICTION_READ) != 0);
+    T_ASSERT_STREQ(prediction_source->string_value, "tree");
+    T_ASSERT_EQ_INT((int)prediction_max_pending->int_value, 7);
     T_ASSERT(find_ext_field(&rx_ok.msg, "trust.tier") == NULL);
   }
 
@@ -5116,6 +5204,144 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
 
   wamble_close_socket(cli);
   wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(server_protocol_prediction_submit_response_contract) {
+  const char *cfg_path = "build/test_network_prediction_submit_contract.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(def prediction-mode 2)\n"
+                    "(def prediction-max-pending 7)\n"
+                    "(def prediction-view-depth-limit 4)\n"
+                    "(defprofile p1 ((def port 19428) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'client_hello', '*', 'allow', 0, "
+          "'hello_access', 'test'), "
+          "(0, 'protocol.ctrl', 'get_predictions', '*', 'allow', 0, "
+          "'prediction_read_proto', 'test'), "
+          "(0, 'protocol.ctrl', 'submit_prediction', '*', 'allow', 0, "
+          "'prediction_submit_proto', 'test'), "
+          "(0, 'prediction.write', 'streak', '*', 'allow', 2, 'write', "
+          "'test'), "
+          "(0, 'prediction.read', 'tree', '*', 'allow', 2, 'read', 'test');") !=
+      0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  T_ASSERT_EQ_INT(prediction_manager_init(), PREDICTION_MANAGER_OK);
+  player_manager_init();
+  board_manager_init();
+
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
+
+  struct WambleMsg hello = {0};
+  hello.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  hello.header_version = WAMBLE_PROTO_VERSION;
+  hello.seq_num = 11;
+  hello.token[0] = 0x77;
+
+  RecvOneCtx rx_hello = {.sock = pair.cli};
+  wamble_thread_t th_hello;
+  T_ASSERT(
+      wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
+  T_ASSERT_EQ_INT(handle_message(pair.srv, &hello, &pair.cliaddr, 0, "p1"),
+                  SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
+  T_ASSERT_EQ_INT(rx_hello.received, 1);
+  T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+
+  struct WambleMsg submit = {0};
+  submit.ctrl = WAMBLE_CTRL_SUBMIT_PREDICTION;
+  submit.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(submit.token, rx_hello.msg.token, TOKEN_LENGTH);
+  submit.board_id = rx_hello.msg.board_id;
+  submit.text.uci_len = 4;
+  memcpy(submit.text.uci, "e2e4", 4);
+
+  RecvOneCtx rx_submit = {.sock = pair.cli};
+  wamble_thread_t th_submit;
+  T_ASSERT(wamble_thread_create(&th_submit, recv_one_and_ack_thread,
+                                &rx_submit) == 0);
+  T_ASSERT_EQ_INT(handle_message(pair.srv, &submit, &pair.cliaddr, 0, "p1"),
+                  SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_submit, NULL));
+  T_ASSERT_EQ_INT(rx_submit.received, 1);
+  T_ASSERT_EQ_INT(rx_submit.msg.ctrl, WAMBLE_CTRL_PREDICTION_DATA);
+  T_ASSERT_EQ_INT((int)rx_submit.msg.prediction.count, 1);
+
+  uint64_t created_id = rx_submit.msg.prediction.entries[0].id;
+  {
+    const WambleMessageExtField *request_kind =
+        find_ext_field(&rx_submit.msg, "prediction.request_kind");
+    const WambleMessageExtField *submit_status =
+        find_ext_field(&rx_submit.msg, "prediction.submit_status");
+    T_ASSERT(request_kind != NULL);
+    T_ASSERT(submit_status != NULL);
+    T_ASSERT_STREQ(request_kind->string_value, "submit");
+    T_ASSERT_EQ_INT((int)submit_status->int_value, 1);
+    T_ASSERT(created_id > 0);
+    T_ASSERT_EQ_INT((int)rx_submit.msg.prediction.entries[0].uci_len, 4);
+    T_ASSERT(memcmp(rx_submit.msg.prediction.entries[0].uci, "e2e4", 4) == 0);
+  }
+
+  RecvOneCtx rx_dup = {.sock = pair.cli};
+  wamble_thread_t th_dup;
+  T_ASSERT(wamble_thread_create(&th_dup, recv_one_and_ack_thread, &rx_dup) ==
+           0);
+  T_ASSERT_EQ_INT(handle_message(pair.srv, &submit, &pair.cliaddr, 0, "p1"),
+                  SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_dup, NULL));
+  T_ASSERT_EQ_INT(rx_dup.received, 1);
+  T_ASSERT_EQ_INT(rx_dup.msg.ctrl, WAMBLE_CTRL_PREDICTION_DATA);
+  T_ASSERT_EQ_INT((int)rx_dup.msg.prediction.count, 1);
+  T_ASSERT_EQ_INT((int)rx_dup.msg.prediction.entries[0].id, (int)created_id);
+  {
+    const WambleMessageExtField *request_kind =
+        find_ext_field(&rx_dup.msg, "prediction.request_kind");
+    const WambleMessageExtField *submit_status =
+        find_ext_field(&rx_dup.msg, "prediction.submit_status");
+    T_ASSERT(request_kind != NULL);
+    T_ASSERT(submit_status != NULL);
+    T_ASSERT_STREQ(request_kind->string_value, "submit");
+    T_ASSERT_EQ_INT((int)submit_status->int_value, 2);
+  }
+
+  struct WambleMsg get_predictions = {0};
+  get_predictions.ctrl = WAMBLE_CTRL_GET_PREDICTIONS;
+  get_predictions.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(get_predictions.token, rx_hello.msg.token, TOKEN_LENGTH);
+  get_predictions.board_id = rx_hello.msg.board_id;
+  get_predictions.prediction.depth = 4;
+  get_predictions.prediction.limit = 8;
+
+  RecvOneCtx rx_tree = {.sock = pair.cli};
+  wamble_thread_t th_tree;
+  T_ASSERT(wamble_thread_create(&th_tree, recv_one_and_ack_thread, &rx_tree) ==
+           0);
+  T_ASSERT_EQ_INT(
+      handle_message(pair.srv, &get_predictions, &pair.cliaddr, 0, "p1"),
+      SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_tree, NULL));
+  T_ASSERT_EQ_INT(rx_tree.received, 1);
+  T_ASSERT_EQ_INT(rx_tree.msg.ctrl, WAMBLE_CTRL_PREDICTION_DATA);
+  T_ASSERT(rx_tree.msg.prediction.count >= 1);
+  {
+    const WambleMessageExtField *request_kind =
+        find_ext_field(&rx_tree.msg, "prediction.request_kind");
+    const WambleMessageExtField *submit_status =
+        find_ext_field(&rx_tree.msg, "prediction.submit_status");
+    T_ASSERT(request_kind != NULL);
+    T_ASSERT(submit_status == NULL);
+    T_ASSERT_STREQ(request_kind->string_value, "tree");
+  }
+
+  cleanup_udp_loopback_pair(&pair);
   return 0;
 }
 
@@ -5342,6 +5568,9 @@ WAMBLE_TESTS_ADD_DB_SM(server_protocol_client_hello_requires_policy,
 WAMBLE_TESTS_ADD_DB_SM(server_protocol_client_hello_advertises_session_caps,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_client_hello_advertises_prediction_limits,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
     server_protocol_client_hello_reuses_existing_reserved_board,
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(server_protocol_profile_info_advertises_profile_caps,
@@ -5406,6 +5635,8 @@ WAMBLE_TESTS_ADD_DB_SM(
     server_protocol_accept_profile_tos_long_profile_name_persists,
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(server_protocol_login_uses_ed25519_challenge_response,
+                       WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(server_protocol_prediction_submit_response_contract,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(server_protocol_profile_tos_fragmented_with_hash,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
