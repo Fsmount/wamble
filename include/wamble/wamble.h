@@ -1850,6 +1850,8 @@ int network_get_client_addr_by_token(const uint8_t *token,
                                      struct sockaddr_in *out_addr);
 void network_bind_client_token(const struct sockaddr_in *addr,
                                const uint8_t *token);
+int network_get_bound_token_for_addr(const struct sockaddr_in *addr,
+                                     uint8_t out_token[TOKEN_LENGTH]);
 void network_end_request(void);
 wamble_socket_t create_and_bind_socket(int port);
 int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
