@@ -1080,6 +1080,7 @@ static void profile_runtime_poll_messages(RunningProfile *rp) {
       if (n <= 0)
         continue;
       (void)handle_message(rp->sockfd, &msg, &ws_cliaddr, 0, rp->name);
+      network_end_request();
     }
   }
 
@@ -1106,6 +1107,7 @@ static void profile_runtime_poll_messages(RunningProfile *rp) {
     if (n <= 0)
       break;
     (void)handle_message(rp->sockfd, &msg, &cliaddr, 0, rp->name);
+    network_end_request();
   }
 
   if (rp->ws_gateway)
