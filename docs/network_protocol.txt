@@ -430,6 +430,16 @@ Reliability
   - Retries up to `max-retries` times, with exponential backoff.
 - Duplicate detection: A sliding window (`W=1024`) of received sequence numbers is
   maintained per session to drop duplicate or old packets.
+- Terminal replay: when a reliable request is served successfully, the server
+  caches the serialized terminal response packet keyed by the request's
+  (token, seq_num). If the same reliable request arrives again (client retry,
+  including retries that arrive after NAT rebind from a new source address),
+  the server replays the cached terminal packet to the current source and
+  resends the request ACK without re-dispatching the handler. The session's
+  stored transport target is updated to the retry's source address in the same
+  step, so the reliable replay goes to the new address. Terminal replay covers
+  single-packet reliable responses; fragmented responses are regenerated on
+  retry.
 
 Unreliable Messages
 - Marked by setting the high bit of the `flags` field (`0x80`).
@@ -457,7 +467,11 @@ Sessions
   `rate-limit-requests-per-sec`; bypass is policy-controlled via
   `rate_limit.bypass` with resource `request`.
 - NAT rebinding: The address:port for a session can be updated if a valid
-  packet arrives with the same token and a valid `seq_num`.
+  packet arrives with the same token and a valid `seq_num`. A reliable retry
+  that arrives from a new source address is matched to the existing session by
+  token; the transport target is rebound to the new address and the cached
+  terminal response (if any) is replayed to that address together with the
+  request ACK.
 - Idle sessions are removed after `session-timeout` seconds.
 
 Profiles

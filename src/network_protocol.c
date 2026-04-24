@@ -3,6 +3,14 @@ void crypto_blake2b(uint8_t *hash, size_t hash_size, const uint8_t *msg,
                     size_t msg_size);
 #define WAMBLE_PENDING_PACKET_CAP 64
 
+typedef struct WambleTerminalCacheSlot {
+  uint32_t req_seq;
+  uint64_t stored_mono_ms;
+  size_t len;
+  size_t cap;
+  uint8_t *data;
+} WambleTerminalCacheSlot;
+
 typedef struct WambleClientSession {
   struct sockaddr_in addr;
   uint8_t token[TOKEN_LENGTH];
@@ -10,7 +18,16 @@ typedef struct WambleClientSession {
   time_t last_seen;
   uint32_t next_seq_num;
   char treatment_group_key[128];
+  WambleTerminalCacheSlot *terminal_cache;
+  int terminal_cache_count;
 } WambleClientSession;
+
+typedef struct WambleCurrentRequest {
+  struct WambleClientSession *session;
+  uint32_t seq_num;
+} WambleCurrentRequest;
+
+static WAMBLE_THREAD_LOCAL WambleCurrentRequest g_current_request;
 
 static WAMBLE_THREAD_LOCAL WambleClientSession *client_sessions;
 static WAMBLE_THREAD_LOCAL int num_sessions = 0;
@@ -591,9 +608,155 @@ create_client_session(const struct sockaddr_in *addr, const uint8_t *token) {
   session->last_seen = wamble_now_wall();
   session->next_seq_num = 1;
   session->treatment_group_key[0] = '\0';
+  session->terminal_cache = NULL;
+  session->terminal_cache_count = 0;
   session_map_put(addr, (int)(session - client_sessions));
   return session;
 }
+
+static void terminal_cache_free_all(WambleClientSession *session) {
+  if (!session || !session->terminal_cache)
+    return;
+  for (int i = 0; i < session->terminal_cache_count; i++)
+    free(session->terminal_cache[i].data);
+  free(session->terminal_cache);
+  session->terminal_cache = NULL;
+  session->terminal_cache_count = 0;
+}
+
+static void terminal_cache_expire(WambleClientSession *session,
+                                  uint64_t now_ms) {
+  if (!session || !session->terminal_cache)
+    return;
+  int ttl = get_config()->terminal_cache_ttl_ms;
+  if (ttl <= 0) {
+    terminal_cache_free_all(session);
+    return;
+  }
+  int write = 0;
+  for (int i = 0; i < session->terminal_cache_count; i++) {
+    WambleTerminalCacheSlot *s = &session->terminal_cache[i];
+    if (now_ms - s->stored_mono_ms > (uint64_t)ttl) {
+      free(s->data);
+      continue;
+    }
+    if (write != i)
+      session->terminal_cache[write] = *s;
+    write++;
+  }
+  session->terminal_cache_count = write;
+  if (write == 0) {
+    free(session->terminal_cache);
+    session->terminal_cache = NULL;
+  }
+}
+
+#define WAMBLE_TERMINAL_CACHE_MAX_SLOTS 8
+
+static int terminal_cache_store(WambleClientSession *session, uint32_t req_seq,
+                                const uint8_t *data, size_t len) {
+  if (!session || !data || len == 0 || len > WAMBLE_MAX_PACKET_SIZE)
+    return -1;
+  int ttl = get_config()->terminal_cache_ttl_ms;
+  if (ttl <= 0)
+    return -1;
+  uint64_t now_ms = wamble_now_mono_millis();
+  terminal_cache_expire(session, now_ms);
+  WambleTerminalCacheSlot *slot = NULL;
+  int oldest = 0;
+  for (int i = 0; i < session->terminal_cache_count; i++) {
+    if (session->terminal_cache[i].req_seq == req_seq) {
+      slot = &session->terminal_cache[i];
+      break;
+    }
+    if (session->terminal_cache[i].stored_mono_ms <
+        session->terminal_cache[oldest].stored_mono_ms)
+      oldest = i;
+  }
+  if (!slot) {
+    if (session->terminal_cache_count >= WAMBLE_TERMINAL_CACHE_MAX_SLOTS) {
+      slot = &session->terminal_cache[oldest];
+    } else {
+      int new_count = session->terminal_cache_count + 1;
+      WambleTerminalCacheSlot *grown = (WambleTerminalCacheSlot *)realloc(
+          session->terminal_cache,
+          (size_t)new_count * sizeof(*session->terminal_cache));
+      if (!grown)
+        return -1;
+      session->terminal_cache = grown;
+      slot = &session->terminal_cache[session->terminal_cache_count];
+      slot->data = NULL;
+      slot->cap = 0;
+      slot->len = 0;
+      session->terminal_cache_count = new_count;
+    }
+  }
+  if (slot->cap < len) {
+    uint8_t *buf = (uint8_t *)realloc(slot->data, len);
+    if (!buf)
+      return -1;
+    slot->data = buf;
+    slot->cap = len;
+  }
+  slot->req_seq = req_seq;
+  slot->len = len;
+  slot->stored_mono_ms = now_ms;
+  memcpy(slot->data, data, len);
+  return 0;
+}
+
+static size_t terminal_cache_lookup_copy(WambleClientSession *session,
+                                         uint32_t req_seq, uint8_t *out,
+                                         size_t out_cap) {
+  if (!session || !session->terminal_cache)
+    return 0;
+  terminal_cache_expire(session, wamble_now_mono_millis());
+  for (int i = 0; i < session->terminal_cache_count; i++) {
+    WambleTerminalCacheSlot *s = &session->terminal_cache[i];
+    if (s->req_seq != req_seq)
+      continue;
+    if (s->len == 0)
+      return 0;
+    if (!out)
+      return s->len;
+    if (out_cap < s->len)
+      return 0;
+    memcpy(out, s->data, s->len);
+    return s->len;
+  }
+  return 0;
+}
+
+static void terminal_cache_release(WambleClientSession *session) {
+  terminal_cache_free_all(session);
+}
+
+static void network_send_raw_to_client(wamble_socket_t sockfd,
+                                       const struct sockaddr_in *cliaddr,
+                                       const uint8_t *data, size_t len) {
+  if (!cliaddr || !data || len == 0)
+    return;
+  int ws_rc = ws_gateway_queue_packet(cliaddr, data, len);
+  if (ws_rc != 0)
+    return;
+  if (sockfd == WAMBLE_INVALID_SOCKET)
+    return;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+  sendto(sockfd, (const char *)data, (int)len, 0,
+         (const struct sockaddr *)cliaddr, (int)sizeof(*cliaddr));
+#else
+  sendto(sockfd, (const char *)data, len, 0, (const struct sockaddr *)cliaddr,
+         (wamble_socklen_t)sizeof(*cliaddr));
+#endif
+}
+
+static void network_begin_request_for_session(WambleClientSession *session,
+                                              uint32_t seq_num) {
+  g_current_request.session = session;
+  g_current_request.seq_num = seq_num;
+}
+
+void network_end_request(void) { g_current_request.session = NULL; }
 
 static void sync_client_session_treatment_group(WambleClientSession *session,
                                                 const uint8_t *token) {
@@ -661,7 +824,10 @@ void network_init_thread_state(void) {
     pending_packets_reset();
     return;
   }
+  for (int i = 0; i < num_sessions; i++)
+    terminal_cache_release(&client_sessions[i]);
   num_sessions = 0;
+  g_current_request.session = NULL;
   pending_packets_reset();
   session_map_init();
 }
@@ -748,7 +914,8 @@ wamble_socket_t create_and_bind_socket(int port) {
   return sockfd;
 }
 
-static int receive_message_from_packet_impl(const uint8_t *packet,
+static int receive_message_from_packet_impl(wamble_socket_t sockfd,
+                                            const uint8_t *packet,
                                             size_t packet_len,
                                             struct WambleMsg *msg,
                                             const struct sockaddr_in *cliaddr) {
@@ -788,15 +955,33 @@ static int receive_message_from_packet_impl(const uint8_t *packet,
   }
   if (msg->ctrl != WAMBLE_CTRL_ACK &&
       (msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0 && is_dup) {
+    if (session && !sockaddr_in_equal(&session->addr, cliaddr)) {
+      session->addr = *cliaddr;
+      session_map_put(cliaddr, (int)(session - client_sessions));
+      session->last_seen = wamble_now_wall();
+    }
+    uint8_t replay_buf[WAMBLE_MAX_PACKET_SIZE];
+    size_t replay_len = terminal_cache_lookup_copy(
+        session, msg->seq_num, replay_buf, sizeof(replay_buf));
+    if (replay_len > 0)
+      network_send_raw_to_client(sockfd, cliaddr, replay_buf, replay_len);
+    send_ack(sockfd, msg, cliaddr);
     return -1;
   }
 
+  int reliable_request = 0;
   if (msg->ctrl == WAMBLE_CTRL_CLIENT_HELLO && token_valid &&
       (msg->flags & WAMBLE_FLAG_UNRELIABLE) != 0) {
     update_client_session(cliaddr, msg->token, msg->seq_num);
   } else if (msg->ctrl != WAMBLE_CTRL_ACK &&
              (msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0) {
     update_client_session(cliaddr, msg->token, msg->seq_num);
+    reliable_request = 1;
+  }
+
+  if (reliable_request) {
+    WambleClientSession *admitted = find_client_session(cliaddr);
+    network_begin_request_for_session(admitted, msg->seq_num);
   }
 
   return (int)packet_len;
@@ -805,7 +990,8 @@ static int receive_message_from_packet_impl(const uint8_t *packet,
 int receive_message_packet(const uint8_t *packet, size_t packet_len,
                            struct WambleMsg *msg,
                            const struct sockaddr_in *cliaddr) {
-  return receive_message_from_packet_impl(packet, packet_len, msg, cliaddr);
+  return receive_message_from_packet_impl(WAMBLE_INVALID_SOCKET, packet,
+                                          packet_len, msg, cliaddr);
 }
 
 int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
@@ -829,7 +1015,7 @@ int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
 
   if (bytes_received <= 0)
     return (int)bytes_received;
-  return receive_message_from_packet_impl(receive_buffer,
+  return receive_message_from_packet_impl(sockfd, receive_buffer,
                                           (size_t)bytes_received, msg, cliaddr);
 }
 
@@ -918,6 +1104,14 @@ static NetworkStatus serialize_packet_with_payload(
   return NET_OK;
 }
 
+static void terminal_cache_store_for_current_request(const uint8_t *data,
+                                                     size_t len) {
+  if (!g_current_request.session)
+    return;
+  (void)terminal_cache_store(g_current_request.session,
+                             g_current_request.seq_num, data, len);
+}
+
 static int send_reliable_serialized_packet(
     wamble_socket_t sockfd, const uint8_t *token, uint32_t seq_num,
     const uint8_t *send_buffer, size_t serialized_size,
@@ -925,8 +1119,10 @@ static int send_reliable_serialized_packet(
   static const uint8_t zero_token[TOKEN_LENGTH] = {0};
   const uint8_t *effective_token = token ? token : zero_token;
   int ws_rc = ws_gateway_queue_packet(cliaddr, send_buffer, serialized_size);
-  if (ws_rc > 0)
+  if (ws_rc > 0) {
+    terminal_cache_store_for_current_request(send_buffer, serialized_size);
     return 0;
+  }
   if (ws_rc < 0)
     return -1;
 
@@ -982,6 +1178,8 @@ static int send_reliable_serialized_packet(
             ack_msg.ctrl == WAMBLE_CTRL_ACK && ack_msg.seq_num == seq_num &&
             sockaddr_in_equal(&ack_cliaddr, cliaddr) &&
             memcmp(ack_msg.token, effective_token, TOKEN_LENGTH) == 0) {
+          terminal_cache_store_for_current_request(send_buffer,
+                                                   serialized_size);
           return 0;
         }
         pending_packet_push(ack_buffer, (size_t)rcv, &ack_cliaddr);
@@ -1395,11 +1593,14 @@ void cleanup_expired_sessions(void) {
         client_sessions[write_idx] = client_sessions[read_idx];
       }
       write_idx++;
+    } else {
+      terminal_cache_release(&client_sessions[read_idx]);
     }
   }
 
   if (write_idx != num_sessions) {
     num_sessions = write_idx;
+    g_current_request.session = NULL;
     session_map_init();
     for (int i = 0; i < num_sessions; i++) {
       session_map_put(&client_sessions[i].addr, i);

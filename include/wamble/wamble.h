@@ -547,6 +547,7 @@ typedef struct WambleConfig {
   int max_message_size;
   int buffer_size;
   int max_client_sessions;
+  int terminal_cache_ttl_ms;
   int rate_limit_requests_per_sec;
   int session_timeout;
   int max_boards;
@@ -1849,6 +1850,7 @@ int network_get_client_addr_by_token(const uint8_t *token,
                                      struct sockaddr_in *out_addr);
 void network_bind_client_token(const struct sockaddr_in *addr,
                                const uint8_t *token);
+void network_end_request(void);
 wamble_socket_t create_and_bind_socket(int port);
 int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
                     struct sockaddr_in *cliaddr);
