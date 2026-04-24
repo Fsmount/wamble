@@ -872,6 +872,20 @@ void network_bind_client_token(const struct sockaddr_in *addr,
   update_client_session(addr, token, 0);
 }
 
+int network_get_bound_token_for_addr(const struct sockaddr_in *addr,
+                                     uint8_t out_token[TOKEN_LENGTH]) {
+  if (!addr || !out_token)
+    return -1;
+  network_ensure_thread_state_initialized();
+  if (!client_sessions)
+    return -1;
+  WambleClientSession *session = find_client_session(addr);
+  if (!session || !token_has_any_byte(session->token))
+    return -1;
+  memcpy(out_token, session->token, TOKEN_LENGTH);
+  return 0;
+}
+
 wamble_socket_t create_and_bind_socket(int port) {
   wamble_socket_t sockfd;
   struct sockaddr_in servaddr;

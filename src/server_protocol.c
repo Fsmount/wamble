@@ -119,6 +119,8 @@ static int ensure_login_challenge_entries(void) {
   return 0;
 }
 
+static int login_challenge_is_fresh(uint64_t issued_at_ms);
+
 static LoginChallengeEntry *find_login_challenge_entry(const uint8_t *token,
                                                        int *out_free_index) {
   if (out_free_index)
@@ -146,11 +148,20 @@ acquire_login_challenge_entry(const uint8_t *token) {
     return entry;
   if (free_index >= 0)
     return &g_login_challenge_entries[free_index];
-  if (g_login_challenge_capacity <= 0)
-    return NULL;
-  int evict =
-      (int)(wamble_token_hash32(token) % (uint32_t)g_login_challenge_capacity);
-  return &g_login_challenge_entries[evict];
+  int oldest_expired = -1;
+  uint64_t oldest_expired_issued = UINT64_MAX;
+  for (int i = 0; i < g_login_challenge_capacity; i++) {
+    LoginChallengeEntry *slot = &g_login_challenge_entries[i];
+    if (login_challenge_is_fresh(slot->issued_at_ms))
+      continue;
+    if (slot->issued_at_ms < oldest_expired_issued) {
+      oldest_expired_issued = slot->issued_at_ms;
+      oldest_expired = i;
+    }
+  }
+  if (oldest_expired >= 0)
+    return &g_login_challenge_entries[oldest_expired];
+  return NULL;
 }
 
 static void clear_login_challenge(const uint8_t *token) {
@@ -215,7 +226,8 @@ static int verify_login_proof(const struct WambleMsg *msg) {
                  : 0;
 
 done:
-  memset(entry, 0, sizeof(*entry));
+  if (!verified)
+    memset(entry, 0, sizeof(*entry));
   return verified ? 0 : -1;
 }
 
@@ -1668,7 +1680,14 @@ static ServerStatus handle_client_hello(wamble_socket_t sockfd,
                                 ? (uint8_t)(requested_caps & supported_caps)
                                 : supported_caps;
 
-  WamblePlayer *player = get_player_by_token(msg->token);
+  WamblePlayer *player = NULL;
+  if (token_has_any_byte(msg->token)) {
+    player = get_player_by_token(msg->token);
+  } else {
+    uint8_t bound_token[TOKEN_LENGTH];
+    if (network_get_bound_token_for_addr(cliaddr, bound_token) == 0)
+      player = get_player_by_token(bound_token);
+  }
   if (!player) {
     player = create_new_player();
     if (!player) {
