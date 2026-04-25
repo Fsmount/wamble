@@ -229,6 +229,105 @@ WAMBLE_TEST(player_token_expiration_enqueues_session_expired_notification) {
   return 0;
 }
 
+WAMBLE_TEST(rehydrated_player_carries_attached_pubkey_and_identity_flag) {
+  const char *cfg_path = "build/test_player_manager_rehydrate_identity.conf";
+  const char *sql_path = "build/test_player_manager_rehydrate_identity.sql";
+  char db_cfg[1024];
+  uint8_t public_key[32];
+  const uint8_t token[TOKEN_LENGTH] = {0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6,
+                                       0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac,
+                                       0xad, 0xae, 0xaf, 0xb0};
+
+  if (test_db_apply_migrations(NULL) != 0)
+    T_FAIL_SIMPLE("test_db_apply_migrations failed");
+  if (test_db_reset(NULL) != 0)
+    T_FAIL_SIMPLE("test_db_reset failed");
+  if (wamble_test_db_config_lines(db_cfg, sizeof(db_cfg)) != 0)
+    T_FAIL_SIMPLE("wamble_test_db_config_lines failed");
+
+  FILE *f = fopen(cfg_path, "wb");
+  T_ASSERT(f != NULL);
+  fwrite(db_cfg, 1, strlen(db_cfg), f);
+  fclose(f);
+
+  T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
+  T_ASSERT_EQ_INT(db_init(NULL), 0);
+  wamble_set_query_service(wamble_get_db_query_service());
+  player_manager_init();
+
+  for (int i = 0; i < 32; i++)
+    public_key[i] = (uint8_t)(0xc0 + i);
+
+  f = fopen(sql_path, "wb");
+  T_ASSERT(f != NULL);
+  fputs("INSERT INTO global_identities (public_key) "
+        "VALUES (decode('c0c1c2c3c4c5c6c7c8c9cacbcccdcecf"
+        "d0d1d2d3d4d5d6d7d8d9dadbdcdddedf', 'hex'))\n"
+        "ON CONFLICT (public_key) DO NOTHING;\n"
+        "INSERT INTO players (public_key, rating)\n"
+        "VALUES (decode('c0c1c2c3c4c5c6c7c8c9cacbcccdcecf"
+        "d0d1d2d3d4d5d6d7d8d9dadbdcdddedf', 'hex'), 1500.0)\n"
+        "ON CONFLICT (public_key) DO NOTHING;\n"
+        "INSERT INTO sessions (token, player_id, global_identity_id)\n"
+        "VALUES (decode('a1a2a3a4a5a6a7a8a9aaabacadaeafb0', 'hex'),\n"
+        "  (SELECT id FROM players\n"
+        "   WHERE public_key = decode('c0c1c2c3c4c5c6c7c8c9cacbcccdcecf"
+        "d0d1d2d3d4d5d6d7d8d9dadbdcdddedf', 'hex')),\n"
+        "  (SELECT id FROM global_identities\n"
+        "   WHERE public_key = decode('c0c1c2c3c4c5c6c7c8c9cacbcccdcecf"
+        "d0d1d2d3d4d5d6d7d8d9dadbdcdddedf', 'hex')));\n",
+        f);
+  fclose(f);
+  T_ASSERT_EQ_INT(test_db_apply_sql_file(sql_path), 0);
+
+  WamblePlayer *player = get_player_by_token(token);
+  T_ASSERT(player != NULL);
+  T_ASSERT(player->has_persistent_identity);
+  T_ASSERT(memcmp(player->public_key, public_key, sizeof(public_key)) == 0);
+  return 0;
+}
+
+WAMBLE_TEST(anonymous_session_in_db_does_not_rehydrate_identity_flag) {
+  const char *cfg_path = "build/test_player_manager_rehydrate_anonymous.conf";
+  const char *sql_path = "build/test_player_manager_rehydrate_anonymous.sql";
+  char db_cfg[1024];
+  const uint8_t token[TOKEN_LENGTH] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+                                       0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+                                       0xdd, 0xee, 0xff, 0x01};
+
+  if (test_db_apply_migrations(NULL) != 0)
+    T_FAIL_SIMPLE("test_db_apply_migrations failed");
+  if (test_db_reset(NULL) != 0)
+    T_FAIL_SIMPLE("test_db_reset failed");
+  if (wamble_test_db_config_lines(db_cfg, sizeof(db_cfg)) != 0)
+    T_FAIL_SIMPLE("wamble_test_db_config_lines failed");
+
+  FILE *f = fopen(cfg_path, "wb");
+  T_ASSERT(f != NULL);
+  fwrite(db_cfg, 1, strlen(db_cfg), f);
+  fclose(f);
+
+  T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
+  T_ASSERT_EQ_INT(db_init(NULL), 0);
+  wamble_set_query_service(wamble_get_db_query_service());
+  player_manager_init();
+
+  f = fopen(sql_path, "wb");
+  T_ASSERT(f != NULL);
+  fputs("INSERT INTO global_identities DEFAULT VALUES;\n"
+        "INSERT INTO sessions (token, player_id, global_identity_id)\n"
+        "VALUES (decode('112233445566778899aabbccddeeff01', 'hex'),\n"
+        "  NULL,\n"
+        "  (SELECT id FROM global_identities ORDER BY id DESC LIMIT 1));\n",
+        f);
+  fclose(f);
+  T_ASSERT_EQ_INT(test_db_apply_sql_file(sql_path), 0);
+
+  WamblePlayer *player = get_player_by_token(token);
+  T_ASSERT(player == NULL);
+  return 0;
+}
+
 WAMBLE_TESTS_BEGIN_NAMED(wamble_register_tests_player_manager)
 WAMBLE_TESTS_ADD_FM(player_pool_capacity_limit, "player_manager");
 WAMBLE_TESTS_ADD_FM(player_token_expiration_removes_entry, "player_manager");
@@ -243,4 +342,9 @@ WAMBLE_TESTS_ADD_DB_FM(
 WAMBLE_TESTS_ADD_DB_FM(
     persistent_login_emits_reservation_for_existing_reserved_board,
     "player_manager");
+WAMBLE_TESTS_ADD_DB_FM(
+    rehydrated_player_carries_attached_pubkey_and_identity_flag,
+    "player_manager");
+WAMBLE_TESTS_ADD_DB_FM(anonymous_session_in_db_does_not_rehydrate_identity_flag,
+                       "player_manager");
 WAMBLE_TESTS_END()

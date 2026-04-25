@@ -386,11 +386,24 @@ WamblePlayer *get_player_by_token(const uint8_t *token) {
   DbStatus st =
       wamble_query_get_persistent_session_by_token(token, &session_id);
   if (st == DB_OK && session_id > 0) {
+    uint8_t session_pubkey[WAMBLE_PUBLIC_KEY_LENGTH] = {0};
+    int session_has_identity = 0;
+    DbStatus pk_st = wamble_query_get_session_public_key(
+        session_id, session_pubkey, &session_has_identity);
+    if (pk_st != DB_OK && pk_st != DB_NOT_FOUND) {
+      wamble_mutex_unlock(&player_mutex);
+      return NULL;
+    }
     WamblePlayer *player = find_empty_player_slot();
     if (player) {
       memcpy(player->token, token, TOKEN_LENGTH);
-      memset(player->public_key, 0, WAMBLE_PUBLIC_KEY_LENGTH);
-      player->has_persistent_identity = true;
+      if (session_has_identity) {
+        memcpy(player->public_key, session_pubkey, WAMBLE_PUBLIC_KEY_LENGTH);
+        player->has_persistent_identity = true;
+      } else {
+        memset(player->public_key, 0, WAMBLE_PUBLIC_KEY_LENGTH);
+        player->has_persistent_identity = false;
+      }
       player->last_seen_time = wamble_now_wall();
       hydrate_player_from_session(player, session_id);
       player_map_put(player->token, (int)(player - player_pool));
