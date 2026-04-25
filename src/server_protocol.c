@@ -1747,6 +1747,8 @@ static ServerStatus handle_logout(const struct WambleMsg *msg,
   clear_login_challenge(msg->token);
   if (detach_persistent_identity(msg->token) != 0)
     return SERVER_ERR_INTERNAL;
+  spectator_discard_by_token(msg->token);
+  discard_player_by_token(msg->token);
   return SERVER_OK;
 }
 
