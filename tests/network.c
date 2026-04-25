@@ -5857,6 +5857,142 @@ WAMBLE_TEST(reliable_retry_from_new_source_replays_to_rebound_address) {
   return 0;
 }
 
+WAMBLE_TEST(
+    server_protocol_reliable_accept_profile_tos_no_text_sends_error_terminal) {
+  const char *cfg_path = "build/test_network_accept_profile_tos_no_text.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19427) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'accept_profile_tos', '*', 'allow', 0, "
+          "'accept_profile_tos_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  struct WambleMsg accept = {0};
+  accept.ctrl = WAMBLE_CTRL_ACCEPT_PROFILE_TOS;
+  accept.header_version = WAMBLE_PROTO_VERSION;
+  accept.seq_num = 7777;
+  accept.token[0] = 0xAB;
+  const char *pname = "p1";
+  accept.text.profile_name_len = (uint8_t)strlen(pname);
+  memcpy(accept.text.profile_name, pname, accept.text.profile_name_len);
+
+  RecvOneCtx rx = {.sock = cli};
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &accept, &cliaddr, 0, "p1"),
+                  SERVER_ERR_INTERNAL);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  T_ASSERT_EQ_INT(rx.received, 1);
+  T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_ERROR);
+  T_ASSERT_EQ_INT(rx.msg.view.error_code, WAMBLE_ERR_ACCESS_DENIED);
+  T_ASSERT((rx.msg.flags & WAMBLE_FLAG_UNRELIABLE) == 0);
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(
+    server_protocol_reliable_legal_moves_invalid_square_sends_error_terminal) {
+  const char *cfg_path = "build/test_network_legal_moves_invalid_square.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19428) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'client_hello', '*', 'allow', 0, "
+          "'hello_access', 'test'), "
+          "(0, 'protocol.ctrl', 'get_legal_moves', '*', 'allow', 0, "
+          "'legal_moves_access', 'test'), "
+          "(0, 'game.move', 'legal', '*', 'allow', 0, 'legal_access', "
+          "'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  struct WambleMsg hello = {0};
+  hello.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  hello.header_version = WAMBLE_PROTO_VERSION;
+  RecvOneCtx rx_hello = {.sock = cli};
+  wamble_thread_t th_hello;
+  T_ASSERT(
+      wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
+  T_ASSERT_EQ_INT(rx_hello.received, 1);
+  T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+  uint64_t board_id = rx_hello.msg.board_id;
+  T_ASSERT(board_id != 0);
+
+  struct WambleMsg req = {0};
+  req.ctrl = WAMBLE_CTRL_GET_LEGAL_MOVES;
+  req.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(req.token, rx_hello.msg.token, TOKEN_LENGTH);
+  req.board_id = board_id;
+  req.stats.legal_moves.square = 64;
+
+  RecvOneCtx rx = {.sock = cli};
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &req, &cliaddr, 0, "p1"),
+                  SERVER_ERR_INTERNAL);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  T_ASSERT_EQ_INT(rx.received, 1);
+  T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_ERROR);
+  T_ASSERT_EQ_INT(rx.msg.view.error_code, WAMBLE_ERR_LEGAL_MOVES_INVALID);
+  T_ASSERT((rx.msg.flags & WAMBLE_FLAG_UNRELIABLE) == 0);
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
 WAMBLE_TESTS_BEGIN_NAMED(wamble_register_tests_network)
 WAMBLE_TESTS_ADD_SM(token_base64url_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
@@ -6000,6 +6136,12 @@ WAMBLE_TESTS_ADD_DB_SM(server_protocol_profile_tos_fragmented_with_hash,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
     server_protocol_logout_tears_down_session_without_goodbye,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_reliable_accept_profile_tos_no_text_sends_error_terminal,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_reliable_legal_moves_invalid_square_sends_error_terminal,
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(spectate_stop_accept, WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(reserved_nonzero_rejected, WAMBLE_SUITE_FUNCTIONAL,
