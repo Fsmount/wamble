@@ -1192,6 +1192,23 @@ static void profile_runtime_send_spectator_updates(RunningProfile *rp) {
     (void)send_reliable_board_state_sync(rp->sockfd, released[i].token, &addr);
   }
   free(released);
+  ExpiredSessionNotification *expired =
+      (ExpiredSessionNotification *)malloc(sizeof(*expired) * (size_t)cap);
+  if (!expired)
+    return;
+  int nexp = player_collect_expired_session_notifications(expired, cap);
+  for (int i = 0; i < nexp; i++) {
+    struct sockaddr_in addr;
+    if (network_get_client_addr_by_token(expired[i].token, &addr) != 0)
+      continue;
+    struct WambleMsg out = {0};
+    out.ctrl = WAMBLE_CTRL_SERVER_NOTIFICATION;
+    memcpy(out.token, expired[i].token, TOKEN_LENGTH);
+    out.flags = WAMBLE_FLAG_UNRELIABLE;
+    out.session.notification_type = WAMBLE_NOTIFICATION_TYPE_SESSION_EXPIRED;
+    (void)send_unreliable_packet(rp->sockfd, &out, &addr);
+  }
+  free(expired);
 }
 
 static int profile_ws_is_enabled(const RunningProfile *rp) {

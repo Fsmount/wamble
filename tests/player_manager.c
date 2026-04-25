@@ -205,9 +205,36 @@ WAMBLE_TEST(persistent_login_emits_reservation_for_existing_reserved_board) {
   return 0;
 }
 
+WAMBLE_TEST(player_token_expiration_enqueues_session_expired_notification) {
+  config_load(NULL, NULL, NULL, 0);
+  player_manager_init();
+
+  WamblePlayer *p = create_new_player();
+  T_ASSERT(p != NULL);
+  uint8_t tok[TOKEN_LENGTH];
+  memcpy(tok, p->token, TOKEN_LENGTH);
+
+  ExpiredSessionNotification drained[8];
+  T_ASSERT_EQ_INT(player_collect_expired_session_notifications(drained, 8), 0);
+
+  p->last_seen_time = wamble_now_wall() - get_config()->token_expiration - 1;
+  player_manager_tick();
+  T_ASSERT(get_player_by_token(tok) == NULL);
+
+  int n = player_collect_expired_session_notifications(drained, 8);
+  T_ASSERT_EQ_INT(n, 1);
+  T_ASSERT(memcmp(drained[0].token, tok, TOKEN_LENGTH) == 0);
+
+  T_ASSERT_EQ_INT(player_collect_expired_session_notifications(drained, 8), 0);
+  return 0;
+}
+
 WAMBLE_TESTS_BEGIN_NAMED(wamble_register_tests_player_manager)
 WAMBLE_TESTS_ADD_FM(player_pool_capacity_limit, "player_manager");
 WAMBLE_TESTS_ADD_FM(player_token_expiration_removes_entry, "player_manager");
+WAMBLE_TESTS_ADD_FM(
+    player_token_expiration_enqueues_session_expired_notification,
+    "player_manager");
 WAMBLE_TESTS_ADD_DB_FM(login_rehydrates_cached_player_from_persistent_stats,
                        "player_manager");
 WAMBLE_TESTS_ADD_DB_FM(
