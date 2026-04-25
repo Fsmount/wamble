@@ -304,13 +304,18 @@ Control Codes
 - `0x0E` LOGIN_CHALLENGE (server to client): One-time challenge for login proof.
   - Payload: `uint8 challenge[32]`.
   - Sent reliably.
-- `0x0F` LOGOUT (client to server): Disassociate persistent identity.
+- `0x0F` LOGOUT (client to server): Disassociate persistent identity and end
+    the session.
   - Payload: empty.
-  - Server clears any pending login challenge and detaches the persistent
-    identity from the session token; no terminal response packet is sent.
+  - Server clears any pending login challenge, detaches the persistent
+    identity from the session token, and tears down the session in-band:
+    spectator entries for the token are removed and the in-memory player
+    record is discarded (which abandons any held board reservation to its
+    timer). No terminal response packet is sent beyond the request `ACK`.
   - Reliable-request ordering: the handler completes its work before the
     request's wire-level `ACK` is sent. On retry the duplicate is detected
-    against the original request and only the request `ACK` is replayed.
+    against the original request and only the request `ACK` is replayed
+    from the terminal cache; the discard is not re-run.
 - `0x10` LOGIN_SUCCESS (server to client): Successful login.
   - Payload: empty.
   - May include extension fields: `session.caps`, `prediction.source`,

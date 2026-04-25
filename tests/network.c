@@ -3615,8 +3615,8 @@ WAMBLE_TEST(server_protocol_reliable_player_move_sends_terminal_before_ack) {
           "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
           "(0, 'protocol.ctrl', 'player_move', '*', 'allow', 0, "
           "'player_move_access', 'test'), "
-          "(0, 'game.move', 'play', '*', 'allow', 0, 'play_access', 'test');") !=
-      0) {
+          "(0, 'game.move', 'play', '*', 'allow', 0, 'play_access', "
+          "'test');") != 0) {
     T_FAIL_SIMPLE("wamble_test_prepare_db failed");
   }
 
@@ -4287,6 +4287,90 @@ WAMBLE_TEST(server_protocol_logout_allowed_before_profile_terms_acceptance) {
   T_ASSERT_STATUS_OK(wamble_thread_join(th_ack, NULL));
   T_ASSERT_EQ_INT(rx_ack.received, 1);
   T_ASSERT_EQ_INT(rx_ack.msg.ctrl, WAMBLE_CTRL_ACK);
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(server_protocol_logout_tears_down_session_without_goodbye) {
+  const char *cfg_path = "build/test_network_logout_self_contained.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19425) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'client_hello', '*', 'allow', 0, "
+          "'hello_access', 'test'), "
+          "(0, 'protocol.ctrl', 'logout', '*', 'allow', 0, "
+          "'logout_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  struct WambleMsg hello = {0};
+  hello.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  hello.header_version = WAMBLE_PROTO_VERSION;
+  RecvOneCtx rx_hello = {.sock = cli};
+  wamble_thread_t th_hello;
+  T_ASSERT(
+      wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
+  T_ASSERT_EQ_INT(rx_hello.received, 1);
+  T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+
+  uint8_t token[TOKEN_LENGTH];
+  memcpy(token, rx_hello.msg.token, TOKEN_LENGTH);
+
+  uint8_t identity_pub[WAMBLE_PUBLIC_KEY_LENGTH];
+  for (int i = 0; i < WAMBLE_PUBLIC_KEY_LENGTH; i++)
+    identity_pub[i] = (uint8_t)(0x40 + i);
+  WamblePlayer *attached = attach_persistent_identity(token, identity_pub);
+  T_ASSERT(attached != NULL);
+  T_ASSERT(attached->has_persistent_identity);
+
+  struct WambleMsg logout = {0};
+  logout.ctrl = WAMBLE_CTRL_LOGOUT;
+  logout.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(logout.token, token, TOKEN_LENGTH);
+
+  RecvOneCtx rx_ack = {.sock = cli};
+  wamble_thread_t th_ack;
+  T_ASSERT(wamble_thread_create(&th_ack, recv_one_thread, &rx_ack) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &logout, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_ack, NULL));
+  T_ASSERT_EQ_INT(rx_ack.received, 1);
+  T_ASSERT_EQ_INT(rx_ack.msg.ctrl, WAMBLE_CTRL_ACK);
+
+  struct WambleMsg logout_again = {0};
+  logout_again.ctrl = WAMBLE_CTRL_LOGOUT;
+  logout_again.header_version = WAMBLE_PROTO_VERSION;
+  logout_again.seq_num = 12345;
+  memcpy(logout_again.token, token, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(handle_message(srv, &logout_again, &cliaddr, 0, "p1"),
+                  SERVER_ERR_UNKNOWN_PLAYER);
 
   wamble_close_socket(cli);
   wamble_close_socket(srv);
@@ -5914,6 +5998,9 @@ WAMBLE_TESTS_ADD_DB_SM(server_protocol_prediction_submit_response_contract,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(server_protocol_profile_tos_fragmented_with_hash,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_logout_tears_down_session_without_goodbye,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(spectate_stop_accept, WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(reserved_nonzero_rejected, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
