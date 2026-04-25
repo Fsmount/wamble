@@ -219,6 +219,10 @@ void board_manager_tick() {
       time_t inactive_time = now - board->last_move_time;
       if (inactive_time >= get_config()->inactivity_timeout) {
         board->state = BOARD_STATE_DORMANT;
+        if (!token_is_zero(board->last_mover_token)) {
+          queue_reservation_release_notification_locked(board->last_mover_token,
+                                                        board->id);
+        }
         wamble_emit_update_board(board->id, board->fen, "DORMANT");
       }
     }

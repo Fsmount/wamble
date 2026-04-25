@@ -1455,6 +1455,7 @@ static inline size_t wamble_build_login_signature_message(
 #define WAMBLE_NOTIFICATION_TYPE_MAINTENANCE 3
 #define WAMBLE_NOTIFICATION_TYPE_ANNOUNCEMENT 4
 #define WAMBLE_NOTIFICATION_TYPE_RESERVATION_RELEASED 5
+#define WAMBLE_NOTIFICATION_TYPE_SESSION_EXPIRED 6
 
 typedef struct {
   uint8_t from;
@@ -1837,6 +1838,10 @@ typedef struct ReservationReleaseNotification {
   uint8_t token[TOKEN_LENGTH];
   uint64_t board_id;
 } ReservationReleaseNotification;
+
+typedef struct ExpiredSessionNotification {
+  uint8_t token[TOKEN_LENGTH];
+} ExpiredSessionNotification;
 
 void network_init_thread_state(void);
 int network_get_session_treatment_group(const uint8_t *token, char *out_group,
@@ -2235,6 +2240,8 @@ WamblePlayer *attach_persistent_identity(const uint8_t *token,
                                          const uint8_t *public_key);
 int detach_persistent_identity(const uint8_t *token);
 void player_manager_tick(void);
+int player_collect_expired_session_notifications(
+    ExpiredSessionNotification *out, int max);
 
 WamblePlayer *get_player_by_token(const uint8_t *token);
 void discard_player_by_token(const uint8_t *token);
