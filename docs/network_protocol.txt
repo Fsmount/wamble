@@ -170,6 +170,11 @@ Control Codes
     `last_move.to`.
 - `0x03` PLAYER_MOVE (client to server): Submit a move.
   - Payload: `uint8 uci_len; char uci[uci_len]` (max 6 bytes).
+  - Terminal result: reliable `BOARD_UPDATE` for the player's next assigned
+    board on success, or a reliable `ERROR` describing the rejection.
+  - Reliable-request ordering: the terminal `BOARD_UPDATE` or `ERROR` is sent
+    before the request's wire-level `ACK`. On retry within the terminal-cache
+    TTL, the cached terminal packet is replayed before the request `ACK`.
 - `0x04` BOARD_UPDATE (server to client): Board state has changed.
   - Payload: `char fen[]`.
   - `flags`: server sets `0x01` when the assigned board is Chess960 *and*
@@ -233,6 +238,12 @@ Control Codes
     (e.g., the focused board that ended). `token` identifies the recipient.
 - `0x0A` CLIENT_GOODBYE (client to server): Graceful disconnect.
   - Payload: empty.
+  - Server discards spectator and player state for the token; no terminal
+    response packet is sent.
+  - Reliable-request ordering: the handler completes its work before the
+    request's wire-level `ACK` is sent. On retry the duplicate is detected
+    against the original request and only the request `ACK` is replayed (the
+    work is not performed twice).
 - `0x0B` SPECTATE_GAME (client to server): Request to watch a game.
   - Payload: empty.
   - `flags` (summary mode only, `board_id=0`):
@@ -295,6 +306,11 @@ Control Codes
   - Sent reliably.
 - `0x0F` LOGOUT (client to server): Disassociate persistent identity.
   - Payload: empty.
+  - Server clears any pending login challenge and detaches the persistent
+    identity from the session token; no terminal response packet is sent.
+  - Reliable-request ordering: the handler completes its work before the
+    request's wire-level `ACK` is sent. On retry the duplicate is detected
+    against the original request and only the request `ACK` is replayed.
 - `0x10` LOGIN_SUCCESS (server to client): Successful login.
   - Payload: empty.
   - May include extension fields: `session.caps`, `prediction.source`,

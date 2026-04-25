@@ -3603,6 +3603,64 @@ WAMBLE_TEST(server_protocol_reliable_spectate_stop_sends_terminal_before_ack) {
   return 0;
 }
 
+WAMBLE_TEST(server_protocol_reliable_player_move_sends_terminal_before_ack) {
+  const char *cfg_path = "build/test_network_player_move_order.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19424) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'player_move', '*', 'allow', 0, "
+          "'player_move_access', 'test'), "
+          "(0, 'game.move', 'play', '*', 'allow', 0, 'play_access', 'test');") !=
+      0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+  spectator_manager_init();
+
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
+
+  HandleMessageCtx ctx = {0};
+  ctx.sockfd = pair.srv;
+  ctx.cliaddr = pair.cliaddr;
+  ctx.trust_tier = 0;
+  ctx.profile_name = "p1";
+  ctx.msg.ctrl = WAMBLE_CTRL_PLAYER_MOVE;
+  ctx.msg.header_version = WAMBLE_PROTO_VERSION;
+  ctx.msg.seq_num = 503;
+  ctx.msg.board_id = 0;
+  ctx.msg.token[0] = 0x91;
+  const char *uci = "e2e4";
+  ctx.msg.text.uci_len = (uint8_t)strlen(uci);
+  memcpy(ctx.msg.text.uci, uci, ctx.msg.text.uci_len);
+
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, handle_message_thread, &ctx) == 0);
+
+  struct WambleMsg rx = {0};
+  struct sockaddr_in from;
+  T_ASSERT(recv_message_with_timeout(pair.cli, &rx, &from, 1000) > 0);
+  T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_ERROR);
+  T_ASSERT_EQ_INT(rx.view.error_code, WAMBLE_ERR_UNKNOWN_PLAYER);
+  T_ASSERT((rx.flags & WAMBLE_FLAG_UNRELIABLE) == 0);
+  T_ASSERT_STATUS_OK(ack_terminal_and_expect_request_ack(pair.cli, &rx, &from,
+                                                         ctx.msg.seq_num));
+
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  T_ASSERT_EQ_INT(ctx.status, SERVER_ERR_INTERNAL);
+
+  spectator_manager_shutdown();
+  cleanup_udp_loopback_pair(&pair);
+  return 0;
+}
+
 WAMBLE_TEST(server_protocol_spectate_stop_returns_reliable_idle_packet) {
   const char *cfg_path = "build/test_network_spectate_stop_packet.conf";
   const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
@@ -5815,6 +5873,9 @@ WAMBLE_TESTS_ADD_DB_SM(
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
     server_protocol_reliable_spectate_stop_sends_terminal_before_ack,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_reliable_player_move_sends_terminal_before_ack,
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
     server_protocol_spectate_stop_returns_reliable_idle_packet,
