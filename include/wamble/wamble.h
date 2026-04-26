@@ -1903,6 +1903,7 @@ int ws_gateway_is_ws_client(const struct sockaddr_in *cliaddr);
 int ws_gateway_queue_packet(const struct sockaddr_in *cliaddr,
                             const uint8_t *packet, size_t packet_len);
 void ws_gateway_flush_outbound(WambleWsGateway *gateway);
+int ws_gateway_flush_route(const struct sockaddr_in *cliaddr);
 
 SpectatorInitStatus spectator_manager_init(void);
 void spectator_manager_shutdown(void);

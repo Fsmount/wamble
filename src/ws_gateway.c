@@ -1702,6 +1702,38 @@ done:
   return result;
 }
 
+int ws_gateway_flush_route(const struct sockaddr_in *cliaddr) {
+  if (!cliaddr)
+    return -1;
+  WambleWsGateway *gw = NULL;
+  int slot_index = -1;
+  uint32_t route_id = 0;
+  if (!ws_route_lookup(cliaddr, &gw, &slot_index, &route_id))
+    return -1;
+  if (!gw || slot_index < 0)
+    return -1;
+  int rc = -1;
+  wamble_mutex_lock(&gw->mutex);
+  if (gw->should_stop || slot_index >= gw->max_clients)
+    goto done;
+  WsClientSlot *slot = &gw->clients[slot_index];
+  if (!slot->in_use || !slot->upgraded || slot->route_id != route_id ||
+      !ws_sockaddr_equal(&slot->virtual_addr, cliaddr) ||
+      slot->tcp_sock == WAMBLE_INVALID_SOCKET) {
+    goto done;
+  }
+  if (ws_slot_flush_locked(gw, slot) != 0) {
+    slot->should_stop = 1;
+    publish_ws_gateway_status_detail(WS_GATEWAY_STATUS_OUTBOUND_FLUSH_FAILED,
+                                     gw, "flush_route");
+    goto done;
+  }
+  rc = 0;
+done:
+  wamble_mutex_unlock(&gw->mutex);
+  return rc;
+}
+
 void ws_gateway_flush_outbound(WambleWsGateway *gateway) {
   if (!gateway)
     return;

@@ -630,31 +630,34 @@ WAMBLE_TEST(ws_server_protocol_discovery_and_fragmented_tos_roundtrip) {
   T_ASSERT_EQ_INT(handle_message(srv, &in, &cliaddr, 0, "open"), SERVER_OK);
   ws_gateway_flush_outbound(g_test_gateway);
 
-  T_ASSERT_CLIENT_STATUS_OK(wamble_client_ws_recv_frame(
-      g_test_client, &opcode, frame, sizeof(frame), &frame_len));
-  T_ASSERT_EQ_INT(opcode, 0x2);
   {
     WambleFragmentReassembly frag;
     wamble_fragment_reassembly_init(&frag);
-    size_t offset = 0;
     int packet_count = 0;
     WambleFragmentReassemblyResult result = WAMBLE_FRAGMENT_REASSEMBLY_IGNORED;
-    while (offset < frame_len) {
-      size_t one_len = 0;
-      struct WambleMsg fragment = {0};
-      uint8_t fragment_flags = 0;
-      T_ASSERT_EQ_INT((int)wamble_wire_packet_size(
-                          frame + offset, frame_len - offset, &one_len),
-                      (int)NET_OK);
-      T_ASSERT(one_len > 0);
-      T_ASSERT_EQ_INT((int)wamble_packet_deserialize(
-                          frame + offset, one_len, &fragment, &fragment_flags),
-                      (int)NET_OK);
-      T_ASSERT_EQ_INT(fragment.ctrl, WAMBLE_CTRL_PROFILE_TOS_DATA);
-      T_ASSERT(msg_uses_fragment_payload(&fragment));
-      result = wamble_fragment_reassembly_push(&frag, &fragment);
-      packet_count++;
-      offset += one_len;
+    while (result != WAMBLE_FRAGMENT_REASSEMBLY_COMPLETE) {
+      T_ASSERT_CLIENT_STATUS_OK(wamble_client_ws_recv_frame(
+          g_test_client, &opcode, frame, sizeof(frame), &frame_len));
+      T_ASSERT_EQ_INT(opcode, 0x2);
+      size_t offset = 0;
+      while (offset < frame_len) {
+        size_t one_len = 0;
+        struct WambleMsg fragment = {0};
+        uint8_t fragment_flags = 0;
+        T_ASSERT_EQ_INT((int)wamble_wire_packet_size(
+                            frame + offset, frame_len - offset, &one_len),
+                        (int)NET_OK);
+        T_ASSERT(one_len > 0);
+        T_ASSERT_EQ_INT((int)wamble_packet_deserialize(frame + offset, one_len,
+                                                       &fragment,
+                                                       &fragment_flags),
+                        (int)NET_OK);
+        T_ASSERT_EQ_INT(fragment.ctrl, WAMBLE_CTRL_PROFILE_TOS_DATA);
+        T_ASSERT(msg_uses_fragment_payload(&fragment));
+        result = wamble_fragment_reassembly_push(&frag, &fragment);
+        packet_count++;
+        offset += one_len;
+      }
     }
     T_ASSERT(packet_count > 1);
     T_ASSERT_EQ_INT(result, WAMBLE_FRAGMENT_REASSEMBLY_COMPLETE);
@@ -921,6 +924,95 @@ WAMBLE_TEST(ws_server_protocol_fragmented_profiles_list_roundtrip) {
   return 0;
 }
 
+WAMBLE_TEST(ws_send_ack_writes_ack_packet_to_ws_route) {
+  config_load(NULL, NULL, NULL, 0);
+  int port = 0;
+  T_ASSERT_EQ_INT(ws_start_gateway(&port), 0);
+  T_ASSERT_EQ_INT(ws_connect_and_upgrade(port), 0);
+
+  struct WambleMsg bootstrap = {0};
+  bootstrap.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  ws_fill_token(bootstrap.token, 0x71);
+  bootstrap.seq_num = 0;
+  T_ASSERT_EQ_INT(ws_send_msg(&bootstrap, 0), 0);
+
+  uint8_t queued[WAMBLE_MAX_PACKET_SIZE];
+  size_t queued_len = 0;
+  struct sockaddr_in src;
+  memset(&src, 0, sizeof(src));
+  T_ASSERT_EQ_INT(
+      ws_pop_packet_wait(queued, sizeof(queued), &queued_len, &src, 2000), 1);
+
+  struct WambleMsg request = {0};
+  request.ctrl = WAMBLE_CTRL_PLAYER_MOVE;
+  memcpy(request.token, bootstrap.token, TOKEN_LENGTH);
+  request.board_id = 17;
+  request.seq_num = 4242;
+  send_ack(WAMBLE_INVALID_SOCKET, &request, &src);
+
+  uint8_t opcode = 0;
+  uint8_t frame[WAMBLE_MAX_PACKET_SIZE];
+  size_t frame_len = 0;
+  T_ASSERT_CLIENT_STATUS_OK(wamble_client_ws_recv_frame(
+      g_test_client, &opcode, frame, sizeof(frame), &frame_len));
+  T_ASSERT_EQ_INT(opcode, 0x2);
+
+  struct WambleMsg decoded = {0};
+  uint8_t decoded_flags = 0;
+  T_ASSERT_EQ_INT((int)wamble_packet_deserialize(frame, frame_len, &decoded,
+                                                 &decoded_flags),
+                  (int)NET_OK);
+  T_ASSERT_EQ_INT((int)decoded.ctrl, (int)WAMBLE_CTRL_ACK);
+  T_ASSERT_EQ_INT((int)decoded.seq_num, 4242);
+  T_ASSERT_EQ_INT((int)decoded.board_id, 17);
+  T_ASSERT(memcmp(decoded.token, bootstrap.token, TOKEN_LENGTH) == 0);
+  return 0;
+}
+
+WAMBLE_TEST(ws_reliable_send_flushes_route_inline) {
+  config_load(NULL, NULL, NULL, 0);
+  int port = 0;
+  T_ASSERT_EQ_INT(ws_start_gateway(&port), 0);
+  T_ASSERT_EQ_INT(ws_connect_and_upgrade(port), 0);
+
+  struct WambleMsg bootstrap = {0};
+  bootstrap.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  ws_fill_token(bootstrap.token, 0x72);
+  bootstrap.seq_num = 0;
+  T_ASSERT_EQ_INT(ws_send_msg(&bootstrap, 0), 0);
+
+  uint8_t queued[WAMBLE_MAX_PACKET_SIZE];
+  size_t queued_len = 0;
+  struct sockaddr_in src;
+  memset(&src, 0, sizeof(src));
+  T_ASSERT_EQ_INT(
+      ws_pop_packet_wait(queued, sizeof(queued), &queued_len, &src, 2000), 1);
+
+  struct WambleMsg out = {0};
+  out.ctrl = WAMBLE_CTRL_SERVER_NOTIFICATION;
+  memcpy(out.token, bootstrap.token, TOKEN_LENGTH);
+  snprintf(out.view.fen, sizeof(out.view.fen), "ws-flush-inline");
+
+  T_ASSERT_EQ_INT(
+      send_reliable_message(WAMBLE_INVALID_SOCKET, &out, &src, 250, 2), 0);
+
+  uint8_t opcode = 0;
+  uint8_t frame[WAMBLE_MAX_PACKET_SIZE];
+  size_t frame_len = 0;
+  T_ASSERT_CLIENT_STATUS_OK(wamble_client_ws_recv_frame(
+      g_test_client, &opcode, frame, sizeof(frame), &frame_len));
+  T_ASSERT_EQ_INT(opcode, 0x2);
+
+  struct WambleMsg decoded = {0};
+  uint8_t decoded_flags = 0;
+  T_ASSERT_EQ_INT((int)wamble_packet_deserialize(frame, frame_len, &decoded,
+                                                 &decoded_flags),
+                  (int)NET_OK);
+  T_ASSERT_EQ_INT((int)decoded.ctrl, (int)WAMBLE_CTRL_SERVER_NOTIFICATION);
+  T_ASSERT(strcmp(decoded.view.fen, "ws-flush-inline") == 0);
+  return 0;
+}
+
 WAMBLE_TESTS_BEGIN_NAMED(wamble_register_tests_ws_gateway)
 WAMBLE_TESTS_ADD_EX_SM(ws_handshake_rejects_invalid_key,
                        WAMBLE_SUITE_FUNCTIONAL, "ws_gateway", ws_test_setup,
@@ -943,6 +1035,12 @@ WAMBLE_TESTS_ADD_EX_SM(ws_reliable_send_skips_ack_retry_for_ws,
                        WAMBLE_SUITE_FUNCTIONAL, "ws_gateway", ws_test_setup,
                        ws_test_teardown, 0);
 WAMBLE_TESTS_ADD_EX_SM(ws_outbound_batches_multiple_packets_per_frame,
+                       WAMBLE_SUITE_FUNCTIONAL, "ws_gateway", ws_test_setup,
+                       ws_test_teardown, 0);
+WAMBLE_TESTS_ADD_EX_SM(ws_send_ack_writes_ack_packet_to_ws_route,
+                       WAMBLE_SUITE_FUNCTIONAL, "ws_gateway", ws_test_setup,
+                       ws_test_teardown, 0);
+WAMBLE_TESTS_ADD_EX_SM(ws_reliable_send_flushes_route_inline,
                        WAMBLE_SUITE_FUNCTIONAL, "ws_gateway", ws_test_setup,
                        ws_test_teardown, 0);
 WAMBLE_TESTS_ADD_DB_EX_SM(

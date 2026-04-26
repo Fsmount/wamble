@@ -1037,8 +1037,6 @@ void send_ack(wamble_socket_t sockfd, const struct WambleMsg *msg,
               const struct sockaddr_in *cliaddr) {
   if (!msg || !cliaddr)
     return;
-  if (ws_gateway_is_ws_client(cliaddr))
-    return;
 
   struct WambleMsg ack_msg;
   memset(&ack_msg, 0, sizeof(ack_msg));
@@ -1057,6 +1055,14 @@ void send_ack(wamble_socket_t sockfd, const struct WambleMsg *msg,
 
     return;
   }
+
+  int ws_rc = ws_gateway_queue_packet(cliaddr, send_buffer, serialized_size);
+  if (ws_rc > 0) {
+    (void)ws_gateway_flush_route(cliaddr);
+    return;
+  }
+  if (ws_rc < 0)
+    return;
 
 #ifdef WAMBLE_PLATFORM_WINDOWS
   sendto(sockfd, (const char *)send_buffer, (int)serialized_size, 0,
@@ -1135,6 +1141,8 @@ static int send_reliable_serialized_packet(
   int ws_rc = ws_gateway_queue_packet(cliaddr, send_buffer, serialized_size);
   if (ws_rc > 0) {
     terminal_cache_store_for_current_request(send_buffer, serialized_size);
+    if (ws_gateway_flush_route(cliaddr) != 0)
+      return -1;
     return 0;
   }
   if (ws_rc < 0)
