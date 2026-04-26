@@ -385,6 +385,45 @@ WAMBLE_TEST(profile_exec_snapshot_flushes_pending_create_session_intent) {
   return 0;
 }
 
+WAMBLE_TEST(profile_exec_snapshot_blocks_while_reservation_in_flight) {
+#if defined(WAMBLE_PLATFORM_POSIX)
+  g_profile_runtime_net_active = 1;
+  T_ASSERT_STATUS_OK(wamble_net_init());
+
+  const char *cfg = "(def port 0)\n";
+  T_ASSERT_EQ_INT(wamble_test_write_optional_db_config_file(conf_path, cfg), 0);
+
+  char status[128];
+  T_ASSERT_STATUS_OK(config_load(conf_path, NULL, status, sizeof(status)));
+
+  int started = 0;
+  T_ASSERT_EQ_INT(start_profile_listeners(&started), PROFILE_START_OK);
+  T_ASSERT_EQ_INT(started, 1);
+  T_ASSERT_EQ_INT(profile_runtime_pump_inline(), 1);
+
+  char state_map[512];
+  int state_count = 0;
+  T_ASSERT_EQ_INT(profile_prepare_state_save_and_inherit(
+                      state_map, sizeof(state_map), &state_count),
+                  PROFILE_EXPORT_OK);
+  T_ASSERT_EQ_INT(state_count, 1);
+  profile_test_track_state_files(state_map);
+
+  WamblePlayer *player = create_new_player();
+  T_ASSERT(player != NULL);
+  WambleBoard *board = find_board_for_player(player);
+  T_ASSERT(board != NULL);
+  T_ASSERT(board_manager_count_active_or_reserved() > 0);
+
+  state_count = 0;
+  T_ASSERT_EQ_INT(profile_prepare_state_save_and_inherit(
+                      state_map, sizeof(state_map), &state_count),
+                  PROFILE_EXPORT_NOT_READY);
+  T_ASSERT_EQ_INT(state_count, 0);
+#endif
+  return 0;
+}
+
 WAMBLE_TEST(profile_config_inheritance_child_uses_base_port) {
   const char *cfg = "(defprofile base ((def port 19200)))\n"
                     "(defprofile child (:inherits base ((def advertise 1))))\n";
@@ -1084,6 +1123,10 @@ WAMBLE_TESTS_BEGIN_NAMED(profile_runtime_tests) {
                          profile_test_setup, profile_test_teardown, 0);
   WAMBLE_TESTS_ADD_DB_EX_SM(
       profile_exec_snapshot_flushes_pending_create_session_intent,
+      WAMBLE_SUITE_FUNCTIONAL, "profile_runtime", profile_test_setup,
+      profile_test_teardown, 0);
+  WAMBLE_TESTS_ADD_EX_SM(
+      profile_exec_snapshot_blocks_while_reservation_in_flight,
       WAMBLE_SUITE_FUNCTIONAL, "profile_runtime", profile_test_setup,
       profile_test_teardown, 0);
   WAMBLE_TESTS_ADD_EX_SM(profile_config_inheritance_child_uses_base_port,

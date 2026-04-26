@@ -1002,6 +1002,22 @@ static char *profile_runtime_snapshot_template(const RunningProfile *rp) {
   return tmpl;
 }
 
+static int profile_runtime_reliable_state_drained(RunningProfile *rp) {
+  if (network_protocol_thread_pending_packet_count() != 0)
+    return 0;
+  if (network_protocol_thread_terminal_cache_packet_count() != 0)
+    return 0;
+  if (server_protocol_thread_pending_login_challenge_count() != 0)
+    return 0;
+  if (rp->ws_gateway && ws_gateway_active_client_count(rp->ws_gateway) != 0)
+    return 0;
+  if (spectator_manager_active_count_for_port(rp->cfg.port) != 0)
+    return 0;
+  if (board_manager_count_active_or_reserved() != 0)
+    return 0;
+  return 1;
+}
+
 static void profile_runtime_prepare_exec_snapshot(RunningProfile *rp) {
 #if defined(WAMBLE_PLATFORM_POSIX)
   int should_prepare = 0;
@@ -1012,6 +1028,8 @@ static void profile_runtime_prepare_exec_snapshot(RunningProfile *rp) {
   if (!should_prepare)
     return;
 
+  if (!profile_runtime_reliable_state_drained(rp))
+    return;
   if (!profile_runtime_flush_intents(rp, 64))
     return;
   char *tmpl = profile_runtime_snapshot_template(rp);
@@ -1352,6 +1370,8 @@ static void profile_runtime_step(RunningProfile *rp) {
   }
 
   profile_runtime_prepare_exec_snapshot(rp);
+  if (rp->ready_for_exec)
+    return;
   if (rp->needs_update) {
     rp->needs_update = 0;
     if (rp->has_pending_cfg) {

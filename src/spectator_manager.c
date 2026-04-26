@@ -498,6 +498,15 @@ void spectator_manager_tick(void) {
   wamble_mutex_unlock(&spectators_mutex);
 }
 
+int spectator_manager_active_count_for_port(int owner_port) {
+  if (!spectators)
+    return 0;
+  wamble_mutex_lock(&spectators_mutex);
+  int n = spectator_active_count_for_port_locked(owner_port);
+  wamble_mutex_unlock(&spectators_mutex);
+  return n;
+}
+
 int spectator_collect_notifications(struct SpectatorUpdate *out, int max) {
   if (!out || max <= 0 || !spectators || spectators_count <= 0)
     return 0;

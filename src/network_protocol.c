@@ -872,6 +872,22 @@ void network_init_thread_state(void) {
   session_map_init();
 }
 
+int network_protocol_thread_pending_packet_count(void) {
+  return pending_packet_count;
+}
+
+int network_protocol_thread_terminal_cache_packet_count(void) {
+  if (!client_sessions)
+    return 0;
+  int total = 0;
+  for (int i = 0; i < num_sessions; i++) {
+    WambleClientSession *session = &client_sessions[i];
+    for (int s = 0; s < session->terminal_cache_count; s++)
+      total += session->terminal_cache[s].packet_count;
+  }
+  return total;
+}
+
 int network_get_session_treatment_group(const uint8_t *token, char *out_group,
                                         size_t out_group_size) {
   if (!token || !out_group || out_group_size == 0)

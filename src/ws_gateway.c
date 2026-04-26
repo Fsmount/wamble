@@ -1608,6 +1608,15 @@ int ws_gateway_matches(const WambleWsGateway *gateway, int ws_port,
   return 1;
 }
 
+int ws_gateway_active_client_count(WambleWsGateway *gateway) {
+  if (!gateway)
+    return 0;
+  wamble_mutex_lock(&gateway->mutex);
+  int n = gateway->active_client_threads;
+  wamble_mutex_unlock(&gateway->mutex);
+  return n;
+}
+
 int ws_gateway_pop_packet(WambleWsGateway *gateway, uint8_t *packet,
                           size_t packet_cap, size_t *out_packet_len,
                           struct sockaddr_in *out_cliaddr) {
