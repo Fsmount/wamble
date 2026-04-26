@@ -41,8 +41,8 @@ static int spectator_count_for_port_locked(int owner_port);
 static int spectator_active_count_for_port_locked(int owner_port);
 static int fill_focus_now(SpectatorEntry *e, SpectatorUpdate *out, int out_cap,
                           int *out_count);
-static void fill_summary_now(SpectatorEntry *e, SpectatorUpdate *out,
-                             int out_cap, int *out_count);
+static int fill_summary_now(SpectatorEntry *e, SpectatorUpdate *out,
+                            int out_cap, int *out_count);
 
 static int token_has_any_byte(const uint8_t *token) {
   if (!token)
@@ -705,11 +705,11 @@ int spectator_collect_state_snapshot(const uint8_t *token, SpectatorUpdate *out,
       continue;
     }
     if (e->state == SPECTATOR_STATE_SUMMARY) {
-      fill_summary_now(e, out, max, &out_count);
-      e->last_summary_sent = now;
+      if (fill_summary_now(e, out, max, &out_count) >= 0)
+        e->last_summary_sent = now;
     } else if (e->state == SPECTATOR_STATE_FOCUS) {
-      (void)fill_focus_now(e, out, max, &out_count);
-      e->last_focus_sent = now;
+      if (fill_focus_now(e, out, max, &out_count) >= 0)
+        e->last_focus_sent = now;
     }
     break;
   }
@@ -719,8 +719,10 @@ int spectator_collect_state_snapshot(const uint8_t *token, SpectatorUpdate *out,
 
 static int fill_focus_now(SpectatorEntry *e, SpectatorUpdate *out, int out_cap,
                           int *out_count) {
-  if (!e || !out || !out_count || *out_count >= out_cap)
+  if (!e || !out || !out_count)
     return 0;
+  if (*out_count >= out_cap)
+    return -1;
   WambleBoard *b = get_board_by_id(e->focus_board_id);
   if (!b || !is_board_eligible(b))
     return 0;
@@ -756,31 +758,39 @@ void spectator_discard_by_token(const uint8_t *token) {
   wamble_mutex_unlock(&spectators_mutex);
 }
 
-static void fill_summary_now(SpectatorEntry *e, SpectatorUpdate *out,
-                             int out_cap, int *out_count) {
-  uint64_t generation = 0;
+static int fill_summary_now(SpectatorEntry *e, SpectatorUpdate *out,
+                            int out_cap, int *out_count) {
   if (!e || !out || !out_count || out_cap <= 0)
-    return;
-  generation = ++summary_generation_counter;
-  if (*out_count < out_cap) {
-    SpectatorUpdate *reset = &out[*out_count];
-    memset(reset, 0, sizeof(*reset));
-    memcpy(reset->token, e->token, TOKEN_LENGTH);
-    reset->addr = e->addr;
-    reset->flags = WAMBLE_FLAG_UNRELIABLE;
-    reset->summary_generation = generation;
-    (*out_count)++;
+    return -1;
+  int needed = 1;
+  for (int i = 0; i < summary_cache_count; i++) {
+    WambleBoard *b = summary_cache[i];
+    GameMode board_game_mode = b->board.game_mode;
+    if (e->game_mode_filter != 0 &&
+        !(e->game_mode_filter & (1u << board_game_mode)))
+      continue;
+    needed++;
   }
+  if (out_cap - *out_count < needed)
+    return -1;
+
+  uint64_t generation = ++summary_generation_counter;
+  SpectatorUpdate *reset = &out[*out_count];
+  memset(reset, 0, sizeof(*reset));
+  memcpy(reset->token, e->token, TOKEN_LENGTH);
+  reset->addr = e->addr;
+  reset->flags = WAMBLE_FLAG_UNRELIABLE;
+  reset->summary_generation = generation;
+  (*out_count)++;
 
   for (int i = 0; i < summary_cache_count; i++) {
-    if (*out_count >= out_cap)
-      break;
     WambleBoard *b = summary_cache[i];
     GameMode board_game_mode = b->board.game_mode;
     if (e->game_mode_filter != 0 &&
         !(e->game_mode_filter & (1u << board_game_mode)))
       continue;
     SpectatorUpdate *u = &out[*out_count];
+    memset(u, 0, sizeof(*u));
     memcpy(u->token, e->token, TOKEN_LENGTH);
     u->board_id = b->id;
     spectator_write_visible_fen(e->token, b, u->fen, sizeof(u->fen));
@@ -791,6 +801,7 @@ static void fill_summary_now(SpectatorEntry *e, SpectatorUpdate *out,
       u->flags |= WAMBLE_FLAG_BOARD_IS_960;
     (*out_count)++;
   }
+  return 1;
 }
 
 int spectator_collect_updates(struct SpectatorUpdate *out, int max) {
@@ -812,37 +823,46 @@ int spectator_collect_updates(struct SpectatorUpdate *out, int max) {
   int out_count = 0;
   int port = cfg ? cfg->port : 0;
   int start = rr_index;
-  int scanned = 0;
+  int served_steps = 0;
   for (int step = 0; step < spectators_count; step++) {
     int i = (start + step) % (spectators_count > 0 ? spectators_count : 1);
     if (spectators_count <= 0)
       break;
     SpectatorEntry *e = &spectators[i];
-    if (e->owner_port != port)
+    if (e->owner_port != port) {
+      served_steps = step + 1;
       continue;
+    }
+    int retry = 0;
     if (e->state == SPECTATOR_STATE_SUMMARY) {
       int due =
           (e->last_summary_sent == 0.0) ||
           (sum_interval > 0.0 && (now - e->last_summary_sent) >= sum_interval);
       if (due) {
-        fill_summary_now(e, out, max, &out_count);
-        e->last_summary_sent = now;
+        if (fill_summary_now(e, out, max, &out_count) >= 0)
+          e->last_summary_sent = now;
+        else
+          retry = 1;
       }
     } else if (e->state == SPECTATOR_STATE_FOCUS) {
       int due =
           (e->last_focus_sent == 0.0) ||
           (foc_interval > 0.0 && (now - e->last_focus_sent) >= foc_interval);
       if (due) {
-        (void)fill_focus_now(e, out, max, &out_count);
-        e->last_focus_sent = now;
+        if (fill_focus_now(e, out, max, &out_count) >= 0)
+          e->last_focus_sent = now;
+        else
+          retry = 1;
       }
     }
-    scanned++;
+    if (retry)
+      break;
+    served_steps = step + 1;
     if (out_count >= max)
       break;
   }
   if (spectators_count > 0)
-    rr_index = (start + scanned) % spectators_count;
+    rr_index = (start + served_steps) % spectators_count;
   wamble_mutex_unlock(&spectators_mutex);
   return out_count;
 }
