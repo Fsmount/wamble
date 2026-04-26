@@ -1904,6 +1904,12 @@ int ws_gateway_queue_packet(const struct sockaddr_in *cliaddr,
                             const uint8_t *packet, size_t packet_len);
 void ws_gateway_flush_outbound(WambleWsGateway *gateway);
 int ws_gateway_flush_route(const struct sockaddr_in *cliaddr);
+int ws_gateway_active_client_count(WambleWsGateway *gateway);
+
+int network_protocol_thread_pending_packet_count(void);
+int network_protocol_thread_terminal_cache_packet_count(void);
+int server_protocol_thread_pending_login_challenge_count(void);
+int board_manager_count_active_or_reserved(void);
 
 SpectatorInitStatus spectator_manager_init(void);
 void spectator_manager_shutdown(void);
@@ -1920,6 +1926,7 @@ int spectator_collect_state_snapshot(const uint8_t *token,
                                      struct SpectatorUpdate *out, int max);
 int spectator_collect_updates(struct SpectatorUpdate *out, int max);
 int spectator_collect_notifications(struct SpectatorUpdate *out, int max);
+int spectator_manager_active_count_for_port(int owner_port);
 int board_collect_reservation_release_notifications(
     ReservationReleaseNotification *out, int max);
 

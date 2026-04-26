@@ -964,6 +964,20 @@ int board_collect_reservation_release_notifications(
   return n;
 }
 
+int board_manager_count_active_or_reserved(void) {
+  if (!board_mutex_initialized || !board_cached)
+    return 0;
+  wamble_mutex_lock(&board_mutex);
+  int n = 0;
+  for (int i = 0; i < num_cached_boards; i++) {
+    BoardState s = board_cached[i].state;
+    if (s == BOARD_STATE_ACTIVE || s == BOARD_STATE_RESERVED)
+      n++;
+  }
+  wamble_mutex_unlock(&board_mutex);
+  return n;
+}
+
 int board_manager_export(WambleBoard *out, int max, int *out_count,
                          uint64_t *out_next_id) {
   if (!out_count || max < 0)

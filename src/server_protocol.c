@@ -199,6 +199,18 @@ static int login_challenge_is_fresh(uint64_t issued_at_ms) {
   return (now - issued_at_ms) <= LOGIN_CHALLENGE_TTL_MS;
 }
 
+int server_protocol_thread_pending_login_challenge_count(void) {
+  if (!g_login_challenge_entries || g_login_challenge_capacity <= 0)
+    return 0;
+  int count = 0;
+  for (int i = 0; i < g_login_challenge_capacity; i++) {
+    LoginChallengeEntry *entry = &g_login_challenge_entries[i];
+    if (entry->used && login_challenge_is_fresh(entry->issued_at_ms))
+      count++;
+  }
+  return count;
+}
+
 static int verify_login_proof(const struct WambleMsg *msg) {
   if (!msg)
     return -1;
