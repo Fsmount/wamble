@@ -2687,8 +2687,8 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
   case WAMBLE_CTRL_LOGIN_REQUEST:
     return handle_login_request(sockfd, cliaddr, msg, profile_name);
   case WAMBLE_CTRL_LOGOUT:
-    return finish_request_after_terminal_send(
-        sockfd, msg, cliaddr, handle_logout(msg, profile_name));
+    return finish_request_after_terminal_send(sockfd, msg, cliaddr,
+                                              handle_logout(msg, profile_name));
   case WAMBLE_CTRL_SPECTATE_GAME: {
     const char *spectate_mode = (msg->board_id == 0) ? "summary" : "focus";
     WamblePolicyDecision decision;
