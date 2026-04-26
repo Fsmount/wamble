@@ -5857,6 +5857,106 @@ WAMBLE_TEST(reliable_retry_from_new_source_replays_to_rebound_address) {
   return 0;
 }
 
+WAMBLE_TEST(shared_token_endpoints_get_independent_seq_state) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli1 = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli1 != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli2 = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli2 != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(
+      bind(cli1, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+  T_ASSERT_STATUS_OK(
+      bind(cli2, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in srvaddr = {0};
+  srvaddr.sin_family = AF_INET;
+  srvaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  srvaddr.sin_port = htons((uint16_t)wamble_socket_bound_port(srv));
+
+  uint8_t token[TOKEN_LENGTH];
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    token[i] = (uint8_t)(0x70 + i);
+
+  struct WambleMsg req = {0};
+  req.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  req.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(req.token, token, TOKEN_LENGTH);
+  req.seq_num = 10;
+
+  uint8_t req_buf[WAMBLE_MAX_PACKET_SIZE];
+  size_t req_len = 0;
+  T_ASSERT(wamble_packet_serialize(&req, req_buf, sizeof(req_buf), &req_len,
+                                   0) == NET_OK);
+
+  T_ASSERT(sendto(cli1, (const char *)req_buf, req_len, 0,
+                  (const struct sockaddr *)&srvaddr, sizeof(srvaddr)) > 0);
+
+  struct WambleMsg in = {0};
+  struct sockaddr_in from;
+  T_ASSERT(receive_message(srv, &in, &from) > 0);
+  T_ASSERT_EQ_INT((int)in.seq_num, 10);
+  network_end_request();
+
+  struct WambleMsg req2 = {0};
+  req2.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  req2.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(req2.token, token, TOKEN_LENGTH);
+  req2.seq_num = 4242;
+
+  uint8_t req2_buf[WAMBLE_MAX_PACKET_SIZE];
+  size_t req2_len = 0;
+  T_ASSERT(wamble_packet_serialize(&req2, req2_buf, sizeof(req2_buf), &req2_len,
+                                   0) == NET_OK);
+
+  T_ASSERT(sendto(cli2, (const char *)req2_buf, req2_len, 0,
+                  (const struct sockaddr *)&srvaddr, sizeof(srvaddr)) > 0);
+
+  struct WambleMsg in2 = {0};
+  struct sockaddr_in from2;
+  int rc2 = receive_message(srv, &in2, &from2);
+  T_ASSERT(rc2 > 0);
+  T_ASSERT_EQ_INT((int)in2.seq_num, 4242);
+  T_ASSERT(from2.sin_port != from.sin_port);
+  network_end_request();
+
+  struct WambleMsg req3 = {0};
+  req3.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  req3.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(req3.token, token, TOKEN_LENGTH);
+  req3.seq_num = 11;
+
+  uint8_t req3_buf[WAMBLE_MAX_PACKET_SIZE];
+  size_t req3_len = 0;
+  T_ASSERT(wamble_packet_serialize(&req3, req3_buf, sizeof(req3_buf), &req3_len,
+                                   0) == NET_OK);
+
+  T_ASSERT(sendto(cli1, (const char *)req3_buf, req3_len, 0,
+                  (const struct sockaddr *)&srvaddr, sizeof(srvaddr)) > 0);
+
+  struct WambleMsg in3 = {0};
+  struct sockaddr_in from3;
+  int rc3 = receive_message(srv, &in3, &from3);
+  T_ASSERT(rc3 > 0);
+  T_ASSERT_EQ_INT((int)in3.seq_num, 11);
+  T_ASSERT_EQ_INT(from3.sin_port, from.sin_port);
+  network_end_request();
+
+  wamble_close_socket(cli1);
+  wamble_close_socket(cli2);
+  wamble_close_socket(srv);
+  return 0;
+}
+
 WAMBLE_TEST(reliable_retry_replays_fragmented_terminal_bundle) {
   config_load(NULL, NULL, NULL, 0);
   network_init_thread_state();
@@ -6327,6 +6427,8 @@ WAMBLE_TESTS_ADD_SM(get_profile_tos_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
 WAMBLE_TESTS_ADD_SM(reliable_retry_replays_cached_terminal_response,
                     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(reliable_retry_from_new_source_replays_to_rebound_address,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(shared_token_endpoints_get_independent_seq_state,
                     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(reliable_retry_replays_fragmented_terminal_bundle,
                     WAMBLE_SUITE_FUNCTIONAL, "network");

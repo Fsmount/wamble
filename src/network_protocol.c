@@ -590,11 +590,14 @@ static WambleClientSession *find_client_session_by_token(const uint8_t *token) {
   network_ensure_thread_state_initialized();
   if (!client_sessions)
     return NULL;
+  WambleClientSession *best = NULL;
   for (int i = 0; i < num_sessions; i++) {
-    if (memcmp(client_sessions[i].token, token, TOKEN_LENGTH) == 0)
-      return &client_sessions[i];
+    if (memcmp(client_sessions[i].token, token, TOKEN_LENGTH) != 0)
+      continue;
+    if (!best || client_sessions[i].last_seen > best->last_seen)
+      best = &client_sessions[i];
   }
-  return NULL;
+  return best;
 }
 
 static WambleClientSession *
@@ -819,20 +822,9 @@ static void update_client_session(const struct sockaddr_in *addr,
   int token_valid = token_has_any_byte(token);
   WambleClientSession *session = find_client_session(addr);
   if (!session) {
-    if (token_valid)
-      session = find_client_session_by_token(token);
-    if (session) {
-
-      uint32_t diff = seq_num - session->last_seq_num;
-      if (diff != 0 && diff <= (UINT32_MAX / 2u)) {
-        session->addr = *addr;
-        session_map_put(addr, (int)(session - client_sessions));
-      }
-    } else {
-      session = create_client_session(addr, token);
-      if (!session)
-        return;
-    }
+    session = create_client_session(addr, token);
+    if (!session)
+      return;
   }
 
   session->last_seq_num = seq_num;
@@ -1025,11 +1017,8 @@ static int receive_message_from_packet_impl(wamble_socket_t sockfd,
   }
   if (msg->ctrl != WAMBLE_CTRL_ACK &&
       (msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0 && is_dup) {
-    if (session && !sockaddr_in_equal(&session->addr, cliaddr)) {
-      session->addr = *cliaddr;
-      session_map_put(cliaddr, (int)(session - client_sessions));
+    if (session)
       session->last_seen = wamble_now_wall();
-    }
     (void)terminal_cache_replay(session, msg->seq_num, sockfd, cliaddr);
     send_ack(sockfd, msg, cliaddr);
     return -1;
