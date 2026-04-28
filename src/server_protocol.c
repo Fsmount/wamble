@@ -330,7 +330,12 @@ int send_reliable_board_state_sync(wamble_socket_t sockfd, const uint8_t *token,
 static int policy_check(const uint8_t *token, const char *profile_name,
                         const char *action, const char *resource,
                         const char *context_key, const char *context_value,
-                        WamblePolicyDecision *out_decision) {
+                        WamblePolicyDecision *out_decision);
+
+static int policy_check_with_session_create(
+    const uint8_t *token, const char *profile_name, const char *action,
+    const char *resource, const char *context_key, const char *context_value,
+    WamblePolicyDecision *out_decision, int create_session_on_missing) {
   int token_nonzero = 0;
   for (int i = 0; token && i < TOKEN_LENGTH; i++) {
     if (token[i] != 0) {
@@ -342,7 +347,7 @@ static int policy_check(const uint8_t *token, const char *profile_name,
   DbStatus st = wamble_query_resolve_policy_decision(
       token, profile_name, action, resource, context_key, context_value,
       &decision);
-  if (st == DB_NOT_FOUND && token_nonzero) {
+  if (st == DB_NOT_FOUND && token_nonzero && create_session_on_missing) {
     (void)wamble_query_create_session(token, 0, NULL);
     st = wamble_query_resolve_policy_decision(token, profile_name, action,
                                               resource, context_key,
@@ -353,6 +358,15 @@ static int policy_check(const uint8_t *token, const char *profile_name,
   if (out_decision)
     *out_decision = decision;
   return decision.allowed ? 1 : 0;
+}
+
+static int policy_check(const uint8_t *token, const char *profile_name,
+                        const char *action, const char *resource,
+                        const char *context_key, const char *context_value,
+                        WamblePolicyDecision *out_decision) {
+  return policy_check_with_session_create(token, profile_name, action, resource,
+                                          context_key, context_value,
+                                          out_decision, 1);
 }
 
 static int resolve_profile_trust_tier(const uint8_t *token,
@@ -699,6 +713,18 @@ static int profile_terms_route_allowed(const uint8_t *token,
     return 1;
   }
   return profile_discovery_allowed(token, p, trust_tier);
+}
+
+static int ctrl_uses_pre_accept_profile_route(uint8_t ctrl) {
+  switch (ctrl) {
+  case WAMBLE_CTRL_LIST_PROFILES:
+  case WAMBLE_CTRL_GET_PROFILE_INFO:
+  case WAMBLE_CTRL_GET_PROFILE_TOS:
+  case WAMBLE_CTRL_ACCEPT_PROFILE_TOS:
+    return 1;
+  default:
+    return 0;
+  }
 }
 
 static ServerStatus send_policy_denied(wamble_socket_t sockfd,
@@ -1718,6 +1744,11 @@ static ServerStatus handle_client_hello(wamble_socket_t sockfd,
         "no board available for assignment", NULL, 0, 1);
   }
 
+  if (wamble_query_create_session(player->token, 0, NULL) != DB_OK) {
+    return send_error_terminal(sockfd, cliaddr, msg->token, WAMBLE_ERR_INTERNAL,
+                               "could not persist player session", NULL, 0);
+  }
+
   struct WambleMsg response = {0};
   response.flags = negotiated_caps;
   response.header_version = WAMBLE_PROTO_VERSION;
@@ -2502,12 +2533,13 @@ static ServerStatus handle_accept_profile_tos(wamble_socket_t sockfd,
     out.ctrl = WAMBLE_CTRL_ERROR;
     memcpy(out.token, msg->token, TOKEN_LENGTH);
     out.view.error_code = WAMBLE_ERR_ACCESS_DENIED;
-    snprintf(out.view.error_reason, sizeof(out.view.error_reason),
-             "failed to persist terms acceptance");
+    snprintf(out.view.error_reason, sizeof(out.view.error_reason), "%s",
+             st == DB_NOT_FOUND ? "session not found"
+                                : "failed to persist terms acceptance");
     (void)append_request_seq_ext(&out, msg->seq_num);
     if (send_reliable_default(sockfd, &out, cliaddr) != 0)
       return SERVER_ERR_SEND_FAILED;
-    return SERVER_ERR_INTERNAL;
+    return st == DB_NOT_FOUND ? SERVER_ERR_FORBIDDEN : SERVER_ERR_INTERNAL;
   }
 
   {
@@ -2623,9 +2655,11 @@ static ServerStatus enforce_message_access_policies(
   if (msg->ctrl != WAMBLE_CTRL_ACK) {
     WamblePolicyDecision bypass = {0};
     const char *ctrl_res = ctrl_policy_resource(msg->ctrl);
-    int bypass_rate_limit =
-        policy_check(msg->token, profile_name, "rate_limit.bypass", "request",
-                     "ctrl", ctrl_res, &bypass);
+    int create_session_for_policy =
+        ctrl_uses_pre_accept_profile_route(msg->ctrl) ? 0 : 1;
+    int bypass_rate_limit = policy_check_with_session_create(
+        msg->token, profile_name, "rate_limit.bypass", "request", "ctrl",
+        ctrl_res, &bypass, create_session_for_policy);
     int max_per_sec = get_config()->rate_limit_requests_per_sec;
     uint8_t rate_key[TOKEN_LENGTH];
     const uint8_t *limit_token =
@@ -2646,8 +2680,11 @@ static ServerStatus enforce_message_access_policies(
 
   if (msg->ctrl != WAMBLE_CTRL_ACK) {
     const char *ctrl_res = ctrl_policy_resource(msg->ctrl);
-    if (!policy_check(msg->token, profile_name, "protocol.ctrl", ctrl_res, NULL,
-                      NULL, NULL)) {
+    int create_session_for_policy =
+        ctrl_uses_pre_accept_profile_route(msg->ctrl) ? 0 : 1;
+    if (!policy_check_with_session_create(msg->token, profile_name,
+                                          "protocol.ctrl", ctrl_res, NULL, NULL,
+                                          NULL, create_session_for_policy)) {
       return send_policy_denied(sockfd, cliaddr, msg->token, profile_name);
     }
   }

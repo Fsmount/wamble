@@ -2897,6 +2897,145 @@ WAMBLE_TEST(server_protocol_accept_profile_tos_persists_terms) {
   return 0;
 }
 
+WAMBLE_TEST(server_protocol_get_profile_tos_does_not_create_session) {
+  const char *cfg_path = "build/test_network_get_profile_tos_no_session.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19423) (def advertise 1) "
+                    "(def tos-text \"profile terms v1\")))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'get_profile_tos', '*', 'allow', 0, "
+          "'get_profile_tos_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  struct WambleMsg tos_req = {0};
+  tos_req.ctrl = WAMBLE_CTRL_GET_PROFILE_TOS;
+  tos_req.header_version = WAMBLE_PROTO_VERSION;
+  tos_req.seq_num = 103;
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    tos_req.token[i] = (uint8_t)(0xb0 + i);
+  memcpy(tos_req.text.profile_name, "p1", 2);
+  tos_req.text.profile_name_len = 2;
+
+  RecvTosFragmentsCtx rx_tos = {.sock = cli};
+  wamble_thread_t th_tos;
+  T_ASSERT(wamble_thread_create(&th_tos, recv_tos_fragments_and_ack_thread,
+                                &rx_tos) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &tos_req, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_tos, NULL));
+  T_ASSERT_EQ_INT(rx_tos.received, 1);
+  T_ASSERT_EQ_INT(rx_tos.expected_chunks, 1);
+  {
+    uint64_t sid = 0;
+    T_ASSERT_EQ_INT(wamble_query_get_session_by_token(tos_req.token, &sid),
+                    DB_NOT_FOUND);
+  }
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(server_protocol_accept_profile_tos_requires_existing_session) {
+  const char *cfg_path = "build/test_network_accept_profile_tos_session.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19423) (def advertise 1) "
+                    "(def tos-text \"profile terms v1\")))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'accept_profile_tos', '*', 'allow', 0, "
+          "'accept_profile_tos_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  struct WambleMsg accept = {0};
+  accept.ctrl = WAMBLE_CTRL_ACCEPT_PROFILE_TOS;
+  accept.header_version = WAMBLE_PROTO_VERSION;
+  accept.seq_num = 102;
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    accept.token[i] = (uint8_t)(0xa0 + i);
+  memcpy(accept.text.profile_name, "p1", 2);
+  accept.text.profile_name_len = 2;
+
+  RecvOneCtx rx_accept = {.sock = cli};
+  wamble_thread_t th_accept;
+  T_ASSERT(wamble_thread_create(&th_accept, recv_one_and_ack_thread,
+                                &rx_accept) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &accept, &cliaddr, 0, "p1"),
+                  SERVER_ERR_FORBIDDEN);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_accept, NULL));
+  T_ASSERT_EQ_INT(rx_accept.received, 1);
+  T_ASSERT_EQ_INT(rx_accept.msg.ctrl, WAMBLE_CTRL_ERROR);
+  T_ASSERT_EQ_INT(rx_accept.msg.view.error_code, WAMBLE_ERR_ACCESS_DENIED);
+  T_ASSERT_STREQ(rx_accept.msg.view.error_reason, "session not found");
+  {
+    const WambleMessageExtField *request_seq =
+        find_ext_field(&rx_accept.msg, "request.seq_num");
+    T_ASSERT(request_seq != NULL);
+    T_ASSERT_EQ_INT((int)request_seq->int_value, (int)accept.seq_num);
+  }
+  {
+    uint64_t sid = 0;
+    WambleProfileTermsAcceptance acceptance = {0};
+    T_ASSERT_EQ_INT(wamble_query_get_session_by_token(accept.token, &sid),
+                    DB_NOT_FOUND);
+    T_ASSERT_EQ_INT(wamble_query_get_latest_profile_terms_acceptance(
+                        accept.token, "p1", &acceptance),
+                    DB_NOT_FOUND);
+  }
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
 WAMBLE_TEST(server_protocol_terms_routes_allow_hidden_bound_profile) {
   const char *cfg_path = "build/test_network_hidden_profile_terms.conf";
   const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
@@ -2948,6 +3087,8 @@ WAMBLE_TEST(server_protocol_terms_routes_allow_hidden_bound_profile) {
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+  T_ASSERT_EQ_INT(wamble_query_create_session(rx_hello.msg.token, 0, NULL),
+                  DB_OK);
 
   struct WambleMsg tos_req = {0};
   tos_req.ctrl = WAMBLE_CTRL_GET_PROFILE_TOS;
@@ -3083,6 +3224,8 @@ WAMBLE_TEST(
     T_ASSERT_EQ_INT(caps->value_type, WAMBLE_TREATMENT_VALUE_INT);
     T_ASSERT_EQ_INT((int)caps->int_value, 0);
   }
+  T_ASSERT_EQ_INT(wamble_query_create_session(rx_hello.msg.token, 0, NULL),
+                  DB_OK);
 
   struct WambleMsg post_join_req = {0};
   post_join_req.ctrl = WAMBLE_CTRL_GET_PLAYER_STATS;
@@ -3995,7 +4138,8 @@ WAMBLE_TEST(server_protocol_player_stats_self_read_does_not_create_session) {
   {
     uint64_t sid = 0;
     T_ASSERT_EQ_INT(wamble_query_get_session_by_token(rx_hello.msg.token, &sid),
-                    DB_NOT_FOUND);
+                    DB_OK);
+    T_ASSERT(sid > 0);
   }
 
   {
@@ -4017,7 +4161,8 @@ WAMBLE_TEST(server_protocol_player_stats_self_read_does_not_create_session) {
   {
     uint64_t sid = 0;
     T_ASSERT_EQ_INT(wamble_query_get_session_by_token(rx_hello.msg.token, &sid),
-                    DB_NOT_FOUND);
+                    DB_OK);
+    T_ASSERT(sid > 0);
   }
 
   wamble_close_socket(cli);
@@ -4084,7 +4229,8 @@ WAMBLE_TEST(server_protocol_error_blocking_ext_marks_fatal_session_only) {
     struct WambleMsg req = {0};
     req.ctrl = WAMBLE_CTRL_GET_LEADERBOARD;
     req.header_version = WAMBLE_PROTO_VERSION;
-    memcpy(req.token, rx_hello.msg.token, TOKEN_LENGTH);
+    for (int i = 0; i < TOKEN_LENGTH; i++)
+      req.token[i] = (uint8_t)(0xc0 + i);
 
     RecvOneCtx rx = {.sock = cli};
     wamble_thread_t th;
@@ -5148,6 +5294,8 @@ WAMBLE_TEST(server_protocol_accept_profile_tos_long_profile_name_persists) {
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+  T_ASSERT_EQ_INT(wamble_query_create_session(rx_hello.msg.token, 0, NULL),
+                  DB_OK);
 
   struct WambleMsg accept = {0};
   accept.ctrl = WAMBLE_CTRL_ACCEPT_PROFILE_TOS;
@@ -6204,6 +6352,7 @@ WAMBLE_TEST(
   accept.header_version = WAMBLE_PROTO_VERSION;
   accept.seq_num = 7777;
   accept.token[0] = 0xAB;
+  T_ASSERT_EQ_INT(wamble_query_create_session(accept.token, 0, NULL), DB_OK);
   const char *pname = "p1";
   accept.text.profile_name_len = (uint8_t)strlen(pname);
   memcpy(accept.text.profile_name, pname, accept.text.profile_name_len);
@@ -6378,6 +6527,11 @@ WAMBLE_TESTS_ADD_DB_SM(
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(server_protocol_accept_profile_tos_persists_terms,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(server_protocol_get_profile_tos_does_not_create_session,
+                       WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_accept_profile_tos_requires_existing_session,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(server_protocol_terms_routes_allow_hidden_bound_profile,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
