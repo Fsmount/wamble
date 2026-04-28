@@ -5957,6 +5957,50 @@ WAMBLE_TEST(shared_token_endpoints_get_independent_seq_state) {
   return 0;
 }
 
+WAMBLE_TEST(token_session_index_tracks_shared_token_rebinds) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  struct sockaddr_in addr1 = {0};
+  addr1.sin_family = AF_INET;
+  addr1.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr1.sin_port = htons(11001);
+
+  struct sockaddr_in addr2 = {0};
+  addr2.sin_family = AF_INET;
+  addr2.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr2.sin_port = htons(11002);
+
+  uint8_t token_a[TOKEN_LENGTH];
+  uint8_t token_b[TOKEN_LENGTH];
+  for (int i = 0; i < TOKEN_LENGTH; i++) {
+    token_a[i] = (uint8_t)(0x80 + i);
+    token_b[i] = (uint8_t)(0xA0 + i);
+  }
+
+  network_bind_client_token(&addr1, token_a);
+  network_bind_client_token(&addr2, token_a);
+  network_bind_client_token(&addr1, token_b);
+
+  struct sockaddr_in out_a = {0};
+  T_ASSERT_STATUS_OK(network_get_client_addr_by_token(token_a, &out_a));
+  T_ASSERT_EQ_INT(out_a.sin_port, addr2.sin_port);
+
+  struct sockaddr_in out_b = {0};
+  T_ASSERT_STATUS_OK(network_get_client_addr_by_token(token_b, &out_b));
+  T_ASSERT_EQ_INT(out_b.sin_port, addr1.sin_port);
+
+  uint8_t bound1[TOKEN_LENGTH] = {0};
+  T_ASSERT_STATUS_OK(network_get_bound_token_for_addr(&addr1, bound1));
+  T_ASSERT(tokens_equal(bound1, token_b));
+
+  uint8_t bound2[TOKEN_LENGTH] = {0};
+  T_ASSERT_STATUS_OK(network_get_bound_token_for_addr(&addr2, bound2));
+  T_ASSERT(tokens_equal(bound2, token_a));
+
+  return 0;
+}
+
 WAMBLE_TEST(reliable_retry_replays_fragmented_terminal_bundle) {
   config_load(NULL, NULL, NULL, 0);
   network_init_thread_state();
@@ -6429,6 +6473,8 @@ WAMBLE_TESTS_ADD_SM(reliable_retry_replays_cached_terminal_response,
 WAMBLE_TESTS_ADD_SM(reliable_retry_from_new_source_replays_to_rebound_address,
                     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(shared_token_endpoints_get_independent_seq_state,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(token_session_index_tracks_shared_token_rebinds,
                     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(reliable_retry_replays_fragmented_terminal_bundle,
                     WAMBLE_SUITE_FUNCTIONAL, "network");

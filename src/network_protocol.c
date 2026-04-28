@@ -19,6 +19,7 @@ typedef struct WambleTerminalCacheSlot {
 typedef struct WambleClientSession {
   struct sockaddr_in addr;
   uint8_t token[TOKEN_LENGTH];
+  int token_next_index;
   uint32_t last_seq_num;
   time_t last_seen;
   uint32_t next_seq_num;
@@ -41,6 +42,14 @@ static WAMBLE_THREAD_LOCAL uint32_t global_fragment_transfer_id = 1;
 
 #define SESSION_MAP_SIZE (get_config()->max_client_sessions * 2)
 static WAMBLE_THREAD_LOCAL int *session_index_map;
+
+typedef struct TokenSessionMapEntry {
+  int used;
+  uint8_t token[TOKEN_LENGTH];
+  int head_index;
+} TokenSessionMapEntry;
+
+static WAMBLE_THREAD_LOCAL TokenSessionMapEntry *token_session_index_map;
 
 typedef struct PendingPacket {
   struct sockaddr_in addr;
@@ -68,6 +77,13 @@ static inline uint64_t addr_hash_key(const struct sockaddr_in *addr) {
   return mix64_s((ip << 16) ^ port);
 }
 
+static inline uint64_t token_hash_key(const uint8_t *token) {
+  uint64_t h = 0x9e3779b97f4a7c15ULL;
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    h = mix64_s(h ^ ((uint64_t)token[i] + ((uint64_t)i << 8)));
+  return h;
+}
+
 static int sockaddr_in_equal(const struct sockaddr_in *a,
                              const struct sockaddr_in *b) {
   if (!a || !b)
@@ -93,6 +109,14 @@ static void session_map_init(void) {
     return;
   for (int i = 0; i < cap; i++)
     session_index_map[i] = -1;
+}
+
+static void token_session_map_init(void) {
+  int cap = session_map_capacity();
+  if (!token_session_index_map || cap <= 0)
+    return;
+  memset(token_session_index_map, 0,
+         (size_t)cap * sizeof(*token_session_index_map));
 }
 
 static void session_map_put(const struct sockaddr_in *addr, int index) {
@@ -136,6 +160,67 @@ static int session_map_get(const struct sockaddr_in *addr) {
     i = session_map_next(i, cap);
   }
   return -1;
+}
+
+static int token_session_map_slot(const uint8_t *token, int create) {
+  int cap = session_map_capacity();
+  if (!token || !token_session_index_map || cap <= 0)
+    return -1;
+  uint64_t h = token_hash_key(token);
+  int i = (int)(h % (uint64_t)cap);
+  for (int probe = 0; probe < cap; probe++) {
+    TokenSessionMapEntry *entry = &token_session_index_map[i];
+    if (!entry->used) {
+      if (!create)
+        return -1;
+      entry->used = 1;
+      memcpy(entry->token, token, TOKEN_LENGTH);
+      entry->head_index = -1;
+      return i;
+    }
+    if (memcmp(entry->token, token, TOKEN_LENGTH) == 0)
+      return i;
+    i = session_map_next(i, cap);
+  }
+  return -1;
+}
+
+static void token_session_map_put(const uint8_t *token, int index) {
+  if (!token || index < 0)
+    return;
+  int slot = token_session_map_slot(token, 1);
+  if (slot < 0)
+    return;
+  WambleClientSession *session = &client_sessions[index];
+  TokenSessionMapEntry *entry = &token_session_index_map[slot];
+  session->token_next_index = entry->head_index;
+  entry->head_index = index;
+}
+
+static void token_session_map_remove(const uint8_t *token, int index) {
+  if (!token || index < 0)
+    return;
+  int slot = token_session_map_slot(token, 0);
+  if (slot < 0)
+    return;
+  TokenSessionMapEntry *entry = &token_session_index_map[slot];
+  int *link = &entry->head_index;
+  while (*link >= 0) {
+    WambleClientSession *session = &client_sessions[*link];
+    if (*link == index) {
+      *link = session->token_next_index;
+      session->token_next_index = -1;
+      return;
+    }
+    link = &session->token_next_index;
+  }
+}
+
+static int token_session_map_head(const uint8_t *token) {
+  int slot = token_session_map_slot(token, 0);
+  if (slot < 0)
+    return -1;
+  return token_session_index_map[slot].head_index;
 }
 
 static void pending_packets_release(void) {
@@ -588,14 +673,19 @@ find_client_session(const struct sockaddr_in *addr) {
 
 static WambleClientSession *find_client_session_by_token(const uint8_t *token) {
   network_ensure_thread_state_initialized();
-  if (!client_sessions)
+  if (!client_sessions || !token_has_any_byte(token))
     return NULL;
+  int head = token_session_map_head(token);
   WambleClientSession *best = NULL;
-  for (int i = 0; i < num_sessions; i++) {
-    if (memcmp(client_sessions[i].token, token, TOKEN_LENGTH) != 0)
-      continue;
-    if (!best || client_sessions[i].last_seen > best->last_seen)
-      best = &client_sessions[i];
+  for (int i = head; i >= 0;) {
+    WambleClientSession *session = &client_sessions[i];
+    int next = session->token_next_index;
+    if (memcmp(session->token, token, TOKEN_LENGTH) == 0 &&
+        (!best || session->last_seen > best->last_seen ||
+         (session->last_seen == best->last_seen && session < best))) {
+      best = session;
+    }
+    i = next;
   }
   return best;
 }
@@ -612,6 +702,7 @@ create_client_session(const struct sockaddr_in *addr, const uint8_t *token) {
   WambleClientSession *session = &client_sessions[num_sessions++];
   session->addr = *addr;
   memcpy(session->token, token, TOKEN_LENGTH);
+  session->token_next_index = -1;
   session->last_seq_num = 0;
   session->last_seen = wamble_now_wall();
   session->next_seq_num = 1;
@@ -619,6 +710,8 @@ create_client_session(const struct sockaddr_in *addr, const uint8_t *token) {
   session->terminal_cache = NULL;
   session->terminal_cache_count = 0;
   session_map_put(addr, (int)(session - client_sessions));
+  if (token_has_any_byte(token))
+    token_session_map_put(token, (int)(session - client_sessions));
   return session;
 }
 
@@ -829,7 +922,15 @@ static void update_client_session(const struct sockaddr_in *addr,
 
   session->last_seq_num = seq_num;
   session->last_seen = wamble_now_wall();
-  memcpy(session->token, token, TOKEN_LENGTH);
+  int token_changed = memcmp(session->token, token, TOKEN_LENGTH) != 0;
+  if (token_changed) {
+    int index = (int)(session - client_sessions);
+    if (token_has_any_byte(session->token))
+      token_session_map_remove(session->token, index);
+    memcpy(session->token, token, TOKEN_LENGTH);
+    if (token_valid)
+      token_session_map_put(session->token, index);
+  }
   if (token_valid) {
     sync_client_session_treatment_group(session, token);
   } else {
@@ -846,12 +947,19 @@ void network_init_thread_state(void) {
     session_index_map =
         malloc(sizeof(int) * (size_t)(get_config()->max_client_sessions * 2));
   }
+  if (!token_session_index_map) {
+    token_session_index_map =
+        malloc(sizeof(*token_session_index_map) *
+               (size_t)(get_config()->max_client_sessions * 2));
+  }
   if ((get_config()->max_client_sessions > 0) &&
-      (!client_sessions || !session_index_map)) {
+      (!client_sessions || !session_index_map || !token_session_index_map)) {
     free(client_sessions);
     free(session_index_map);
+    free(token_session_index_map);
     client_sessions = NULL;
     session_index_map = NULL;
+    token_session_index_map = NULL;
     num_sessions = 0;
     pending_packets_reset();
     return;
@@ -862,6 +970,7 @@ void network_init_thread_state(void) {
   g_current_request.session = NULL;
   pending_packets_reset();
   session_map_init();
+  token_session_map_init();
 }
 
 int network_protocol_thread_pending_packet_count(void) {
