@@ -734,6 +734,7 @@ WAMBLE_TEST(ws_server_protocol_profile_terms_acceptance_roundtrip) {
                   (int)NET_OK);
   T_ASSERT_EQ_INT(hello_out.ctrl, WAMBLE_CTRL_SERVER_HELLO);
   memcpy(client_token, hello_out.token, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(wamble_query_create_session(client_token, 0, NULL), DB_OK);
 
   struct WambleMsg missing_info_req = {0};
   missing_info_req.ctrl = WAMBLE_CTRL_GET_PROFILE_INFO;
