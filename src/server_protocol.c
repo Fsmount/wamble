@@ -324,7 +324,7 @@ int send_reliable_board_state_sync(wamble_socket_t sockfd, const uint8_t *token,
                                      wamble_runtime_profile_key()) != 0) {
     return send_reliable_board_state_error(sockfd, token, cliaddr);
   }
-  return send_reliable_default(sockfd, &out, cliaddr);
+  return send_reliable_message_once(sockfd, &out, cliaddr);
 }
 
 static int policy_check(const uint8_t *token, const char *profile_name,

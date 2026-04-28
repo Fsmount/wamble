@@ -3450,36 +3450,36 @@ WAMBLE_TEST(server_protocol_reliable_spectate_focus_sends_terminal_before_ack) {
   UdpLoopbackPair pair;
   T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
 
-  HandleMessageCtx ctx = {0};
-  ctx.sockfd = pair.srv;
-  ctx.cliaddr = pair.cliaddr;
-  ctx.trust_tier = 0;
-  ctx.profile_name = "p1";
-  ctx.msg.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
-  ctx.msg.header_version = WAMBLE_PROTO_VERSION;
-  ctx.msg.seq_num = 401;
-  ctx.msg.board_id = board->id;
-  ctx.msg.token[0] = 0x81;
+  struct WambleMsg req = {0};
+  req.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  req.header_version = WAMBLE_PROTO_VERSION;
+  req.seq_num = 401;
+  req.board_id = board->id;
+  req.token[0] = 0x81;
 
+  RecvOneCtx terminal_rx = {.sock = pair.cli};
   wamble_thread_t th;
-  T_ASSERT(wamble_thread_create(&th, handle_message_thread, &ctx) == 0);
+  T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &terminal_rx) ==
+           0);
 
-  struct WambleMsg rx = {0};
-  struct sockaddr_in from;
-  T_ASSERT(recv_message_with_timeout(pair.cli, &rx, &from, 1000) > 0);
-  T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SPECTATE_UPDATE);
-  T_ASSERT((rx.flags & WAMBLE_FLAG_UNRELIABLE) == 0);
+  T_ASSERT_EQ_INT(handle_message(pair.srv, &req, &pair.cliaddr, 0, "p1"),
+                  SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  T_ASSERT_EQ_INT(terminal_rx.received, 1);
+  T_ASSERT_EQ_INT(terminal_rx.msg.ctrl, WAMBLE_CTRL_SPECTATE_UPDATE);
+  T_ASSERT((terminal_rx.msg.flags & WAMBLE_FLAG_UNRELIABLE) == 0);
   {
-    const WambleMessageExtField *state = find_ext_field(&rx, "spectate.state");
+    const WambleMessageExtField *state =
+        find_ext_field(&terminal_rx.msg, "spectate.state");
     T_ASSERT(state != NULL);
     T_ASSERT_EQ_INT(state->value_type, WAMBLE_TREATMENT_VALUE_STRING);
     T_ASSERT(strcmp(state->string_value, "focus") == 0);
   }
-  T_ASSERT_STATUS_OK(ack_terminal_and_expect_request_ack(pair.cli, &rx, &from,
-                                                         ctx.msg.seq_num));
-
-  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
-  T_ASSERT_EQ_INT(ctx.status, SERVER_OK);
+  struct WambleMsg ack = {0};
+  struct sockaddr_in ack_from;
+  T_ASSERT(recv_message_with_timeout(pair.cli, &ack, &ack_from, 1000) > 0);
+  T_ASSERT_EQ_INT(ack.ctrl, WAMBLE_CTRL_ACK);
+  T_ASSERT_EQ_INT((int)ack.seq_num, (int)req.seq_num);
 
   spectator_manager_shutdown();
   cleanup_udp_loopback_pair(&pair);

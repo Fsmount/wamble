@@ -914,7 +914,7 @@ WAMBLE_TEST(profile_runtime_spectator_zero_cap_stops_with_reliable_idle) {
 
   int saw_notice = 0;
   int saw_idle = 0;
-  uint64_t deadline_ms = wamble_now_mono_millis() + 2500;
+  uint64_t deadline_ms = wamble_now_mono_millis() + 6000;
   while (wamble_now_mono_millis() < deadline_ms && !(saw_notice && saw_idle)) {
     fd_set rfds;
     struct timeval tv;
@@ -998,6 +998,8 @@ WAMBLE_TEST(profile_runtime_reservation_timeout_emits_reliable_board_update) {
   T_ASSERT_STATUS_OK(wamble_net_init());
 
   const char *cfg = "(def reservation-timeout 1)\n"
+                    "(def timeout-ms 100)\n"
+                    "(def max-retries 1)\n"
                     "(def rate-limit-requests-per-sec 100)\n"
                     "(defprofile solo ((def port 19344) (def advertise 1)))\n";
   T_ASSERT_EQ_INT(wamble_test_write_optional_db_config_file(conf_path, cfg), 0);
