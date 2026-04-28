@@ -1,5 +1,6 @@
 #include "common/wamble_test.h"
 #include "wamble/wamble.h"
+#include "wamble/wamble_db.h"
 
 WAMBLE_TEST(spectator_summary_and_focus_flow) {
   char msg[128];
@@ -659,6 +660,58 @@ WAMBLE_TEST(spectator_truncated_focus_retries_next_tick) {
   return 0;
 }
 
+WAMBLE_TEST(spectator_focus_render_does_not_refresh_last_mover_liveness) {
+  char msg[128];
+  T_ASSERT_STATUS(config_load(NULL, NULL, msg, sizeof(msg)),
+                  CONFIG_LOAD_DEFAULTS);
+  spectator_manager_init();
+  board_manager_init();
+  player_manager_init();
+
+  WambleIntentBuffer intents = {0};
+  wamble_intents_init(&intents);
+  wamble_set_intent_buffer(&intents);
+
+  WamblePlayer *last_mover = create_new_player();
+  T_ASSERT(last_mover != NULL);
+  WambleBoard *board = find_board_for_player(last_mover);
+  T_ASSERT(board != NULL);
+  board_move_played(board->id, last_mover->token, NULL);
+  wamble_intents_clear(&intents);
+
+  time_t old_seen = wamble_now_wall() - 30;
+  last_mover->last_seen_time = old_seen;
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons((uint16_t)get_config()->port);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+  uint8_t spectator_token[TOKEN_LENGTH] = {33};
+  struct WambleMsg req = {0};
+  req.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  req.board_id = board->id;
+  memcpy(req.token, spectator_token, TOKEN_LENGTH);
+
+  SpectatorState state = SPECTATOR_STATE_IDLE;
+  uint64_t focus = 0;
+  T_ASSERT_EQ_INT(
+      spectator_handle_request(&req, &addr, 0, 0, 1, &state, &focus),
+      SPECTATOR_OK_FOCUS);
+
+  SpectatorUpdate updates[4];
+  int count = spectator_collect_updates(updates, 4);
+  T_ASSERT(count > 0);
+  T_ASSERT_EQ_INT((int)last_mover->last_seen_time, (int)old_seen);
+  T_ASSERT_EQ_INT(intents.count, 0);
+
+  wamble_set_intent_buffer(NULL);
+  wamble_intents_free(&intents);
+  spectator_manager_shutdown();
+  return 0;
+}
+
 WAMBLE_TESTS_BEGIN_NAMED(spectator_tests) {
   WAMBLE_TESTS_ADD_FM(spectator_summary_and_focus_flow, "spectator");
   WAMBLE_TESTS_ADD_FM(spectator_summary_updates_emit_full_snapshots,
@@ -674,5 +727,7 @@ WAMBLE_TESTS_BEGIN_NAMED(spectator_tests) {
   WAMBLE_TESTS_ADD_FM(spectator_truncated_summary_retries_next_tick,
                       "spectator");
   WAMBLE_TESTS_ADD_FM(spectator_truncated_focus_retries_next_tick, "spectator");
+  WAMBLE_TESTS_ADD_FM(
+      spectator_focus_render_does_not_refresh_last_mover_liveness, "spectator");
 }
 WAMBLE_TESTS_END()

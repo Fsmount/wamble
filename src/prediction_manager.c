@@ -264,17 +264,17 @@ static int prediction_treatment_feature_bool(const uint8_t *token,
       }
     }
     if (have_prev && fact_count + 2 <= 32) {
-      WamblePlayer *prev = get_player_by_token(board->last_mover_token);
-      if (prev) {
+      WamblePlayer prev;
+      if (get_player_snapshot_by_token(board->last_mover_token, &prev) == 0) {
         snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
                  "previous_player.rating");
         facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
-        facts[fact_count].double_value = prev->rating;
+        facts[fact_count].double_value = prev.rating;
         fact_count++;
         snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
                  "previous_player.score");
         facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
-        facts[fact_count].double_value = prev->score;
+        facts[fact_count].double_value = prev.score;
         fact_count++;
       }
     }
