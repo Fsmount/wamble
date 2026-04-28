@@ -418,6 +418,45 @@ WamblePlayer *get_player_by_token(const uint8_t *token) {
   return NULL;
 }
 
+int get_player_snapshot_by_token(const uint8_t *token, WamblePlayer *out) {
+  if (!token || !out || !player_manager_ready_flag)
+    return -1;
+
+  memset(out, 0, sizeof(*out));
+  wamble_mutex_lock(&player_mutex);
+
+  int idx = player_map_get(token);
+  if (idx >= 0) {
+    *out = player_pool[idx];
+    wamble_mutex_unlock(&player_mutex);
+    return 0;
+  }
+
+  uint64_t session_id = 0;
+  DbStatus st =
+      wamble_query_get_persistent_session_by_token(token, &session_id);
+  if (st == DB_OK && session_id > 0) {
+    uint8_t session_pubkey[WAMBLE_PUBLIC_KEY_LENGTH] = {0};
+    int session_has_identity = 0;
+    DbStatus pk_st = wamble_query_get_session_public_key(
+        session_id, session_pubkey, &session_has_identity);
+    if (pk_st == DB_OK || pk_st == DB_NOT_FOUND) {
+      memcpy(out->token, token, TOKEN_LENGTH);
+      if (session_has_identity) {
+        memcpy(out->public_key, session_pubkey, WAMBLE_PUBLIC_KEY_LENGTH);
+        out->has_persistent_identity = true;
+      }
+      hydrate_player_from_session(out, session_id);
+      wamble_mutex_unlock(&player_mutex);
+      return 0;
+    }
+  }
+
+  wamble_mutex_unlock(&player_mutex);
+  memset(out, 0, sizeof(*out));
+  return -1;
+}
+
 WamblePlayer *create_new_player(void) {
   if (!player_manager_ready_flag)
     return NULL;

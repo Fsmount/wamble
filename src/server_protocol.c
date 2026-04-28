@@ -442,18 +442,18 @@ static void write_visible_board_fen(const uint8_t *token,
   memset(facts, 0, sizeof(facts));
   int fact_count = wamble_collect_board_treatment_facts(board, facts, 24);
   if (token_has_any_byte(board->last_mover_token) && fact_count + 2 <= 24) {
-    WamblePlayer *prev = get_player_by_token(board->last_mover_token);
-    if (prev) {
+    WamblePlayer prev;
+    if (get_player_snapshot_by_token(board->last_mover_token, &prev) == 0) {
       snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
                "previous_player.rating");
       facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
-      facts[fact_count].double_value = prev->rating;
+      facts[fact_count].double_value = prev.rating;
       fact_count++;
 
       snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
                "previous_player.score");
       facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
-      facts[fact_count].double_value = prev->score;
+      facts[fact_count].double_value = prev.score;
       fact_count++;
     }
   }
@@ -492,18 +492,18 @@ static int prediction_read_uses_move_projection(const uint8_t *token,
   memset(facts, 0, sizeof(facts));
   int fact_count = wamble_collect_board_treatment_facts(board, facts, 24);
   if (token_has_any_byte(board->last_mover_token) && fact_count + 2 <= 24) {
-    WamblePlayer *prev = get_player_by_token(board->last_mover_token);
-    if (prev) {
+    WamblePlayer prev;
+    if (get_player_snapshot_by_token(board->last_mover_token, &prev) == 0) {
       snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
                "previous_player.rating");
       facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
-      facts[fact_count].double_value = prev->rating;
+      facts[fact_count].double_value = prev.rating;
       fact_count++;
 
       snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
                "previous_player.score");
       facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
-      facts[fact_count].double_value = prev->score;
+      facts[fact_count].double_value = prev.score;
       fact_count++;
     }
   }
@@ -1120,18 +1120,18 @@ static int collect_board_read_treatment_facts(const WambleBoard *board,
   fact_count = wamble_collect_board_treatment_facts(board, facts, max_facts);
   if (token_has_any_byte(board->last_mover_token) &&
       fact_count + 2 <= max_facts) {
-    WamblePlayer *prev = get_player_by_token(board->last_mover_token);
-    if (prev) {
+    WamblePlayer prev;
+    if (get_player_snapshot_by_token(board->last_mover_token, &prev) == 0) {
       snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
                "previous_player.rating");
       facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
-      facts[fact_count].double_value = prev->rating;
+      facts[fact_count].double_value = prev.rating;
       fact_count++;
 
       snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
                "previous_player.score");
       facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
-      facts[fact_count].double_value = prev->score;
+      facts[fact_count].double_value = prev.score;
       fact_count++;
     }
   }

@@ -2252,6 +2252,7 @@ int player_collect_expired_session_notifications(
     ExpiredSessionNotification *out, int max);
 
 WamblePlayer *get_player_by_token(const uint8_t *token);
+int get_player_snapshot_by_token(const uint8_t *token, WamblePlayer *out);
 void discard_player_by_token(const uint8_t *token);
 
 void rng_init(void);
