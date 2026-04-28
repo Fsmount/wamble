@@ -1397,7 +1397,7 @@ static void profile_runtime_step(RunningProfile *rp) {
     cleanup_expired_sessions();
     rp->last_cleanup = now;
   }
-  if (now - rp->last_tick > 1) {
+  if (now - rp->last_tick >= 1) {
     player_manager_tick();
     board_manager_tick();
     spectator_manager_tick();

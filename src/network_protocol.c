@@ -337,6 +337,31 @@ static int ctrl_is_supported(uint8_t ctrl) {
   }
 }
 
+static int ctrl_is_client_request(uint8_t ctrl) {
+  switch (ctrl) {
+  case WAMBLE_CTRL_CLIENT_HELLO:
+  case WAMBLE_CTRL_PLAYER_MOVE:
+  case WAMBLE_CTRL_LIST_PROFILES:
+  case WAMBLE_CTRL_GET_PROFILE_INFO:
+  case WAMBLE_CTRL_GET_PROFILE_TOS:
+  case WAMBLE_CTRL_ACCEPT_PROFILE_TOS:
+  case WAMBLE_CTRL_GET_ACTIVE_RESERVATIONS:
+  case WAMBLE_CTRL_LOGIN_REQUEST:
+  case WAMBLE_CTRL_LOGOUT:
+  case WAMBLE_CTRL_CLIENT_GOODBYE:
+  case WAMBLE_CTRL_SPECTATE_GAME:
+  case WAMBLE_CTRL_SPECTATE_STOP:
+  case WAMBLE_CTRL_GET_PLAYER_STATS:
+  case WAMBLE_CTRL_GET_LEGAL_MOVES:
+  case WAMBLE_CTRL_GET_LEADERBOARD:
+  case WAMBLE_CTRL_GET_PREDICTIONS:
+  case WAMBLE_CTRL_SUBMIT_PREDICTION:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
 static int token_has_any_byte(const uint8_t *token) {
   if (!token)
     return 0;
@@ -1124,7 +1149,7 @@ static int receive_message_from_packet_impl(wamble_socket_t sockfd,
         is_dup = 1;
     }
   }
-  if (msg->ctrl != WAMBLE_CTRL_ACK &&
+  if (ctrl_is_client_request(msg->ctrl) &&
       (msg->flags & WAMBLE_FLAG_UNRELIABLE) == 0 && is_dup) {
     if (session)
       session->last_seen = wamble_now_wall();
@@ -1617,6 +1642,50 @@ int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
   return send_reliable_serialized_packet(
       sockfd, reliable_msg.token, reliable_msg.seq_num, send_buffer,
       serialized_size, cliaddr, timeout_ms, max_retries);
+}
+
+int send_reliable_message_once(wamble_socket_t sockfd,
+                               const struct WambleMsg *msg,
+                               const struct sockaddr_in *cliaddr) {
+  if (!msg || !cliaddr)
+    return -1;
+  struct WambleMsg reliable_msg = *msg;
+  reliable_msg.flags = (uint8_t)(reliable_msg.flags & ~WAMBLE_FLAG_UNRELIABLE);
+  if (reliable_msg.seq_num == 0)
+    reliable_msg.seq_num = reserve_reliable_seq_num(cliaddr, msg->token);
+
+  uint8_t send_buffer[WAMBLE_MAX_PACKET_SIZE];
+  size_t serialized_size = 0;
+  NetworkStatus serialize_status =
+      wamble_packet_serialize(&reliable_msg, send_buffer, sizeof(send_buffer),
+                              &serialized_size, reliable_msg.flags);
+  if (serialize_status != NET_OK)
+    return -1;
+
+  int ws_rc = ws_gateway_queue_packet(cliaddr, send_buffer, serialized_size);
+  if (ws_rc > 0) {
+    terminal_cache_store_for_current_request(send_buffer, serialized_size);
+    return ws_gateway_flush_route(cliaddr);
+  }
+  if (ws_rc < 0)
+    return -1;
+
+  ssize_t bytes_sent = sendto(sockfd, (const char *)send_buffer,
+#ifdef WAMBLE_PLATFORM_WINDOWS
+                              (int)serialized_size,
+#else
+                              (size_t)serialized_size,
+#endif
+                              0, (const struct sockaddr *)cliaddr,
+#ifdef WAMBLE_PLATFORM_WINDOWS
+                              (int)sizeof(*cliaddr)
+#else
+                              (wamble_socklen_t)sizeof(*cliaddr)
+#endif
+  );
+  if (bytes_sent < 0)
+    return -1;
+  return 0;
 }
 
 static int send_reliable_spectate_state_update(
