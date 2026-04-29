@@ -1183,10 +1183,11 @@ static void profile_runtime_send_reliable_spectate_transition(
 
 static void profile_runtime_send_spectator_updates(RunningProfile *rp) {
   const WambleConfig *cfg = get_config();
-  int cap = cfg->max_client_sessions;
-  int summary_cap = cfg->max_boards + 1;
-  if (cap < summary_cap)
-    cap = summary_cap;
+  int cap = spectator_manager_active_count_for_port(rp->cfg.port);
+  if (cap < cfg->max_boards + 1)
+    cap = cfg->max_boards + 1;
+  if (cap < cfg->max_players)
+    cap = cfg->max_players;
   if (cap < 1)
     cap = 1;
   SpectatorUpdate *events =
@@ -1276,9 +1277,9 @@ static WsGatewayStatus profile_ws_reconcile(RunningProfile *rp) {
   if (udp_port <= 0)
     udp_port = rp->cfg.port;
   WsGatewayStatus ws_status = WS_GATEWAY_OK;
-  rp->ws_gateway = ws_gateway_start(
-      rp->name ? rp->name : "default", profile_ws_port(rp), udp_port,
-      rp->cfg.websocket_path, rp->cfg.max_client_sessions, &ws_status);
+  rp->ws_gateway =
+      ws_gateway_start(rp->name ? rp->name : "default", profile_ws_port(rp),
+                       udp_port, rp->cfg.websocket_path, &ws_status);
   if (!rp->ws_gateway) {
     publish_ws_gateway_status(ws_status, rp->name);
     if (ws_status == WS_GATEWAY_ERR_CONFIG) {
@@ -1603,10 +1604,8 @@ static int runtime_cfg_requires_restart(const WambleConfig *a,
                                         const WambleConfig *b) {
   if (!a || !b)
     return 1;
-  return a->buffer_size != b->buffer_size ||
-         a->max_client_sessions != b->max_client_sessions ||
-         a->max_boards != b->max_boards || a->min_boards != b->min_boards ||
-         a->max_players != b->max_players ||
+  return a->buffer_size != b->buffer_size || a->max_boards != b->max_boards ||
+         a->min_boards != b->min_boards || a->max_players != b->max_players ||
          !cfg_str_eq(a->db_host, b->db_host) ||
          !cfg_str_eq(a->db_user, b->db_user) ||
          !cfg_str_eq(a->db_pass, b->db_pass) ||
@@ -1627,7 +1626,6 @@ static int runtime_cfg_equals(const WambleConfig *a, const WambleConfig *b) {
          a->timeout_ms == b->timeout_ms && a->max_retries == b->max_retries &&
          a->max_message_size == b->max_message_size &&
          a->buffer_size == b->buffer_size &&
-         a->max_client_sessions == b->max_client_sessions &&
          a->rate_limit_requests_per_sec == b->rate_limit_requests_per_sec &&
          a->session_timeout == b->session_timeout &&
          a->max_boards == b->max_boards && a->min_boards == b->min_boards &&

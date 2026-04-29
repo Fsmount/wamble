@@ -483,7 +483,8 @@ Spectator Policy
 
 Sessions
 - A session is identified by a `token` and the client's address:port.
-- Session table size is `max-client-sessions` per listener.
+- Session tables grow on demand per listener and expire inactive entries using
+  `session-timeout`.
 - Request throughput can be limited per token using
   `rate-limit-requests-per-sec`; bypass is policy-controlled via
   `rate_limit.bypass` with resource `request`.

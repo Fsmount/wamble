@@ -89,34 +89,46 @@ static int is_valid_stats_handle(const char *handle) {
 }
 
 static int ensure_rate_limit_entries(void) {
-  int desired = get_config()->max_client_sessions;
-  if (desired <= 0)
-    desired = 1;
-  if (g_rate_limit_entries && g_rate_limit_capacity == desired)
+  if (g_rate_limit_entries && g_rate_limit_capacity > 0)
     return 0;
-
-  RequestRateLimitEntry *next = calloc((size_t)desired, sizeof(*next));
+  RequestRateLimitEntry *next = calloc(1, sizeof(*next));
   if (!next)
     return -1;
-  free(g_rate_limit_entries);
   g_rate_limit_entries = next;
-  g_rate_limit_capacity = desired;
+  g_rate_limit_capacity = 1;
   return 0;
 }
 
-static int ensure_login_challenge_entries(void) {
-  int desired = get_config()->max_client_sessions;
-  if (desired <= 0)
-    desired = 1;
-  if (g_login_challenge_entries && g_login_challenge_capacity == desired)
-    return 0;
-  LoginChallengeEntry *next = calloc((size_t)desired, sizeof(*next));
+static RequestRateLimitEntry *grow_rate_limit_entries(void) {
+  int old_capacity = g_rate_limit_capacity;
+  int new_capacity = old_capacity > 0 ? old_capacity * 2 : 1;
+  if (new_capacity <= old_capacity)
+    return NULL;
+  RequestRateLimitEntry *next = (RequestRateLimitEntry *)realloc(
+      g_rate_limit_entries, (size_t)new_capacity * sizeof(*next));
   if (!next)
-    return -1;
-  free(g_login_challenge_entries);
+    return NULL;
+  memset(&next[old_capacity], 0,
+         (size_t)(new_capacity - old_capacity) * sizeof(*next));
+  g_rate_limit_entries = next;
+  g_rate_limit_capacity = new_capacity;
+  return &g_rate_limit_entries[old_capacity];
+}
+
+static LoginChallengeEntry *grow_login_challenge_entries(void) {
+  int old_capacity = g_login_challenge_capacity;
+  int new_capacity = old_capacity > 0 ? old_capacity * 2 : 1;
+  if (new_capacity <= old_capacity)
+    return NULL;
+  LoginChallengeEntry *next = (LoginChallengeEntry *)realloc(
+      g_login_challenge_entries, (size_t)new_capacity * sizeof(*next));
+  if (!next)
+    return NULL;
+  memset(&next[old_capacity], 0,
+         (size_t)(new_capacity - old_capacity) * sizeof(*next));
   g_login_challenge_entries = next;
-  g_login_challenge_capacity = desired;
-  return 0;
+  g_login_challenge_capacity = new_capacity;
+  return &g_login_challenge_entries[old_capacity];
 }
 
 static int login_challenge_is_fresh(uint64_t issued_at_ms);
@@ -161,7 +173,7 @@ acquire_login_challenge_entry(const uint8_t *token) {
   }
   if (oldest_expired >= 0)
     return &g_login_challenge_entries[oldest_expired];
-  return NULL;
+  return grow_login_challenge_entries();
 }
 
 static void clear_login_challenge(const uint8_t *token) {
@@ -176,8 +188,6 @@ static int
 issue_login_challenge(const uint8_t *token, const uint8_t *public_key,
                       uint8_t out_challenge[WAMBLE_LOGIN_CHALLENGE_LENGTH]) {
   if (!token || !public_key || !out_challenge)
-    return -1;
-  if (ensure_login_challenge_entries() != 0)
     return -1;
   LoginChallengeEntry *entry = acquire_login_challenge_entry(token);
   if (!entry)
@@ -238,8 +248,7 @@ static int verify_login_proof(const struct WambleMsg *msg) {
                  : 0;
 
 done:
-  if (!verified)
-    memset(entry, 0, sizeof(*entry));
+  memset(entry, 0, sizeof(*entry));
   return verified ? 0 : -1;
 }
 
@@ -649,9 +658,10 @@ static int rate_limit_allowed(const uint8_t *token, int max_per_sec) {
       entry->count = 0;
     }
   } else {
-    if (free_idx < 0)
+    entry = free_idx >= 0 ? &g_rate_limit_entries[free_idx]
+                          : grow_rate_limit_entries();
+    if (!entry)
       return 0;
-    entry = &g_rate_limit_entries[free_idx];
     entry->used = 1;
     memcpy(entry->token, token, TOKEN_LENGTH);
     entry->window_start_ms = now;

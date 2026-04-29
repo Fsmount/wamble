@@ -1994,7 +1994,6 @@ static const ConfigVarMap config_map[] = {
     CONF_ITEM("max-retries", CONF_INT, max_retries),
     CONF_ITEM("max-message-size", CONF_INT, max_message_size),
     CONF_ITEM("buffer-size", CONF_INT, buffer_size),
-    CONF_ITEM("max-client-sessions", CONF_INT, max_client_sessions),
     CONF_ITEM("terminal-cache-ttl-ms", CONF_INT, terminal_cache_ttl_ms),
     CONF_ITEM("rate-limit-requests-per-sec", CONF_INT,
               rate_limit_requests_per_sec),
@@ -2116,7 +2115,6 @@ static void config_set_defaults(void) {
   g_config.max_retries = 3;
   g_config.max_message_size = 126;
   g_config.buffer_size = 32768;
-  g_config.max_client_sessions = 1024;
   g_config.terminal_cache_ttl_ms = 2000;
   g_config.rate_limit_requests_per_sec = 120;
   g_config.session_timeout = 300;
