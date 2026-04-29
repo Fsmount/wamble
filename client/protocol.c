@@ -1328,16 +1328,14 @@ int decode_token_from_url(const char *url_string, uint8_t *token_buffer) {
 void crypto_blake2b(uint8_t *hash, size_t hash_size, const uint8_t *msg,
                     size_t msg_size);
 
-WAMBLE_WEAK void
-wamble_fragment_reassembly_init(WambleFragmentReassembly *reassembly) {
+void wamble_fragment_reassembly_init(WambleFragmentReassembly *reassembly) {
   if (!reassembly)
     return;
   memset(reassembly, 0, sizeof(*reassembly));
   reassembly->integrity = WAMBLE_FRAGMENT_INTEGRITY_UNKNOWN;
 }
 
-WAMBLE_WEAK void
-wamble_fragment_reassembly_reset(WambleFragmentReassembly *reassembly) {
+void wamble_fragment_reassembly_reset(WambleFragmentReassembly *reassembly) {
   if (!reassembly)
     return;
   reassembly->active = 0;
@@ -1353,8 +1351,7 @@ wamble_fragment_reassembly_reset(WambleFragmentReassembly *reassembly) {
     memset(reassembly->chunk_seen, 0, reassembly->chunk_seen_capacity);
 }
 
-WAMBLE_WEAK void
-wamble_fragment_reassembly_free(WambleFragmentReassembly *reassembly) {
+void wamble_fragment_reassembly_free(WambleFragmentReassembly *reassembly) {
   if (!reassembly)
     return;
   free(reassembly->data);
@@ -1444,8 +1441,72 @@ static int reassembly_begin_transfer(WambleFragmentReassembly *reassembly,
   return 0;
 }
 
-WAMBLE_WEAK WambleFragmentReassemblyResult wamble_fragment_reassembly_push(
-    WambleFragmentReassembly *reassembly, const struct WambleMsg *msg) {
+static int reassembly_payload_base_len(const uint8_t *payload,
+                                       size_t payload_len,
+                                       size_t *out_base_len) {
+  enum {
+    WAMBLE_EXT_MAGIC_0_LOCAL = 0x57,
+    WAMBLE_EXT_MAGIC_1_LOCAL = 0x58,
+    WAMBLE_EXT_VERSION_LOCAL = 1
+  };
+  if (!payload || !out_base_len)
+    return 0;
+  *out_base_len = payload_len;
+  if (payload_len < 4 || payload[payload_len - 4] != WAMBLE_EXT_MAGIC_0_LOCAL ||
+      payload[payload_len - 3] != WAMBLE_EXT_MAGIC_1_LOCAL) {
+    return 0;
+  }
+
+  uint16_t body_be = 0;
+  memcpy(&body_be, payload + payload_len - 2, 2);
+  size_t body_len = (size_t)ntohs(body_be);
+  if (body_len < 2 || body_len > payload_len - 4)
+    return 0;
+  *out_base_len = payload_len - 4 - body_len;
+
+  const uint8_t *p = payload + *out_base_len;
+  const uint8_t *end = p + body_len;
+  if (p[0] != WAMBLE_EXT_VERSION_LOCAL)
+    return 0;
+  uint8_t count = p[1];
+  p += 2;
+  for (uint8_t i = 0; i < count; i++) {
+    if ((size_t)(end - p) < 2)
+      return 0;
+    uint8_t key_len = *p++;
+    if (key_len == 0 || (size_t)(end - p) < (size_t)key_len + 1)
+      return 0;
+    p += key_len;
+    uint8_t value_type = *p++;
+    if (value_type == WAMBLE_TREATMENT_VALUE_STRING) {
+      if ((size_t)(end - p) < 2)
+        return 0;
+      uint16_t slen_be = 0;
+      memcpy(&slen_be, p, 2);
+      p += 2;
+      size_t slen = (size_t)ntohs(slen_be);
+      if ((size_t)(end - p) < slen)
+        return 0;
+      p += slen;
+    } else if (value_type == WAMBLE_TREATMENT_VALUE_INT ||
+               value_type == WAMBLE_TREATMENT_VALUE_DOUBLE) {
+      if ((size_t)(end - p) < 8)
+        return 0;
+      p += 8;
+    } else if (value_type == WAMBLE_TREATMENT_VALUE_BOOL) {
+      if ((size_t)(end - p) < 1)
+        return 0;
+      p += 1;
+    } else {
+      return 0;
+    }
+  }
+  return p == end;
+}
+
+WambleFragmentReassemblyResult
+wamble_fragment_reassembly_push(WambleFragmentReassembly *reassembly,
+                                const struct WambleMsg *msg) {
   if (!reassembly || !msg)
     return WAMBLE_FRAGMENT_REASSEMBLY_ERR_INVALID;
   if (!ctrl_supports_fragment_payload(msg->ctrl))
@@ -1498,6 +1559,14 @@ WAMBLE_WEAK WambleFragmentReassemblyResult wamble_fragment_reassembly_push(
   if (memcmp(computed_hash, reassembly->expected_hash,
              WAMBLE_FRAGMENT_HASH_LENGTH) == 0) {
     reassembly->integrity = WAMBLE_FRAGMENT_INTEGRITY_OK;
+    if (reassembly->ctrl == WAMBLE_CTRL_PROFILE_TOS_DATA) {
+      size_t base_len = 0;
+      if (reassembly_payload_base_len(
+              reassembly->data, (size_t)reassembly->total_len, &base_len) &&
+          base_len <= UINT32_MAX) {
+        reassembly->total_len = (uint32_t)base_len;
+      }
+    }
     return WAMBLE_FRAGMENT_REASSEMBLY_COMPLETE;
   }
   reassembly->integrity = WAMBLE_FRAGMENT_INTEGRITY_MISMATCH;

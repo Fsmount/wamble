@@ -55,12 +55,6 @@
 #include <string.h>
 #include <time.h>
 
-#if defined(_MSC_VER)
-#define WAMBLE_WEAK
-#else
-#define WAMBLE_WEAK __attribute__((weak))
-#endif
-
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 #define WAMBLE_ALIGNOF(type) _Alignof(type)
 #define WAMBLE_STATIC_ASSERT(name, expr) _Static_assert((expr), #name)
@@ -1872,9 +1866,9 @@ void send_ack(wamble_socket_t sockfd, const struct WambleMsg *msg,
 int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
                           const struct sockaddr_in *cliaddr, int timeout_ms,
                           int max_retries);
-int send_reliable_message_once(wamble_socket_t sockfd,
-                               const struct WambleMsg *msg,
-                               const struct sockaddr_in *cliaddr);
+int send_replayable_terminal_message(wamble_socket_t sockfd,
+                                     const struct WambleMsg *msg,
+                                     const struct sockaddr_in *cliaddr);
 int send_reliable_payload_bytes(wamble_socket_t sockfd, uint8_t ctrl,
                                 const uint8_t *token, uint64_t board_id,
                                 const uint8_t *payload, size_t payload_len,
