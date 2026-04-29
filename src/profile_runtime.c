@@ -1182,7 +1182,11 @@ static void profile_runtime_send_reliable_spectate_transition(
 }
 
 static void profile_runtime_send_spectator_updates(RunningProfile *rp) {
-  int cap = get_config()->max_client_sessions;
+  const WambleConfig *cfg = get_config();
+  int cap = cfg->max_client_sessions;
+  int summary_cap = cfg->max_boards + 1;
+  if (cap < summary_cap)
+    cap = summary_cap;
   if (cap < 1)
     cap = 1;
   SpectatorUpdate *events =

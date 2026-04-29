@@ -275,13 +275,7 @@ static void build_oversized_string_extensions(struct WambleMsg *msg) {
 
 static const WambleMessageExtField *find_ext_field(const struct WambleMsg *msg,
                                                    const char *key) {
-  if (!msg || !key)
-    return NULL;
-  for (uint8_t i = 0; i < msg->extensions.count; i++) {
-    if (strcmp(msg->extensions.fields[i].key, key) == 0)
-      return &msg->extensions.fields[i];
-  }
-  return NULL;
+  return wamble_msg_ext_find(msg, key);
 }
 
 static int parse_payload_string_ext(const uint8_t *payload, size_t payload_len,
@@ -2185,23 +2179,10 @@ WAMBLE_TEST(get_profile_info_long_name_roundtrip) {
 
 WAMBLE_TEST(profile_info_roundtrip) {
   config_load(NULL, NULL, NULL, 0);
-  wamble_socket_t srv = create_and_bind_socket(0);
-  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
-  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
-  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
 
-  struct sockaddr_in bindaddr;
-  memset(&bindaddr, 0, sizeof(bindaddr));
-  bindaddr.sin_family = AF_INET;
-  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  bindaddr.sin_port = 0;
-  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
-
-  struct sockaddr_in cliaddr;
-  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
-  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
-
-  RecvOneCtx ctx = {.sock = cli};
+  RecvOneCtx ctx = {.sock = pair.cli};
   wamble_thread_t th;
   T_ASSERT(wamble_thread_create(&th, recv_one_thread, &ctx) == 0);
 
@@ -2213,7 +2194,7 @@ WAMBLE_TEST(profile_info_roundtrip) {
            "alpha;8888;1;0");
   out.text.profile_info_len = (uint16_t)strlen(out.text.profile_info);
 
-  T_ASSERT_STATUS_OK(send_unreliable_packet(srv, &out, &cliaddr));
+  T_ASSERT_STATUS_OK(send_unreliable_packet(pair.srv, &out, &pair.cliaddr));
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
 
   T_ASSERT_EQ_INT(ctx.received, 1);
@@ -2222,8 +2203,7 @@ WAMBLE_TEST(profile_info_roundtrip) {
                   (int)strlen("alpha;8888;1;0"));
   T_ASSERT_STREQ(ctx.msg.text.profile_info, "alpha;8888;1;0");
 
-  wamble_close_socket(cli);
-  wamble_close_socket(srv);
+  cleanup_udp_loopback_pair(&pair);
   return 0;
 }
 
@@ -2287,23 +2267,10 @@ WAMBLE_TEST(profile_info_endpoint_ext_roundtrip) {
 
 WAMBLE_TEST(profiles_list_roundtrip) {
   config_load(NULL, NULL, NULL, 0);
-  wamble_socket_t srv = create_and_bind_socket(0);
-  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
-  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
-  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
 
-  struct sockaddr_in bindaddr;
-  memset(&bindaddr, 0, sizeof(bindaddr));
-  bindaddr.sin_family = AF_INET;
-  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  bindaddr.sin_port = 0;
-  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
-
-  struct sockaddr_in cliaddr;
-  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
-  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
-
-  RecvOneCtx ctx = {.sock = cli};
+  RecvOneCtx ctx = {.sock = pair.cli};
   wamble_thread_t th;
   T_ASSERT(wamble_thread_create(&th, recv_one_thread, &ctx) == 0);
 
@@ -2315,7 +2282,7 @@ WAMBLE_TEST(profiles_list_roundtrip) {
            "alpha,beta,canary");
   out.view.profiles_list_len = (uint16_t)strlen(out.view.profiles_list);
 
-  T_ASSERT_STATUS_OK(send_unreliable_packet(srv, &out, &cliaddr));
+  T_ASSERT_STATUS_OK(send_unreliable_packet(pair.srv, &out, &pair.cliaddr));
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
 
   T_ASSERT_EQ_INT(ctx.received, 1);
@@ -2324,8 +2291,7 @@ WAMBLE_TEST(profiles_list_roundtrip) {
                   (int)strlen("alpha,beta,canary"));
   T_ASSERT_STREQ(ctx.msg.view.profiles_list, "alpha,beta,canary");
 
-  wamble_close_socket(cli);
-  wamble_close_socket(srv);
+  cleanup_udp_loopback_pair(&pair);
   return 0;
 }
 
@@ -2457,21 +2423,8 @@ WAMBLE_TEST(server_protocol_client_hello_advertises_session_caps) {
   player_manager_init();
   board_manager_init();
 
-  wamble_socket_t srv = create_and_bind_socket(0);
-  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
-  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
-  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
-
-  struct sockaddr_in bindaddr;
-  memset(&bindaddr, 0, sizeof(bindaddr));
-  bindaddr.sin_family = AF_INET;
-  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  bindaddr.sin_port = 0;
-  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
-
-  struct sockaddr_in cliaddr;
-  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
-  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
 
   struct WambleMsg hello = {0};
   hello.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
@@ -2479,11 +2432,12 @@ WAMBLE_TEST(server_protocol_client_hello_advertises_session_caps) {
   hello.seq_num = 8;
   hello.token[0] = 0x33;
 
-  RecvOneCtx rx = {.sock = cli};
+  RecvOneCtx rx = {.sock = pair.cli};
   wamble_thread_t th;
   T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
 
-  T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_EQ_INT(handle_message(pair.srv, &hello, &pair.cliaddr, 0, "p1"),
+                  SERVER_OK);
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
   T_ASSERT_EQ_INT(rx.received, 1);
   T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -2504,8 +2458,7 @@ WAMBLE_TEST(server_protocol_client_hello_advertises_session_caps) {
   T_ASSERT(find_ext_field(&rx.msg, "trust.tier") == NULL);
   T_ASSERT(find_ext_field(&rx.msg, "prediction.source") == NULL);
 
-  wamble_close_socket(cli);
-  wamble_close_socket(srv);
+  cleanup_udp_loopback_pair(&pair);
   return 0;
 }
 
@@ -2595,31 +2548,19 @@ WAMBLE_TEST(server_protocol_client_hello_reuses_existing_reserved_board) {
   player_manager_init();
   board_manager_init();
 
-  wamble_socket_t srv = create_and_bind_socket(0);
-  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
-  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
-  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
-
-  struct sockaddr_in bindaddr;
-  memset(&bindaddr, 0, sizeof(bindaddr));
-  bindaddr.sin_family = AF_INET;
-  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  bindaddr.sin_port = 0;
-  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
-
-  struct sockaddr_in cliaddr;
-  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
-  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
 
   struct WambleMsg hello = {0};
   hello.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
   hello.header_version = WAMBLE_PROTO_VERSION;
   hello.token[0] = 0x51;
 
-  RecvOneCtx rx1 = {.sock = cli};
+  RecvOneCtx rx1 = {.sock = pair.cli};
   wamble_thread_t th1;
   T_ASSERT(wamble_thread_create(&th1, recv_one_and_ack_thread, &rx1) == 0);
-  T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_EQ_INT(handle_message(pair.srv, &hello, &pair.cliaddr, 0, "p1"),
+                  SERVER_OK);
   T_ASSERT_STATUS_OK(wamble_thread_join(th1, NULL));
   T_ASSERT_EQ_INT(rx1.received, 1);
   T_ASSERT_EQ_INT(rx1.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -2639,11 +2580,12 @@ WAMBLE_TEST(server_protocol_client_hello_reuses_existing_reserved_board) {
   hello_again.header_version = WAMBLE_PROTO_VERSION;
   memcpy(hello_again.token, rx1.msg.token, TOKEN_LENGTH);
 
-  RecvOneCtx rx2 = {.sock = cli};
+  RecvOneCtx rx2 = {.sock = pair.cli};
   wamble_thread_t th2;
   T_ASSERT(wamble_thread_create(&th2, recv_one_and_ack_thread, &rx2) == 0);
-  T_ASSERT_EQ_INT(handle_message(srv, &hello_again, &cliaddr, 0, "p1"),
-                  SERVER_OK);
+  T_ASSERT_EQ_INT(
+      handle_message(pair.srv, &hello_again, &pair.cliaddr, 0, "p1"),
+      SERVER_OK);
   T_ASSERT_STATUS_OK(wamble_thread_join(th2, NULL));
   T_ASSERT_EQ_INT(rx2.received, 1);
   T_ASSERT_EQ_INT(rx2.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -2661,8 +2603,7 @@ WAMBLE_TEST(server_protocol_client_hello_reuses_existing_reserved_board) {
   T_ASSERT_EQ_INT((int)reserved_at_ext_2->int_value,
                   (int)reserved_at_ext_1->int_value);
 
-  wamble_close_socket(cli);
-  wamble_close_socket(srv);
+  cleanup_udp_loopback_pair(&pair);
   return 0;
 }
 
@@ -2684,21 +2625,8 @@ WAMBLE_TEST(server_protocol_profile_info_advertises_profile_caps) {
     T_FAIL_SIMPLE("wamble_test_prepare_db failed");
   }
 
-  wamble_socket_t srv = create_and_bind_socket(0);
-  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
-  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
-  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
-
-  struct sockaddr_in bindaddr;
-  memset(&bindaddr, 0, sizeof(bindaddr));
-  bindaddr.sin_family = AF_INET;
-  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  bindaddr.sin_port = 0;
-  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
-
-  struct sockaddr_in cliaddr;
-  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
-  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
 
   struct WambleMsg req = {0};
   req.ctrl = WAMBLE_CTRL_GET_PROFILE_INFO;
@@ -2706,11 +2634,12 @@ WAMBLE_TEST(server_protocol_profile_info_advertises_profile_caps) {
   req.text.profile_name_len = 2;
   memcpy(req.text.profile_name, "p1", 2);
 
-  RecvOneCtx rx = {.sock = cli};
+  RecvOneCtx rx = {.sock = pair.cli};
   wamble_thread_t th;
   T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
 
-  T_ASSERT_EQ_INT(handle_message(srv, &req, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_EQ_INT(handle_message(pair.srv, &req, &pair.cliaddr, 0, "p1"),
+                  SERVER_OK);
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
   T_ASSERT_EQ_INT(rx.received, 1);
   T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_PROFILE_INFO);
@@ -2729,8 +2658,7 @@ WAMBLE_TEST(server_protocol_profile_info_advertises_profile_caps) {
   T_ASSERT_EQ_INT((int)ws_port->int_value, 0);
   T_ASSERT(ws_path == NULL);
 
-  wamble_close_socket(cli);
-  wamble_close_socket(srv);
+  cleanup_udp_loopback_pair(&pair);
   return 0;
 }
 
@@ -5524,6 +5452,9 @@ WAMBLE_TEST(server_protocol_prediction_submit_response_contract) {
   }
 
   T_ASSERT_EQ_INT(prediction_manager_init(), PREDICTION_MANAGER_OK);
+  WambleIntentBuffer intents = {0};
+  wamble_intents_init(&intents);
+  wamble_set_intent_buffer(&intents);
   player_manager_init();
   board_manager_init();
 
@@ -5545,6 +5476,17 @@ WAMBLE_TEST(server_protocol_prediction_submit_response_contract) {
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+  {
+    int selected_bytes = 0;
+    int attempted = 0;
+    int failures = 0;
+    wamble_persistence_clear_status();
+    T_ASSERT_EQ_INT(wamble_apply_intents_with_db_checked(
+                        &intents, 0, 0, &selected_bytes, &attempted, &failures),
+                    PERSISTENCE_STATUS_OK);
+    T_ASSERT_EQ_INT(failures, 0);
+    wamble_intents_clear(&intents);
+  }
 
   struct WambleMsg submit = {0};
   submit.ctrl = WAMBLE_CTRL_SUBMIT_PREDICTION;
@@ -5632,6 +5574,8 @@ WAMBLE_TEST(server_protocol_prediction_submit_response_contract) {
   }
 
   cleanup_udp_loopback_pair(&pair);
+  wamble_set_intent_buffer(NULL);
+  wamble_intents_free(&intents);
   return 0;
 }
 

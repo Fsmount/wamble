@@ -5,12 +5,6 @@
 #include "wamble/wamble.h"
 #include "wamble/wamble_db.h"
 
-#if defined(__GNUC__)
-__attribute__((weak)) void wamble_register_tests(void) {}
-#else
-void wamble_register_tests(void) {}
-#endif
-
 #include <errno.h>
 #include <math.h>
 #include <signal.h>
