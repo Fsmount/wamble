@@ -279,12 +279,8 @@ static SpectatorEntry *ensure_spectator(const struct sockaddr_in *addr,
       return &spectators[i];
     }
   }
-  if (spectator_count_for_port_locked(owner_port) >=
-      get_config()->max_client_sessions) {
-    return NULL;
-  }
   if (spectators_count >= spectators_capacity) {
-    int new_cap = spectators_capacity > 0 ? spectators_capacity * 2 : 16;
+    int new_cap = spectators_capacity > 0 ? spectators_capacity * 2 : 1;
     SpectatorEntry *new_entries = (SpectatorEntry *)realloc(
         spectators, (size_t)new_cap * sizeof(*spectators));
     if (!new_entries)
@@ -322,16 +318,7 @@ SpectatorInitStatus spectator_manager_init(void) {
   }
   spectators_count = 0;
 
-  spectators_capacity = get_config()->max_client_sessions;
-  if (spectators_capacity <= 0) {
-    wamble_mutex_unlock(&spectators_mutex);
-    return SPECTATOR_INIT_ERR_NO_CAPACITY;
-  }
-  spectators = calloc((size_t)spectators_capacity, sizeof(SpectatorEntry));
-  if (!spectators) {
-    wamble_mutex_unlock(&spectators_mutex);
-    return SPECTATOR_INIT_ERR_ALLOC;
-  }
+  spectators_capacity = 0;
 
   if (summary_cache) {
     free(summary_cache);

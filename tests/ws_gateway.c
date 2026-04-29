@@ -60,7 +60,7 @@ static int ws_start_gateway(int *out_port) {
     }
     g_last_ws_port = port;
     g_test_gateway =
-        ws_gateway_start("test", port, 1, "/ws", 8, &g_last_ws_status);
+        ws_gateway_start("test", port, 1, "/ws", &g_last_ws_status);
     if (g_test_gateway) {
       *out_port = port;
       return 0;

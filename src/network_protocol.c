@@ -1,4 +1,5 @@
 #include "../include/wamble/wamble.h"
+#include <limits.h>
 void crypto_blake2b(uint8_t *hash, size_t hash_size, const uint8_t *msg,
                     size_t msg_size);
 #define WAMBLE_PENDING_PACKET_CAP 64
@@ -37,11 +38,12 @@ static WAMBLE_THREAD_LOCAL WambleCurrentRequest g_current_request;
 
 static WAMBLE_THREAD_LOCAL WambleClientSession *client_sessions;
 static WAMBLE_THREAD_LOCAL int num_sessions = 0;
+static WAMBLE_THREAD_LOCAL int client_sessions_capacity = 0;
 static WAMBLE_THREAD_LOCAL uint32_t global_seq_num = 1;
 static WAMBLE_THREAD_LOCAL uint32_t global_fragment_transfer_id = 1;
 
-#define SESSION_MAP_SIZE (get_config()->max_client_sessions * 2)
 static WAMBLE_THREAD_LOCAL int *session_index_map;
+static WAMBLE_THREAD_LOCAL int session_index_map_capacity = 0;
 
 typedef struct TokenSessionMapEntry {
   int used;
@@ -50,6 +52,7 @@ typedef struct TokenSessionMapEntry {
 } TokenSessionMapEntry;
 
 static WAMBLE_THREAD_LOCAL TokenSessionMapEntry *token_session_index_map;
+static WAMBLE_THREAD_LOCAL int token_session_index_map_capacity = 0;
 
 typedef struct PendingPacket {
   struct sockaddr_in addr;
@@ -63,6 +66,7 @@ static WAMBLE_THREAD_LOCAL int pending_packet_head = 0;
 static WAMBLE_THREAD_LOCAL int pending_packet_count = 0;
 
 static int token_has_any_byte(const uint8_t *token);
+static int ensure_client_session_capacity(int needed);
 
 static inline uint64_t mix64_s(uint64_t x) {
   x ^= x >> 33;
@@ -86,16 +90,21 @@ static int sockaddr_in_equal(const struct sockaddr_in *a,
   return a->sin_addr.s_addr == b->sin_addr.s_addr && a->sin_port == b->sin_port;
 }
 
-static int session_map_capacity(void) {
-  int cap = SESSION_MAP_SIZE;
-  return cap > 0 ? cap : 0;
-}
+static int session_map_capacity(void) { return session_index_map_capacity; }
 
 static int session_map_next(int idx, int cap) {
   idx++;
   if (idx >= cap)
     idx = 0;
   return idx;
+}
+
+static int map_capacity_for_session_capacity(int session_capacity) {
+  if (session_capacity <= 0)
+    return 0;
+  if (session_capacity > INT_MAX / 2)
+    return 0;
+  return session_capacity * 2;
 }
 
 static void session_map_init(void) {
@@ -107,7 +116,7 @@ static void session_map_init(void) {
 }
 
 static void token_session_map_init(void) {
-  int cap = session_map_capacity();
+  int cap = token_session_index_map_capacity;
   if (!token_session_index_map || cap <= 0)
     return;
   memset(token_session_index_map, 0,
@@ -137,6 +146,14 @@ static void session_map_put(const struct sockaddr_in *addr, int index) {
   }
 }
 
+static void session_map_rebuild(void) {
+  session_map_init();
+  if (!client_sessions)
+    return;
+  for (int i = 0; i < num_sessions; i++)
+    session_map_put(&client_sessions[i].addr, i);
+}
+
 static int session_map_get(const struct sockaddr_in *addr) {
   int cap = session_map_capacity();
   if (!addr || !session_index_map || cap <= 0)
@@ -158,7 +175,7 @@ static int session_map_get(const struct sockaddr_in *addr) {
 }
 
 static int token_session_map_slot(const uint8_t *token, int create) {
-  int cap = session_map_capacity();
+  int cap = token_session_index_map_capacity;
   if (!token || !token_session_index_map || cap <= 0)
     return -1;
   uint32_t h = wamble_token_hash32(token);
@@ -479,10 +496,9 @@ static WambleClientSession *find_client_session_by_token(const uint8_t *token) {
 
 static WambleClientSession *
 create_client_session(const struct sockaddr_in *addr, const uint8_t *token) {
-  if (!client_sessions)
+  if (ensure_client_session_capacity(num_sessions + 1) != 0)
     return NULL;
-  if (num_sessions >= get_config()->max_client_sessions) {
-
+  if (num_sessions >= client_sessions_capacity) {
     return NULL;
   }
 
@@ -500,6 +516,72 @@ create_client_session(const struct sockaddr_in *addr, const uint8_t *token) {
   if (token_has_any_byte(token))
     token_session_map_put(token, (int)(session - client_sessions));
   return session;
+}
+
+static int ensure_client_session_capacity(int needed) {
+  int required_map_capacity =
+      map_capacity_for_session_capacity(client_sessions_capacity);
+  if (needed <= client_sessions_capacity && client_sessions &&
+      session_index_map && token_session_index_map &&
+      session_index_map_capacity >= required_map_capacity &&
+      token_session_index_map_capacity >= required_map_capacity)
+    return 0;
+  int old_capacity = client_sessions_capacity;
+  int new_capacity = old_capacity > 0 ? old_capacity : 1;
+  while (new_capacity < needed) {
+    if (new_capacity > INT_MAX / 2)
+      return -1;
+    new_capacity *= 2;
+  }
+  int map_capacity = map_capacity_for_session_capacity(new_capacity);
+  if (map_capacity <= 0)
+    return -1;
+
+  int current_request_index = -1;
+  if (g_current_request.session && client_sessions) {
+    current_request_index = (int)(g_current_request.session - client_sessions);
+    if (current_request_index < 0 || current_request_index >= num_sessions)
+      current_request_index = -1;
+  }
+
+  int *new_session_map =
+      (int *)malloc((size_t)map_capacity * sizeof(*new_session_map));
+  if (!new_session_map)
+    return -1;
+  TokenSessionMapEntry *new_token_map = (TokenSessionMapEntry *)malloc(
+      (size_t)map_capacity * sizeof(*new_token_map));
+  if (!new_token_map) {
+    free(new_session_map);
+    return -1;
+  }
+
+  WambleClientSession *grown_sessions = (WambleClientSession *)realloc(
+      client_sessions, (size_t)new_capacity * sizeof(*client_sessions));
+  if (!grown_sessions) {
+    free(new_session_map);
+    free(new_token_map);
+    return -1;
+  }
+  if (new_capacity > old_capacity) {
+    memset(grown_sessions + old_capacity, 0,
+           (size_t)(new_capacity - old_capacity) * sizeof(*grown_sessions));
+  }
+  client_sessions = grown_sessions;
+  client_sessions_capacity = new_capacity;
+
+  free(session_index_map);
+  session_index_map = new_session_map;
+  session_index_map_capacity = map_capacity;
+
+  free(token_session_index_map);
+  token_session_index_map = new_token_map;
+  token_session_index_map_capacity = map_capacity;
+
+  if (current_request_index >= 0)
+    g_current_request.session = &client_sessions[current_request_index];
+  session_map_rebuild();
+  token_session_map_rebuild();
+  return 0;
 }
 
 static void network_send_raw_to_client(wamble_socket_t sockfd,
@@ -725,6 +807,14 @@ static void update_client_session(const struct sockaddr_in *addr,
   }
 }
 
+static void rebind_client_session(WambleClientSession *session,
+                                  const struct sockaddr_in *addr) {
+  if (!session || !addr || sockaddr_in_equal(&session->addr, addr))
+    return;
+  session->addr = *addr;
+  session_map_rebuild();
+}
+
 static int reliable_sequence_is_duplicate(const WambleClientSession *session,
                                           uint32_t seq_num) {
   if (!session)
@@ -757,8 +847,10 @@ static int replay_duplicate_reliable_request(
   }
   if (!reliable_sequence_is_duplicate(session, msg->seq_num))
     return 0;
-  if (session)
+  if (session) {
+    rebind_client_session(session, cliaddr);
     session->last_seen = wamble_now_wall();
+  }
   (void)terminal_cache_replay(session, msg->seq_num, sockfd, cliaddr);
   send_ack(sockfd, msg, cliaddr);
   return 1;
@@ -784,31 +876,6 @@ static void admit_client_packet(const struct sockaddr_in *cliaddr,
 }
 
 void network_init_thread_state(void) {
-  if (!client_sessions) {
-    client_sessions = malloc(sizeof(WambleClientSession) *
-                             (size_t)get_config()->max_client_sessions);
-  }
-  if (!session_index_map) {
-    session_index_map =
-        malloc(sizeof(int) * (size_t)(get_config()->max_client_sessions * 2));
-  }
-  if (!token_session_index_map) {
-    token_session_index_map =
-        malloc(sizeof(*token_session_index_map) *
-               (size_t)(get_config()->max_client_sessions * 2));
-  }
-  if ((get_config()->max_client_sessions > 0) &&
-      (!client_sessions || !session_index_map || !token_session_index_map)) {
-    free(client_sessions);
-    free(session_index_map);
-    free(token_session_index_map);
-    client_sessions = NULL;
-    session_index_map = NULL;
-    token_session_index_map = NULL;
-    num_sessions = 0;
-    pending_packets_reset();
-    return;
-  }
   for (int i = 0; i < num_sessions; i++)
     terminal_cache_release(&client_sessions[i]);
   num_sessions = 0;
@@ -921,11 +988,6 @@ wamble_socket_t create_and_bind_socket(int port) {
   (void)wamble_set_nonblocking(sockfd);
 
   network_init_thread_state();
-  if (get_config()->max_client_sessions > 0 &&
-      (!client_sessions || !session_index_map)) {
-    wamble_close_socket(sockfd);
-    return WAMBLE_INVALID_SOCKET;
-  }
 
   return sockfd;
 }
@@ -1471,12 +1533,10 @@ int send_replayable_terminal_message(wamble_socket_t sockfd,
   if (serialize_status != NET_OK)
     return -1;
 
-  if (send_serialized_packet_once(sockfd, send_buffer, serialized_size, cliaddr,
-                                  NULL) != 0) {
-    return -1;
-  }
-  terminal_cache_store_for_current_request(send_buffer, serialized_size);
-  return 0;
+  return send_reliable_serialized_packet(
+      sockfd, reliable_msg.token, reliable_msg.seq_num, send_buffer,
+      serialized_size, cliaddr, get_config()->timeout_ms,
+      get_config()->max_retries);
 }
 
 static int send_reliable_spectate_state_update(
@@ -1633,11 +1693,8 @@ void cleanup_expired_sessions(void) {
   if (write_idx != num_sessions) {
     num_sessions = write_idx;
     g_current_request.session = NULL;
-    session_map_init();
+    session_map_rebuild();
     token_session_map_rebuild();
-    for (int i = 0; i < num_sessions; i++) {
-      session_map_put(&client_sessions[i].addr, i);
-    }
   }
 }
 

@@ -5336,6 +5336,7 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
   T_ASSERT_EQ_INT(st, SERVER_OK);
   T_ASSERT_EQ_INT(rx_challenge.received, 1);
   T_ASSERT_EQ_INT(rx_challenge.msg.ctrl, WAMBLE_CTRL_LOGIN_CHALLENGE);
+  T_ASSERT_EQ_INT(server_protocol_thread_pending_login_challenge_count(), 1);
 
   uint8_t bad_signature[WAMBLE_LOGIN_SIGNATURE_LENGTH] = {0};
   T_ASSERT(wamble_client_sign_challenge(secret_key, player->token, public_key,
@@ -5359,6 +5360,7 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
   T_ASSERT_EQ_INT(bad_st, SERVER_ERR_LOGIN_FAILED);
   T_ASSERT_EQ_INT(rx_bad.received, 1);
   T_ASSERT_EQ_INT(rx_bad.msg.ctrl, WAMBLE_CTRL_LOGIN_FAILED);
+  T_ASSERT_EQ_INT(server_protocol_thread_pending_login_challenge_count(), 0);
 
   RecvOneCtx rx_challenge_2 = {.sock = cli};
   wamble_thread_t th_challenge_2;
@@ -5369,6 +5371,7 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
   T_ASSERT_EQ_INT(st, SERVER_OK);
   T_ASSERT_EQ_INT(rx_challenge_2.received, 1);
   T_ASSERT_EQ_INT(rx_challenge_2.msg.ctrl, WAMBLE_CTRL_LOGIN_CHALLENGE);
+  T_ASSERT_EQ_INT(server_protocol_thread_pending_login_challenge_count(), 1);
 
   uint8_t good_signature[WAMBLE_LOGIN_SIGNATURE_LENGTH] = {0};
   T_ASSERT(wamble_client_sign_challenge(secret_key, player->token, public_key,
@@ -5391,6 +5394,7 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
   T_ASSERT_EQ_INT(ok_st, SERVER_OK);
   T_ASSERT_EQ_INT(rx_ok.received, 1);
   T_ASSERT_EQ_INT(rx_ok.msg.ctrl, WAMBLE_CTRL_LOGIN_SUCCESS);
+  T_ASSERT_EQ_INT(server_protocol_thread_pending_login_challenge_count(), 0);
   {
     const WambleMessageExtField *caps =
         find_ext_field(&rx_ok.msg, "session.caps");
@@ -5936,6 +5940,10 @@ WAMBLE_TEST(reliable_retry_from_new_source_replays_to_rebound_address) {
                       &saw_request_ack_cli2);
   T_ASSERT(saw_board_update_cli2 >= 1);
   T_ASSERT(saw_request_ack_cli2 >= 1);
+
+  struct sockaddr_in rebound = {0};
+  T_ASSERT_STATUS_OK(network_get_client_addr_by_token(token, &rebound));
+  T_ASSERT_EQ_INT(rebound.sin_port, dup_from.sin_port);
 
   int cli1_board = 0;
   int cli1_ack = 0;

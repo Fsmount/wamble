@@ -540,7 +540,6 @@ typedef struct WambleConfig {
   int max_retries;
   int max_message_size;
   int buffer_size;
-  int max_client_sessions;
   int terminal_cache_ttl_ms;
   int rate_limit_requests_per_sec;
   int session_timeout;
@@ -1889,7 +1888,7 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
 
 WambleWsGateway *ws_gateway_start(const char *profile_name, int ws_port,
                                   int udp_port, const char *ws_path,
-                                  int max_clients, WsGatewayStatus *out_status);
+                                  WsGatewayStatus *out_status);
 void ws_gateway_stop(WambleWsGateway *gateway);
 int ws_gateway_matches(const WambleWsGateway *gateway, int ws_port,
                        int udp_port, const char *ws_path);
