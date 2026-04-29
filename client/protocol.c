@@ -1444,64 +1444,11 @@ static int reassembly_begin_transfer(WambleFragmentReassembly *reassembly,
 static int reassembly_payload_base_len(const uint8_t *payload,
                                        size_t payload_len,
                                        size_t *out_base_len) {
-  enum {
-    WAMBLE_EXT_MAGIC_0_LOCAL = 0x57,
-    WAMBLE_EXT_MAGIC_1_LOCAL = 0x58,
-    WAMBLE_EXT_VERSION_LOCAL = 1
-  };
   if (!payload || !out_base_len)
     return 0;
-  *out_base_len = payload_len;
-  if (payload_len < 4 || payload[payload_len - 4] != WAMBLE_EXT_MAGIC_0_LOCAL ||
-      payload[payload_len - 3] != WAMBLE_EXT_MAGIC_1_LOCAL) {
-    return 0;
-  }
-
-  uint16_t body_be = 0;
-  memcpy(&body_be, payload + payload_len - 2, 2);
-  size_t body_len = (size_t)ntohs(body_be);
-  if (body_len < 2 || body_len > payload_len - 4)
-    return 0;
-  *out_base_len = payload_len - 4 - body_len;
-
-  const uint8_t *p = payload + *out_base_len;
-  const uint8_t *end = p + body_len;
-  if (p[0] != WAMBLE_EXT_VERSION_LOCAL)
-    return 0;
-  uint8_t count = p[1];
-  p += 2;
-  for (uint8_t i = 0; i < count; i++) {
-    if ((size_t)(end - p) < 2)
-      return 0;
-    uint8_t key_len = *p++;
-    if (key_len == 0 || (size_t)(end - p) < (size_t)key_len + 1)
-      return 0;
-    p += key_len;
-    uint8_t value_type = *p++;
-    if (value_type == WAMBLE_TREATMENT_VALUE_STRING) {
-      if ((size_t)(end - p) < 2)
-        return 0;
-      uint16_t slen_be = 0;
-      memcpy(&slen_be, p, 2);
-      p += 2;
-      size_t slen = (size_t)ntohs(slen_be);
-      if ((size_t)(end - p) < slen)
-        return 0;
-      p += slen;
-    } else if (value_type == WAMBLE_TREATMENT_VALUE_INT ||
-               value_type == WAMBLE_TREATMENT_VALUE_DOUBLE) {
-      if ((size_t)(end - p) < 8)
-        return 0;
-      p += 8;
-    } else if (value_type == WAMBLE_TREATMENT_VALUE_BOOL) {
-      if ((size_t)(end - p) < 1)
-        return 0;
-      p += 1;
-    } else {
-      return 0;
-    }
-  }
-  return p == end;
+  struct WambleMsg msg = {0};
+  return wamble_client_payload_decode_extensions(payload, payload_len, &msg,
+                                                 out_base_len) == 0;
 }
 
 WambleFragmentReassemblyResult

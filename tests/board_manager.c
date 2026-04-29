@@ -194,7 +194,7 @@ WAMBLE_TEST(board_inactivity_dormant_enqueues_release_for_last_mover) {
 
   int n = board_collect_reservation_release_notifications(drained, 8);
   T_ASSERT_EQ_INT(n, 1);
-  T_ASSERT(memcmp(drained[0].token, mover_token, TOKEN_LENGTH) == 0);
+  T_ASSERT(tokens_equal(drained[0].token, mover_token));
   T_ASSERT_EQ_INT((int)drained[0].board_id, (int)board_id);
   return 0;
 }

@@ -39,6 +39,7 @@ struct WambleWsGateway {
   char *ws_path;
   int ws_port;
   int udp_port;
+  int max_clients;
   int clients_capacity;
 
   wamble_socket_t listen_sock;
@@ -1329,7 +1330,13 @@ static int ws_allocate_client_slot(WambleWsGateway *gw, wamble_socket_t sock,
   wamble_mutex_lock(&gw->mutex);
   for (int i = 0; i < gw->clients_capacity; i++) {
     WsClientSlot *slot = gw->clients[i];
-    if (slot && !slot->in_use) {
+    if (!slot) {
+      slot = (WsClientSlot *)calloc(1, sizeof(*slot));
+      if (!slot)
+        continue;
+      gw->clients[i] = slot;
+    }
+    if (!slot->in_use) {
       slot->in_use = 1;
       slot->should_stop = 0;
       slot->upgraded = 0;
@@ -1344,6 +1351,8 @@ static int ws_allocate_client_slot(WambleWsGateway *gw, wamble_socket_t sock,
   if (*out_slot < 0) {
     int old_capacity = gw->clients_capacity;
     int new_capacity = old_capacity > 0 ? old_capacity * 2 : 1;
+    if (new_capacity > gw->max_clients)
+      new_capacity = gw->max_clients;
     if (new_capacity > old_capacity) {
       WsClientSlot **grown = (WsClientSlot **)realloc(
           gw->clients, (size_t)new_capacity * sizeof(*gw->clients));
@@ -1513,6 +1522,8 @@ WambleWsGateway *ws_gateway_start(const char *profile_name, int ws_port,
   gw->ws_path = ws_strdup_local(ws_path);
   gw->ws_port = ws_port;
   gw->udp_port = udp_port;
+  gw->max_clients =
+      get_config()->max_players > 0 ? get_config()->max_players : 1;
   gw->clients_capacity = 0;
   gw->listen_sock = WAMBLE_INVALID_SOCKET;
   gw->running = 0;

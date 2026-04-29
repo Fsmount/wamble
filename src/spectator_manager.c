@@ -749,16 +749,8 @@ static int fill_summary_now(SpectatorEntry *e, SpectatorUpdate *out,
                             int out_cap, int *out_count) {
   if (!e || !out || !out_count || out_cap <= 0)
     return -1;
-  int needed = 1;
-  for (int i = 0; i < summary_cache_count; i++) {
-    WambleBoard *b = summary_cache[i];
-    GameMode board_game_mode = b->board.game_mode;
-    if (e->game_mode_filter != 0 &&
-        !(e->game_mode_filter & (1u << board_game_mode)))
-      continue;
-    needed++;
-  }
-  if (out_cap - *out_count < needed)
+  int start_count = *out_count;
+  if (out_cap - *out_count < 1)
     return -1;
 
   uint64_t generation = ++summary_generation_counter;
@@ -776,6 +768,10 @@ static int fill_summary_now(SpectatorEntry *e, SpectatorUpdate *out,
     if (e->game_mode_filter != 0 &&
         !(e->game_mode_filter & (1u << board_game_mode)))
       continue;
+    if (*out_count >= out_cap) {
+      *out_count = start_count;
+      return -1;
+    }
     SpectatorUpdate *u = &out[*out_count];
     memset(u, 0, sizeof(*u));
     memcpy(u->token, e->token, TOKEN_LENGTH);

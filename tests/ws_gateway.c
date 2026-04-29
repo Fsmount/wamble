@@ -966,7 +966,7 @@ WAMBLE_TEST(ws_send_ack_writes_ack_packet_to_ws_route) {
   T_ASSERT_EQ_INT((int)decoded.ctrl, (int)WAMBLE_CTRL_ACK);
   T_ASSERT_EQ_INT((int)decoded.seq_num, 4242);
   T_ASSERT_EQ_INT((int)decoded.board_id, 17);
-  T_ASSERT(memcmp(decoded.token, bootstrap.token, TOKEN_LENGTH) == 0);
+  T_ASSERT(tokens_equal(decoded.token, bootstrap.token));
   return 0;
 }
 
