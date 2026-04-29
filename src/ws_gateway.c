@@ -40,6 +40,7 @@ struct WambleWsGateway {
   int ws_port;
   int udp_port;
   int max_clients;
+  int clients_capacity;
 
   wamble_socket_t listen_sock;
   wamble_thread_t thread;
@@ -49,7 +50,7 @@ struct WambleWsGateway {
   wamble_mutex_t mutex;
   wamble_cond_t clients_done;
   int active_client_threads;
-  WsClientSlot *clients;
+  WsClientSlot **clients;
   WsInboundPacket *inbound_packets;
   int inbound_cap;
   int inbound_head;
@@ -1270,16 +1271,18 @@ static void ws_mark_client_slot_closed(WambleWsGateway *gw, int slot_index) {
     return;
   uint32_t route_id = 0;
   wamble_mutex_lock(&gw->mutex);
-  if (slot_index < gw->max_clients) {
-    route_id = gw->clients[slot_index].route_id;
-    gw->clients[slot_index].in_use = 0;
-    gw->clients[slot_index].should_stop = 0;
-    gw->clients[slot_index].upgraded = 0;
-    gw->clients[slot_index].route_id = 0;
-    gw->clients[slot_index].tx_batch_len = 0;
-    memset(&gw->clients[slot_index].virtual_addr, 0,
-           sizeof(gw->clients[slot_index].virtual_addr));
-    gw->clients[slot_index].tcp_sock = WAMBLE_INVALID_SOCKET;
+  if (slot_index < gw->clients_capacity) {
+    WsClientSlot *slot = gw->clients[slot_index];
+    if (slot) {
+      route_id = slot->route_id;
+      slot->in_use = 0;
+      slot->should_stop = 0;
+      slot->upgraded = 0;
+      slot->route_id = 0;
+      slot->tx_batch_len = 0;
+      memset(&slot->virtual_addr, 0, sizeof(slot->virtual_addr));
+      slot->tcp_sock = WAMBLE_INVALID_SOCKET;
+    }
   }
   if (gw->active_client_threads > 0)
     gw->active_client_threads--;
@@ -1301,9 +1304,10 @@ static void *ws_client_main(void *arg) {
   WsClientSlot *slot = NULL;
 
   wamble_mutex_lock(&gw->mutex);
-  if (slot_index >= 0 && slot_index < gw->max_clients) {
-    slot = &gw->clients[slot_index];
-    tcp_sock = slot->tcp_sock;
+  if (slot_index >= 0 && slot_index < gw->clients_capacity) {
+    slot = gw->clients[slot_index];
+    if (slot)
+      tcp_sock = slot->tcp_sock;
   }
   wamble_mutex_unlock(&gw->mutex);
 
@@ -1324,18 +1328,51 @@ static int ws_allocate_client_slot(WambleWsGateway *gw, wamble_socket_t sock,
     return -1;
   *out_slot = -1;
   wamble_mutex_lock(&gw->mutex);
-  for (int i = 0; i < gw->max_clients; i++) {
-    if (!gw->clients[i].in_use) {
-      gw->clients[i].in_use = 1;
-      gw->clients[i].should_stop = 0;
-      gw->clients[i].upgraded = 0;
-      gw->clients[i].route_id = 0;
-      gw->clients[i].tx_batch_len = 0;
-      memset(&gw->clients[i].virtual_addr, 0,
-             sizeof(gw->clients[i].virtual_addr));
-      gw->clients[i].tcp_sock = sock;
+  for (int i = 0; i < gw->clients_capacity; i++) {
+    WsClientSlot *slot = gw->clients[i];
+    if (!slot) {
+      slot = (WsClientSlot *)calloc(1, sizeof(*slot));
+      if (!slot)
+        continue;
+      gw->clients[i] = slot;
+    }
+    if (!slot->in_use) {
+      slot->in_use = 1;
+      slot->should_stop = 0;
+      slot->upgraded = 0;
+      slot->route_id = 0;
+      slot->tx_batch_len = 0;
+      memset(&slot->virtual_addr, 0, sizeof(slot->virtual_addr));
+      slot->tcp_sock = sock;
       *out_slot = i;
       break;
+    }
+  }
+  if (*out_slot < 0) {
+    int old_capacity = gw->clients_capacity;
+    int new_capacity = old_capacity > 0 ? old_capacity * 2 : 1;
+    if (new_capacity > gw->max_clients)
+      new_capacity = gw->max_clients;
+    if (new_capacity > old_capacity) {
+      WsClientSlot **grown = (WsClientSlot **)realloc(
+          gw->clients, (size_t)new_capacity * sizeof(*gw->clients));
+      if (grown) {
+        memset(grown + old_capacity, 0,
+               (size_t)(new_capacity - old_capacity) * sizeof(*grown));
+        WsClientSlot *slot = (WsClientSlot *)calloc(1, sizeof(*slot));
+        if (!slot) {
+          gw->clients = grown;
+          gw->clients_capacity = new_capacity;
+          wamble_mutex_unlock(&gw->mutex);
+          return -1;
+        }
+        slot->tcp_sock = sock;
+        slot->in_use = 1;
+        gw->clients = grown;
+        gw->clients_capacity = new_capacity;
+        gw->clients[old_capacity] = slot;
+        *out_slot = old_capacity;
+      }
     }
   }
   wamble_mutex_unlock(&gw->mutex);
@@ -1447,14 +1484,14 @@ static wamble_socket_t ws_create_listener(int port) {
 static void ws_request_client_shutdowns(WambleWsGateway *gateway) {
   if (!gateway || !gateway->clients)
     return;
-  for (int i = 0; i < gateway->max_clients; i++) {
-    if (gateway->clients[i].in_use &&
-        gateway->clients[i].tcp_sock != WAMBLE_INVALID_SOCKET) {
-      gateway->clients[i].should_stop = 1;
+  for (int i = 0; i < gateway->clients_capacity; i++) {
+    WsClientSlot *slot = gateway->clients[i];
+    if (slot && slot->in_use && slot->tcp_sock != WAMBLE_INVALID_SOCKET) {
+      slot->should_stop = 1;
 #ifdef WAMBLE_PLATFORM_WINDOWS
-      (void)shutdown(gateway->clients[i].tcp_sock, SD_BOTH);
+      (void)shutdown(slot->tcp_sock, SD_BOTH);
 #else
-      (void)shutdown(gateway->clients[i].tcp_sock, SHUT_RDWR);
+      (void)shutdown(slot->tcp_sock, SHUT_RDWR);
 #endif
     }
   }
@@ -1462,7 +1499,6 @@ static void ws_request_client_shutdowns(WambleWsGateway *gateway) {
 
 WambleWsGateway *ws_gateway_start(const char *profile_name, int ws_port,
                                   int udp_port, const char *ws_path,
-                                  int max_clients,
                                   WsGatewayStatus *out_status) {
   WsGatewayStatus status = WS_GATEWAY_OK;
   int sync_ready = 0;
@@ -1478,9 +1514,6 @@ WambleWsGateway *ws_gateway_start(const char *profile_name, int ws_port,
     status = WS_GATEWAY_ERR_CONFIG;
     goto fail;
   }
-  if (max_clients <= 0)
-    max_clients = 1;
-
   gw = (WambleWsGateway *)calloc(1, sizeof(WambleWsGateway));
   if (!gw)
     goto fail_alloc;
@@ -1489,7 +1522,9 @@ WambleWsGateway *ws_gateway_start(const char *profile_name, int ws_port,
   gw->ws_path = ws_strdup_local(ws_path);
   gw->ws_port = ws_port;
   gw->udp_port = udp_port;
-  gw->max_clients = max_clients;
+  gw->max_clients =
+      get_config()->max_players > 0 ? get_config()->max_players : 1;
+  gw->clients_capacity = 0;
   gw->listen_sock = WAMBLE_INVALID_SOCKET;
   gw->running = 0;
   gw->should_stop = 0;
@@ -1502,21 +1537,12 @@ WambleWsGateway *ws_gateway_start(const char *profile_name, int ws_port,
   if (!gw->profile_name || !gw->ws_path)
     goto fail_alloc;
 
-  gw->clients =
-      (WsClientSlot *)calloc((size_t)gw->max_clients, sizeof(WsClientSlot));
-  if (!gw->clients)
-    goto fail_alloc;
-  gw->inbound_cap = gw->max_clients * 32;
-  if (gw->inbound_cap < WS_INBOUND_QUEUE_CAP_DEFAULT)
-    gw->inbound_cap = WS_INBOUND_QUEUE_CAP_DEFAULT;
+  gw->inbound_cap = WS_INBOUND_QUEUE_CAP_DEFAULT;
   gw->inbound_packets = (WsInboundPacket *)calloc((size_t)gw->inbound_cap,
                                                   sizeof(WsInboundPacket));
   if (!gw->inbound_packets)
     goto fail_alloc;
 
-  for (int i = 0; i < gw->max_clients; i++) {
-    gw->clients[i].tcp_sock = WAMBLE_INVALID_SOCKET;
-  }
   wamble_mutex_init(&gw->mutex);
   wamble_cond_init(&gw->clients_done);
   sync_ready = 1;
@@ -1550,6 +1576,8 @@ fail:
     wamble_cond_destroy(&gw->clients_done);
     wamble_mutex_destroy(&gw->mutex);
   }
+  for (int i = 0; i < gw->clients_capacity; i++)
+    free(gw->clients ? gw->clients[i] : NULL);
   free(gw->clients);
   free(gw->inbound_packets);
   free(gw->profile_name);
@@ -1587,6 +1615,8 @@ void ws_gateway_stop(WambleWsGateway *gateway) {
 
   wamble_cond_destroy(&gateway->clients_done);
   wamble_mutex_destroy(&gateway->mutex);
+  for (int i = 0; i < gateway->clients_capacity; i++)
+    free(gateway->clients ? gateway->clients[i] : NULL);
   free(gateway->clients);
   free(gateway->inbound_packets);
   free(gateway->profile_name);
@@ -1606,6 +1636,15 @@ int ws_gateway_matches(const WambleWsGateway *gateway, int ws_port,
   if (strcmp(gateway->ws_path, ws_path) != 0)
     return 0;
   return 1;
+}
+
+int ws_gateway_active_client_count(WambleWsGateway *gateway) {
+  if (!gateway)
+    return 0;
+  wamble_mutex_lock(&gateway->mutex);
+  int n = gateway->active_client_threads;
+  wamble_mutex_unlock(&gateway->mutex);
+  return n;
 }
 
 int ws_gateway_pop_packet(WambleWsGateway *gateway, uint8_t *packet,
@@ -1655,10 +1694,10 @@ int ws_gateway_queue_packet(const struct sockaddr_in *cliaddr,
 
   int result = -1;
   wamble_mutex_lock(&gw->mutex);
-  if (gw->should_stop || slot_index >= gw->max_clients)
+  if (gw->should_stop || slot_index >= gw->clients_capacity)
     goto done;
-  WsClientSlot *slot = &gw->clients[slot_index];
-  if (!slot->in_use || !slot->upgraded || slot->route_id != route_id ||
+  WsClientSlot *slot = gw->clients[slot_index];
+  if (!slot || !slot->in_use || !slot->upgraded || slot->route_id != route_id ||
       !ws_sockaddr_equal(&slot->virtual_addr, cliaddr) ||
       slot->tcp_sock == WAMBLE_INVALID_SOCKET) {
     goto done;
@@ -1702,13 +1741,45 @@ done:
   return result;
 }
 
+int ws_gateway_flush_route(const struct sockaddr_in *cliaddr) {
+  if (!cliaddr)
+    return -1;
+  WambleWsGateway *gw = NULL;
+  int slot_index = -1;
+  uint32_t route_id = 0;
+  if (!ws_route_lookup(cliaddr, &gw, &slot_index, &route_id))
+    return -1;
+  if (!gw || slot_index < 0)
+    return -1;
+  int rc = -1;
+  wamble_mutex_lock(&gw->mutex);
+  if (gw->should_stop || slot_index >= gw->clients_capacity)
+    goto done;
+  WsClientSlot *slot = gw->clients[slot_index];
+  if (!slot || !slot->in_use || !slot->upgraded || slot->route_id != route_id ||
+      !ws_sockaddr_equal(&slot->virtual_addr, cliaddr) ||
+      slot->tcp_sock == WAMBLE_INVALID_SOCKET) {
+    goto done;
+  }
+  if (ws_slot_flush_locked(gw, slot) != 0) {
+    slot->should_stop = 1;
+    publish_ws_gateway_status_detail(WS_GATEWAY_STATUS_OUTBOUND_FLUSH_FAILED,
+                                     gw, "flush_route");
+    goto done;
+  }
+  rc = 0;
+done:
+  wamble_mutex_unlock(&gw->mutex);
+  return rc;
+}
+
 void ws_gateway_flush_outbound(WambleWsGateway *gateway) {
   if (!gateway)
     return;
   wamble_mutex_lock(&gateway->mutex);
-  for (int i = 0; i < gateway->max_clients; i++) {
-    WsClientSlot *slot = &gateway->clients[i];
-    if (!slot->in_use || !slot->upgraded || slot->should_stop ||
+  for (int i = 0; i < gateway->clients_capacity; i++) {
+    WsClientSlot *slot = gateway->clients[i];
+    if (!slot || !slot->in_use || !slot->upgraded || slot->should_stop ||
         slot->tcp_sock == WAMBLE_INVALID_SOCKET || slot->tx_batch_len == 0) {
       continue;
     }

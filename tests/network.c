@@ -39,6 +39,21 @@ typedef struct {
   int received;
 } RecvOneCtx;
 
+typedef struct {
+  wamble_socket_t sockfd;
+  struct WambleMsg msg;
+  struct sockaddr_in cliaddr;
+  int trust_tier;
+  const char *profile_name;
+  ServerStatus status;
+} HandleMessageCtx;
+
+typedef struct {
+  wamble_socket_t srv;
+  wamble_socket_t cli;
+  struct sockaddr_in cliaddr;
+} UdpLoopbackPair;
+
 static void *recv_one_thread(void *arg) {
   RecvOneCtx *c = arg;
   fd_set rfds;
@@ -77,6 +92,83 @@ static void *recv_one_and_ack_thread(void *arg) {
     send_ack(c->sock, &c->msg, &c->from);
   }
   return NULL;
+}
+
+static void *handle_message_thread(void *arg) {
+  HandleMessageCtx *ctx = arg;
+  ctx->status = handle_message(ctx->sockfd, &ctx->msg, &ctx->cliaddr,
+                               ctx->trust_tier, ctx->profile_name);
+  return NULL;
+}
+
+static int recv_message_with_timeout(wamble_socket_t sock,
+                                     struct WambleMsg *msg,
+                                     struct sockaddr_in *from, int timeout_ms) {
+  fd_set rfds;
+  struct timeval tv;
+  FD_ZERO(&rfds);
+  FD_SET(sock, &rfds);
+  tv.tv_sec = timeout_ms / 1000;
+  tv.tv_usec = (timeout_ms % 1000) * 1000;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+  int ready = select(0, &rfds, NULL, NULL, &tv);
+#else
+  int ready = select(sock + 1, &rfds, NULL, NULL, &tv);
+#endif
+  if (ready <= 0)
+    return ready;
+  return receive_message(sock, msg, from);
+}
+
+static int init_udp_loopback_pair(UdpLoopbackPair *pair) {
+  struct sockaddr_in bindaddr;
+  wamble_socklen_t slen;
+
+  T_ASSERT(pair != NULL);
+  memset(pair, 0, sizeof(*pair));
+  pair->srv = create_and_bind_socket(0);
+  T_ASSERT(pair->srv != WAMBLE_INVALID_SOCKET);
+  pair->cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(pair->cli != WAMBLE_INVALID_SOCKET);
+
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(
+      bind(pair->cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  slen = (wamble_socklen_t)sizeof(pair->cliaddr);
+  T_ASSERT_STATUS_OK(
+      getsockname(pair->cli, (struct sockaddr *)&pair->cliaddr, &slen));
+  return 0;
+}
+
+static void cleanup_udp_loopback_pair(UdpLoopbackPair *pair) {
+  if (!pair)
+    return;
+  if (pair->cli != WAMBLE_INVALID_SOCKET)
+    wamble_close_socket(pair->cli);
+  if (pair->srv != WAMBLE_INVALID_SOCKET)
+    wamble_close_socket(pair->srv);
+  pair->cli = WAMBLE_INVALID_SOCKET;
+  pair->srv = WAMBLE_INVALID_SOCKET;
+}
+
+static int ack_terminal_and_expect_request_ack(wamble_socket_t cli,
+                                               const struct WambleMsg *terminal,
+                                               const struct sockaddr_in *from,
+                                               uint32_t request_seq) {
+  struct WambleMsg rx = {0};
+  struct sockaddr_in ack_from;
+
+  T_ASSERT(terminal != NULL);
+  T_ASSERT(from != NULL);
+  send_ack(cli, terminal, from);
+  T_ASSERT(recv_message_with_timeout(cli, &rx, &ack_from, 1000) > 0);
+  T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_ACK);
+  T_ASSERT_EQ_INT((int)rx.seq_num, (int)request_seq);
+  return 0;
 }
 
 typedef struct {
@@ -183,13 +275,7 @@ static void build_oversized_string_extensions(struct WambleMsg *msg) {
 
 static const WambleMessageExtField *find_ext_field(const struct WambleMsg *msg,
                                                    const char *key) {
-  if (!msg || !key)
-    return NULL;
-  for (uint8_t i = 0; i < msg->extensions.count; i++) {
-    if (strcmp(msg->extensions.fields[i].key, key) == 0)
-      return &msg->extensions.fields[i];
-  }
-  return NULL;
+  return wamble_msg_ext_find(msg, key);
 }
 
 static int parse_payload_string_ext(const uint8_t *payload, size_t payload_len,
@@ -2093,23 +2179,10 @@ WAMBLE_TEST(get_profile_info_long_name_roundtrip) {
 
 WAMBLE_TEST(profile_info_roundtrip) {
   config_load(NULL, NULL, NULL, 0);
-  wamble_socket_t srv = create_and_bind_socket(0);
-  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
-  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
-  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
 
-  struct sockaddr_in bindaddr;
-  memset(&bindaddr, 0, sizeof(bindaddr));
-  bindaddr.sin_family = AF_INET;
-  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  bindaddr.sin_port = 0;
-  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
-
-  struct sockaddr_in cliaddr;
-  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
-  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
-
-  RecvOneCtx ctx = {.sock = cli};
+  RecvOneCtx ctx = {.sock = pair.cli};
   wamble_thread_t th;
   T_ASSERT(wamble_thread_create(&th, recv_one_thread, &ctx) == 0);
 
@@ -2121,7 +2194,7 @@ WAMBLE_TEST(profile_info_roundtrip) {
            "alpha;8888;1;0");
   out.text.profile_info_len = (uint16_t)strlen(out.text.profile_info);
 
-  T_ASSERT_STATUS_OK(send_unreliable_packet(srv, &out, &cliaddr));
+  T_ASSERT_STATUS_OK(send_unreliable_packet(pair.srv, &out, &pair.cliaddr));
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
 
   T_ASSERT_EQ_INT(ctx.received, 1);
@@ -2130,8 +2203,7 @@ WAMBLE_TEST(profile_info_roundtrip) {
                   (int)strlen("alpha;8888;1;0"));
   T_ASSERT_STREQ(ctx.msg.text.profile_info, "alpha;8888;1;0");
 
-  wamble_close_socket(cli);
-  wamble_close_socket(srv);
+  cleanup_udp_loopback_pair(&pair);
   return 0;
 }
 
@@ -2195,23 +2267,10 @@ WAMBLE_TEST(profile_info_endpoint_ext_roundtrip) {
 
 WAMBLE_TEST(profiles_list_roundtrip) {
   config_load(NULL, NULL, NULL, 0);
-  wamble_socket_t srv = create_and_bind_socket(0);
-  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
-  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
-  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
 
-  struct sockaddr_in bindaddr;
-  memset(&bindaddr, 0, sizeof(bindaddr));
-  bindaddr.sin_family = AF_INET;
-  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  bindaddr.sin_port = 0;
-  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
-
-  struct sockaddr_in cliaddr;
-  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
-  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
-
-  RecvOneCtx ctx = {.sock = cli};
+  RecvOneCtx ctx = {.sock = pair.cli};
   wamble_thread_t th;
   T_ASSERT(wamble_thread_create(&th, recv_one_thread, &ctx) == 0);
 
@@ -2223,7 +2282,7 @@ WAMBLE_TEST(profiles_list_roundtrip) {
            "alpha,beta,canary");
   out.view.profiles_list_len = (uint16_t)strlen(out.view.profiles_list);
 
-  T_ASSERT_STATUS_OK(send_unreliable_packet(srv, &out, &cliaddr));
+  T_ASSERT_STATUS_OK(send_unreliable_packet(pair.srv, &out, &pair.cliaddr));
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
 
   T_ASSERT_EQ_INT(ctx.received, 1);
@@ -2232,8 +2291,7 @@ WAMBLE_TEST(profiles_list_roundtrip) {
                   (int)strlen("alpha,beta,canary"));
   T_ASSERT_STREQ(ctx.msg.view.profiles_list, "alpha,beta,canary");
 
-  wamble_close_socket(cli);
-  wamble_close_socket(srv);
+  cleanup_udp_loopback_pair(&pair);
   return 0;
 }
 
@@ -2365,21 +2423,8 @@ WAMBLE_TEST(server_protocol_client_hello_advertises_session_caps) {
   player_manager_init();
   board_manager_init();
 
-  wamble_socket_t srv = create_and_bind_socket(0);
-  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
-  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
-  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
-
-  struct sockaddr_in bindaddr;
-  memset(&bindaddr, 0, sizeof(bindaddr));
-  bindaddr.sin_family = AF_INET;
-  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  bindaddr.sin_port = 0;
-  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
-
-  struct sockaddr_in cliaddr;
-  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
-  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
 
   struct WambleMsg hello = {0};
   hello.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
@@ -2387,11 +2432,12 @@ WAMBLE_TEST(server_protocol_client_hello_advertises_session_caps) {
   hello.seq_num = 8;
   hello.token[0] = 0x33;
 
-  RecvOneCtx rx = {.sock = cli};
+  RecvOneCtx rx = {.sock = pair.cli};
   wamble_thread_t th;
   T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
 
-  T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_EQ_INT(handle_message(pair.srv, &hello, &pair.cliaddr, 0, "p1"),
+                  SERVER_OK);
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
   T_ASSERT_EQ_INT(rx.received, 1);
   T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -2412,8 +2458,152 @@ WAMBLE_TEST(server_protocol_client_hello_advertises_session_caps) {
   T_ASSERT(find_ext_field(&rx.msg, "trust.tier") == NULL);
   T_ASSERT(find_ext_field(&rx.msg, "prediction.source") == NULL);
 
-  wamble_close_socket(cli);
-  wamble_close_socket(srv);
+  cleanup_udp_loopback_pair(&pair);
+  return 0;
+}
+
+WAMBLE_TEST(server_protocol_client_hello_advertises_prediction_limits) {
+  const char *cfg_path = "build/test_network_client_hello_prediction_caps.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(def prediction-mode 2)\n"
+                    "(def prediction-max-pending 7)\n"
+                    "(defprofile p1 ((def port 19427) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 2, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'client_hello', '*', 'allow', 0, "
+          "'hello_access', 'test'), "
+          "(0, 'protocol.ctrl', 'get_predictions', '*', 'allow', 0, "
+          "'prediction_read_proto', 'test'), "
+          "(0, 'protocol.ctrl', 'submit_prediction', '*', 'allow', 0, "
+          "'prediction_submit_proto', 'test'), "
+          "(0, 'prediction.write', 'streak', '*', 'allow', 2, 'write', "
+          "'test'), "
+          "(0, 'prediction.read', 'tree', '*', 'allow', 2, 'read', 'test');") !=
+      0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  T_ASSERT_EQ_INT(prediction_manager_init(), PREDICTION_MANAGER_OK);
+  player_manager_init();
+  board_manager_init();
+
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
+
+  struct WambleMsg hello = {0};
+  hello.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  hello.header_version = WAMBLE_PROTO_VERSION;
+  hello.seq_num = 8;
+  hello.token[0] = 0x55;
+
+  RecvOneCtx rx = {.sock = pair.cli};
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
+
+  T_ASSERT_EQ_INT(handle_message(pair.srv, &hello, &pair.cliaddr, 0, "p1"),
+                  SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  T_ASSERT_EQ_INT(rx.received, 1);
+  T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+
+  {
+    const WambleMessageExtField *caps = find_ext_field(&rx.msg, "session.caps");
+    const WambleMessageExtField *source =
+        find_ext_field(&rx.msg, "prediction.source");
+    const WambleMessageExtField *max_pending =
+        find_ext_field(&rx.msg, "prediction.max_pending");
+    T_ASSERT(caps != NULL);
+    T_ASSERT(source != NULL);
+    T_ASSERT(max_pending != NULL);
+    T_ASSERT((caps->int_value & WAMBLE_SESSION_UI_CAP_PREDICTION_SUBMIT) != 0);
+    T_ASSERT((caps->int_value & WAMBLE_SESSION_UI_CAP_PREDICTION_READ) != 0);
+    T_ASSERT_STREQ(source->string_value, "tree");
+    T_ASSERT_EQ_INT((int)max_pending->int_value, 7);
+  }
+
+  cleanup_udp_loopback_pair(&pair);
+  return 0;
+}
+
+WAMBLE_TEST(server_protocol_client_hello_reuses_existing_reserved_board) {
+  const char *cfg_path = "build/test_network_client_hello_reuse_board.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(def reservation-timeout 120)\n"
+                    "(defprofile p1 ((def port 19421) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 2, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'client_hello', '*', 'allow', 0, "
+          "'hello_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
+
+  struct WambleMsg hello = {0};
+  hello.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  hello.header_version = WAMBLE_PROTO_VERSION;
+  hello.token[0] = 0x51;
+
+  RecvOneCtx rx1 = {.sock = pair.cli};
+  wamble_thread_t th1;
+  T_ASSERT(wamble_thread_create(&th1, recv_one_and_ack_thread, &rx1) == 0);
+  T_ASSERT_EQ_INT(handle_message(pair.srv, &hello, &pair.cliaddr, 0, "p1"),
+                  SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th1, NULL));
+  T_ASSERT_EQ_INT(rx1.received, 1);
+  T_ASSERT_EQ_INT(rx1.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+
+  uint64_t board_id_1 = rx1.msg.board_id;
+  WambleBoard *board_1 = get_board_by_id(board_id_1);
+  T_ASSERT(board_1 != NULL);
+  time_t reserved_at_1 = board_1->reservation_time;
+  T_ASSERT(board_is_reserved_for_player(board_id_1, rx1.msg.token));
+  const WambleMessageExtField *reserved_at_ext_1 =
+      find_ext_field(&rx1.msg, "reservation.reserved_at");
+  T_ASSERT(reserved_at_ext_1 != NULL);
+  T_ASSERT_EQ_INT(reserved_at_ext_1->value_type, WAMBLE_TREATMENT_VALUE_INT);
+
+  struct WambleMsg hello_again = {0};
+  hello_again.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  hello_again.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(hello_again.token, rx1.msg.token, TOKEN_LENGTH);
+
+  RecvOneCtx rx2 = {.sock = pair.cli};
+  wamble_thread_t th2;
+  T_ASSERT(wamble_thread_create(&th2, recv_one_and_ack_thread, &rx2) == 0);
+  T_ASSERT_EQ_INT(
+      handle_message(pair.srv, &hello_again, &pair.cliaddr, 0, "p1"),
+      SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th2, NULL));
+  T_ASSERT_EQ_INT(rx2.received, 1);
+  T_ASSERT_EQ_INT(rx2.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+  T_ASSERT(tokens_equal(rx1.msg.token, rx2.msg.token));
+  T_ASSERT_EQ_INT((int)rx2.msg.board_id, (int)board_id_1);
+  T_ASSERT(board_is_reserved_for_player(rx2.msg.board_id, rx2.msg.token));
+
+  WambleBoard *board_2 = get_board_by_id(rx2.msg.board_id);
+  T_ASSERT(board_2 != NULL);
+  T_ASSERT_EQ_INT((int)board_2->reservation_time, (int)reserved_at_1);
+  const WambleMessageExtField *reserved_at_ext_2 =
+      find_ext_field(&rx2.msg, "reservation.reserved_at");
+  T_ASSERT(reserved_at_ext_2 != NULL);
+  T_ASSERT_EQ_INT(reserved_at_ext_2->value_type, WAMBLE_TREATMENT_VALUE_INT);
+  T_ASSERT_EQ_INT((int)reserved_at_ext_2->int_value,
+                  (int)reserved_at_ext_1->int_value);
+
+  cleanup_udp_loopback_pair(&pair);
   return 0;
 }
 
@@ -2435,21 +2625,8 @@ WAMBLE_TEST(server_protocol_profile_info_advertises_profile_caps) {
     T_FAIL_SIMPLE("wamble_test_prepare_db failed");
   }
 
-  wamble_socket_t srv = create_and_bind_socket(0);
-  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
-  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
-  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
-
-  struct sockaddr_in bindaddr;
-  memset(&bindaddr, 0, sizeof(bindaddr));
-  bindaddr.sin_family = AF_INET;
-  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  bindaddr.sin_port = 0;
-  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
-
-  struct sockaddr_in cliaddr;
-  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
-  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
 
   struct WambleMsg req = {0};
   req.ctrl = WAMBLE_CTRL_GET_PROFILE_INFO;
@@ -2457,11 +2634,12 @@ WAMBLE_TEST(server_protocol_profile_info_advertises_profile_caps) {
   req.text.profile_name_len = 2;
   memcpy(req.text.profile_name, "p1", 2);
 
-  RecvOneCtx rx = {.sock = cli};
+  RecvOneCtx rx = {.sock = pair.cli};
   wamble_thread_t th;
   T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
 
-  T_ASSERT_EQ_INT(handle_message(srv, &req, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_EQ_INT(handle_message(pair.srv, &req, &pair.cliaddr, 0, "p1"),
+                  SERVER_OK);
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
   T_ASSERT_EQ_INT(rx.received, 1);
   T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_PROFILE_INFO);
@@ -2480,8 +2658,7 @@ WAMBLE_TEST(server_protocol_profile_info_advertises_profile_caps) {
   T_ASSERT_EQ_INT((int)ws_port->int_value, 0);
   T_ASSERT(ws_path == NULL);
 
-  wamble_close_socket(cli);
-  wamble_close_socket(srv);
+  cleanup_udp_loopback_pair(&pair);
   return 0;
 }
 
@@ -2648,6 +2825,145 @@ WAMBLE_TEST(server_protocol_accept_profile_tos_persists_terms) {
   return 0;
 }
 
+WAMBLE_TEST(server_protocol_get_profile_tos_does_not_create_session) {
+  const char *cfg_path = "build/test_network_get_profile_tos_no_session.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19423) (def advertise 1) "
+                    "(def tos-text \"profile terms v1\")))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'get_profile_tos', '*', 'allow', 0, "
+          "'get_profile_tos_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  struct WambleMsg tos_req = {0};
+  tos_req.ctrl = WAMBLE_CTRL_GET_PROFILE_TOS;
+  tos_req.header_version = WAMBLE_PROTO_VERSION;
+  tos_req.seq_num = 103;
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    tos_req.token[i] = (uint8_t)(0xb0 + i);
+  memcpy(tos_req.text.profile_name, "p1", 2);
+  tos_req.text.profile_name_len = 2;
+
+  RecvTosFragmentsCtx rx_tos = {.sock = cli};
+  wamble_thread_t th_tos;
+  T_ASSERT(wamble_thread_create(&th_tos, recv_tos_fragments_and_ack_thread,
+                                &rx_tos) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &tos_req, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_tos, NULL));
+  T_ASSERT_EQ_INT(rx_tos.received, 1);
+  T_ASSERT_EQ_INT(rx_tos.expected_chunks, 1);
+  {
+    uint64_t sid = 0;
+    T_ASSERT_EQ_INT(wamble_query_get_session_by_token(tos_req.token, &sid),
+                    DB_NOT_FOUND);
+  }
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(server_protocol_accept_profile_tos_requires_existing_session) {
+  const char *cfg_path = "build/test_network_accept_profile_tos_session.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19423) (def advertise 1) "
+                    "(def tos-text \"profile terms v1\")))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'accept_profile_tos', '*', 'allow', 0, "
+          "'accept_profile_tos_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  struct WambleMsg accept = {0};
+  accept.ctrl = WAMBLE_CTRL_ACCEPT_PROFILE_TOS;
+  accept.header_version = WAMBLE_PROTO_VERSION;
+  accept.seq_num = 102;
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    accept.token[i] = (uint8_t)(0xa0 + i);
+  memcpy(accept.text.profile_name, "p1", 2);
+  accept.text.profile_name_len = 2;
+
+  RecvOneCtx rx_accept = {.sock = cli};
+  wamble_thread_t th_accept;
+  T_ASSERT(wamble_thread_create(&th_accept, recv_one_and_ack_thread,
+                                &rx_accept) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &accept, &cliaddr, 0, "p1"),
+                  SERVER_ERR_FORBIDDEN);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_accept, NULL));
+  T_ASSERT_EQ_INT(rx_accept.received, 1);
+  T_ASSERT_EQ_INT(rx_accept.msg.ctrl, WAMBLE_CTRL_ERROR);
+  T_ASSERT_EQ_INT(rx_accept.msg.view.error_code, WAMBLE_ERR_ACCESS_DENIED);
+  T_ASSERT_STREQ(rx_accept.msg.view.error_reason, "session not found");
+  {
+    const WambleMessageExtField *request_seq =
+        find_ext_field(&rx_accept.msg, "request.seq_num");
+    T_ASSERT(request_seq != NULL);
+    T_ASSERT_EQ_INT((int)request_seq->int_value, (int)accept.seq_num);
+  }
+  {
+    uint64_t sid = 0;
+    WambleProfileTermsAcceptance acceptance = {0};
+    T_ASSERT_EQ_INT(wamble_query_get_session_by_token(accept.token, &sid),
+                    DB_NOT_FOUND);
+    T_ASSERT_EQ_INT(wamble_query_get_latest_profile_terms_acceptance(
+                        accept.token, "p1", &acceptance),
+                    DB_NOT_FOUND);
+  }
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
 WAMBLE_TEST(server_protocol_terms_routes_allow_hidden_bound_profile) {
   const char *cfg_path = "build/test_network_hidden_profile_terms.conf";
   const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
@@ -2699,6 +3015,8 @@ WAMBLE_TEST(server_protocol_terms_routes_allow_hidden_bound_profile) {
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+  T_ASSERT_EQ_INT(wamble_query_create_session(rx_hello.msg.token, 0, NULL),
+                  DB_OK);
 
   struct WambleMsg tos_req = {0};
   tos_req.ctrl = WAMBLE_CTRL_GET_PROFILE_TOS;
@@ -2834,6 +3152,8 @@ WAMBLE_TEST(
     T_ASSERT_EQ_INT(caps->value_type, WAMBLE_TREATMENT_VALUE_INT);
     T_ASSERT_EQ_INT((int)caps->int_value, 0);
   }
+  T_ASSERT_EQ_INT(wamble_query_create_session(rx_hello.msg.token, 0, NULL),
+                  DB_OK);
 
   struct WambleMsg post_join_req = {0};
   post_join_req.ctrl = WAMBLE_CTRL_GET_PLAYER_STATS;
@@ -3024,6 +3344,524 @@ WAMBLE_TEST(server_protocol_spectate_denial_reports_capacity_full_error_code) {
   spectator_manager_shutdown();
   wamble_close_socket(cli);
   wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(server_protocol_reliable_spectate_focus_sends_terminal_before_ack) {
+  const char *cfg_path = "build/test_network_spectate_focus_order.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19424) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'spectate_game', '*', 'allow', 0, "
+          "'spectate_game_access', 'test'), "
+          "(0, 'protocol.ctrl', 'spectate_stop', '*', 'allow', 0, "
+          "'spectate_stop_access', 'test'), "
+          "(0, 'spectate.access', 'view', '*', 'allow', 0, "
+          "'spectate_view_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+  spectator_manager_init();
+
+  WamblePlayer *player = create_new_player();
+  T_ASSERT(player != NULL);
+  WambleBoard *board = find_board_for_player(player);
+  T_ASSERT(board != NULL);
+
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
+
+  struct WambleMsg req = {0};
+  req.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  req.header_version = WAMBLE_PROTO_VERSION;
+  req.seq_num = 401;
+  req.board_id = board->id;
+  req.token[0] = 0x81;
+
+  RecvOneCtx terminal_rx = {.sock = pair.cli};
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &terminal_rx) ==
+           0);
+
+  T_ASSERT_EQ_INT(handle_message(pair.srv, &req, &pair.cliaddr, 0, "p1"),
+                  SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  T_ASSERT_EQ_INT(terminal_rx.received, 1);
+  T_ASSERT_EQ_INT(terminal_rx.msg.ctrl, WAMBLE_CTRL_SPECTATE_UPDATE);
+  T_ASSERT((terminal_rx.msg.flags & WAMBLE_FLAG_UNRELIABLE) == 0);
+  {
+    const WambleMessageExtField *state =
+        find_ext_field(&terminal_rx.msg, "spectate.state");
+    T_ASSERT(state != NULL);
+    T_ASSERT_EQ_INT(state->value_type, WAMBLE_TREATMENT_VALUE_STRING);
+    T_ASSERT(strcmp(state->string_value, "focus") == 0);
+  }
+  struct WambleMsg ack = {0};
+  struct sockaddr_in ack_from;
+  T_ASSERT(recv_message_with_timeout(pair.cli, &ack, &ack_from, 1000) > 0);
+  T_ASSERT_EQ_INT(ack.ctrl, WAMBLE_CTRL_ACK);
+  T_ASSERT_EQ_INT((int)ack.seq_num, (int)req.seq_num);
+
+  spectator_manager_shutdown();
+  cleanup_udp_loopback_pair(&pair);
+  return 0;
+}
+
+WAMBLE_TEST(
+    server_protocol_reliable_spectate_denial_sends_terminal_before_ack) {
+  const char *cfg_path = "build/test_network_spectate_denial_order.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(def max-spectators 0)\n"
+                    "(defprofile p1 ((def port 19424) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'spectate_game', '*', 'allow', 0, "
+          "'spectate_game_access', 'test'), "
+          "(0, 'protocol.ctrl', 'spectate_stop', '*', 'allow', 0, "
+          "'spectate_stop_access', 'test'), "
+          "(0, 'spectate.access', 'view', '*', 'allow', 0, "
+          "'spectate_view_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+  spectator_manager_init();
+
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
+
+  HandleMessageCtx ctx = {0};
+  ctx.sockfd = pair.srv;
+  ctx.cliaddr = pair.cliaddr;
+  ctx.trust_tier = 0;
+  ctx.profile_name = "p1";
+  ctx.msg.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  ctx.msg.header_version = WAMBLE_PROTO_VERSION;
+  ctx.msg.seq_num = 402;
+  ctx.msg.token[0] = 0x82;
+
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, handle_message_thread, &ctx) == 0);
+
+  struct WambleMsg rx = {0};
+  struct sockaddr_in from;
+  T_ASSERT(recv_message_with_timeout(pair.cli, &rx, &from, 1000) > 0);
+  T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_ERROR);
+  T_ASSERT_EQ_INT(rx.view.error_code, WAMBLE_ERR_SPECTATE_FULL);
+  T_ASSERT_STATUS_OK(ack_terminal_and_expect_request_ack(pair.cli, &rx, &from,
+                                                         ctx.msg.seq_num));
+
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  T_ASSERT_EQ_INT(ctx.status, SERVER_ERR_SPECTATOR);
+
+  spectator_manager_shutdown();
+  cleanup_udp_loopback_pair(&pair);
+  return 0;
+}
+
+WAMBLE_TEST(server_protocol_spectate_summary_returns_reliable_snapshot) {
+  const char *cfg_path = "build/test_network_spectate_summary_snapshot.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(def spectator-summary-hz 0)\n"
+                    "(defprofile p1 ((def port 19424) (def advertise 1)))\n"
+                    "(defprofile p2 ((def port 19425) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'client_hello', '*', 'allow', 0, "
+          "'hello_access', 'test'), "
+          "(0, 'protocol.ctrl', 'spectate_game', '*', 'allow', 0, "
+          "'spectate_game_access', 'test'), "
+          "(0, 'protocol.ctrl', 'spectate_stop', '*', 'allow', 0, "
+          "'spectate_stop_access', 'test'), "
+          "(0, 'spectate.access', 'view', '*', 'allow', 0, "
+          "'spectate_view_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  T_ASSERT_STATUS_OK(wamble_net_init());
+  int started = 0;
+  T_ASSERT_EQ_INT(start_profile_listeners(&started), PROFILE_START_OK);
+  T_ASSERT_EQ_INT(started, 2);
+  wamble_sleep_ms(50);
+
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in dst;
+  memset(&dst, 0, sizeof(dst));
+  dst.sin_family = AF_INET;
+  dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  dst.sin_port = htons(19424);
+
+  struct WambleMsg hello = {0};
+  hello.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  hello.header_version = WAMBLE_PROTO_VERSION;
+  hello.flags = WAMBLE_FLAG_UNRELIABLE;
+  hello.token[0] = 0x51;
+  T_ASSERT_STATUS_OK(send_unreliable_packet(cli, &hello, &dst));
+
+  struct WambleMsg rx = {0};
+  struct sockaddr_in from;
+  int board_id = 0;
+  {
+    fd_set rfds;
+    struct timeval tv;
+    FD_ZERO(&rfds);
+    FD_SET(cli, &rfds);
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+    T_ASSERT(select(0, &rfds, NULL, NULL, &tv) > 0);
+#else
+    T_ASSERT(select(cli + 1, &rfds, NULL, NULL, &tv) > 0);
+#endif
+    T_ASSERT(receive_message(cli, &rx, &from) > 0);
+    T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+    board_id = (int)rx.board_id;
+    send_ack(cli, &rx, &from);
+  }
+  T_ASSERT(board_id > 0);
+
+  struct WambleMsg req = {0};
+  req.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  req.header_version = WAMBLE_PROTO_VERSION;
+  req.flags = WAMBLE_FLAG_UNRELIABLE;
+  req.token[0] = 0x61;
+  req.board_id = 0;
+  T_ASSERT_STATUS_OK(send_unreliable_packet(cli, &req, &dst));
+
+  int saw_state = 0;
+  int saw_reset = 0;
+  int quiet_polls = 0;
+  while (quiet_polls < 3 && !(saw_state && saw_reset)) {
+    fd_set rfds;
+    struct timeval tv;
+    FD_ZERO(&rfds);
+    FD_SET(cli, &rfds);
+    tv.tv_sec = 0;
+    tv.tv_usec = 250 * 1000;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+    int ready = select(0, &rfds, NULL, NULL, &tv);
+#else
+    int ready = select(cli + 1, &rfds, NULL, NULL, &tv);
+#endif
+    if (ready <= 0) {
+      quiet_polls++;
+      continue;
+    }
+    quiet_polls = 0;
+    T_ASSERT(receive_message(cli, &rx, &from) > 0);
+    T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SPECTATE_UPDATE);
+    T_ASSERT((rx.flags & WAMBLE_FLAG_UNRELIABLE) == 0);
+    send_ack(cli, &rx, &from);
+    const WambleMessageExtField *state = find_ext_field(&rx, "spectate.state");
+    if (state && state->value_type == WAMBLE_TREATMENT_VALUE_STRING &&
+        strcmp(state->string_value, "summary") == 0) {
+      saw_state = 1;
+    }
+    if (wamble_msg_ext_find(&rx, "spectate.summary_generation") &&
+        rx.board_id == 0 && rx.view.fen[0] == '\0') {
+      saw_reset = 1;
+    }
+  }
+  T_ASSERT(saw_state);
+  T_ASSERT(saw_reset);
+
+  stop_profile_listeners();
+  wamble_net_cleanup();
+  wamble_close_socket(cli);
+  return 0;
+}
+
+WAMBLE_TEST(server_protocol_reliable_spectate_stop_sends_terminal_before_ack) {
+  const char *cfg_path = "build/test_network_spectate_stop_order.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19424) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'spectate_game', '*', 'allow', 0, "
+          "'spectate_game_access', 'test'), "
+          "(0, 'protocol.ctrl', 'spectate_stop', '*', 'allow', 0, "
+          "'spectate_stop_access', 'test'), "
+          "(0, 'spectate.access', 'view', '*', 'allow', 0, "
+          "'spectate_view_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+  spectator_manager_init();
+
+  WamblePlayer *player = create_new_player();
+  T_ASSERT(player != NULL);
+  WambleBoard *board = find_board_for_player(player);
+  T_ASSERT(board != NULL);
+
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
+
+  {
+    struct WambleMsg focus = {0};
+    SpectatorState state = SPECTATOR_STATE_IDLE;
+    uint64_t focus_id = 0;
+    focus.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+    focus.board_id = board->id;
+    focus.token[0] = 0x83;
+    T_ASSERT_EQ_INT(spectator_handle_request(&focus, &pair.cliaddr, 0, 0, 0,
+                                             &state, &focus_id),
+                    SPECTATOR_OK_FOCUS);
+  }
+
+  HandleMessageCtx ctx = {0};
+  ctx.sockfd = pair.srv;
+  ctx.cliaddr = pair.cliaddr;
+  ctx.trust_tier = 0;
+  ctx.profile_name = "p1";
+  ctx.msg.ctrl = WAMBLE_CTRL_SPECTATE_STOP;
+  ctx.msg.header_version = WAMBLE_PROTO_VERSION;
+  ctx.msg.seq_num = 403;
+  ctx.msg.token[0] = 0x83;
+
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, handle_message_thread, &ctx) == 0);
+
+  struct WambleMsg rx = {0};
+  struct sockaddr_in from;
+  T_ASSERT(recv_message_with_timeout(pair.cli, &rx, &from, 1000) > 0);
+  T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SPECTATE_UPDATE);
+  T_ASSERT_EQ_INT((int)rx.board_id, 0);
+  {
+    const WambleMessageExtField *state = find_ext_field(&rx, "spectate.state");
+    T_ASSERT(state != NULL);
+    T_ASSERT_EQ_INT(state->value_type, WAMBLE_TREATMENT_VALUE_STRING);
+    T_ASSERT(strcmp(state->string_value, "idle") == 0);
+  }
+  T_ASSERT_STATUS_OK(ack_terminal_and_expect_request_ack(pair.cli, &rx, &from,
+                                                         ctx.msg.seq_num));
+
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  T_ASSERT_EQ_INT(ctx.status, SERVER_OK);
+
+  spectator_manager_shutdown();
+  cleanup_udp_loopback_pair(&pair);
+  return 0;
+}
+
+WAMBLE_TEST(server_protocol_reliable_player_move_sends_terminal_before_ack) {
+  const char *cfg_path = "build/test_network_player_move_order.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19424) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'player_move', '*', 'allow', 0, "
+          "'player_move_access', 'test'), "
+          "(0, 'game.move', 'play', '*', 'allow', 0, 'play_access', "
+          "'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+  spectator_manager_init();
+
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
+
+  HandleMessageCtx ctx = {0};
+  ctx.sockfd = pair.srv;
+  ctx.cliaddr = pair.cliaddr;
+  ctx.trust_tier = 0;
+  ctx.profile_name = "p1";
+  ctx.msg.ctrl = WAMBLE_CTRL_PLAYER_MOVE;
+  ctx.msg.header_version = WAMBLE_PROTO_VERSION;
+  ctx.msg.seq_num = 503;
+  ctx.msg.board_id = 0;
+  ctx.msg.token[0] = 0x91;
+  const char *uci = "e2e4";
+  ctx.msg.text.uci_len = (uint8_t)strlen(uci);
+  memcpy(ctx.msg.text.uci, uci, ctx.msg.text.uci_len);
+
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, handle_message_thread, &ctx) == 0);
+
+  struct WambleMsg rx = {0};
+  struct sockaddr_in from;
+  T_ASSERT(recv_message_with_timeout(pair.cli, &rx, &from, 1000) > 0);
+  T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_ERROR);
+  T_ASSERT_EQ_INT(rx.view.error_code, WAMBLE_ERR_UNKNOWN_PLAYER);
+  T_ASSERT((rx.flags & WAMBLE_FLAG_UNRELIABLE) == 0);
+  T_ASSERT_STATUS_OK(ack_terminal_and_expect_request_ack(pair.cli, &rx, &from,
+                                                         ctx.msg.seq_num));
+
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  T_ASSERT_EQ_INT(ctx.status, SERVER_ERR_INTERNAL);
+
+  spectator_manager_shutdown();
+  cleanup_udp_loopback_pair(&pair);
+  return 0;
+}
+
+WAMBLE_TEST(server_protocol_spectate_stop_returns_reliable_idle_packet) {
+  const char *cfg_path = "build/test_network_spectate_stop_packet.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19424) (def advertise 1)))\n"
+                    "(defprofile p2 ((def port 19425) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'client_hello', '*', 'allow', 0, "
+          "'hello_access', 'test'), "
+          "(0, 'protocol.ctrl', 'spectate_game', '*', 'allow', 0, "
+          "'spectate_game_access', 'test'), "
+          "(0, 'protocol.ctrl', 'spectate_stop', '*', 'allow', 0, "
+          "'spectate_stop_access', 'test'), "
+          "(0, 'spectate.access', 'view', '*', 'allow', 0, "
+          "'spectate_view_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  T_ASSERT_STATUS_OK(wamble_net_init());
+  int started = 0;
+  T_ASSERT_EQ_INT(start_profile_listeners(&started), PROFILE_START_OK);
+  T_ASSERT_EQ_INT(started, 2);
+  wamble_sleep_ms(50);
+
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in dst;
+  memset(&dst, 0, sizeof(dst));
+  dst.sin_family = AF_INET;
+  dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  dst.sin_port = htons(19424);
+
+  struct WambleMsg hello = {0};
+  struct WambleMsg rx = {0};
+  struct sockaddr_in from;
+  hello.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  hello.header_version = WAMBLE_PROTO_VERSION;
+  hello.flags = WAMBLE_FLAG_UNRELIABLE;
+  hello.token[0] = 0x52;
+  T_ASSERT_STATUS_OK(send_unreliable_packet(cli, &hello, &dst));
+
+  {
+    fd_set rfds;
+    struct timeval tv;
+    FD_ZERO(&rfds);
+    FD_SET(cli, &rfds);
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+    T_ASSERT(select(0, &rfds, NULL, NULL, &tv) > 0);
+#else
+    T_ASSERT(select(cli + 1, &rfds, NULL, NULL, &tv) > 0);
+#endif
+    T_ASSERT(receive_message(cli, &rx, &from) > 0);
+    T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+    send_ack(cli, &rx, &from);
+  }
+
+  struct WambleMsg req = {0};
+  req.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  req.header_version = WAMBLE_PROTO_VERSION;
+  req.flags = WAMBLE_FLAG_UNRELIABLE;
+  req.token[0] = 0x62;
+  req.board_id = rx.board_id;
+  T_ASSERT_STATUS_OK(send_unreliable_packet(cli, &req, &dst));
+
+  {
+    fd_set rfds;
+    struct timeval tv;
+    FD_ZERO(&rfds);
+    FD_SET(cli, &rfds);
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+    T_ASSERT(select(0, &rfds, NULL, NULL, &tv) > 0);
+#else
+    T_ASSERT(select(cli + 1, &rfds, NULL, NULL, &tv) > 0);
+#endif
+    T_ASSERT(receive_message(cli, &rx, &from) > 0);
+    T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SPECTATE_UPDATE);
+    send_ack(cli, &rx, &from);
+  }
+
+  struct WambleMsg stop = {0};
+  stop.ctrl = WAMBLE_CTRL_SPECTATE_STOP;
+  stop.header_version = WAMBLE_PROTO_VERSION;
+  stop.flags = WAMBLE_FLAG_UNRELIABLE;
+  stop.token[0] = 0x62;
+  T_ASSERT_STATUS_OK(send_unreliable_packet(cli, &stop, &dst));
+
+  {
+    fd_set rfds;
+    struct timeval tv;
+    FD_ZERO(&rfds);
+    FD_SET(cli, &rfds);
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+    T_ASSERT(select(0, &rfds, NULL, NULL, &tv) > 0);
+#else
+    T_ASSERT(select(cli + 1, &rfds, NULL, NULL, &tv) > 0);
+#endif
+    T_ASSERT(receive_message(cli, &rx, &from) > 0);
+    T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SPECTATE_UPDATE);
+    T_ASSERT((rx.flags & WAMBLE_FLAG_UNRELIABLE) == 0);
+    T_ASSERT_EQ_INT((int)rx.board_id, 0);
+    send_ack(cli, &rx, &from);
+  }
+  {
+    const WambleMessageExtField *state = find_ext_field(&rx, "spectate.state");
+    T_ASSERT(state != NULL);
+    T_ASSERT_EQ_INT(state->value_type, WAMBLE_TREATMENT_VALUE_STRING);
+    T_ASSERT(strcmp(state->string_value, "idle") == 0);
+  }
+
+  stop_profile_listeners();
+  wamble_net_cleanup();
+  wamble_close_socket(cli);
   return 0;
 }
 
@@ -3228,7 +4066,8 @@ WAMBLE_TEST(server_protocol_player_stats_self_read_does_not_create_session) {
   {
     uint64_t sid = 0;
     T_ASSERT_EQ_INT(wamble_query_get_session_by_token(rx_hello.msg.token, &sid),
-                    DB_NOT_FOUND);
+                    DB_OK);
+    T_ASSERT(sid > 0);
   }
 
   {
@@ -3250,7 +4089,8 @@ WAMBLE_TEST(server_protocol_player_stats_self_read_does_not_create_session) {
   {
     uint64_t sid = 0;
     T_ASSERT_EQ_INT(wamble_query_get_session_by_token(rx_hello.msg.token, &sid),
-                    DB_NOT_FOUND);
+                    DB_OK);
+    T_ASSERT(sid > 0);
   }
 
   wamble_close_socket(cli);
@@ -3317,7 +4157,8 @@ WAMBLE_TEST(server_protocol_error_blocking_ext_marks_fatal_session_only) {
     struct WambleMsg req = {0};
     req.ctrl = WAMBLE_CTRL_GET_LEADERBOARD;
     req.header_version = WAMBLE_PROTO_VERSION;
-    memcpy(req.token, rx_hello.msg.token, TOKEN_LENGTH);
+    for (int i = 0; i < TOKEN_LENGTH; i++)
+      req.token[i] = (uint8_t)(0xc0 + i);
 
     RecvOneCtx rx = {.sock = cli};
     wamble_thread_t th;
@@ -3520,6 +4361,90 @@ WAMBLE_TEST(server_protocol_logout_allowed_before_profile_terms_acceptance) {
   T_ASSERT_STATUS_OK(wamble_thread_join(th_ack, NULL));
   T_ASSERT_EQ_INT(rx_ack.received, 1);
   T_ASSERT_EQ_INT(rx_ack.msg.ctrl, WAMBLE_CTRL_ACK);
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(server_protocol_logout_tears_down_session_without_goodbye) {
+  const char *cfg_path = "build/test_network_logout_self_contained.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19425) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'client_hello', '*', 'allow', 0, "
+          "'hello_access', 'test'), "
+          "(0, 'protocol.ctrl', 'logout', '*', 'allow', 0, "
+          "'logout_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  struct WambleMsg hello = {0};
+  hello.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  hello.header_version = WAMBLE_PROTO_VERSION;
+  RecvOneCtx rx_hello = {.sock = cli};
+  wamble_thread_t th_hello;
+  T_ASSERT(
+      wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
+  T_ASSERT_EQ_INT(rx_hello.received, 1);
+  T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+
+  uint8_t token[TOKEN_LENGTH];
+  memcpy(token, rx_hello.msg.token, TOKEN_LENGTH);
+
+  uint8_t identity_pub[WAMBLE_PUBLIC_KEY_LENGTH];
+  for (int i = 0; i < WAMBLE_PUBLIC_KEY_LENGTH; i++)
+    identity_pub[i] = (uint8_t)(0x40 + i);
+  WamblePlayer *attached = attach_persistent_identity(token, identity_pub);
+  T_ASSERT(attached != NULL);
+  T_ASSERT(attached->has_persistent_identity);
+
+  struct WambleMsg logout = {0};
+  logout.ctrl = WAMBLE_CTRL_LOGOUT;
+  logout.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(logout.token, token, TOKEN_LENGTH);
+
+  RecvOneCtx rx_ack = {.sock = cli};
+  wamble_thread_t th_ack;
+  T_ASSERT(wamble_thread_create(&th_ack, recv_one_thread, &rx_ack) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &logout, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_ack, NULL));
+  T_ASSERT_EQ_INT(rx_ack.received, 1);
+  T_ASSERT_EQ_INT(rx_ack.msg.ctrl, WAMBLE_CTRL_ACK);
+
+  struct WambleMsg logout_again = {0};
+  logout_again.ctrl = WAMBLE_CTRL_LOGOUT;
+  logout_again.header_version = WAMBLE_PROTO_VERSION;
+  logout_again.seq_num = 12345;
+  memcpy(logout_again.token, token, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(handle_message(srv, &logout_again, &cliaddr, 0, "p1"),
+                  SERVER_ERR_UNKNOWN_PLAYER);
 
   wamble_close_socket(cli);
   wamble_close_socket(srv);
@@ -3878,6 +4803,114 @@ WAMBLE_TEST(server_protocol_get_active_reservations_identity_query) {
     uint16_t count_be = 0;
     uint64_t board_be = 0;
     uint64_t expires_be = 0;
+    uint64_t live_board_be = 0;
+    uint64_t live_expires_be = 0;
+    uint8_t available = 0;
+    uint8_t profile_len = 0;
+    uint8_t live_available = 0;
+    uint8_t live_profile_len = 0;
+    memcpy(&count_be, rx.msg.fragment.fragment_data, 2);
+    memcpy(&board_be, rx.msg.fragment.fragment_data + 2, 8);
+    memcpy(&expires_be, rx.msg.fragment.fragment_data + 18, 8);
+    available = rx.msg.fragment.fragment_data[26];
+    profile_len = rx.msg.fragment.fragment_data[27];
+    memcpy(&live_board_be, rx.msg.fragment.fragment_data + 28, 8);
+    memcpy(&live_expires_be, rx.msg.fragment.fragment_data + 44, 8);
+    live_available = rx.msg.fragment.fragment_data[52];
+    live_profile_len = rx.msg.fragment.fragment_data[53];
+    T_ASSERT_EQ_INT((int)ntohs(count_be), 2);
+    T_ASSERT_EQ_INT((int)wamble_net_to_host64(board_be), 777);
+    T_ASSERT(wamble_net_to_host64(expires_be) > 0);
+    T_ASSERT_EQ_INT((int)available, 0);
+    T_ASSERT_EQ_INT((int)profile_len, 0);
+    T_ASSERT_EQ_INT((int)wamble_net_to_host64(live_board_be),
+                    (int)rx_hello.msg.board_id);
+    T_ASSERT(wamble_net_to_host64(live_expires_be) > 0);
+    T_ASSERT_EQ_INT((int)live_available, 1);
+    T_ASSERT_EQ_INT((int)live_profile_len, 2);
+    T_ASSERT(memcmp(rx.msg.fragment.fragment_data + 54, "p1", 2) == 0);
+  }
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(
+    server_protocol_get_active_reservations_includes_live_attached_board) {
+  const char *cfg_path =
+      "build/test_network_get_active_reservations_live_attach.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(def reservation-timeout 120)\n"
+                    "(defprofile p1 ((def port 19426) (def advertise 1)))\n";
+  const uint8_t target_pub[WAMBLE_PUBLIC_KEY_LENGTH] = {
+      0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b,
+      0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36,
+      0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40};
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'client_hello', '*', 'allow', 0, "
+          "'hello_access', 'test'), "
+          "(0, 'protocol.ctrl', 'get_active_reservations', '*', 'allow', 0, "
+          "'reservations_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  struct WambleMsg hello = {0};
+  hello.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  hello.header_version = WAMBLE_PROTO_VERSION;
+  RecvOneCtx rx_hello = {.sock = cli};
+  wamble_thread_t th_hello;
+  T_ASSERT(
+      wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
+  T_ASSERT_EQ_INT(rx_hello.received, 1);
+  T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+  T_ASSERT(
+      board_is_reserved_for_player(rx_hello.msg.board_id, rx_hello.msg.token));
+
+  T_ASSERT(attach_persistent_identity(rx_hello.msg.token, target_pub) != NULL);
+
+  struct WambleMsg req = {0};
+  req.ctrl = WAMBLE_CTRL_GET_ACTIVE_RESERVATIONS;
+  req.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(req.token, rx_hello.msg.token, TOKEN_LENGTH);
+
+  RecvOneCtx rx = {.sock = cli};
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &req, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  T_ASSERT_EQ_INT(rx.received, 1);
+  T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_ACTIVE_RESERVATIONS_DATA);
+  T_ASSERT(rx.msg.fragment.fragment_data_len >= 30);
+  {
+    uint16_t count_be = 0;
+    uint64_t board_be = 0;
+    uint64_t expires_be = 0;
     uint8_t available = 0;
     uint8_t profile_len = 0;
     memcpy(&count_be, rx.msg.fragment.fragment_data, 2);
@@ -3886,12 +4919,13 @@ WAMBLE_TEST(server_protocol_get_active_reservations_identity_query) {
     available = rx.msg.fragment.fragment_data[26];
     profile_len = rx.msg.fragment.fragment_data[27];
     T_ASSERT_EQ_INT((int)ntohs(count_be), 1);
-    T_ASSERT_EQ_INT((int)wamble_net_to_host64(board_be), 777);
+    T_ASSERT_EQ_INT((int)wamble_net_to_host64(board_be), rx_hello.msg.board_id);
     T_ASSERT(wamble_net_to_host64(expires_be) > 0);
     T_ASSERT_EQ_INT((int)available, 1);
     T_ASSERT_EQ_INT((int)profile_len, 2);
     T_ASSERT(memcmp(rx.msg.fragment.fragment_data + 28, "p1", 2) == 0);
   }
+
   wamble_close_socket(cli);
   wamble_close_socket(srv);
   return 0;
@@ -4005,9 +5039,9 @@ WAMBLE_TEST(server_protocol_get_active_reservations_caps_payload_count) {
   {
     uint16_t count_be = 0;
     memcpy(&count_be, rx.msg.fragment.fragment_data, 2);
-    T_ASSERT_EQ_INT((int)ntohs(count_be), 40);
+    T_ASSERT_EQ_INT((int)ntohs(count_be), 41);
   }
-  T_ASSERT_EQ_INT((int)rx.msg.session.active_count, 40);
+  T_ASSERT_EQ_INT((int)rx.msg.session.active_count, 41);
 
   wamble_close_socket(cli);
   wamble_close_socket(srv);
@@ -4188,6 +5222,8 @@ WAMBLE_TEST(server_protocol_accept_profile_tos_long_profile_name_persists) {
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+  T_ASSERT_EQ_INT(wamble_query_create_session(rx_hello.msg.token, 0, NULL),
+                  DB_OK);
 
   struct WambleMsg accept = {0};
   accept.ctrl = WAMBLE_CTRL_ACCEPT_PROFILE_TOS;
@@ -4234,6 +5270,8 @@ WAMBLE_TEST(server_protocol_accept_profile_tos_long_profile_name_persists) {
 WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
   const char *cfg_path = "build/test_network_login_ed25519.conf";
   const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(def prediction-mode 2)\n"
+                    "(def prediction-max-pending 7)\n"
                     "(defprofile p1 ((def port 19424) (def advertise 1)))\n";
   if (wamble_test_prepare_db(
           cfg_path, cfg,
@@ -4242,10 +5280,19 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
           "permission_level, reason, source) VALUES "
           "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
           "(0, 'protocol.ctrl', 'login_request', '*', 'allow', 0, "
-          "'login_access', 'test');") != 0) {
+          "'login_access', 'test'), "
+          "(0, 'protocol.ctrl', 'get_predictions', '*', 'allow', 0, "
+          "'prediction_read_proto', 'test'), "
+          "(0, 'protocol.ctrl', 'submit_prediction', '*', 'allow', 0, "
+          "'prediction_submit_proto', 'test'), "
+          "(0, 'prediction.write', 'streak', '*', 'allow', 2, 'write', "
+          "'test'), "
+          "(0, 'prediction.read', 'tree', '*', 'allow', 2, 'read', 'test');") !=
+      0) {
     T_FAIL_SIMPLE("wamble_test_prepare_db failed");
   }
 
+  T_ASSERT_EQ_INT(prediction_manager_init(), PREDICTION_MANAGER_OK);
   player_manager_init();
   board_manager_init();
 
@@ -4289,6 +5336,7 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
   T_ASSERT_EQ_INT(st, SERVER_OK);
   T_ASSERT_EQ_INT(rx_challenge.received, 1);
   T_ASSERT_EQ_INT(rx_challenge.msg.ctrl, WAMBLE_CTRL_LOGIN_CHALLENGE);
+  T_ASSERT_EQ_INT(server_protocol_thread_pending_login_challenge_count(), 1);
 
   uint8_t bad_signature[WAMBLE_LOGIN_SIGNATURE_LENGTH] = {0};
   T_ASSERT(wamble_client_sign_challenge(secret_key, player->token, public_key,
@@ -4312,6 +5360,7 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
   T_ASSERT_EQ_INT(bad_st, SERVER_ERR_LOGIN_FAILED);
   T_ASSERT_EQ_INT(rx_bad.received, 1);
   T_ASSERT_EQ_INT(rx_bad.msg.ctrl, WAMBLE_CTRL_LOGIN_FAILED);
+  T_ASSERT_EQ_INT(server_protocol_thread_pending_login_challenge_count(), 0);
 
   RecvOneCtx rx_challenge_2 = {.sock = cli};
   wamble_thread_t th_challenge_2;
@@ -4322,6 +5371,7 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
   T_ASSERT_EQ_INT(st, SERVER_OK);
   T_ASSERT_EQ_INT(rx_challenge_2.received, 1);
   T_ASSERT_EQ_INT(rx_challenge_2.msg.ctrl, WAMBLE_CTRL_LOGIN_CHALLENGE);
+  T_ASSERT_EQ_INT(server_protocol_thread_pending_login_challenge_count(), 1);
 
   uint8_t good_signature[WAMBLE_LOGIN_SIGNATURE_LENGTH] = {0};
   T_ASSERT(wamble_client_sign_challenge(secret_key, player->token, public_key,
@@ -4344,16 +5394,27 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
   T_ASSERT_EQ_INT(ok_st, SERVER_OK);
   T_ASSERT_EQ_INT(rx_ok.received, 1);
   T_ASSERT_EQ_INT(rx_ok.msg.ctrl, WAMBLE_CTRL_LOGIN_SUCCESS);
+  T_ASSERT_EQ_INT(server_protocol_thread_pending_login_challenge_count(), 0);
   {
     const WambleMessageExtField *caps =
         find_ext_field(&rx_ok.msg, "session.caps");
     const WambleMessageExtField *reserved_at =
         find_ext_field(&rx_ok.msg, "reservation.reserved_at");
+    const WambleMessageExtField *prediction_source =
+        find_ext_field(&rx_ok.msg, "prediction.source");
+    const WambleMessageExtField *prediction_max_pending =
+        find_ext_field(&rx_ok.msg, "prediction.max_pending");
     T_ASSERT(caps != NULL);
     T_ASSERT(reserved_at != NULL);
+    T_ASSERT(prediction_source != NULL);
+    T_ASSERT(prediction_max_pending != NULL);
     T_ASSERT(rx_ok.msg.board_id > 0);
     T_ASSERT(rx_ok.msg.view.fen[0] != '\0');
     T_ASSERT((caps->int_value & WAMBLE_SESSION_UI_CAP_ATTACH_IDENTITY) != 0);
+    T_ASSERT((caps->int_value & WAMBLE_SESSION_UI_CAP_PREDICTION_SUBMIT) != 0);
+    T_ASSERT((caps->int_value & WAMBLE_SESSION_UI_CAP_PREDICTION_READ) != 0);
+    T_ASSERT_STREQ(prediction_source->string_value, "tree");
+    T_ASSERT_EQ_INT((int)prediction_max_pending->int_value, 7);
     T_ASSERT(find_ext_field(&rx_ok.msg, "trust.tier") == NULL);
   }
 
@@ -4365,6 +5426,160 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
 
   wamble_close_socket(cli);
   wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(server_protocol_prediction_submit_response_contract) {
+  const char *cfg_path = "build/test_network_prediction_submit_contract.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(def prediction-mode 2)\n"
+                    "(def prediction-max-pending 7)\n"
+                    "(def prediction-view-depth-limit 4)\n"
+                    "(defprofile p1 ((def port 19428) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'client_hello', '*', 'allow', 0, "
+          "'hello_access', 'test'), "
+          "(0, 'protocol.ctrl', 'get_predictions', '*', 'allow', 0, "
+          "'prediction_read_proto', 'test'), "
+          "(0, 'protocol.ctrl', 'submit_prediction', '*', 'allow', 0, "
+          "'prediction_submit_proto', 'test'), "
+          "(0, 'prediction.write', 'streak', '*', 'allow', 2, 'write', "
+          "'test'), "
+          "(0, 'prediction.read', 'tree', '*', 'allow', 2, 'read', 'test');") !=
+      0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  T_ASSERT_EQ_INT(prediction_manager_init(), PREDICTION_MANAGER_OK);
+  WambleIntentBuffer intents = {0};
+  wamble_intents_init(&intents);
+  wamble_set_intent_buffer(&intents);
+  player_manager_init();
+  board_manager_init();
+
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
+
+  struct WambleMsg hello = {0};
+  hello.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  hello.header_version = WAMBLE_PROTO_VERSION;
+  hello.seq_num = 11;
+  hello.token[0] = 0x77;
+
+  RecvOneCtx rx_hello = {.sock = pair.cli};
+  wamble_thread_t th_hello;
+  T_ASSERT(
+      wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
+  T_ASSERT_EQ_INT(handle_message(pair.srv, &hello, &pair.cliaddr, 0, "p1"),
+                  SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
+  T_ASSERT_EQ_INT(rx_hello.received, 1);
+  T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+  {
+    int selected_bytes = 0;
+    int attempted = 0;
+    int failures = 0;
+    wamble_persistence_clear_status();
+    T_ASSERT_EQ_INT(wamble_apply_intents_with_db_checked(
+                        &intents, 0, 0, &selected_bytes, &attempted, &failures),
+                    PERSISTENCE_STATUS_OK);
+    T_ASSERT_EQ_INT(failures, 0);
+    wamble_intents_clear(&intents);
+  }
+
+  struct WambleMsg submit = {0};
+  submit.ctrl = WAMBLE_CTRL_SUBMIT_PREDICTION;
+  submit.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(submit.token, rx_hello.msg.token, TOKEN_LENGTH);
+  submit.board_id = rx_hello.msg.board_id;
+  submit.text.uci_len = 4;
+  memcpy(submit.text.uci, "e2e4", 4);
+
+  RecvOneCtx rx_submit = {.sock = pair.cli};
+  wamble_thread_t th_submit;
+  T_ASSERT(wamble_thread_create(&th_submit, recv_one_and_ack_thread,
+                                &rx_submit) == 0);
+  T_ASSERT_EQ_INT(handle_message(pair.srv, &submit, &pair.cliaddr, 0, "p1"),
+                  SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_submit, NULL));
+  T_ASSERT_EQ_INT(rx_submit.received, 1);
+  T_ASSERT_EQ_INT(rx_submit.msg.ctrl, WAMBLE_CTRL_PREDICTION_DATA);
+  T_ASSERT_EQ_INT((int)rx_submit.msg.prediction.count, 1);
+
+  uint64_t created_id = rx_submit.msg.prediction.entries[0].id;
+  {
+    const WambleMessageExtField *request_kind =
+        find_ext_field(&rx_submit.msg, "prediction.request_kind");
+    const WambleMessageExtField *submit_status =
+        find_ext_field(&rx_submit.msg, "prediction.submit_status");
+    T_ASSERT(request_kind != NULL);
+    T_ASSERT(submit_status != NULL);
+    T_ASSERT_STREQ(request_kind->string_value, "submit");
+    T_ASSERT_EQ_INT((int)submit_status->int_value, 1);
+    T_ASSERT(created_id > 0);
+    T_ASSERT_EQ_INT((int)rx_submit.msg.prediction.entries[0].uci_len, 4);
+    T_ASSERT(memcmp(rx_submit.msg.prediction.entries[0].uci, "e2e4", 4) == 0);
+  }
+
+  RecvOneCtx rx_dup = {.sock = pair.cli};
+  wamble_thread_t th_dup;
+  T_ASSERT(wamble_thread_create(&th_dup, recv_one_and_ack_thread, &rx_dup) ==
+           0);
+  T_ASSERT_EQ_INT(handle_message(pair.srv, &submit, &pair.cliaddr, 0, "p1"),
+                  SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_dup, NULL));
+  T_ASSERT_EQ_INT(rx_dup.received, 1);
+  T_ASSERT_EQ_INT(rx_dup.msg.ctrl, WAMBLE_CTRL_PREDICTION_DATA);
+  T_ASSERT_EQ_INT((int)rx_dup.msg.prediction.count, 1);
+  T_ASSERT_EQ_INT((int)rx_dup.msg.prediction.entries[0].id, (int)created_id);
+  {
+    const WambleMessageExtField *request_kind =
+        find_ext_field(&rx_dup.msg, "prediction.request_kind");
+    const WambleMessageExtField *submit_status =
+        find_ext_field(&rx_dup.msg, "prediction.submit_status");
+    T_ASSERT(request_kind != NULL);
+    T_ASSERT(submit_status != NULL);
+    T_ASSERT_STREQ(request_kind->string_value, "submit");
+    T_ASSERT_EQ_INT((int)submit_status->int_value, 2);
+  }
+
+  struct WambleMsg get_predictions = {0};
+  get_predictions.ctrl = WAMBLE_CTRL_GET_PREDICTIONS;
+  get_predictions.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(get_predictions.token, rx_hello.msg.token, TOKEN_LENGTH);
+  get_predictions.board_id = rx_hello.msg.board_id;
+  get_predictions.prediction.depth = 4;
+  get_predictions.prediction.limit = 8;
+
+  RecvOneCtx rx_tree = {.sock = pair.cli};
+  wamble_thread_t th_tree;
+  T_ASSERT(wamble_thread_create(&th_tree, recv_one_and_ack_thread, &rx_tree) ==
+           0);
+  T_ASSERT_EQ_INT(
+      handle_message(pair.srv, &get_predictions, &pair.cliaddr, 0, "p1"),
+      SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_tree, NULL));
+  T_ASSERT_EQ_INT(rx_tree.received, 1);
+  T_ASSERT_EQ_INT(rx_tree.msg.ctrl, WAMBLE_CTRL_PREDICTION_DATA);
+  T_ASSERT(rx_tree.msg.prediction.count >= 1);
+  {
+    const WambleMessageExtField *request_kind =
+        find_ext_field(&rx_tree.msg, "prediction.request_kind");
+    const WambleMessageExtField *submit_status =
+        find_ext_field(&rx_tree.msg, "prediction.submit_status");
+    T_ASSERT(request_kind != NULL);
+    T_ASSERT(submit_status == NULL);
+    T_ASSERT_STREQ(request_kind->string_value, "tree");
+  }
+
+  cleanup_udp_loopback_pair(&pair);
+  wamble_set_intent_buffer(NULL);
+  wamble_intents_free(&intents);
   return 0;
 }
 
@@ -4525,6 +5740,667 @@ WAMBLE_TEST(accept_profile_tos_roundtrip) {
   return 0;
 }
 
+static void drain_replay_counts(wamble_socket_t sock,
+                                uint64_t expected_board_id,
+                                uint32_t expected_request_seq, int max_iters,
+                                int per_iter_timeout_ms,
+                                int *out_board_update_count,
+                                int *out_request_ack_count) {
+  *out_board_update_count = 0;
+  *out_request_ack_count = 0;
+  for (int attempt = 0; attempt < max_iters; attempt++) {
+    fd_set rfds;
+    struct timeval tv;
+    FD_ZERO(&rfds);
+    FD_SET(sock, &rfds);
+    tv.tv_sec = per_iter_timeout_ms / 1000;
+    tv.tv_usec = (per_iter_timeout_ms % 1000) * 1000;
+    int ready = select((int)(sock + 1), &rfds, NULL, NULL, &tv);
+    if (ready <= 0)
+      break;
+    uint8_t buf[WAMBLE_MAX_PACKET_SIZE];
+    struct sockaddr_in f;
+    wamble_socklen_t flen = (wamble_socklen_t)sizeof(f);
+    ssize_t r = recvfrom(sock, (char *)buf, sizeof(buf), 0,
+                         (struct sockaddr *)&f, &flen);
+    if (r <= 0)
+      break;
+    struct WambleMsg m = {0};
+    uint8_t flags = 0;
+    if (wamble_packet_deserialize(buf, (size_t)r, &m, &flags) != NET_OK)
+      continue;
+    if (m.ctrl == WAMBLE_CTRL_BOARD_UPDATE && m.board_id == expected_board_id)
+      (*out_board_update_count)++;
+    else if (m.ctrl == WAMBLE_CTRL_ACK && m.seq_num == expected_request_seq)
+      (*out_request_ack_count)++;
+  }
+}
+
+WAMBLE_TEST(reliable_retry_replays_cached_terminal_response) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  struct sockaddr_in srvaddr = {0};
+  srvaddr.sin_family = AF_INET;
+  srvaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  srvaddr.sin_port = htons((uint16_t)wamble_socket_bound_port(srv));
+
+  uint8_t token[TOKEN_LENGTH];
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    token[i] = (uint8_t)(0x10 + i);
+
+  struct WambleMsg req = {0};
+  req.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  req.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(req.token, token, TOKEN_LENGTH);
+  req.seq_num = 1;
+
+  uint8_t req_buf[WAMBLE_MAX_PACKET_SIZE];
+  size_t req_len = 0;
+  T_ASSERT(wamble_packet_serialize(&req, req_buf, sizeof(req_buf), &req_len,
+                                   0) == NET_OK);
+
+  T_ASSERT(sendto(cli, (const char *)req_buf, req_len, 0,
+                  (const struct sockaddr *)&srvaddr, sizeof(srvaddr)) > 0);
+
+  struct WambleMsg in = {0};
+  struct sockaddr_in from;
+  T_ASSERT(receive_message(srv, &in, &from) > 0);
+  T_ASSERT_EQ_INT(in.ctrl, WAMBLE_CTRL_CLIENT_HELLO);
+  T_ASSERT_EQ_INT((int)in.seq_num, 1);
+
+  struct WambleMsg resp = {0};
+  resp.ctrl = WAMBLE_CTRL_BOARD_UPDATE;
+  resp.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(resp.token, token, TOKEN_LENGTH);
+  resp.board_id = 42;
+  strncpy(resp.view.fen, "resp-fen", FEN_MAX_LENGTH);
+
+  RecvOneCtx rx = {.sock = cli};
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
+  int send_rc = send_reliable_message(srv, &resp, &from, 500, 5);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  T_ASSERT_STATUS_OK(send_rc);
+  T_ASSERT_EQ_INT(rx.received, 1);
+  T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_BOARD_UPDATE);
+  T_ASSERT_EQ_INT((int)rx.msg.board_id, 42);
+  network_end_request();
+
+  T_ASSERT(sendto(cli, (const char *)req_buf, req_len, 0,
+                  (const struct sockaddr *)&srvaddr, sizeof(srvaddr)) > 0);
+
+  struct WambleMsg dup_in = {0};
+  struct sockaddr_in dup_from;
+  int rc2 = receive_message(srv, &dup_in, &dup_from);
+  T_ASSERT_EQ_INT(rc2, -1);
+
+  int saw_board_update = 0;
+  int saw_request_ack = 0;
+  drain_replay_counts(cli, 42, 1, 6, 400, &saw_board_update, &saw_request_ack);
+  T_ASSERT(saw_board_update >= 1);
+  T_ASSERT(saw_request_ack >= 1);
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(reliable_retry_from_new_source_replays_to_rebound_address) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli1 = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli1 != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli2 = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli2 != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(
+      bind(cli1, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+  T_ASSERT_STATUS_OK(
+      bind(cli2, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in srvaddr = {0};
+  srvaddr.sin_family = AF_INET;
+  srvaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  srvaddr.sin_port = htons((uint16_t)wamble_socket_bound_port(srv));
+
+  uint8_t token[TOKEN_LENGTH];
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    token[i] = (uint8_t)(0x30 + i);
+
+  struct WambleMsg req = {0};
+  req.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  req.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(req.token, token, TOKEN_LENGTH);
+  req.seq_num = 1;
+
+  uint8_t req_buf[WAMBLE_MAX_PACKET_SIZE];
+  size_t req_len = 0;
+  T_ASSERT(wamble_packet_serialize(&req, req_buf, sizeof(req_buf), &req_len,
+                                   0) == NET_OK);
+
+  T_ASSERT(sendto(cli1, (const char *)req_buf, req_len, 0,
+                  (const struct sockaddr *)&srvaddr, sizeof(srvaddr)) > 0);
+
+  struct WambleMsg in = {0};
+  struct sockaddr_in from;
+  T_ASSERT(receive_message(srv, &in, &from) > 0);
+
+  struct WambleMsg resp = {0};
+  resp.ctrl = WAMBLE_CTRL_BOARD_UPDATE;
+  resp.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(resp.token, token, TOKEN_LENGTH);
+  resp.board_id = 91;
+  strncpy(resp.view.fen, "rebind-fen", FEN_MAX_LENGTH);
+
+  RecvOneCtx rx = {.sock = cli1};
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
+  int send_rc = send_reliable_message(srv, &resp, &from, 500, 5);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  T_ASSERT_STATUS_OK(send_rc);
+  T_ASSERT_EQ_INT(rx.received, 1);
+  network_end_request();
+
+  T_ASSERT(sendto(cli2, (const char *)req_buf, req_len, 0,
+                  (const struct sockaddr *)&srvaddr, sizeof(srvaddr)) > 0);
+
+  struct WambleMsg dup_in = {0};
+  struct sockaddr_in dup_from;
+  int rc2 = receive_message(srv, &dup_in, &dup_from);
+  T_ASSERT_EQ_INT(rc2, -1);
+
+  int saw_board_update_cli2 = 0;
+  int saw_request_ack_cli2 = 0;
+  drain_replay_counts(cli2, 91, 1, 6, 400, &saw_board_update_cli2,
+                      &saw_request_ack_cli2);
+  T_ASSERT(saw_board_update_cli2 >= 1);
+  T_ASSERT(saw_request_ack_cli2 >= 1);
+
+  struct sockaddr_in rebound = {0};
+  T_ASSERT_STATUS_OK(network_get_client_addr_by_token(token, &rebound));
+  T_ASSERT_EQ_INT(rebound.sin_port, dup_from.sin_port);
+
+  int cli1_board = 0;
+  int cli1_ack = 0;
+  drain_replay_counts(cli1, 91, 1, 2, 200, &cli1_board, &cli1_ack);
+  T_ASSERT_EQ_INT(cli1_board, 0);
+  T_ASSERT_EQ_INT(cli1_ack, 0);
+
+  wamble_close_socket(cli1);
+  wamble_close_socket(cli2);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(shared_token_endpoints_get_independent_seq_state) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli1 = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli1 != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli2 = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli2 != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(
+      bind(cli1, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+  T_ASSERT_STATUS_OK(
+      bind(cli2, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in srvaddr = {0};
+  srvaddr.sin_family = AF_INET;
+  srvaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  srvaddr.sin_port = htons((uint16_t)wamble_socket_bound_port(srv));
+
+  uint8_t token[TOKEN_LENGTH];
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    token[i] = (uint8_t)(0x70 + i);
+
+  struct WambleMsg req = {0};
+  req.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  req.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(req.token, token, TOKEN_LENGTH);
+  req.seq_num = 10;
+
+  uint8_t req_buf[WAMBLE_MAX_PACKET_SIZE];
+  size_t req_len = 0;
+  T_ASSERT(wamble_packet_serialize(&req, req_buf, sizeof(req_buf), &req_len,
+                                   0) == NET_OK);
+
+  T_ASSERT(sendto(cli1, (const char *)req_buf, req_len, 0,
+                  (const struct sockaddr *)&srvaddr, sizeof(srvaddr)) > 0);
+
+  struct WambleMsg in = {0};
+  struct sockaddr_in from;
+  T_ASSERT(receive_message(srv, &in, &from) > 0);
+  T_ASSERT_EQ_INT((int)in.seq_num, 10);
+  network_end_request();
+
+  struct WambleMsg req2 = {0};
+  req2.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  req2.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(req2.token, token, TOKEN_LENGTH);
+  req2.seq_num = 4242;
+
+  uint8_t req2_buf[WAMBLE_MAX_PACKET_SIZE];
+  size_t req2_len = 0;
+  T_ASSERT(wamble_packet_serialize(&req2, req2_buf, sizeof(req2_buf), &req2_len,
+                                   0) == NET_OK);
+
+  T_ASSERT(sendto(cli2, (const char *)req2_buf, req2_len, 0,
+                  (const struct sockaddr *)&srvaddr, sizeof(srvaddr)) > 0);
+
+  struct WambleMsg in2 = {0};
+  struct sockaddr_in from2;
+  int rc2 = receive_message(srv, &in2, &from2);
+  T_ASSERT(rc2 > 0);
+  T_ASSERT_EQ_INT((int)in2.seq_num, 4242);
+  T_ASSERT(from2.sin_port != from.sin_port);
+  network_end_request();
+
+  struct WambleMsg req3 = {0};
+  req3.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  req3.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(req3.token, token, TOKEN_LENGTH);
+  req3.seq_num = 11;
+
+  uint8_t req3_buf[WAMBLE_MAX_PACKET_SIZE];
+  size_t req3_len = 0;
+  T_ASSERT(wamble_packet_serialize(&req3, req3_buf, sizeof(req3_buf), &req3_len,
+                                   0) == NET_OK);
+
+  T_ASSERT(sendto(cli1, (const char *)req3_buf, req3_len, 0,
+                  (const struct sockaddr *)&srvaddr, sizeof(srvaddr)) > 0);
+
+  struct WambleMsg in3 = {0};
+  struct sockaddr_in from3;
+  int rc3 = receive_message(srv, &in3, &from3);
+  T_ASSERT(rc3 > 0);
+  T_ASSERT_EQ_INT((int)in3.seq_num, 11);
+  T_ASSERT_EQ_INT(from3.sin_port, from.sin_port);
+  network_end_request();
+
+  wamble_close_socket(cli1);
+  wamble_close_socket(cli2);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(token_session_index_tracks_shared_token_rebinds) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  struct sockaddr_in addr1 = {0};
+  addr1.sin_family = AF_INET;
+  addr1.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr1.sin_port = htons(11001);
+
+  struct sockaddr_in addr2 = {0};
+  addr2.sin_family = AF_INET;
+  addr2.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr2.sin_port = htons(11002);
+
+  uint8_t token_a[TOKEN_LENGTH];
+  uint8_t token_b[TOKEN_LENGTH];
+  for (int i = 0; i < TOKEN_LENGTH; i++) {
+    token_a[i] = (uint8_t)(0x80 + i);
+    token_b[i] = (uint8_t)(0xA0 + i);
+  }
+
+  network_bind_client_token(&addr1, token_a);
+  network_bind_client_token(&addr2, token_a);
+  network_bind_client_token(&addr1, token_b);
+
+  struct sockaddr_in out_a = {0};
+  T_ASSERT_STATUS_OK(network_get_client_addr_by_token(token_a, &out_a));
+  T_ASSERT_EQ_INT(out_a.sin_port, addr2.sin_port);
+
+  struct sockaddr_in out_b = {0};
+  T_ASSERT_STATUS_OK(network_get_client_addr_by_token(token_b, &out_b));
+  T_ASSERT_EQ_INT(out_b.sin_port, addr1.sin_port);
+
+  uint8_t bound1[TOKEN_LENGTH] = {0};
+  T_ASSERT_STATUS_OK(network_get_bound_token_for_addr(&addr1, bound1));
+  T_ASSERT(tokens_equal(bound1, token_b));
+
+  uint8_t bound2[TOKEN_LENGTH] = {0};
+  T_ASSERT_STATUS_OK(network_get_bound_token_for_addr(&addr2, bound2));
+  T_ASSERT(tokens_equal(bound2, token_a));
+
+  return 0;
+}
+
+WAMBLE_TEST(reliable_retry_replays_fragmented_terminal_bundle) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in srvaddr = {0};
+  srvaddr.sin_family = AF_INET;
+  srvaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  srvaddr.sin_port = htons((uint16_t)wamble_socket_bound_port(srv));
+
+  uint8_t token[TOKEN_LENGTH];
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    token[i] = (uint8_t)(0x50 + i);
+
+  struct WambleMsg req = {0};
+  req.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  req.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(req.token, token, TOKEN_LENGTH);
+  req.seq_num = 1;
+
+  uint8_t req_buf[WAMBLE_MAX_PACKET_SIZE];
+  size_t req_len = 0;
+  T_ASSERT(wamble_packet_serialize(&req, req_buf, sizeof(req_buf), &req_len,
+                                   0) == NET_OK);
+
+  T_ASSERT(sendto(cli, (const char *)req_buf, req_len, 0,
+                  (const struct sockaddr *)&srvaddr, sizeof(srvaddr)) > 0);
+
+  struct WambleMsg in = {0};
+  struct sockaddr_in from;
+  T_ASSERT(receive_message(srv, &in, &from) > 0);
+  T_ASSERT_EQ_INT(in.ctrl, WAMBLE_CTRL_CLIENT_HELLO);
+
+  enum { CHUNK_COUNT = 3, CHUNK_BYTES = 32 };
+  uint8_t payload[CHUNK_COUNT * CHUNK_BYTES];
+  for (int i = 0; i < (int)sizeof(payload); i++)
+    payload[i] = (uint8_t)(i ^ 0xa5);
+  uint8_t payload_hash[WAMBLE_FRAGMENT_HASH_LENGTH];
+  crypto_blake2b(payload_hash, WAMBLE_FRAGMENT_HASH_LENGTH, payload,
+                 sizeof(payload));
+  uint32_t transfer_id = 0xdeadbeefu;
+
+  struct {
+    uint16_t chunk_index;
+    uint16_t chunk_count;
+    uint32_t transfer_id;
+    uint32_t total_len;
+    uint16_t data_len;
+    uint8_t hash[WAMBLE_FRAGMENT_HASH_LENGTH];
+    uint8_t data[CHUNK_BYTES];
+  } original[CHUNK_COUNT];
+
+  for (int chunk = 0; chunk < CHUNK_COUNT; chunk++) {
+    struct WambleMsg resp = {0};
+    resp.ctrl = WAMBLE_CTRL_PROFILE_TOS_DATA;
+    resp.header_version = WAMBLE_PROTO_VERSION;
+    memcpy(resp.token, token, TOKEN_LENGTH);
+    resp.fragment.fragment_version = WAMBLE_FRAGMENT_VERSION;
+    resp.fragment.fragment_hash_algo = WAMBLE_FRAGMENT_HASH_BLAKE2B_256;
+    resp.fragment.fragment_chunk_index = (uint16_t)chunk;
+    resp.fragment.fragment_chunk_count = CHUNK_COUNT;
+    resp.fragment.fragment_total_len = (uint32_t)sizeof(payload);
+    resp.fragment.fragment_transfer_id = transfer_id;
+    memcpy(resp.fragment.fragment_hash, payload_hash,
+           WAMBLE_FRAGMENT_HASH_LENGTH);
+    resp.fragment.fragment_data_len = CHUNK_BYTES;
+    memcpy(resp.fragment.fragment_data, payload + chunk * CHUNK_BYTES,
+           CHUNK_BYTES);
+
+    RecvOneCtx rx = {.sock = cli};
+    wamble_thread_t th;
+    T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
+    int rc = send_reliable_message(srv, &resp, &from, 500, 5);
+    T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+    T_ASSERT_STATUS_OK(rc);
+    T_ASSERT_EQ_INT(rx.received, 1);
+    T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_PROFILE_TOS_DATA);
+
+    original[chunk].chunk_index = rx.msg.fragment.fragment_chunk_index;
+    original[chunk].chunk_count = rx.msg.fragment.fragment_chunk_count;
+    original[chunk].transfer_id = rx.msg.fragment.fragment_transfer_id;
+    original[chunk].total_len = rx.msg.fragment.fragment_total_len;
+    original[chunk].data_len = rx.msg.fragment.fragment_data_len;
+    memcpy(original[chunk].hash, rx.msg.fragment.fragment_hash,
+           WAMBLE_FRAGMENT_HASH_LENGTH);
+    memcpy(original[chunk].data, rx.msg.fragment.fragment_data, CHUNK_BYTES);
+  }
+  network_end_request();
+
+  T_ASSERT(sendto(cli, (const char *)req_buf, req_len, 0,
+                  (const struct sockaddr *)&srvaddr, sizeof(srvaddr)) > 0);
+
+  struct WambleMsg dup_in = {0};
+  struct sockaddr_in dup_from;
+  int rc2 = receive_message(srv, &dup_in, &dup_from);
+  T_ASSERT_EQ_INT(rc2, -1);
+
+  int seen_chunks[CHUNK_COUNT] = {0};
+  int request_acks = 0;
+  for (int attempt = 0; attempt < 12; attempt++) {
+    fd_set rfds;
+    struct timeval tv;
+    FD_ZERO(&rfds);
+    FD_SET(cli, &rfds);
+    tv.tv_sec = 0;
+    tv.tv_usec = 400 * 1000;
+    int ready = select((int)(cli + 1), &rfds, NULL, NULL, &tv);
+    if (ready <= 0)
+      break;
+    uint8_t buf[WAMBLE_MAX_PACKET_SIZE];
+    struct sockaddr_in f;
+    wamble_socklen_t flen = (wamble_socklen_t)sizeof(f);
+    ssize_t r = recvfrom(cli, (char *)buf, sizeof(buf), 0,
+                         (struct sockaddr *)&f, &flen);
+    if (r <= 0)
+      break;
+    struct WambleMsg m = {0};
+    uint8_t flags = 0;
+    if (wamble_packet_deserialize(buf, (size_t)r, &m, &flags) != NET_OK)
+      continue;
+    if (m.ctrl == WAMBLE_CTRL_ACK && m.seq_num == 1) {
+      request_acks++;
+      continue;
+    }
+    if (m.ctrl != WAMBLE_CTRL_PROFILE_TOS_DATA)
+      continue;
+    int idx = m.fragment.fragment_chunk_index;
+    if (idx < 0 || idx >= CHUNK_COUNT)
+      continue;
+    T_ASSERT_EQ_INT((int)m.fragment.fragment_chunk_count,
+                    (int)original[idx].chunk_count);
+    T_ASSERT_EQ_INT((int)m.fragment.fragment_transfer_id,
+                    (int)original[idx].transfer_id);
+    T_ASSERT_EQ_INT((int)m.fragment.fragment_total_len,
+                    (int)original[idx].total_len);
+    T_ASSERT_EQ_INT((int)m.fragment.fragment_data_len,
+                    (int)original[idx].data_len);
+    T_ASSERT(memcmp(m.fragment.fragment_hash, original[idx].hash,
+                    WAMBLE_FRAGMENT_HASH_LENGTH) == 0);
+    T_ASSERT(
+        memcmp(m.fragment.fragment_data, original[idx].data, CHUNK_BYTES) == 0);
+    seen_chunks[idx]++;
+  }
+  for (int i = 0; i < CHUNK_COUNT; i++)
+    T_ASSERT(seen_chunks[i] >= 1);
+  T_ASSERT(request_acks >= 1);
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(
+    server_protocol_reliable_accept_profile_tos_no_text_sends_error_terminal) {
+  const char *cfg_path = "build/test_network_accept_profile_tos_no_text.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19427) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'accept_profile_tos', '*', 'allow', 0, "
+          "'accept_profile_tos_access', 'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  struct WambleMsg accept = {0};
+  accept.ctrl = WAMBLE_CTRL_ACCEPT_PROFILE_TOS;
+  accept.header_version = WAMBLE_PROTO_VERSION;
+  accept.seq_num = 7777;
+  accept.token[0] = 0xAB;
+  T_ASSERT_EQ_INT(wamble_query_create_session(accept.token, 0, NULL), DB_OK);
+  const char *pname = "p1";
+  accept.text.profile_name_len = (uint8_t)strlen(pname);
+  memcpy(accept.text.profile_name, pname, accept.text.profile_name_len);
+
+  RecvOneCtx rx = {.sock = cli};
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &accept, &cliaddr, 0, "p1"),
+                  SERVER_ERR_INTERNAL);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  T_ASSERT_EQ_INT(rx.received, 1);
+  T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_ERROR);
+  T_ASSERT_EQ_INT(rx.msg.view.error_code, WAMBLE_ERR_ACCESS_DENIED);
+  T_ASSERT((rx.msg.flags & WAMBLE_FLAG_UNRELIABLE) == 0);
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(
+    server_protocol_reliable_legal_moves_invalid_square_sends_error_terminal) {
+  const char *cfg_path = "build/test_network_legal_moves_invalid_square.conf";
+  const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
+                    "(defprofile p1 ((def port 19428) (def advertise 1)))\n";
+  if (wamble_test_prepare_db(
+          cfg_path, cfg,
+          "INSERT INTO global_policy_rules "
+          "(global_identity_id, action, resource, scope, effect, "
+          "permission_level, reason, source) VALUES "
+          "(0, 'trust.tier', 'tier', '*', 'allow', 1, 'trust', 'test'), "
+          "(0, 'protocol.ctrl', 'client_hello', '*', 'allow', 0, "
+          "'hello_access', 'test'), "
+          "(0, 'protocol.ctrl', 'get_legal_moves', '*', 'allow', 0, "
+          "'legal_moves_access', 'test'), "
+          "(0, 'game.move', 'legal', '*', 'allow', 0, 'legal_access', "
+          "'test');") != 0) {
+    T_FAIL_SIMPLE("wamble_test_prepare_db failed");
+  }
+
+  player_manager_init();
+  board_manager_init();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in bindaddr;
+  memset(&bindaddr, 0, sizeof(bindaddr));
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  struct WambleMsg hello = {0};
+  hello.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  hello.header_version = WAMBLE_PROTO_VERSION;
+  RecvOneCtx rx_hello = {.sock = cli};
+  wamble_thread_t th_hello;
+  T_ASSERT(
+      wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
+  T_ASSERT_EQ_INT(rx_hello.received, 1);
+  T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+  uint64_t board_id = rx_hello.msg.board_id;
+  T_ASSERT(board_id != 0);
+
+  struct WambleMsg req = {0};
+  req.ctrl = WAMBLE_CTRL_GET_LEGAL_MOVES;
+  req.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(req.token, rx_hello.msg.token, TOKEN_LENGTH);
+  req.board_id = board_id;
+  req.stats.legal_moves.square = 64;
+
+  RecvOneCtx rx = {.sock = cli};
+  wamble_thread_t th;
+  T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
+  T_ASSERT_EQ_INT(handle_message(srv, &req, &cliaddr, 0, "p1"),
+                  SERVER_ERR_INTERNAL);
+  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  T_ASSERT_EQ_INT(rx.received, 1);
+  T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_ERROR);
+  T_ASSERT_EQ_INT(rx.msg.view.error_code, WAMBLE_ERR_LEGAL_MOVES_INVALID);
+  T_ASSERT((rx.msg.flags & WAMBLE_FLAG_UNRELIABLE) == 0);
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
 WAMBLE_TESTS_BEGIN_NAMED(wamble_register_tests_network)
 WAMBLE_TESTS_ADD_SM(token_base64url_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
@@ -4590,6 +6466,12 @@ WAMBLE_TESTS_ADD_DB_SM(server_protocol_client_hello_requires_policy,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(server_protocol_client_hello_advertises_session_caps,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_client_hello_advertises_prediction_limits,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_client_hello_reuses_existing_reserved_board,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(server_protocol_profile_info_advertises_profile_caps,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
@@ -4597,6 +6479,11 @@ WAMBLE_TESTS_ADD_DB_SM(
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(server_protocol_accept_profile_tos_persists_terms,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(server_protocol_get_profile_tos_does_not_create_session,
+                       WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_accept_profile_tos_requires_existing_session,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(server_protocol_terms_routes_allow_hidden_bound_profile,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
@@ -4607,6 +6494,24 @@ WAMBLE_TESTS_ADD_DB_SM(
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
     server_protocol_spectate_denial_reports_capacity_full_error_code,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_reliable_spectate_focus_sends_terminal_before_ack,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_reliable_spectate_denial_sends_terminal_before_ack,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_spectate_summary_returns_reliable_snapshot,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_reliable_spectate_stop_sends_terminal_before_ack,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_reliable_player_move_sends_terminal_before_ack,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_spectate_stop_returns_reliable_idle_packet,
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(server_protocol_player_stats_scope_context_is_ignored,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
@@ -4625,6 +6530,9 @@ WAMBLE_TESTS_ADD_DB_SM(
 WAMBLE_TESTS_ADD_DB_SM(server_protocol_get_active_reservations_identity_query,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_get_active_reservations_includes_live_attached_board,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
     server_protocol_get_active_reservations_caps_payload_count,
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
@@ -4635,8 +6543,19 @@ WAMBLE_TESTS_ADD_DB_SM(
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(server_protocol_login_uses_ed25519_challenge_response,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(server_protocol_prediction_submit_response_contract,
+                       WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(server_protocol_profile_tos_fragmented_with_hash,
                        WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_logout_tears_down_session_without_goodbye,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_reliable_accept_profile_tos_no_text_sends_error_terminal,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_DB_SM(
+    server_protocol_reliable_legal_moves_invalid_square_sends_error_terminal,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(spectate_stop_accept, WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(reserved_nonzero_rejected, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
@@ -4655,6 +6574,16 @@ WAMBLE_TESTS_ADD_SM(token_base64url_wrong_length, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
 WAMBLE_TESTS_ADD_SM(get_profile_tos_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
+WAMBLE_TESTS_ADD_SM(reliable_retry_replays_cached_terminal_response,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(reliable_retry_from_new_source_replays_to_rebound_address,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(shared_token_endpoints_get_independent_seq_state,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(token_session_index_tracks_shared_token_rebinds,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(reliable_retry_replays_fragmented_terminal_bundle,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(accept_profile_tos_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
 WAMBLE_TESTS_END()

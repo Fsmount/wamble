@@ -65,6 +65,21 @@ Extension Trailer (reserved)
 - Current capability metadata keys:
   - `session.caps` (`int` bitmask): server-advertised UI/session actions.
   - `prediction.source` (`string`): `tree` or `moves` for prediction reads.
+    Emitted when the session has prediction read capability.
+  - `prediction.max_pending` (`int`): authoritative pending-submission cap for
+    the session on the referenced board, derived from `prediction-max-pending`
+    config and current treatment. Emitted on `SERVER_HELLO`, `BOARD_UPDATE`,
+    and `LOGIN_SUCCESS` when the session has prediction submit capability.
+    Clients must use this value rather than a compile-time default.
+  - `prediction.request_kind` (`string`): `submit` on `PREDICTION_DATA`
+    returned for `SUBMIT_PREDICTION`, `tree` on `PREDICTION_DATA` returned for
+    `GET_PREDICTIONS`. Authoritative discriminator for the two response
+    shapes.
+  - `prediction.submit_status` (`int`): outcome code for `SUBMIT_PREDICTION`,
+    present only when `prediction.request_kind=submit`. Values:
+    `1=created`, `2=duplicate`, `3=duplicate_move`, `4=rejected_invalid`,
+    `5=rejected_limit`, `6=rejected_not_allowed`, `7=rejected_not_found`,
+    `8=rejected_disabled`.
   - `reservation.reserved_at` (`int`): wall-clock Unix epoch seconds when the
     current board reservation was created. Only present when the board has an
     active reservation. Carried on `SERVER_HELLO`, `BOARD_UPDATE`, and
@@ -151,15 +166,22 @@ Control Codes
 - `0x02` SERVER_HELLO (server to client): Response to HELLO.
   - Payload: `char fen[]` (current board state).
   - May include extension fields: `session.caps`, `prediction.source`,
-    `reservation.reserved_at`, `last_move.from`, `last_move.to`.
+    `prediction.max_pending`, `reservation.reserved_at`, `last_move.from`,
+    `last_move.to`.
 - `0x03` PLAYER_MOVE (client to server): Submit a move.
   - Payload: `uint8 uci_len; char uci[uci_len]` (max 6 bytes).
+  - Terminal result: reliable `BOARD_UPDATE` for the player's next assigned
+    board on success, or a reliable `ERROR` describing the rejection.
+  - Reliable-request ordering: the terminal `BOARD_UPDATE` or `ERROR` is sent
+    before the request's wire-level `ACK`. On retry within the terminal-cache
+    TTL, the cached terminal packet is replayed before the request `ACK`.
 - `0x04` BOARD_UPDATE (server to client): Board state has changed.
   - Payload: `char fen[]`.
   - `flags`: server sets `0x01` when the assigned board is Chess960 *and*
     `session.caps` includes game-mode visibility (`0x00000200`).
   - May include extension fields: `session.caps`, `prediction.source`,
-    `reservation.reserved_at`, `last_move.from`, `last_move.to`.
+    `prediction.max_pending`, `reservation.reserved_at`, `last_move.from`,
+    `last_move.to`.
 - `0x05` ACK (bidirectional): Acknowledges a reliable packet.
   - Payload: empty. Header `seq_num` matches the packet being ACKed.
 - `0x06` LIST_PROFILES (client to server): Request available profiles.
@@ -216,6 +238,12 @@ Control Codes
     (e.g., the focused board that ended). `token` identifies the recipient.
 - `0x0A` CLIENT_GOODBYE (client to server): Graceful disconnect.
   - Payload: empty.
+  - Server discards spectator and player state for the token; no terminal
+    response packet is sent.
+  - Reliable-request ordering: the handler completes its work before the
+    request's wire-level `ACK` is sent. On retry the duplicate is detected
+    against the original request and only the request `ACK` is replayed (the
+    work is not performed twice).
 - `0x0B` SPECTATE_GAME (client to server): Request to watch a game.
   - Payload: empty.
   - `flags` (summary mode only, `board_id=0`):
@@ -225,25 +253,37 @@ Control Codes
   - If game-mode visibility is denied for the session, mode filter bits are
     ignored and mode-specific flags are not exposed in updates.
   - Header semantics:
-    - `board_id=0` enters summary mode. The server will push per-board
+    - `board_id=0` enters summary mode. The terminal result is a reliable
+      summary snapshot: one or more `SPECTATE_UPDATE` packets carrying
+      `spectate.state=summary`, including a summary-reset packet
+      (`board_id=0`, empty `fen`) with `spectate.summary_generation`. After
+      that, the server pushes periodic mostly-unreliable per-board
       `SPECTATE_UPDATE` packets for eligible boards (ACTIVE+RESERVED), sorted
-      by recency and attractiveness. Immediate unreliable updates are sent on
-      entry, followed by periodic updates at `spectate-summary-hz`.
-    - `board_id>0` focuses a specific board. The server will push
-      `SPECTATE_UPDATE` packets for that board only. Immediate unreliable
-      update is sent on entry, followed by periodic updates at
-      `spectate-focus-hz`.
+      by recency and attractiveness, at `spectate-summary-hz`.
+    - `board_id>0` focuses a specific board. The terminal result is a reliable
+      `SPECTATE_UPDATE` snapshot with `spectate.state=focus` for that board.
+      After that, the server pushes periodic mostly-unreliable
+      `SPECTATE_UPDATE` packets for that board at `spectate-focus-hz`.
+  - Reliable-request ordering: the terminal `SPECTATE_UPDATE` or denial
+    `ERROR` is sent before the request's wire-level `ACK`.
 - `0x16` SPECTATE_STOP (client to server): Stop spectating.
-  - Payload: empty. Server acknowledges. Puts session in `IDLE` state.
+  - Payload: empty.
+  - Terminal result: reliable `SPECTATE_UPDATE` with `spectate.state=idle`.
+  - Reliable-request ordering: the idle `SPECTATE_UPDATE` is sent before the
+    request's wire-level `ACK`.
 - `0x0C` SPECTATE_UPDATE (server to client): Board update for spectators.
   - Header: `board_id` identifies the board for this update (authoritative).
   - Payload: `char fen[]`.
-  - Typically sent as unreliable (`flags` high bit set). One packet per board.
+  - Used for both reliable state snapshots and periodic unreliable board
+    refreshes.
+  - Typically periodic updates are sent as unreliable (`flags` high bit set).
+    One packet per board.
   - Payload carries FEN data; `board_id` is always present in the header and
     clients use it to associate updates with boards.
   - `flags`: server sets `0x01` when the update is for a Chess960 board and
     the spectator session has game-mode visibility.
-  - May include extension fields: `last_move.from`, `last_move.to`.
+  - May include extension fields: `spectate.state`,
+    `spectate.summary_generation`, `last_move.from`, `last_move.to`.
 - `0x0D` LOGIN_REQUEST (client to server): Attach persistent identity to an
   existing anonymous session.
   - Two-step payload variants:
@@ -264,12 +304,23 @@ Control Codes
 - `0x0E` LOGIN_CHALLENGE (server to client): One-time challenge for login proof.
   - Payload: `uint8 challenge[32]`.
   - Sent reliably.
-- `0x0F` LOGOUT (client to server): Disassociate persistent identity.
+- `0x0F` LOGOUT (client to server): Disassociate persistent identity and end
+    the session.
   - Payload: empty.
+  - Server clears any pending login challenge, detaches the persistent
+    identity from the session token, and tears down the session in-band:
+    spectator entries for the token are removed and the in-memory player
+    record is discarded (which abandons any held board reservation to its
+    timer). No terminal response packet is sent beyond the request `ACK`.
+  - Reliable-request ordering: the handler completes its work before the
+    request's wire-level `ACK` is sent. On retry the duplicate is detected
+    against the original request and only the request `ACK` is replayed
+    from the terminal cache; the discard is not re-run.
 - `0x10` LOGIN_SUCCESS (server to client): Successful login.
   - Payload: empty.
   - May include extension fields: `session.caps`, `prediction.source`,
-    `reservation.reserved_at`, `last_move.from`, `last_move.to`.
+    `prediction.max_pending`, `reservation.reserved_at`, `last_move.from`,
+    `last_move.to`.
 - `0x11` LOGIN_FAILED (server to client): Failed login.
   - Payload: `uint16 code; uint8 reason_len; char reason[reason_len]`.
 - `0x12` GET_PLAYER_STATS (client to server): Request player statistics.
@@ -343,13 +394,23 @@ Control Codes
   - `status`: `0=pending`, `1=correct`, `2=incorrect`, `3=expired`.
   - `points_bits_be` is an IEEE-754 double bit pattern in big-endian order.
   - Maximum entries per packet: 16.
+  - Every PREDICTION_DATA packet carries `prediction.request_kind`
+    (`submit` or `tree`). Submit responses additionally carry
+    `prediction.submit_status`; tree responses never do. Clients must
+    discriminate submit vs tree responses via `request_kind`, not local
+    sequence tracking or payload parsing.
+  - Successful submit: `count=1` with the created row read back from the
+    persisted submit result (not re-derived from a depth-limited tree read),
+    `prediction.submit_status=1`.
   - Failure states: prediction failures (access denied, duplicate, invalid
     request) are returned as PREDICTION_DATA with `count=0` rather than a
     generic ERROR. On duplicate (PREDICTION_ERR_DUPLICATE or
     PREDICTION_ERR_DUPLICATE_MOVE) when the submitter has prediction read
     access, the server returns PREDICTION_DATA with `count=1` containing the
-    existing prediction row. This follows the inline domain response pattern
-    used elsewhere in the protocol (LOGIN_FAILED, LEGAL_MOVES count=0, etc.).
+    existing prediction row and `prediction.submit_status=2` (same session)
+    or `3` (same UCI from another session). This follows the inline domain
+    response pattern used elsewhere in the protocol (LOGIN_FAILED,
+    LEGAL_MOVES count=0, etc.).
 - `0x1E` GET_PROFILE_TOS (client to server): Request ToS text for a profile.
   - Payload: `uint8 name_len; char name[name_len]`.
   - Authorization: profile must be discoverable by the requesting session's
@@ -365,7 +426,8 @@ Control Codes
   - Payload: `uint8 name_len; char name[name_len]`.
   - Authorization matches `GET_PROFILE_TOS`: discoverable profile or the
     caller's currently bound listener profile.
-  - Reliable clients receive an immediate `ACK`; failures return `ERROR`.
+- Reliable clients currently receive an immediate `ACK`; failures return
+  `ERROR`.
 - `0x21` GET_ACTIVE_RESERVATIONS (client to server): Request active board
   reservations for the caller's persistent identity.
   - Payload: empty.
@@ -389,6 +451,16 @@ Reliability
   - Retries up to `max-retries` times, with exponential backoff.
 - Duplicate detection: A sliding window (`W=1024`) of received sequence numbers is
   maintained per session to drop duplicate or old packets.
+- Terminal replay: when a reliable request is served successfully, the server
+  caches the serialized terminal response packet keyed by the request's
+  (token, seq_num). If the same reliable request arrives again (client retry,
+  including retries that arrive after NAT rebind from a new source address),
+  the server replays the cached terminal packet to the current source and
+  resends the request ACK without re-dispatching the handler. The session's
+  stored transport target is updated to the retry's source address in the same
+  step, so the reliable replay goes to the new address. Terminal replay covers
+  single-packet reliable responses; fragmented responses are regenerated on
+  retry.
 
 Unreliable Messages
 - Marked by setting the high bit of the `flags` field (`0x80`).
@@ -411,12 +483,17 @@ Spectator Policy
 
 Sessions
 - A session is identified by a `token` and the client's address:port.
-- Session table size is `max-client-sessions` per listener.
+- Session tables grow on demand per listener and expire inactive entries using
+  `session-timeout`.
 - Request throughput can be limited per token using
   `rate-limit-requests-per-sec`; bypass is policy-controlled via
   `rate_limit.bypass` with resource `request`.
 - NAT rebinding: The address:port for a session can be updated if a valid
-  packet arrives with the same token and a valid `seq_num`.
+  packet arrives with the same token and a valid `seq_num`. A reliable retry
+  that arrives from a new source address is matched to the existing session by
+  token; the transport target is rebound to the new address and the cached
+  terminal response (if any) is replayed to that address together with the
+  request ACK.
 - Idle sessions are removed after `session-timeout` seconds.
 
 Profiles

@@ -1,5 +1,6 @@
 #include "common/wamble_test.h"
 #include "wamble/wamble.h"
+#include "wamble/wamble_db.h"
 
 WAMBLE_TEST(spectator_summary_and_focus_flow) {
   char msg[128];
@@ -443,6 +444,274 @@ WAMBLE_TEST(spectator_mode_filters_ignored_without_game_mode_visibility) {
   return 0;
 }
 
+WAMBLE_TEST(spectator_reconnect_reuses_existing_entry) {
+  char msg[128];
+  T_ASSERT_STATUS(config_load(NULL, NULL, msg, sizeof(msg)),
+                  CONFIG_LOAD_DEFAULTS);
+  spectator_manager_init();
+  board_manager_init();
+  player_manager_init();
+
+  WamblePlayer *player = create_new_player();
+  T_ASSERT(player != NULL);
+  WambleBoard *board = find_board_for_player(player);
+  T_ASSERT(board != NULL);
+  uint64_t active_id = board->id;
+  board_move_played(board->id, NULL, NULL);
+
+  struct sockaddr_in addr_a;
+  memset(&addr_a, 0, sizeof(addr_a));
+  addr_a.sin_family = AF_INET;
+  addr_a.sin_port = htons((uint16_t)get_config()->port);
+  addr_a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+  struct sockaddr_in addr_b = addr_a;
+  addr_b.sin_port = htons((uint16_t)(get_config()->port + 1));
+
+  uint8_t token[TOKEN_LENGTH] = {11};
+  struct WambleMsg focus = {0};
+  focus.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  focus.board_id = active_id;
+  memcpy(focus.token, token, TOKEN_LENGTH);
+
+  SpectatorState state = SPECTATOR_STATE_IDLE;
+  uint64_t focus_id = 0;
+  T_ASSERT_EQ_INT(
+      spectator_handle_request(&focus, &addr_a, 0, 0, 1, &state, &focus_id),
+      SPECTATOR_OK_FOCUS);
+
+  SpectatorUpdate updates[8];
+  int count = spectator_collect_updates(updates, 8);
+  T_ASSERT_EQ_INT(count, 1);
+  T_ASSERT_EQ_INT((int)updates[0].addr.sin_port, (int)addr_a.sin_port);
+
+  T_ASSERT_EQ_INT(
+      spectator_handle_request(&focus, &addr_b, 0, 0, 1, &state, &focus_id),
+      SPECTATOR_OK_FOCUS);
+
+  count = spectator_collect_updates(updates, 8);
+  T_ASSERT_EQ_INT(count, 1);
+  T_ASSERT_EQ_INT((int)updates[0].addr.sin_port, (int)addr_b.sin_port);
+
+  struct WambleMsg stop = {0};
+  stop.ctrl = WAMBLE_CTRL_SPECTATE_STOP;
+  memcpy(stop.token, token, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(
+      spectator_handle_request(&stop, &addr_b, 0, 0, 0, &state, &focus_id),
+      SPECTATOR_OK_STOP);
+
+  count = spectator_collect_updates(updates, 8);
+  T_ASSERT_EQ_INT(count, 0);
+
+  spectator_manager_shutdown();
+  return 0;
+}
+
+WAMBLE_TEST(spectator_truncated_summary_retries_next_tick) {
+  char msg[128];
+  T_ASSERT_STATUS(config_load(NULL, NULL, msg, sizeof(msg)),
+                  CONFIG_LOAD_DEFAULTS);
+  spectator_manager_init();
+  board_manager_init();
+  player_manager_init();
+
+  WamblePlayer *player_a = create_new_player();
+  WamblePlayer *player_b = create_new_player();
+  T_ASSERT(player_a != NULL);
+  T_ASSERT(player_b != NULL);
+  WambleBoard *board_a = find_board_for_player(player_a);
+  WambleBoard *board_b = find_board_for_player(player_b);
+  T_ASSERT(board_a != NULL);
+  T_ASSERT(board_b != NULL);
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons((uint16_t)get_config()->port);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+  uint8_t token_a[TOKEN_LENGTH] = {21};
+  uint8_t token_b[TOKEN_LENGTH] = {22};
+
+  struct WambleMsg req = {0};
+  req.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  SpectatorState state = SPECTATOR_STATE_IDLE;
+  uint64_t focus = 0;
+  memcpy(req.token, token_a, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(
+      spectator_handle_request(&req, &addr, 0, 0, 1, &state, &focus),
+      SPECTATOR_OK_SUMMARY);
+  state = SPECTATOR_STATE_IDLE;
+  focus = 0;
+  memcpy(req.token, token_b, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(
+      spectator_handle_request(&req, &addr, 0, 0, 1, &state, &focus),
+      SPECTATOR_OK_SUMMARY);
+
+  SpectatorUpdate updates[3];
+  int count = spectator_collect_updates(updates, 3);
+  T_ASSERT(count >= 1);
+  int saw_a = 0;
+  int saw_b = 0;
+  for (int i = 0; i < count; i++) {
+    if (tokens_equal(updates[i].token, token_a))
+      saw_a = 1;
+    if (tokens_equal(updates[i].token, token_b))
+      saw_b = 1;
+  }
+  T_ASSERT(saw_a != saw_b);
+
+  WambleConfig cfg = *get_config();
+  cfg.spectator_summary_hz = 1000;
+  wamble_config_push(&cfg);
+  wamble_sleep_ms(2);
+  SpectatorUpdate updates2[16];
+  int count2 = spectator_collect_updates(updates2, 16);
+  wamble_config_pop();
+
+  int saw_a2 = 0;
+  int saw_b2 = 0;
+  for (int i = 0; i < count2; i++) {
+    if (tokens_equal(updates2[i].token, token_a))
+      saw_a2 = 1;
+    if (tokens_equal(updates2[i].token, token_b))
+      saw_b2 = 1;
+  }
+  T_ASSERT(saw_a2);
+  T_ASSERT(saw_b2);
+
+  spectator_manager_shutdown();
+  return 0;
+}
+
+WAMBLE_TEST(spectator_truncated_focus_retries_next_tick) {
+  char msg[128];
+  T_ASSERT_STATUS(config_load(NULL, NULL, msg, sizeof(msg)),
+                  CONFIG_LOAD_DEFAULTS);
+  spectator_manager_init();
+  board_manager_init();
+  player_manager_init();
+
+  WamblePlayer *player_a = create_new_player();
+  WamblePlayer *player_b = create_new_player();
+  T_ASSERT(player_a != NULL);
+  T_ASSERT(player_b != NULL);
+  WambleBoard *board_a = find_board_for_player(player_a);
+  WambleBoard *board_b = find_board_for_player(player_b);
+  T_ASSERT(board_a != NULL);
+  T_ASSERT(board_b != NULL);
+  board_move_played(board_a->id, NULL, NULL);
+  board_move_played(board_b->id, NULL, NULL);
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons((uint16_t)get_config()->port);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+  uint8_t token_a[TOKEN_LENGTH] = {31};
+  uint8_t token_b[TOKEN_LENGTH] = {32};
+
+  struct WambleMsg req = {0};
+  req.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  SpectatorState state = SPECTATOR_STATE_IDLE;
+  uint64_t focus = 0;
+  req.board_id = board_a->id;
+  memcpy(req.token, token_a, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(
+      spectator_handle_request(&req, &addr, 0, 0, 1, &state, &focus),
+      SPECTATOR_OK_FOCUS);
+  state = SPECTATOR_STATE_IDLE;
+  focus = 0;
+  req.board_id = board_b->id;
+  memcpy(req.token, token_b, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(
+      spectator_handle_request(&req, &addr, 0, 0, 1, &state, &focus),
+      SPECTATOR_OK_FOCUS);
+
+  SpectatorUpdate one[1];
+  int count = spectator_collect_updates(one, 1);
+  T_ASSERT_EQ_INT(count, 1);
+  uint8_t served[TOKEN_LENGTH];
+  memcpy(served, one[0].token, TOKEN_LENGTH);
+  int served_a = tokens_equal(served, token_a);
+  T_ASSERT(served_a || tokens_equal(served, token_b));
+
+  WambleConfig cfg = *get_config();
+  cfg.spectator_focus_hz = 1000;
+  wamble_config_push(&cfg);
+  wamble_sleep_ms(2);
+  SpectatorUpdate updates2[8];
+  int count2 = spectator_collect_updates(updates2, 8);
+  wamble_config_pop();
+
+  int saw_a = 0;
+  int saw_b = 0;
+  for (int i = 0; i < count2; i++) {
+    if (tokens_equal(updates2[i].token, token_a))
+      saw_a = 1;
+    if (tokens_equal(updates2[i].token, token_b))
+      saw_b = 1;
+  }
+  T_ASSERT(saw_a);
+  T_ASSERT(saw_b);
+
+  spectator_manager_shutdown();
+  return 0;
+}
+
+WAMBLE_TEST(spectator_focus_render_does_not_refresh_last_mover_liveness) {
+  char msg[128];
+  T_ASSERT_STATUS(config_load(NULL, NULL, msg, sizeof(msg)),
+                  CONFIG_LOAD_DEFAULTS);
+  spectator_manager_init();
+  board_manager_init();
+  player_manager_init();
+
+  WambleIntentBuffer intents = {0};
+  wamble_intents_init(&intents);
+  wamble_set_intent_buffer(&intents);
+
+  WamblePlayer *last_mover = create_new_player();
+  T_ASSERT(last_mover != NULL);
+  WambleBoard *board = find_board_for_player(last_mover);
+  T_ASSERT(board != NULL);
+  board_move_played(board->id, last_mover->token, NULL);
+  wamble_intents_clear(&intents);
+
+  time_t old_seen = wamble_now_wall() - 30;
+  last_mover->last_seen_time = old_seen;
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons((uint16_t)get_config()->port);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+  uint8_t spectator_token[TOKEN_LENGTH] = {33};
+  struct WambleMsg req = {0};
+  req.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
+  req.board_id = board->id;
+  memcpy(req.token, spectator_token, TOKEN_LENGTH);
+
+  SpectatorState state = SPECTATOR_STATE_IDLE;
+  uint64_t focus = 0;
+  T_ASSERT_EQ_INT(
+      spectator_handle_request(&req, &addr, 0, 0, 1, &state, &focus),
+      SPECTATOR_OK_FOCUS);
+
+  SpectatorUpdate updates[4];
+  int count = spectator_collect_updates(updates, 4);
+  T_ASSERT(count > 0);
+  T_ASSERT_EQ_INT((int)last_mover->last_seen_time, (int)old_seen);
+  T_ASSERT_EQ_INT(intents.count, 0);
+
+  wamble_set_intent_buffer(NULL);
+  wamble_intents_free(&intents);
+  spectator_manager_shutdown();
+  return 0;
+}
+
 WAMBLE_TESTS_BEGIN_NAMED(spectator_tests) {
   WAMBLE_TESTS_ADD_FM(spectator_summary_and_focus_flow, "spectator");
   WAMBLE_TESTS_ADD_FM(spectator_summary_updates_emit_full_snapshots,
@@ -454,5 +723,11 @@ WAMBLE_TESTS_BEGIN_NAMED(spectator_tests) {
                       "spectator");
   WAMBLE_TESTS_ADD_FM(
       spectator_mode_filters_ignored_without_game_mode_visibility, "spectator");
+  WAMBLE_TESTS_ADD_FM(spectator_reconnect_reuses_existing_entry, "spectator");
+  WAMBLE_TESTS_ADD_FM(spectator_truncated_summary_retries_next_tick,
+                      "spectator");
+  WAMBLE_TESTS_ADD_FM(spectator_truncated_focus_retries_next_tick, "spectator");
+  WAMBLE_TESTS_ADD_FM(
+      spectator_focus_render_does_not_refresh_last_mover_liveness, "spectator");
 }
 WAMBLE_TESTS_END()

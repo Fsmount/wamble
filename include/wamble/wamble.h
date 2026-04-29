@@ -55,12 +55,6 @@
 #include <string.h>
 #include <time.h>
 
-#if defined(_MSC_VER)
-#define WAMBLE_WEAK
-#else
-#define WAMBLE_WEAK __attribute__((weak))
-#endif
-
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 #define WAMBLE_ALIGNOF(type) _Alignof(type)
 #define WAMBLE_STATIC_ASSERT(name, expr) _Static_assert((expr), #name)
@@ -546,7 +540,7 @@ typedef struct WambleConfig {
   int max_retries;
   int max_message_size;
   int buffer_size;
-  int max_client_sessions;
+  int terminal_cache_ttl_ms;
   int rate_limit_requests_per_sec;
   int session_timeout;
   int max_boards;
@@ -1454,6 +1448,7 @@ static inline size_t wamble_build_login_signature_message(
 #define WAMBLE_NOTIFICATION_TYPE_MAINTENANCE 3
 #define WAMBLE_NOTIFICATION_TYPE_ANNOUNCEMENT 4
 #define WAMBLE_NOTIFICATION_TYPE_RESERVATION_RELEASED 5
+#define WAMBLE_NOTIFICATION_TYPE_SESSION_EXPIRED 6
 
 typedef struct {
   uint8_t from;
@@ -1837,6 +1832,10 @@ typedef struct ReservationReleaseNotification {
   uint64_t board_id;
 } ReservationReleaseNotification;
 
+typedef struct ExpiredSessionNotification {
+  uint8_t token[TOKEN_LENGTH];
+} ExpiredSessionNotification;
+
 void network_init_thread_state(void);
 int network_get_session_treatment_group(const uint8_t *token, char *out_group,
                                         size_t out_group_size);
@@ -1847,6 +1846,11 @@ int receive_message_packet(const uint8_t *packet, size_t packet_len,
                            const struct sockaddr_in *cliaddr);
 int network_get_client_addr_by_token(const uint8_t *token,
                                      struct sockaddr_in *out_addr);
+void network_bind_client_token(const struct sockaddr_in *addr,
+                               const uint8_t *token);
+int network_get_bound_token_for_addr(const struct sockaddr_in *addr,
+                                     uint8_t out_token[TOKEN_LENGTH]);
+void network_end_request(void);
 wamble_socket_t create_and_bind_socket(int port);
 int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
                     struct sockaddr_in *cliaddr);
@@ -1861,12 +1865,20 @@ void send_ack(wamble_socket_t sockfd, const struct WambleMsg *msg,
 int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
                           const struct sockaddr_in *cliaddr, int timeout_ms,
                           int max_retries);
+int send_replayable_terminal_message(wamble_socket_t sockfd,
+                                     const struct WambleMsg *msg,
+                                     const struct sockaddr_in *cliaddr);
 int send_reliable_payload_bytes(wamble_socket_t sockfd, uint8_t ctrl,
                                 const uint8_t *token, uint64_t board_id,
                                 const uint8_t *payload, size_t payload_len,
                                 const struct sockaddr_in *cliaddr,
                                 int timeout_ms, int max_retries,
                                 int force_fragment);
+int send_reliable_spectate_state_sync(wamble_socket_t sockfd,
+                                      const uint8_t *token,
+                                      const struct sockaddr_in *cliaddr);
+int send_reliable_board_state_sync(wamble_socket_t sockfd, const uint8_t *token,
+                                   const struct sockaddr_in *cliaddr);
 int send_unreliable_packet(wamble_socket_t sockfd, const struct WambleMsg *msg,
                            const struct sockaddr_in *cliaddr);
 int wamble_socket_bound_port(wamble_socket_t sock);
@@ -1876,7 +1888,7 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
 
 WambleWsGateway *ws_gateway_start(const char *profile_name, int ws_port,
                                   int udp_port, const char *ws_path,
-                                  int max_clients, WsGatewayStatus *out_status);
+                                  WsGatewayStatus *out_status);
 void ws_gateway_stop(WambleWsGateway *gateway);
 int ws_gateway_matches(const WambleWsGateway *gateway, int ws_port,
                        int udp_port, const char *ws_path);
@@ -1887,6 +1899,13 @@ int ws_gateway_is_ws_client(const struct sockaddr_in *cliaddr);
 int ws_gateway_queue_packet(const struct sockaddr_in *cliaddr,
                             const uint8_t *packet, size_t packet_len);
 void ws_gateway_flush_outbound(WambleWsGateway *gateway);
+int ws_gateway_flush_route(const struct sockaddr_in *cliaddr);
+int ws_gateway_active_client_count(WambleWsGateway *gateway);
+
+int network_protocol_thread_pending_packet_count(void);
+int network_protocol_thread_terminal_cache_packet_count(void);
+int server_protocol_thread_pending_login_challenge_count(void);
+int board_manager_count_active_or_reserved(void);
 
 SpectatorInitStatus spectator_manager_init(void);
 void spectator_manager_shutdown(void);
@@ -1895,9 +1914,15 @@ SpectatorRequestStatus spectator_handle_request(
     const struct WambleMsg *msg, const struct sockaddr_in *cliaddr,
     int trust_tier, int capacity_bypass, int game_mode_visible,
     SpectatorState *out_state, uint64_t *out_focus_board_id);
+int spectator_get_state_by_token(const uint8_t *token,
+                                 SpectatorState *out_state,
+                                 uint64_t *out_focus_board_id);
 void spectator_discard_by_token(const uint8_t *token);
+int spectator_collect_state_snapshot(const uint8_t *token,
+                                     struct SpectatorUpdate *out, int max);
 int spectator_collect_updates(struct SpectatorUpdate *out, int max);
 int spectator_collect_notifications(struct SpectatorUpdate *out, int max);
+int spectator_manager_active_count_for_port(int owner_port);
 int board_collect_reservation_release_notifications(
     ReservationReleaseNotification *out, int max);
 
@@ -2201,6 +2226,9 @@ void board_game_completed(uint64_t board_id, GameResult result);
 bool board_is_reserved_for_player(uint64_t board_id,
                                   const uint8_t *player_token);
 void board_release_reservation(uint64_t board_id);
+int board_emit_persistent_reservation_for_token(const uint8_t *player_token);
+int board_fill_active_reservation_for_token(const uint8_t *player_token,
+                                            DbActiveReservationEntry *out);
 void update_player_ratings(WambleBoard *board);
 WambleBoard *get_board_by_id(uint64_t board_id);
 int board_manager_export(WambleBoard *out, int max, int *out_count,
@@ -2216,8 +2244,11 @@ WamblePlayer *attach_persistent_identity(const uint8_t *token,
                                          const uint8_t *public_key);
 int detach_persistent_identity(const uint8_t *token);
 void player_manager_tick(void);
+int player_collect_expired_session_notifications(
+    ExpiredSessionNotification *out, int max);
 
 WamblePlayer *get_player_by_token(const uint8_t *token);
+int get_player_snapshot_by_token(const uint8_t *token, WamblePlayer *out);
 void discard_player_by_token(const uint8_t *token);
 
 void rng_init(void);
@@ -2247,6 +2278,8 @@ PredictionStatus prediction_collect_tree(uint64_t board_id,
                                          int *out_count);
 PredictionStatus prediction_get_view_by_id(uint64_t prediction_id,
                                            WamblePredictionView *out);
+int prediction_max_pending_for_player(const WambleBoard *board,
+                                      const uint8_t *player_token);
 int prediction_get_runtime_counts(uint64_t board_id, const uint8_t *token,
                                   int *out_pending_count,
                                   int *out_failed_count);

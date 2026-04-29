@@ -23,7 +23,6 @@ Core Options (common defaults)
 - `max-retries` (int, 3): Reliable send retries.
 - `max-message-size` (int, 126): Fixed message body size (informational).
 - `buffer-size` (int, 32768): Socket send/recv buffer bytes.
-- `max-client-sessions` (int, 1024): Client session capacity.
 - `rate-limit-requests-per-sec` (int, 120; `0` disables): Per-token request
   budget applied at runtime.
 - `session-timeout` (int, 300): Idle session timeout (sec).

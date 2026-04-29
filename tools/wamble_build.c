@@ -266,7 +266,7 @@ typedef struct {
   int warn;
   int gnu99;         /* 1: -std=gnu99, 0: -std=c99 */
   int section_flags; /* 1: add -ffunction-sections -fdata-sections */
-  int test_mode;     /* 1: add WAMBLE_TEST_ONLY / TEST_PROFILE_RUNTIME */
+  int test_mode;     /* 1: add TEST_PROFILE_RUNTIME */
   int use_msvc;
   const char *skip[COMPILE_SKIP_MAX]; /* NULL terminated list of filenames */
   int err;
@@ -316,7 +316,6 @@ static int compile_unit_cb(const char *name, int is_dir, void *vctx) {
     sv_push(&ccargs, "/Iinclude");
     if (c->test_mode) {
       sv_push(&ccargs, "/DTEST_PROFILE_RUNTIME");
-      sv_push(&ccargs, "/DWAMBLE_TEST_ONLY");
     }
     sv_push(&ccargs, "/c");
     sv_push(&ccargs, srcpath);
@@ -335,7 +334,6 @@ static int compile_unit_cb(const char *name, int is_dir, void *vctx) {
     sv_push(&ccargs, "-Iinclude");
     if (c->test_mode) {
       sv_push(&ccargs, "-DTEST_PROFILE_RUNTIME");
-      sv_push(&ccargs, "-DWAMBLE_TEST_ONLY");
     }
     sv_push(&ccargs, "-c");
     sv_push(&ccargs, srcpath);
@@ -748,7 +746,6 @@ int main(int argc, char **argv) {
       sv_push(&targs, "/Iinclude");
       sv_push(&targs, "/Itests/common");
 
-      sv_push(&targs, "/DWAMBLE_TEST_ONLY");
       if (with_db)
         sv_push(&targs, "/DWAMBLE_ENABLE_DB");
       sv_push(&targs, "tests/common/wamble_test.c");
@@ -774,7 +771,6 @@ int main(int argc, char **argv) {
       sv_push(&targs, "-Iinclude");
       sv_push(&targs, "-Itests/common");
 
-      sv_push(&targs, "-DWAMBLE_TEST_ONLY");
       if (with_db)
         sv_push(&targs, "-DWAMBLE_ENABLE_DB");
       sv_push(&targs, "tests/common/wamble_test.c");

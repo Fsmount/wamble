@@ -106,6 +106,75 @@ void rng_bytes(uint8_t *out, size_t len) {
 static WAMBLE_THREAD_LOCAL int *player_index_map;
 static WAMBLE_THREAD_LOCAL int player_manager_ready_flag = 0;
 
+#define EXPIRED_SESSION_NOTIFICATION_MIN_CAP 32
+static WAMBLE_THREAD_LOCAL ExpiredSessionNotification
+    *expired_session_notifications;
+static WAMBLE_THREAD_LOCAL int expired_session_notification_cap = 0;
+static WAMBLE_THREAD_LOCAL int expired_session_notification_head = 0;
+static WAMBLE_THREAD_LOCAL int expired_session_notification_count = 0;
+
+static int ensure_expired_session_notification_capacity(int need) {
+  if (need <= expired_session_notification_cap)
+    return 0;
+  int new_cap = expired_session_notification_cap > 0
+                    ? expired_session_notification_cap
+                    : EXPIRED_SESSION_NOTIFICATION_MIN_CAP;
+  while (new_cap < need)
+    new_cap *= 2;
+  ExpiredSessionNotification *next =
+      (ExpiredSessionNotification *)calloc((size_t)new_cap, sizeof(*next));
+  if (!next)
+    return -1;
+  for (int i = 0; i < expired_session_notification_count; i++) {
+    int src = (expired_session_notification_head + i) %
+              expired_session_notification_cap;
+    next[i] = expired_session_notifications[src];
+  }
+  free(expired_session_notifications);
+  expired_session_notifications = next;
+  expired_session_notification_cap = new_cap;
+  expired_session_notification_head = 0;
+  return 0;
+}
+
+static void
+queue_expired_session_notification_locked(const uint8_t token[TOKEN_LENGTH]) {
+  if (!token)
+    return;
+  if (ensure_expired_session_notification_capacity(
+          expired_session_notification_count + 1) != 0) {
+    return;
+  }
+  int slot =
+      (expired_session_notification_head + expired_session_notification_count) %
+      expired_session_notification_cap;
+  memcpy(expired_session_notifications[slot].token, token, TOKEN_LENGTH);
+  expired_session_notification_count++;
+}
+
+int player_collect_expired_session_notifications(
+    ExpiredSessionNotification *out, int max) {
+  if (!out || max <= 0 || !player_manager_ready_flag)
+    return 0;
+  wamble_mutex_lock(&player_mutex);
+  int n = expired_session_notification_count;
+  if (n > max)
+    n = max;
+  for (int i = 0; i < n; i++) {
+    int src = (expired_session_notification_head + i) %
+              expired_session_notification_cap;
+    out[i] = expired_session_notifications[src];
+  }
+  if (n > 0) {
+    expired_session_notification_head =
+        (expired_session_notification_head + n) %
+        expired_session_notification_cap;
+    expired_session_notification_count -= n;
+  }
+  wamble_mutex_unlock(&player_mutex);
+  return n;
+}
+
 static void hydrate_player_from_session(WamblePlayer *player,
                                         uint64_t session_id) {
   if (!player || session_id == 0)
@@ -271,6 +340,11 @@ void player_manager_init(void) {
     wamble_mutex_destroy(&player_mutex);
     wamble_mutex_destroy(&rng_mutex);
   }
+  free(expired_session_notifications);
+  expired_session_notifications = NULL;
+  expired_session_notification_cap = 0;
+  expired_session_notification_head = 0;
+  expired_session_notification_count = 0;
   if (get_config()->max_players <= 0)
     return;
   size_t nplayers = (size_t)get_config()->max_players;
@@ -312,11 +386,24 @@ WamblePlayer *get_player_by_token(const uint8_t *token) {
   DbStatus st =
       wamble_query_get_persistent_session_by_token(token, &session_id);
   if (st == DB_OK && session_id > 0) {
+    uint8_t session_pubkey[WAMBLE_PUBLIC_KEY_LENGTH] = {0};
+    int session_has_identity = 0;
+    DbStatus pk_st = wamble_query_get_session_public_key(
+        session_id, session_pubkey, &session_has_identity);
+    if (pk_st != DB_OK && pk_st != DB_NOT_FOUND) {
+      wamble_mutex_unlock(&player_mutex);
+      return NULL;
+    }
     WamblePlayer *player = find_empty_player_slot();
     if (player) {
       memcpy(player->token, token, TOKEN_LENGTH);
-      memset(player->public_key, 0, WAMBLE_PUBLIC_KEY_LENGTH);
-      player->has_persistent_identity = true;
+      if (session_has_identity) {
+        memcpy(player->public_key, session_pubkey, WAMBLE_PUBLIC_KEY_LENGTH);
+        player->has_persistent_identity = true;
+      } else {
+        memset(player->public_key, 0, WAMBLE_PUBLIC_KEY_LENGTH);
+        player->has_persistent_identity = false;
+      }
       player->last_seen_time = wamble_now_wall();
       hydrate_player_from_session(player, session_id);
       player_map_put(player->token, (int)(player - player_pool));
@@ -329,6 +416,45 @@ WamblePlayer *get_player_by_token(const uint8_t *token) {
 
   wamble_mutex_unlock(&player_mutex);
   return NULL;
+}
+
+int get_player_snapshot_by_token(const uint8_t *token, WamblePlayer *out) {
+  if (!token || !out || !player_manager_ready_flag)
+    return -1;
+
+  memset(out, 0, sizeof(*out));
+  wamble_mutex_lock(&player_mutex);
+
+  int idx = player_map_get(token);
+  if (idx >= 0) {
+    *out = player_pool[idx];
+    wamble_mutex_unlock(&player_mutex);
+    return 0;
+  }
+
+  uint64_t session_id = 0;
+  DbStatus st =
+      wamble_query_get_persistent_session_by_token(token, &session_id);
+  if (st == DB_OK && session_id > 0) {
+    uint8_t session_pubkey[WAMBLE_PUBLIC_KEY_LENGTH] = {0};
+    int session_has_identity = 0;
+    DbStatus pk_st = wamble_query_get_session_public_key(
+        session_id, session_pubkey, &session_has_identity);
+    if (pk_st == DB_OK || pk_st == DB_NOT_FOUND) {
+      memcpy(out->token, token, TOKEN_LENGTH);
+      if (session_has_identity) {
+        memcpy(out->public_key, session_pubkey, WAMBLE_PUBLIC_KEY_LENGTH);
+        out->has_persistent_identity = true;
+      }
+      hydrate_player_from_session(out, session_id);
+      wamble_mutex_unlock(&player_mutex);
+      return 0;
+    }
+  }
+
+  wamble_mutex_unlock(&player_mutex);
+  memset(out, 0, sizeof(*out));
+  return -1;
 }
 
 WamblePlayer *create_new_player(void) {
@@ -410,6 +536,7 @@ WamblePlayer *attach_persistent_identity(const uint8_t *token,
     apply_persistent_player_stats(player, &stats);
   wamble_emit_link_session_to_pubkey(player->token, public_key);
   wamble_mutex_unlock(&player_mutex);
+  (void)board_emit_persistent_reservation_for_token(token);
   return player;
 }
 
@@ -445,6 +572,7 @@ void player_manager_tick(void) {
             get_config()->token_expiration) {
       uint8_t old_token[TOKEN_LENGTH];
       memcpy(old_token, player_pool[i].token, TOKEN_LENGTH);
+      queue_expired_session_notification_locked(old_token);
       player_map_delete(old_token);
       memset(&player_pool[i], 0, sizeof(player_pool[i]));
     }

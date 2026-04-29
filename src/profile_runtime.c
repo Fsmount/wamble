@@ -1002,6 +1002,22 @@ static char *profile_runtime_snapshot_template(const RunningProfile *rp) {
   return tmpl;
 }
 
+static int profile_runtime_reliable_state_drained(RunningProfile *rp) {
+  if (network_protocol_thread_pending_packet_count() != 0)
+    return 0;
+  if (network_protocol_thread_terminal_cache_packet_count() != 0)
+    return 0;
+  if (server_protocol_thread_pending_login_challenge_count() != 0)
+    return 0;
+  if (rp->ws_gateway && ws_gateway_active_client_count(rp->ws_gateway) != 0)
+    return 0;
+  if (spectator_manager_active_count_for_port(rp->cfg.port) != 0)
+    return 0;
+  if (board_manager_count_active_or_reserved() != 0)
+    return 0;
+  return 1;
+}
+
 static void profile_runtime_prepare_exec_snapshot(RunningProfile *rp) {
 #if defined(WAMBLE_PLATFORM_POSIX)
   int should_prepare = 0;
@@ -1012,6 +1028,8 @@ static void profile_runtime_prepare_exec_snapshot(RunningProfile *rp) {
   if (!should_prepare)
     return;
 
+  if (!profile_runtime_reliable_state_drained(rp))
+    return;
   if (!profile_runtime_flush_intents(rp, 64))
     return;
   char *tmpl = profile_runtime_snapshot_template(rp);
@@ -1080,6 +1098,7 @@ static void profile_runtime_poll_messages(RunningProfile *rp) {
       if (n <= 0)
         continue;
       (void)handle_message(rp->sockfd, &msg, &ws_cliaddr, 0, rp->name);
+      network_end_request();
     }
   }
 
@@ -1106,6 +1125,7 @@ static void profile_runtime_poll_messages(RunningProfile *rp) {
     if (n <= 0)
       break;
     (void)handle_message(rp->sockfd, &msg, &cliaddr, 0, rp->name);
+    network_end_request();
   }
 
   if (rp->ws_gateway)
@@ -1142,21 +1162,58 @@ static void send_spectator_batch(wamble_socket_t sockfd,
   }
 }
 
-static void profile_runtime_send_spectator_updates(RunningProfile *rp) {
-  int cap = get_config()->max_client_sessions;
+static void profile_runtime_send_reliable_spectate_transition(
+    wamble_socket_t sockfd, const SpectatorUpdate *notice) {
+  if (!notice ||
+      notice->notification_type != WAMBLE_NOTIFICATION_TYPE_SPECTATE_ENDED) {
+    return;
+  }
+
+  if (notice->flags & WAMBLE_FLAG_SPECTATE_NOTICE_STOPPED) {
+    (void)send_reliable_spectate_state_sync(sockfd, notice->token,
+                                            &notice->addr);
+    return;
+  }
+
+  if (notice->flags & WAMBLE_FLAG_SPECTATE_NOTICE_SUMMARY_FALLBACK) {
+    (void)send_reliable_spectate_state_sync(sockfd, notice->token,
+                                            &notice->addr);
+  }
+}
+
+static int profile_runtime_spectator_event_cap(const RunningProfile *rp) {
+  int cap = spectator_manager_active_count_for_port(rp->cfg.port);
+  if (cap < get_config()->max_boards + 1)
+    cap = get_config()->max_boards + 1;
   if (cap < 1)
     cap = 1;
+  return cap;
+}
+
+static int profile_runtime_player_event_cap(void) {
+  int cap = get_config()->max_players;
+  return cap > 0 ? cap : 1;
+}
+
+static void profile_runtime_send_spectator_events(RunningProfile *rp) {
+  int cap = profile_runtime_spectator_event_cap(rp);
   SpectatorUpdate *events =
       (SpectatorUpdate *)malloc(sizeof(SpectatorUpdate) * (size_t)cap);
   if (!events)
     return;
-  int nupd = spectator_collect_updates(events, cap);
-  send_spectator_batch(rp->sockfd, events, nupd, WAMBLE_CTRL_SPECTATE_UPDATE);
   int nnot = spectator_collect_notifications(events, cap);
+  for (int i = 0; i < nnot; i++) {
+    profile_runtime_send_reliable_spectate_transition(rp->sockfd, &events[i]);
+  }
   send_spectator_batch(rp->sockfd, events, nnot,
                        WAMBLE_CTRL_SERVER_NOTIFICATION);
+  int nupd = spectator_collect_updates(events, cap);
+  send_spectator_batch(rp->sockfd, events, nupd, WAMBLE_CTRL_SPECTATE_UPDATE);
   free(events);
+}
 
+static void profile_runtime_send_reservation_releases(RunningProfile *rp) {
+  int cap = profile_runtime_player_event_cap();
   ReservationReleaseNotification *released =
       (ReservationReleaseNotification *)malloc(sizeof(*released) * (size_t)cap);
   if (!released)
@@ -1166,16 +1223,36 @@ static void profile_runtime_send_spectator_updates(RunningProfile *rp) {
     struct sockaddr_in addr;
     if (network_get_client_addr_by_token(released[i].token, &addr) != 0)
       continue;
-    struct WambleMsg out = {0};
-    out.ctrl = WAMBLE_CTRL_SERVER_NOTIFICATION;
-    out.flags = WAMBLE_FLAG_UNRELIABLE;
-    out.session.notification_type =
-        WAMBLE_NOTIFICATION_TYPE_RESERVATION_RELEASED;
-    out.board_id = released[i].board_id;
-    memcpy(out.token, released[i].token, TOKEN_LENGTH);
-    (void)send_unreliable_packet(rp->sockfd, &out, &addr);
+    (void)send_reliable_board_state_sync(rp->sockfd, released[i].token, &addr);
   }
   free(released);
+}
+
+static void profile_runtime_send_expired_session_notices(RunningProfile *rp) {
+  int cap = profile_runtime_player_event_cap();
+  ExpiredSessionNotification *expired =
+      (ExpiredSessionNotification *)malloc(sizeof(*expired) * (size_t)cap);
+  if (!expired)
+    return;
+  int nexp = player_collect_expired_session_notifications(expired, cap);
+  for (int i = 0; i < nexp; i++) {
+    struct sockaddr_in addr;
+    if (network_get_client_addr_by_token(expired[i].token, &addr) != 0)
+      continue;
+    struct WambleMsg out = {0};
+    out.ctrl = WAMBLE_CTRL_SERVER_NOTIFICATION;
+    memcpy(out.token, expired[i].token, TOKEN_LENGTH);
+    out.flags = WAMBLE_FLAG_UNRELIABLE;
+    out.session.notification_type = WAMBLE_NOTIFICATION_TYPE_SESSION_EXPIRED;
+    (void)send_unreliable_packet(rp->sockfd, &out, &addr);
+  }
+  free(expired);
+}
+
+static void profile_runtime_send_spectator_updates(RunningProfile *rp) {
+  profile_runtime_send_spectator_events(rp);
+  profile_runtime_send_reservation_releases(rp);
+  profile_runtime_send_expired_session_notices(rp);
 }
 
 static int profile_ws_is_enabled(const RunningProfile *rp) {
@@ -1221,9 +1298,9 @@ static WsGatewayStatus profile_ws_reconcile(RunningProfile *rp) {
   if (udp_port <= 0)
     udp_port = rp->cfg.port;
   WsGatewayStatus ws_status = WS_GATEWAY_OK;
-  rp->ws_gateway = ws_gateway_start(
-      rp->name ? rp->name : "default", profile_ws_port(rp), udp_port,
-      rp->cfg.websocket_path, rp->cfg.max_client_sessions, &ws_status);
+  rp->ws_gateway =
+      ws_gateway_start(rp->name ? rp->name : "default", profile_ws_port(rp),
+                       udp_port, rp->cfg.websocket_path, &ws_status);
   if (!rp->ws_gateway) {
     publish_ws_gateway_status(ws_status, rp->name);
     if (ws_status == WS_GATEWAY_ERR_CONFIG) {
@@ -1319,6 +1396,8 @@ static void profile_runtime_step(RunningProfile *rp) {
   }
 
   profile_runtime_prepare_exec_snapshot(rp);
+  if (rp->ready_for_exec)
+    return;
   if (rp->needs_update) {
     rp->needs_update = 0;
     if (rp->has_pending_cfg) {
@@ -1344,7 +1423,7 @@ static void profile_runtime_step(RunningProfile *rp) {
     cleanup_expired_sessions();
     rp->last_cleanup = now;
   }
-  if (now - rp->last_tick > 1) {
+  if (now - rp->last_tick >= 1) {
     player_manager_tick();
     board_manager_tick();
     spectator_manager_tick();
@@ -1546,10 +1625,8 @@ static int runtime_cfg_requires_restart(const WambleConfig *a,
                                         const WambleConfig *b) {
   if (!a || !b)
     return 1;
-  return a->buffer_size != b->buffer_size ||
-         a->max_client_sessions != b->max_client_sessions ||
-         a->max_boards != b->max_boards || a->min_boards != b->min_boards ||
-         a->max_players != b->max_players ||
+  return a->buffer_size != b->buffer_size || a->max_boards != b->max_boards ||
+         a->min_boards != b->min_boards || a->max_players != b->max_players ||
          !cfg_str_eq(a->db_host, b->db_host) ||
          !cfg_str_eq(a->db_user, b->db_user) ||
          !cfg_str_eq(a->db_pass, b->db_pass) ||
@@ -1570,7 +1647,6 @@ static int runtime_cfg_equals(const WambleConfig *a, const WambleConfig *b) {
          a->timeout_ms == b->timeout_ms && a->max_retries == b->max_retries &&
          a->max_message_size == b->max_message_size &&
          a->buffer_size == b->buffer_size &&
-         a->max_client_sessions == b->max_client_sessions &&
          a->rate_limit_requests_per_sec == b->rate_limit_requests_per_sec &&
          a->session_timeout == b->session_timeout &&
          a->max_boards == b->max_boards && a->min_boards == b->min_boards &&

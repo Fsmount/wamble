@@ -2912,11 +2912,12 @@ DbStatus db_record_profile_terms_acceptance(
     return DB_ERR_EXEC;
 
   uint64_t session_id = 0;
-  if (db_get_session_by_token(token, &session_id) != DB_OK || session_id == 0) {
-    session_id = db_create_session(token, 0);
-    if (session_id == 0)
-      return DB_ERR_EXEC;
+  DbStatus session_st = db_get_session_by_token(token, &session_id);
+  if (session_st == DB_NOT_FOUND || (session_st == DB_OK && session_id == 0)) {
+    return DB_NOT_FOUND;
   }
+  if (session_st != DB_OK)
+    return session_st;
 
   const char *query =
       "INSERT INTO profile_terms_acceptances ("

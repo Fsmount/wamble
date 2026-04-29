@@ -101,7 +101,11 @@ API
     (`0x100`) to bypass the move-identical duplicate check.
 - `prediction_resolve_move()`.
 - `prediction_collect_tree()`.
-- `prediction_get_view_by_id()`.
+- `prediction_get_view_by_id()` - authoritative read for `SUBMIT_PREDICTION`
+  responses; server returns the persisted submit result by id rather than
+  walking a depth-limited tree re-read.
+- `prediction_max_pending_for_player()` - resolves the treatment-adjusted
+  pending cap advertised via the `prediction.max_pending` extension field.
 - `prediction_expire_board()`.
 
 References
@@ -113,8 +117,16 @@ References
   `prediction-enforce-move-duplicate`, `prediction-view-depth-limit`.
 - Protocol (see docs/network_protocol.txt): `SUBMIT_PREDICTION`,
   `GET_PREDICTIONS`, `PREDICTION_DATA`.
+  - Every `PREDICTION_DATA` packet carries `prediction.request_kind`
+    (`submit`|`tree`). Submit responses additionally carry
+    `prediction.submit_status` (1=created, 2=duplicate, 3=duplicate_move,
+    4=rejected_invalid, 5=rejected_limit, 6=rejected_not_allowed,
+    7=rejected_not_found, 8=rejected_disabled).
   - Prediction failures respond with `PREDICTION_DATA` (count=0), not generic
     `ERROR`. On duplicate with read access, the existing prediction row is
-    returned (count=1).
+    returned (count=1) with `prediction.submit_status` of 2 or 3.
+  - `SERVER_HELLO`, `BOARD_UPDATE`, and `LOGIN_SUCCESS` carry
+    `prediction.max_pending` when submit capability is set; clients must use
+    this value rather than any compile-time default.
 - Scoring (see docs/scoring.txt): normal board pot scoring remains separate.
 - Database (see docs/database.txt): tables `predictions`, `sessions`.

@@ -264,17 +264,17 @@ static int prediction_treatment_feature_bool(const uint8_t *token,
       }
     }
     if (have_prev && fact_count + 2 <= 32) {
-      WamblePlayer *prev = get_player_by_token(board->last_mover_token);
-      if (prev) {
+      WamblePlayer prev;
+      if (get_player_snapshot_by_token(board->last_mover_token, &prev) == 0) {
         snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
                  "previous_player.rating");
         facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
-        facts[fact_count].double_value = prev->rating;
+        facts[fact_count].double_value = prev.rating;
         fact_count++;
         snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
                  "previous_player.score");
         facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
-        facts[fact_count].double_value = prev->score;
+        facts[fact_count].double_value = prev.score;
         fact_count++;
       }
     }
@@ -1090,6 +1090,20 @@ PredictionStatus prediction_get_view_by_id(uint64_t prediction_id,
   prediction_fill_view_locked(&g_predictions[idx], out);
   wamble_mutex_unlock(&g_prediction_mutex);
   return PREDICTION_OK;
+}
+
+int prediction_max_pending_for_player(const WambleBoard *board,
+                                      const uint8_t *player_token) {
+  int max_pending = get_config()->prediction_max_pending;
+  if (max_pending < 1)
+    max_pending = 1;
+  if (!board || !player_token || !g_prediction_mutex_ready)
+    return max_pending;
+  wamble_mutex_lock(&g_prediction_mutex);
+  max_pending =
+      prediction_treatment_max_pending_locked(player_token, board, max_pending);
+  wamble_mutex_unlock(&g_prediction_mutex);
+  return max_pending;
 }
 
 static void prediction_clear_board(uint64_t board_id) {
