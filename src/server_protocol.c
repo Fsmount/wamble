@@ -100,8 +100,15 @@ static int ensure_rate_limit_entries(void) {
 }
 
 static RequestRateLimitEntry *grow_rate_limit_entries(void) {
+  int max_capacity = get_config()->max_players;
+  if (max_capacity < 1)
+    max_capacity = 1;
   int old_capacity = g_rate_limit_capacity;
+  if (old_capacity >= max_capacity)
+    return NULL;
   int new_capacity = old_capacity > 0 ? old_capacity * 2 : 1;
+  if (new_capacity > max_capacity)
+    new_capacity = max_capacity;
   if (new_capacity <= old_capacity)
     return NULL;
   RequestRateLimitEntry *next = (RequestRateLimitEntry *)realloc(
@@ -1041,17 +1048,6 @@ static ServerStatus send_access_denied_for_request(
   if (send_terminal_response(sockfd, &err, cliaddr) != 0)
     return SERVER_ERR_SEND_FAILED;
   return SERVER_ERR_FORBIDDEN;
-}
-
-static const WambleMessageExtField *
-find_ext_field_by_key(const struct WambleMsg *msg, const char *key) {
-  if (!msg || !key || !key[0])
-    return NULL;
-  for (uint8_t i = 0; i < msg->extensions.count; i++) {
-    if (strcmp(msg->extensions.fields[i].key, key) == 0)
-      return &msg->extensions.fields[i];
-  }
-  return NULL;
 }
 
 static int effective_profile_websocket_port(const WambleProfile *profile);
@@ -2830,13 +2826,11 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
   }
   case WAMBLE_CTRL_GET_PLAYER_STATS: {
     const WambleMessageExtField *target_sid_ext =
-        find_ext_field_by_key(msg, "stats.target_session_id");
+        wamble_msg_ext_find(msg, "stats.target_session_id");
     const WambleMessageExtField *target_handle_ext =
-        find_ext_field_by_key(msg, "stats.target_handle");
+        wamble_msg_ext_find(msg, "stats.target_handle");
     const WambleMessageExtField *target_pub_ext =
-        find_ext_field_by_key(msg, "stats.target_public_key");
-    const WambleMessageExtField *request_id_ext =
-        find_ext_field_by_key(msg, "stats.request_id");
+        wamble_msg_ext_find(msg, "stats.target_public_key");
     int has_explicit_target = 0;
     int requester_known = 0;
     int target_has_identity = 0;
@@ -2849,11 +2843,9 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     int games_played = 0;
     int chess960_games_played = 0;
 
-    if (request_id_ext &&
-        request_id_ext->value_type == WAMBLE_TREATMENT_VALUE_INT &&
-        request_id_ext->int_value > 0) {
-      stats_request_id = request_id_ext->int_value;
-    }
+    if (!wamble_msg_ext_read_int(msg, "stats.request_id", &stats_request_id) ||
+        stats_request_id < 0)
+      stats_request_id = 0;
 
     if (wamble_query_get_session_by_token(msg->token, &requester_session_id) ==
         DB_OK) {
@@ -3042,7 +3034,7 @@ ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
     int limit = msg->leaderboard_payload.limit
                     ? (int)msg->leaderboard_payload.limit
                     : 10;
-    page_index_field = find_ext_field_by_key(msg, "leaderboard.page_index");
+    page_index_field = wamble_msg_ext_find(msg, "leaderboard.page_index");
     if (page_index_field &&
         page_index_field->value_type == WAMBLE_TREATMENT_VALUE_INT) {
       page_index_ext = page_index_field->int_value;

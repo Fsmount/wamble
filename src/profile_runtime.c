@@ -1181,15 +1181,22 @@ static void profile_runtime_send_reliable_spectate_transition(
   }
 }
 
-static void profile_runtime_send_spectator_updates(RunningProfile *rp) {
-  const WambleConfig *cfg = get_config();
+static int profile_runtime_spectator_event_cap(const RunningProfile *rp) {
   int cap = spectator_manager_active_count_for_port(rp->cfg.port);
-  if (cap < cfg->max_boards + 1)
-    cap = cfg->max_boards + 1;
-  if (cap < cfg->max_players)
-    cap = cfg->max_players;
+  if (cap < get_config()->max_boards + 1)
+    cap = get_config()->max_boards + 1;
   if (cap < 1)
     cap = 1;
+  return cap;
+}
+
+static int profile_runtime_player_event_cap(void) {
+  int cap = get_config()->max_players;
+  return cap > 0 ? cap : 1;
+}
+
+static void profile_runtime_send_spectator_events(RunningProfile *rp) {
+  int cap = profile_runtime_spectator_event_cap(rp);
   SpectatorUpdate *events =
       (SpectatorUpdate *)malloc(sizeof(SpectatorUpdate) * (size_t)cap);
   if (!events)
@@ -1203,6 +1210,10 @@ static void profile_runtime_send_spectator_updates(RunningProfile *rp) {
   int nupd = spectator_collect_updates(events, cap);
   send_spectator_batch(rp->sockfd, events, nupd, WAMBLE_CTRL_SPECTATE_UPDATE);
   free(events);
+}
+
+static void profile_runtime_send_reservation_releases(RunningProfile *rp) {
+  int cap = profile_runtime_player_event_cap();
   ReservationReleaseNotification *released =
       (ReservationReleaseNotification *)malloc(sizeof(*released) * (size_t)cap);
   if (!released)
@@ -1215,6 +1226,10 @@ static void profile_runtime_send_spectator_updates(RunningProfile *rp) {
     (void)send_reliable_board_state_sync(rp->sockfd, released[i].token, &addr);
   }
   free(released);
+}
+
+static void profile_runtime_send_expired_session_notices(RunningProfile *rp) {
+  int cap = profile_runtime_player_event_cap();
   ExpiredSessionNotification *expired =
       (ExpiredSessionNotification *)malloc(sizeof(*expired) * (size_t)cap);
   if (!expired)
@@ -1232,6 +1247,12 @@ static void profile_runtime_send_spectator_updates(RunningProfile *rp) {
     (void)send_unreliable_packet(rp->sockfd, &out, &addr);
   }
   free(expired);
+}
+
+static void profile_runtime_send_spectator_updates(RunningProfile *rp) {
+  profile_runtime_send_spectator_events(rp);
+  profile_runtime_send_reservation_releases(rp);
+  profile_runtime_send_expired_session_notices(rp);
 }
 
 static int profile_ws_is_enabled(const RunningProfile *rp) {

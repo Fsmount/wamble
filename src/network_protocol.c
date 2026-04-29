@@ -67,6 +67,11 @@ static WAMBLE_THREAD_LOCAL int pending_packet_count = 0;
 
 static int token_has_any_byte(const uint8_t *token);
 static int ensure_client_session_capacity(int needed);
+static int send_serialized_packet_once(wamble_socket_t sockfd,
+                                       const uint8_t *send_buffer,
+                                       size_t serialized_size,
+                                       const struct sockaddr_in *cliaddr,
+                                       int *sent_over_ws);
 
 static inline uint64_t mix64_s(uint64_t x) {
   x ^= x >> 33;
@@ -590,7 +595,11 @@ static void network_send_raw_to_client(wamble_socket_t sockfd,
   if (!cliaddr || !data || len == 0)
     return;
   int ws_rc = ws_gateway_queue_packet(cliaddr, data, len);
-  if (ws_rc != 0)
+  if (ws_rc > 0) {
+    (void)ws_gateway_flush_route(cliaddr);
+    return;
+  }
+  if (ws_rc < 0)
     return;
   if (sockfd == WAMBLE_INVALID_SOCKET)
     return;
@@ -1079,21 +1088,8 @@ void send_ack(wamble_socket_t sockfd, const struct WambleMsg *msg,
     return;
   }
 
-  int ws_rc = ws_gateway_queue_packet(cliaddr, send_buffer, serialized_size);
-  if (ws_rc > 0) {
-    (void)ws_gateway_flush_route(cliaddr);
-    return;
-  }
-  if (ws_rc < 0)
-    return;
-
-#ifdef WAMBLE_PLATFORM_WINDOWS
-  sendto(sockfd, (const char *)send_buffer, (int)serialized_size, 0,
-         (const struct sockaddr *)cliaddr, (int)sizeof(*cliaddr));
-#else
-  sendto(sockfd, (const char *)send_buffer, (size_t)serialized_size, 0,
-         (const struct sockaddr *)cliaddr, (wamble_socklen_t)sizeof(*cliaddr));
-#endif
+  (void)send_serialized_packet_once(sockfd, send_buffer, serialized_size,
+                                    cliaddr, NULL);
 }
 
 static uint32_t reserve_reliable_seq_num(const struct sockaddr_in *cliaddr,

@@ -223,7 +223,7 @@ WAMBLE_TEST(player_token_expiration_enqueues_session_expired_notification) {
 
   int n = player_collect_expired_session_notifications(drained, 8);
   T_ASSERT_EQ_INT(n, 1);
-  T_ASSERT(memcmp(drained[0].token, tok, TOKEN_LENGTH) == 0);
+  T_ASSERT(tokens_equal(drained[0].token, tok));
 
   T_ASSERT_EQ_INT(player_collect_expired_session_notifications(drained, 8), 0);
   return 0;
