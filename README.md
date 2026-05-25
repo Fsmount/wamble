@@ -2,6 +2,10 @@
 
 Wamble is a multiplayer chess variant where after every move you're switched to a new board. The goal is to keep it fast, small, and with minimal deps.
 
+---
+
+While the product works, I am really not proud of the current state of the codebase, I am moving to making many things statically generated instead of handwritten. At least I now know that I hate C and to always check the code before merging AI generated changes.
+
 ## Features
 
 ### Host facing
