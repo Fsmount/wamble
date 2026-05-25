@@ -242,6 +242,33 @@ void wamble_metric(const char *name, const char *fmt, ...) {
   fprintf(stdout, "\n");
 }
 
+int send_reliable_terminal_and_drive(wamble_socket_t sockfd,
+                                     const struct WambleMsg *msg,
+                                     const struct sockaddr_in *addr,
+                                     int timeout_ms, int max_retries) {
+  if (network_enqueue_replayable_terminal(msg, addr) != 0)
+    return -1;
+  if (sockfd == WAMBLE_INVALID_SOCKET) {
+    TransportDriveResult drive = network_runtime_drive_once(sockfd, 0, NULL);
+    return drive.status == TRANSPORT_DRIVE_PROGRESS ? 0 : -1;
+  }
+  if (timeout_ms <= 0)
+    timeout_ms = get_config()->timeout_ms;
+  if (max_retries <= 0)
+    max_retries = get_config()->max_retries;
+  uint64_t deadline = wamble_now_mono_millis() +
+                      (uint64_t)timeout_ms * (uint64_t)max_retries + 1000u;
+  while (wamble_now_mono_millis() < deadline) {
+    TransportDriveResult drive = network_runtime_drive_once(sockfd, 10, NULL);
+    if (transport_outbound_count() == 0)
+      return 0;
+    if (drive.status == TRANSPORT_DRIVE_ERROR && drive.outbound_pending == 0)
+      return -1;
+    wamble_sleep_ms(1);
+  }
+  return -1;
+}
+
 int wamble_test_mkstemp_file(char *out, size_t out_len, const char *subdir,
                              const char *prefix) {
   char dir[512];

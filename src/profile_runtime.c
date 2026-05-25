@@ -1,5 +1,6 @@
 #include "../include/wamble/wamble.h"
 #include "../include/wamble/wamble_db.h"
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #if defined(_MSC_VER) && !defined(strtoull)
@@ -14,6 +15,13 @@
 #include <process.h>
 #include <windows.h>
 #endif
+
+typedef struct WambleWsGateway WambleWsGateway;
+
+enum {
+  WS_GATEWAY_OK = 0,
+  WS_GATEWAY_ERR_CONFIG = -1,
+};
 
 typedef struct RunningProfile {
   char *name;
@@ -34,7 +42,9 @@ typedef struct RunningProfile {
   time_t last_tick;
   uint64_t last_flush_ms;
   uint64_t ws_next_retry_ms;
+  uint64_t manager_event_generation_seen;
   int ws_retry_enabled;
+  int exec_ws_shutdown_requested;
   WambleWsGateway *ws_gateway;
 } RunningProfile;
 
@@ -44,11 +54,48 @@ static wamble_mutex_t g_mutex;
 static int g_mutex_initialized = 0;
 static int g_prepare_exec = 0;
 static WAMBLE_THREAD_LOCAL char g_runtime_profile_key[128];
+
+void network_init_thread_state(void);
+void cleanup_expired_sessions(void);
+wamble_socket_t create_and_bind_socket(int port);
+int wamble_socket_bound_port(wamble_socket_t sock);
+WambleWsGateway *ws_gateway_start(const char *profile_name, int ws_port,
+                                  int udp_port, const char *ws_path,
+                                  int *out_status);
+void ws_gateway_stop(WambleWsGateway *gateway);
+void ws_gateway_request_restart_clients(WambleWsGateway *gateway);
+int ws_gateway_matches(const WambleWsGateway *gateway, int ws_port,
+                       int udp_port, const char *ws_path);
+void network_runtime_drive_budget(wamble_socket_t sockfd,
+                                  WambleWsGateway *ws_gateway,
+                                  long base_select_usec,
+                                  const char *profile_name, int step_budget);
+void network_runtime_drive_reload_drain(wamble_socket_t sockfd,
+                                        WambleWsGateway *ws_gateway,
+                                        const char *profile_name,
+                                        int step_budget);
+void network_runtime_reset_thread_state(void);
+int network_runtime_reload_drain_complete(void);
+int server_protocol_enqueue_reliable_spectate_state_sync(
+    const uint8_t *token, const struct sockaddr_in *cliaddr);
+int server_protocol_enqueue_reliable_board_state_sync(
+    const uint8_t *token, const struct sockaddr_in *cliaddr);
+int server_protocol_enqueue_spectator_batch(SpectatorUpdate *events, int count,
+                                            uint8_t ctrl);
+int server_protocol_enqueue_session_expired_notice(
+    const uint8_t *token, const struct sockaddr_in *cliaddr);
+int server_protocol_thread_pending_login_challenge_count(void);
+int spectator_collect_updates(struct SpectatorUpdate *out, int max);
+int spectator_collect_notifications(struct SpectatorUpdate *out, int max);
+int spectator_manager_active_count_for_port(int owner_port);
+int board_collect_reservation_release_notifications(
+    ReservationReleaseNotification *out, int max);
 enum { RUNTIME_EVENT_QUEUE_CAP = 256 };
 static WambleRuntimeEvent g_runtime_event_queue[RUNTIME_EVENT_QUEUE_CAP];
 static int g_runtime_event_head = 0;
 static int g_runtime_event_tail = 0;
 static int g_runtime_event_count = 0;
+static uint64_t g_manager_event_generation = 0;
 
 static void free_running(RunningProfile *rp);
 static void profile_runtime_shutdown(RunningProfile *rp);
@@ -98,6 +145,64 @@ void wamble_runtime_event_publish(WambleRuntimeStatus status,
   wamble_mutex_unlock(&g_mutex);
 }
 
+static void profile_runtime_wake_socket(wamble_socket_t sockfd) {
+  if (sockfd == WAMBLE_INVALID_SOCKET)
+    return;
+  int port = wamble_socket_bound_port(sockfd);
+  if (port <= 0)
+    return;
+  struct sockaddr_in wake_addr;
+  memset(&wake_addr, 0, sizeof(wake_addr));
+  wake_addr.sin_family = AF_INET;
+  wake_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  wake_addr.sin_port = htons((uint16_t)port);
+  const uint8_t byte = 0;
+  (void)sendto(sockfd, (const char *)&byte,
+#ifdef WAMBLE_PLATFORM_WINDOWS
+               1,
+#else
+               sizeof(byte),
+#endif
+               0, (const struct sockaddr *)&wake_addr, sizeof(wake_addr));
+}
+
+void profile_runtime_manager_event_signal(void) {
+  wamble_socket_t *wake_sockets = NULL;
+  int wake_count = 0;
+  int wake_capacity = 0;
+  ensure_mutex_init();
+  wamble_mutex_lock(&g_mutex);
+  if (g_manager_event_generation != UINT64_MAX)
+    g_manager_event_generation++;
+  wake_capacity = g_running_count;
+  if (wake_capacity > 0)
+    wake_sockets = (wamble_socket_t *)malloc(sizeof(*wake_sockets) *
+                                             (size_t)wake_capacity);
+  if (wake_sockets) {
+    for (int i = 0; i < g_running_count; i++) {
+      if (g_running[i].runtime_ready &&
+          g_running[i].sockfd != WAMBLE_INVALID_SOCKET) {
+        wake_sockets[wake_count++] = g_running[i].sockfd;
+      }
+    }
+  }
+  wamble_mutex_unlock(&g_mutex);
+  for (int i = 0; i < wake_count; i++)
+    profile_runtime_wake_socket(wake_sockets[i]);
+  free(wake_sockets);
+}
+
+static int profile_runtime_manager_event_pending(RunningProfile *rp) {
+  if (!rp)
+    return 0;
+  int pending = 0;
+  wamble_mutex_lock(&g_mutex);
+  pending = (rp->manager_event_generation_seen != g_manager_event_generation);
+  rp->manager_event_generation_seen = g_manager_event_generation;
+  wamble_mutex_unlock(&g_mutex);
+  return pending;
+}
+
 int wamble_runtime_event_take(WambleRuntimeEvent *out_event) {
   ensure_mutex_init();
   if (out_event)
@@ -124,10 +229,9 @@ static void publish_prediction_manager_status(PredictionManagerStatus status,
   wamble_runtime_event_publish(runtime_status, profile_name, NULL);
 }
 
-static void publish_ws_gateway_status(WsGatewayStatus status,
-                                      const char *profile_name) {
+static void publish_ws_gateway_status(int status, const char *profile_name) {
   WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_WS_GATEWAY,
-                                        (int)status};
+                                        status};
   wamble_runtime_event_publish(runtime_status, profile_name, NULL);
 }
 
@@ -435,8 +539,10 @@ static void join_and_cleanup_profiles(RunningProfile *profiles, int count,
   for (int i = 0; i < count; i++) {
     if (profiles[i].thread)
       wamble_thread_join(profiles[i].thread, NULL);
-    else if (profiles[i].run_inline)
+    else if (profiles[i].run_inline) {
       profile_runtime_shutdown(&profiles[i]);
+      set_thread_config(NULL);
+    }
     if (close_sockets && profiles[i].sockfd != WAMBLE_INVALID_SOCKET) {
       wamble_close_socket(profiles[i].sockfd);
       profiles[i].sockfd = WAMBLE_INVALID_SOCKET;
@@ -517,6 +623,7 @@ static int copy_profile_config_for_runtime(RunningProfile *rp,
 static int copy_default_config_for_runtime(RunningProfile *rp) {
   if (!rp)
     return -1;
+  set_thread_config(NULL);
   return copy_named_config_for_runtime(rp, NULL, get_config());
 }
 
@@ -1002,18 +1109,11 @@ static char *profile_runtime_snapshot_template(const RunningProfile *rp) {
   return tmpl;
 }
 
-static int profile_runtime_reliable_state_drained(RunningProfile *rp) {
-  if (network_protocol_thread_pending_packet_count() != 0)
-    return 0;
-  if (network_protocol_thread_terminal_cache_packet_count() != 0)
+static int profile_runtime_hot_reload_snapshot_ready(RunningProfile *rp) {
+  (void)rp;
+  if (!network_runtime_reload_drain_complete())
     return 0;
   if (server_protocol_thread_pending_login_challenge_count() != 0)
-    return 0;
-  if (rp->ws_gateway && ws_gateway_active_client_count(rp->ws_gateway) != 0)
-    return 0;
-  if (spectator_manager_active_count_for_port(rp->cfg.port) != 0)
-    return 0;
-  if (board_manager_count_active_or_reserved() != 0)
     return 0;
   return 1;
 }
@@ -1028,7 +1128,7 @@ static void profile_runtime_prepare_exec_snapshot(RunningProfile *rp) {
   if (!should_prepare)
     return;
 
-  if (!profile_runtime_reliable_state_drained(rp))
+  if (!profile_runtime_hot_reload_snapshot_ready(rp))
     return;
   if (!profile_runtime_flush_intents(rp, 64))
     return;
@@ -1059,6 +1159,8 @@ static void profile_runtime_prepare_exec_snapshot(RunningProfile *rp) {
   if (!should_prepare)
     return;
 
+  if (!profile_runtime_hot_reload_snapshot_ready(rp))
+    return;
   if (!profile_runtime_flush_intents(rp, 64))
     return;
   char *tmpl = profile_runtime_snapshot_template(rp);
@@ -1084,100 +1186,27 @@ static void profile_runtime_prepare_exec_snapshot(RunningProfile *rp) {
 }
 
 static void profile_runtime_poll_messages(RunningProfile *rp) {
-  if (rp->ws_gateway) {
-    uint8_t packet[WAMBLE_MAX_PACKET_SIZE];
-    size_t packet_len = 0;
-    struct sockaddr_in ws_cliaddr;
-    for (int drained_ws = 0; drained_ws < 256; drained_ws++) {
-      int ws_rc = ws_gateway_pop_packet(rp->ws_gateway, packet, sizeof(packet),
-                                        &packet_len, &ws_cliaddr);
-      if (ws_rc <= 0)
-        break;
-      struct WambleMsg msg;
-      int n = receive_message_packet(packet, packet_len, &msg, &ws_cliaddr);
-      if (n <= 0)
-        continue;
-      (void)handle_message(rp->sockfd, &msg, &ws_cliaddr, 0, rp->name);
-      network_end_request();
-    }
-  }
-
-  fd_set rfds;
-  struct timeval tv;
-  FD_ZERO(&rfds);
-  FD_SET(rp->sockfd, &rfds);
-  tv.tv_sec = 0;
-  tv.tv_usec = get_config()->select_timeout_usec;
-
-  int ready =
-#ifdef WAMBLE_PLATFORM_WINDOWS
-      select(0, &rfds, NULL, NULL, &tv);
-#else
-      select(rp->sockfd + 1, &rfds, NULL, NULL, &tv);
-#endif
-  if (!(ready > 0 && FD_ISSET(rp->sockfd, &rfds)))
-    return;
-
-  for (int drained = 0; drained < 64; drained++) {
-    struct WambleMsg msg;
-    struct sockaddr_in cliaddr;
-    int n = receive_message(rp->sockfd, &msg, &cliaddr);
-    if (n <= 0)
-      break;
-    (void)handle_message(rp->sockfd, &msg, &cliaddr, 0, rp->name);
-    network_end_request();
-  }
-
-  if (rp->ws_gateway)
-    ws_gateway_flush_outbound(rp->ws_gateway);
-}
-
-static void send_spectator_batch(wamble_socket_t sockfd,
-                                 SpectatorUpdate *events, int count,
-                                 uint8_t ctrl) {
-  for (int i = 0; i < count; i++) {
-    struct WambleMsg out = {0};
-    out.ctrl = ctrl;
-    memcpy(out.token, events[i].token, TOKEN_LENGTH);
-    out.board_id = events[i].board_id;
-    out.seq_num = 0;
-    out.flags = (uint8_t)(events[i].flags | WAMBLE_FLAG_UNRELIABLE);
-    out.session.notification_type = events[i].notification_type;
-    {
-      size_t __len = strnlen(events[i].fen, FEN_MAX_LENGTH - 1);
-      memcpy(out.view.fen, events[i].fen, __len);
-      out.view.fen[__len] = '\0';
-    }
-    if (ctrl == WAMBLE_CTRL_SPECTATE_UPDATE &&
-        events[i].summary_generation > 0) {
-      out.extensions.count = 1;
-      snprintf(out.extensions.fields[0].key,
-               sizeof(out.extensions.fields[0].key), "%s",
-               "spectate.summary_generation");
-      out.extensions.fields[0].value_type = WAMBLE_TREATMENT_VALUE_INT;
-      out.extensions.fields[0].int_value =
-          (int64_t)events[i].summary_generation;
-    }
-    (void)send_unreliable_packet(sockfd, &out, &events[i].addr);
-  }
+  network_runtime_drive_budget(rp->sockfd, rp->ws_gateway,
+                               get_config()->select_timeout_usec, rp->name, 4);
 }
 
 static void profile_runtime_send_reliable_spectate_transition(
     wamble_socket_t sockfd, const SpectatorUpdate *notice) {
+  (void)sockfd;
   if (!notice ||
       notice->notification_type != WAMBLE_NOTIFICATION_TYPE_SPECTATE_ENDED) {
     return;
   }
 
   if (notice->flags & WAMBLE_FLAG_SPECTATE_NOTICE_STOPPED) {
-    (void)send_reliable_spectate_state_sync(sockfd, notice->token,
-                                            &notice->addr);
+    (void)server_protocol_enqueue_reliable_spectate_state_sync(notice->token,
+                                                               &notice->addr);
     return;
   }
 
   if (notice->flags & WAMBLE_FLAG_SPECTATE_NOTICE_SUMMARY_FALLBACK) {
-    (void)send_reliable_spectate_state_sync(sockfd, notice->token,
-                                            &notice->addr);
+    (void)server_protocol_enqueue_reliable_spectate_state_sync(notice->token,
+                                                               &notice->addr);
   }
 }
 
@@ -1205,14 +1234,16 @@ static void profile_runtime_send_spectator_events(RunningProfile *rp) {
   for (int i = 0; i < nnot; i++) {
     profile_runtime_send_reliable_spectate_transition(rp->sockfd, &events[i]);
   }
-  send_spectator_batch(rp->sockfd, events, nnot,
-                       WAMBLE_CTRL_SERVER_NOTIFICATION);
+  (void)server_protocol_enqueue_spectator_batch(
+      events, nnot, WAMBLE_CTRL_SERVER_NOTIFICATION);
   int nupd = spectator_collect_updates(events, cap);
-  send_spectator_batch(rp->sockfd, events, nupd, WAMBLE_CTRL_SPECTATE_UPDATE);
+  (void)server_protocol_enqueue_spectator_batch(events, nupd,
+                                                WAMBLE_CTRL_SPECTATE_UPDATE);
   free(events);
 }
 
 static void profile_runtime_send_reservation_releases(RunningProfile *rp) {
+  (void)rp;
   int cap = profile_runtime_player_event_cap();
   ReservationReleaseNotification *released =
       (ReservationReleaseNotification *)malloc(sizeof(*released) * (size_t)cap);
@@ -1220,15 +1251,14 @@ static void profile_runtime_send_reservation_releases(RunningProfile *rp) {
     return;
   int nrel = board_collect_reservation_release_notifications(released, cap);
   for (int i = 0; i < nrel; i++) {
-    struct sockaddr_in addr;
-    if (network_get_client_addr_by_token(released[i].token, &addr) != 0)
-      continue;
-    (void)send_reliable_board_state_sync(rp->sockfd, released[i].token, &addr);
+    (void)server_protocol_enqueue_reliable_board_state_sync(released[i].token,
+                                                            NULL);
   }
   free(released);
 }
 
 static void profile_runtime_send_expired_session_notices(RunningProfile *rp) {
+  (void)rp;
   int cap = profile_runtime_player_event_cap();
   ExpiredSessionNotification *expired =
       (ExpiredSessionNotification *)malloc(sizeof(*expired) * (size_t)cap);
@@ -1236,15 +1266,8 @@ static void profile_runtime_send_expired_session_notices(RunningProfile *rp) {
     return;
   int nexp = player_collect_expired_session_notifications(expired, cap);
   for (int i = 0; i < nexp; i++) {
-    struct sockaddr_in addr;
-    if (network_get_client_addr_by_token(expired[i].token, &addr) != 0)
-      continue;
-    struct WambleMsg out = {0};
-    out.ctrl = WAMBLE_CTRL_SERVER_NOTIFICATION;
-    memcpy(out.token, expired[i].token, TOKEN_LENGTH);
-    out.flags = WAMBLE_FLAG_UNRELIABLE;
-    out.session.notification_type = WAMBLE_NOTIFICATION_TYPE_SESSION_EXPIRED;
-    (void)send_unreliable_packet(rp->sockfd, &out, &addr);
+    (void)server_protocol_enqueue_session_expired_notice(expired[i].token,
+                                                         NULL);
   }
   free(expired);
 }
@@ -1269,7 +1292,7 @@ static int profile_ws_port(const RunningProfile *rp) {
   return (rp->cfg.websocket_port > 0) ? rp->cfg.websocket_port : rp->cfg.port;
 }
 
-static WsGatewayStatus profile_ws_reconcile(RunningProfile *rp) {
+static int profile_ws_reconcile(RunningProfile *rp) {
   if (!rp)
     return WS_GATEWAY_OK;
   if (!profile_ws_is_enabled(rp)) {
@@ -1297,7 +1320,7 @@ static WsGatewayStatus profile_ws_reconcile(RunningProfile *rp) {
   int udp_port = wamble_socket_bound_port(rp->sockfd);
   if (udp_port <= 0)
     udp_port = rp->cfg.port;
-  WsGatewayStatus ws_status = WS_GATEWAY_OK;
+  int ws_status = WS_GATEWAY_OK;
   rp->ws_gateway =
       ws_gateway_start(rp->name ? rp->name : "default", profile_ws_port(rp),
                        udp_port, rp->cfg.websocket_path, &ws_status);
@@ -1381,6 +1404,7 @@ static void profile_runtime_shutdown(RunningProfile *rp) {
     ws_gateway_stop(rp->ws_gateway);
     rp->ws_gateway = NULL;
   }
+  network_runtime_reset_thread_state();
   db_cleanup_thread();
   rp->runtime_ready = 0;
 }
@@ -1398,6 +1422,16 @@ static void profile_runtime_step(RunningProfile *rp) {
   profile_runtime_prepare_exec_snapshot(rp);
   if (rp->ready_for_exec)
     return;
+  if (g_prepare_exec) {
+    if (rp->ws_gateway && !rp->exec_ws_shutdown_requested) {
+      ws_gateway_request_restart_clients(rp->ws_gateway);
+      rp->exec_ws_shutdown_requested = 1;
+    }
+    network_runtime_drive_reload_drain(rp->sockfd, rp->ws_gateway, rp->name, 4);
+    profile_runtime_flush_intents(rp, PERSIST_FLUSH_MAX_BATCHES_PER_CYCLE);
+    profile_runtime_prepare_exec_snapshot(rp);
+    return;
+  }
   if (rp->needs_update) {
     rp->needs_update = 0;
     if (rp->has_pending_cfg) {
@@ -1417,7 +1451,10 @@ static void profile_runtime_step(RunningProfile *rp) {
       (void)profile_ws_reconcile(rp);
     }
   }
-  profile_runtime_poll_messages(rp);
+  if (profile_runtime_manager_event_pending(rp))
+    network_runtime_drive_budget(rp->sockfd, rp->ws_gateway, 0, rp->name, 1);
+  else
+    profile_runtime_poll_messages(rp);
   time_t now = wamble_now_wall();
   if (now - rp->last_cleanup > get_config()->cleanup_interval_sec) {
     cleanup_expired_sessions();
@@ -1439,8 +1476,7 @@ static void profile_runtime_step(RunningProfile *rp) {
     }
   }
   profile_runtime_send_spectator_updates(rp);
-  if (rp->ws_gateway)
-    ws_gateway_flush_outbound(rp->ws_gateway);
+  network_runtime_drive_budget(rp->sockfd, rp->ws_gateway, 0, rp->name, 1);
 }
 
 static void profile_runtime_run(RunningProfile *rp) {
@@ -1645,6 +1681,7 @@ static int runtime_cfg_equals(const WambleConfig *a, const WambleConfig *b) {
          a->experiment_enabled == b->experiment_enabled &&
          a->experiment_seed == b->experiment_seed &&
          a->timeout_ms == b->timeout_ms && a->max_retries == b->max_retries &&
+         a->rto_cap_ms == b->rto_cap_ms &&
          a->max_message_size == b->max_message_size &&
          a->buffer_size == b->buffer_size &&
          a->rate_limit_requests_per_sec == b->rate_limit_requests_per_sec &&

@@ -4,6 +4,8 @@
 #include <sys/random.h>
 #endif
 
+void profile_runtime_manager_event_signal(void);
+
 static WAMBLE_THREAD_LOCAL WamblePlayer *player_pool;
 static WAMBLE_THREAD_LOCAL int num_players = 0;
 static WAMBLE_THREAD_LOCAL wamble_mutex_t player_mutex;
@@ -150,6 +152,7 @@ queue_expired_session_notification_locked(const uint8_t token[TOKEN_LENGTH]) {
       expired_session_notification_cap;
   memcpy(expired_session_notifications[slot].token, token, TOKEN_LENGTH);
   expired_session_notification_count++;
+  profile_runtime_manager_event_signal();
 }
 
 int player_collect_expired_session_notifications(

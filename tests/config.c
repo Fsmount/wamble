@@ -18,6 +18,7 @@ WAMBLE_TEST(config_basic_eval) {
       "(def timeout-ms (add2 40 2))\n"
       "(defmacro inc (x) (do (+ x 1)))\n"
       "(def max-retries (inc 3))\n"
+      "(def rto-cap-ms 9000)\n"
       "(defprofile base ((def port 8888) (def advertise 1) (def visibility "
       "1)))\n"
       "(defprofile canary :inherits base ((def port 8891) (def visibility "
@@ -26,6 +27,7 @@ WAMBLE_TEST(config_basic_eval) {
 
   T_ASSERT_EQ_INT(get_config()->timeout_ms, 42);
   T_ASSERT_EQ_INT(get_config()->max_retries, 4);
+  T_ASSERT_EQ_INT(get_config()->rto_cap_ms, 9000);
   T_ASSERT_EQ_INT(get_config()->log_level, 3);
 
   int n = config_profile_count();
@@ -48,6 +50,7 @@ WAMBLE_TEST(config_defaults_no_file) {
   T_ASSERT_STATUS(s, CONFIG_LOAD_DEFAULTS);
   T_ASSERT_EQ_INT(get_config()->port, 8888);
   T_ASSERT_EQ_INT(get_config()->timeout_ms, 100);
+  T_ASSERT_EQ_INT(get_config()->rto_cap_ms, 8000);
   T_ASSERT_EQ_INT(get_config()->rate_limit_requests_per_sec, 120);
   T_ASSERT_EQ_INT(get_config()->experiment_enabled, 0);
   T_ASSERT_EQ_INT(get_config()->experiment_seed, 0);
@@ -548,45 +551,6 @@ static int config_db_prepare(void) {
   return 0;
 }
 
-static int config_network_seed_session(const uint8_t *token) {
-  struct WambleMsg out = {0};
-  struct WambleMsg in = {0};
-  struct sockaddr_in dst;
-  struct sockaddr_in from;
-  wamble_socklen_t dst_len = (wamble_socklen_t)sizeof(dst);
-  wamble_socket_t srv = create_and_bind_socket(0);
-  if (srv == WAMBLE_INVALID_SOCKET)
-    return -1;
-  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
-  if (cli == WAMBLE_INVALID_SOCKET) {
-    wamble_close_socket(srv);
-    return -1;
-  }
-  if (getsockname(srv, (struct sockaddr *)&dst, &dst_len) != 0) {
-    wamble_close_socket(cli);
-    wamble_close_socket(srv);
-    return -1;
-  }
-  dst.sin_family = AF_INET;
-  dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  memcpy(out.token, token, TOKEN_LENGTH);
-  out.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
-  if (send_unreliable_packet(cli, &out, &dst) != NET_OK) {
-    wamble_close_socket(cli);
-    wamble_close_socket(srv);
-    return -1;
-  }
-  int received = -1;
-  for (int i = 0; i < 100; i++) {
-    received = receive_message(srv, &in, &from);
-    if (received > 0)
-      break;
-  }
-  wamble_close_socket(cli);
-  wamble_close_socket(srv);
-  return received > 0 ? 0 : -1;
-}
-
 WAMBLE_TEST(config_db_policy_validation_requires_trust_tier_rule) {
   if (config_db_prepare() != 0)
     T_FAIL_SIMPLE("config_db_prepare failed");
@@ -848,7 +812,7 @@ WAMBLE_TEST(config_db_reapply_policy_rules_reexpands_tag_selectors) {
 WAMBLE_TEST(config_db_reset_clears_tag_and_treatment_state) {
   if (config_db_prepare() != 0)
     T_FAIL_SIMPLE("config_db_prepare failed");
-  T_ASSERT_STATUS_OK(test_db_apply_sql(
+  const char *seed_sql =
       "INSERT INTO global_identities (public_key) "
       "VALUES (decode('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       "aaaaaaaaaa', 'hex'));"
@@ -881,7 +845,9 @@ WAMBLE_TEST(config_db_reset_clears_tag_and_treatment_state) {
       "(group_key, hook_name, output_kind, output_key, value_type, "
       "value_bool, source, snapshot_revision_id) "
       "VALUES ('vip', '*', 'feature', 'prediction.gated', 4, TRUE, 'test', "
-      "0);"));
+      "0);";
+  DbStatus seed_status = test_db_apply_sql(seed_sql);
+  T_ASSERT_STATUS_OK(seed_status);
 
   T_ASSERT_STATUS_OK(test_db_apply_sql(
       "DO $$ DECLARE c_tags INT; c_groups INT; c_rules INT; c_predicates INT; "
@@ -1323,7 +1289,7 @@ WAMBLE_TEST(config_db_logout_unlinks_persistent_identity_and_clears_treatment) {
   return 0;
 }
 
-WAMBLE_TEST(config_network_treatment_group_refreshes_after_reassignment) {
+WAMBLE_TEST(config_db_treatment_group_refreshes_after_reassignment) {
   uint8_t token[TOKEN_LENGTH] = {0xde, 0xad, 0xbe, 0xef, 0x10, 0x20,
                                  0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
                                  0x90, 0xa0, 0xb0, 0xc0};
@@ -1343,19 +1309,17 @@ WAMBLE_TEST(config_network_treatment_group_refreshes_after_reassignment) {
   T_ASSERT_STATUS_OK(db_apply_config_treatment_rules("__default__"));
   T_ASSERT(db_create_session(token, 0) > 0);
 
-  network_init_thread_state();
-  T_ASSERT_STATUS_OK(config_network_seed_session(token));
-
   WambleTreatmentAction actions[8];
   int action_count = 0;
   T_ASSERT_STATUS(db_resolve_treatment_actions(token, "", "prediction.submit",
                                                NULL, NULL, 0, actions, 8,
                                                &action_count),
                   DB_OK);
-  char current_group[128] = {0};
-  T_ASSERT_STATUS_OK(network_get_session_treatment_group(
-      token, current_group, sizeof(current_group)));
-  T_ASSERT_STREQ(current_group, "control");
+  WambleTreatmentAssignment assignment;
+  memset(&assignment, 0, sizeof(assignment));
+  T_ASSERT_STATUS(db_get_session_treatment_assignment(token, &assignment),
+                  DB_OK);
+  T_ASSERT_STREQ(assignment.group_key, "control");
 
   WambleFact facts[1] = {0};
   snprintf(facts[0].key, sizeof(facts[0].key), "%s", "session.games");
@@ -1365,10 +1329,10 @@ WAMBLE_TEST(config_network_treatment_group_refreshes_after_reassignment) {
                                                NULL, facts, 1, actions, 8,
                                                &action_count),
                   DB_OK);
-  memset(current_group, 0, sizeof(current_group));
-  T_ASSERT_STATUS_OK(network_get_session_treatment_group(
-      token, current_group, sizeof(current_group)));
-  T_ASSERT_STREQ(current_group, "vip");
+  memset(&assignment, 0, sizeof(assignment));
+  T_ASSERT_STATUS(db_get_session_treatment_assignment(token, &assignment),
+                  DB_OK);
+  T_ASSERT_STREQ(assignment.group_key, "vip");
   return 0;
 }
 
@@ -1575,8 +1539,8 @@ WAMBLE_TESTS_ADD_DB_FM(config_db_treatment_reassigns_when_runtime_facts_arrive,
 WAMBLE_TESTS_ADD_DB_FM(
     config_db_logout_unlinks_persistent_identity_and_clears_treatment,
     "config");
-WAMBLE_TESTS_ADD_DB_FM(
-    config_network_treatment_group_refreshes_after_reassignment, "config");
+WAMBLE_TESTS_ADD_DB_FM(config_db_treatment_group_refreshes_after_reassignment,
+                       "config");
 WAMBLE_TESTS_ADD_DB_FM(config_db_treatment_scopes_by_profile_source, "config");
 WAMBLE_TESTS_ADD_DB_FM(
     config_db_record_payout_with_zero_awarded_persists_canonical, "config");

@@ -19,8 +19,10 @@ Core Options (common defaults)
   opponent-group edges, and treatment outputs for this profile.
 - `experiment-seed` (int, 0): Reserved for deterministic experiment behavior
   that depends on a per-profile seed.
-- `timeout-ms` (int, 100): Reliable send ACK timeout (ms).
+- `timeout-ms` (int, 100): Initial reliable retry timeout in milliseconds,
+  used before adaptive ACK-latency samples are available.
 - `max-retries` (int, 3): Reliable send retries.
+- `rto-cap-ms` (int, 8000): Safety ceiling for adaptive reliable retry timing.
 - `max-message-size` (int, 126): Fixed message body size (informational).
 - `buffer-size` (int, 32768): Socket send/recv buffer bytes.
 - `rate-limit-requests-per-sec` (int, 120; `0` disables): Per-token request

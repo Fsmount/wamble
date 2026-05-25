@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+void profile_runtime_manager_event_signal(void);
+
 static WAMBLE_THREAD_LOCAL WambleBoard *board_cached;
 static WAMBLE_THREAD_LOCAL int num_cached_boards = 0;
 static WAMBLE_THREAD_LOCAL int total_boards = 0;
@@ -187,6 +189,7 @@ queue_reservation_release_notification_locked(const uint8_t token[TOKEN_LENGTH],
   memcpy(reservation_release_notifications[slot].token, token, TOKEN_LENGTH);
   reservation_release_notifications[slot].board_id = board_id;
   reservation_release_notification_count++;
+  profile_runtime_manager_event_signal();
 }
 
 void board_manager_tick() {
@@ -420,6 +423,22 @@ static bool is_board_eligible_for_assignment(const WambleBoard *board) {
          board->result == GAME_RESULT_IN_PROGRESS;
 }
 
+static int board_has_prior_mover(const WambleBoard *board) {
+  if (!board)
+    return 0;
+  if (board->last_move_time > 0 || board->last_move_uci[0] ||
+      board->last_move_shown_uci[0])
+    return 1;
+  return !token_is_zero(board->last_mover_token);
+}
+
+static void board_publish_treatment_query_failed(void) {
+  WambleRuntimeStatus runtime_status = {WAMBLE_RUNTIME_STATUS_TREATMENT_AUDIT,
+                                        TREATMENT_AUDIT_STATUS_QUERY_FAILED};
+  wamble_runtime_event_publish(runtime_status, wamble_runtime_profile_key(),
+                               NULL);
+}
+
 static int board_pairing_allowed_for_player(const WambleBoard *board,
                                             const WamblePlayer *player) {
   if (!board || !player)
@@ -427,18 +446,23 @@ static int board_pairing_allowed_for_player(const WambleBoard *board,
   if (!get_config()->experiment_enabled)
     return 1;
 
-  char current_group[128] = {0};
   WambleTreatmentAssignment assignment = {0};
-  if (network_get_session_treatment_group(player->token, current_group,
-                                          sizeof(current_group)) != 0 &&
-      wamble_query_get_session_treatment_assignment(player->token,
-                                                    &assignment) == DB_OK) {
-    snprintf(current_group, sizeof(current_group), "%s", assignment.group_key);
+  DbStatus assignment_status =
+      wamble_query_get_session_treatment_assignment(player->token, &assignment);
+  if (assignment_status != DB_OK || !assignment.group_key[0]) {
+    board_publish_treatment_query_failed();
+    return 0;
   }
-  if (!board->last_mover_treatment_group[0] || !current_group[0])
-    return 1;
+
+  if (!board->last_mover_treatment_group[0]) {
+    if (!board_has_prior_mover(board))
+      return 1;
+    board_publish_treatment_query_failed();
+    return 0;
+  }
+
   return wamble_query_treatment_edge_allows(wamble_runtime_profile_key(),
-                                            current_group,
+                                            assignment.group_key,
                                             board->last_mover_treatment_group);
 }
 
@@ -1030,6 +1054,7 @@ int board_manager_import(const WambleBoard *in, int count, uint64_t next_id) {
     board_map_put(board_cached[i].id, i);
   }
   num_cached_boards = count;
+  total_boards = count;
   ensure_board_id_mutex();
   wamble_mutex_lock(&next_board_id_mutex);
   next_board_id = (next_id > 0) ? next_id : (uint64_t)(count + 1);
@@ -1112,6 +1137,12 @@ static int append_dormant_eligible_boards(WamblePlayer *player,
     temp_board.state = BOARD_STATE_DORMANT;
     temp_board.result = GAME_RESULT_IN_PROGRESS;
     temp_board.last_assignment_time = br.last_assignment_time;
+    temp_board.last_move_time = br.last_move_time;
+    snprintf(temp_board.last_move_uci, sizeof(temp_board.last_move_uci), "%s",
+             br.last_move_uci);
+    snprintf(temp_board.last_move_shown_uci,
+             sizeof(temp_board.last_move_shown_uci), "%s",
+             br.last_move_shown_uci);
     temp_board.board.game_mode =
         (br.mode_variant_id >= 0) ? GAME_MODE_CHESS960 : GAME_MODE_STANDARD;
     temp_board.mode_params.chess960_position_id = br.mode_variant_id;

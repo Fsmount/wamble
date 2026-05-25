@@ -38,8 +38,8 @@ Requests
   - Terminal response: reliable `SPECTATE_UPDATE` snapshot with
     `spectate.state=idle`.
 - Low trust or capacity issues return an error (see enum values).
-- For reliable spectate requests, the terminal `SPECTATE_UPDATE` or denial
-  `ERROR` is sent before the request-level `ACK`.
+- For reliable spectate requests, the request-level `ACK` is sent before the
+  terminal `SPECTATE_UPDATE` or denial `ERROR`.
 
 Updates
 - Collected by `spectator_collect_updates()` at the configured rate per mode.
@@ -73,3 +73,4 @@ API
 References
 - Config (see docs/configuration.txt): `max-spectators`, `spectator-visibility`, `spectator-summary-hz`, `spectator-focus-hz`, `spectator-max-focus-per-session`, `spectator-summary-mode`.
 - Protocol (see docs/network_protocol.txt): `SPECTATE_GAME`, `SPECTATE_UPDATE`, `SPECTATE_STOP`, `SERVER_NOTIFICATION`.
+- Runtime/state (see docs/runtime_and_state.txt): hot-reload snapshot scope for spectator subscription intent.

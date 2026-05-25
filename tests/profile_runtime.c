@@ -385,12 +385,12 @@ WAMBLE_TEST(profile_exec_snapshot_flushes_pending_create_session_intent) {
   return 0;
 }
 
-WAMBLE_TEST(profile_exec_snapshot_blocks_while_reservation_in_flight) {
+WAMBLE_TEST(profile_exec_snapshot_exports_logical_board_state) {
 #if defined(WAMBLE_PLATFORM_POSIX)
   g_profile_runtime_net_active = 1;
   T_ASSERT_STATUS_OK(wamble_net_init());
 
-  const char *cfg = "(def port 0)\n";
+  const char *cfg = "(def port 0)\n(def min-boards 1)\n(def max-boards 4)\n";
   T_ASSERT_EQ_INT(wamble_test_write_optional_db_config_file(conf_path, cfg), 0);
 
   char status[128];
@@ -409,17 +409,62 @@ WAMBLE_TEST(profile_exec_snapshot_blocks_while_reservation_in_flight) {
   T_ASSERT_EQ_INT(state_count, 1);
   profile_test_track_state_files(state_map);
 
-  WamblePlayer *player = create_new_player();
-  T_ASSERT(player != NULL);
-  WambleBoard *board = find_board_for_player(player);
-  T_ASSERT(board != NULL);
+  WambleBoard boards[1];
+  memset(boards, 0, sizeof(boards));
+  boards[0].id = 1;
+  snprintf(boards[0].fen, sizeof(boards[0].fen), "%s",
+           "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+  boards[0].state = BOARD_STATE_RESERVED;
+  boards[0].result = GAME_RESULT_IN_PROGRESS;
+  boards[0].reservation_time = wamble_now_wall();
+  memset(boards[0].reservation_player_token, 7, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(board_manager_import(boards, 1, 2), 0);
   T_ASSERT(board_manager_count_active_or_reserved() > 0);
 
   state_count = 0;
   T_ASSERT_EQ_INT(profile_prepare_state_save_and_inherit(
                       state_map, sizeof(state_map), &state_count),
+                  PROFILE_EXPORT_OK);
+  T_ASSERT_EQ_INT(state_count, 1);
+  profile_test_track_state_files(state_map);
+#endif
+  return 0;
+}
+
+WAMBLE_TEST(profile_exec_snapshot_blocks_pending_login_challenge) {
+#if defined(WAMBLE_PLATFORM_POSIX)
+  g_profile_runtime_net_active = 1;
+  T_ASSERT_STATUS_OK(wamble_net_init());
+
+  const char *cfg = "(def port 0)\n(def max-players 8)\n";
+  T_ASSERT_EQ_INT(wamble_test_write_optional_db_config_file(conf_path, cfg), 0);
+
+  char status[128];
+  T_ASSERT_STATUS_OK(config_load(conf_path, NULL, status, sizeof(status)));
+
+  int started = 0;
+  T_ASSERT_EQ_INT(start_profile_listeners(&started), PROFILE_START_OK);
+  T_ASSERT_EQ_INT(started, 1);
+  T_ASSERT_EQ_INT(profile_runtime_pump_inline(), 1);
+
+  WamblePlayer *player = create_new_player();
+  T_ASSERT(player != NULL);
+  uint8_t public_key[WAMBLE_PUBLIC_KEY_LENGTH];
+  for (int i = 0; i < WAMBLE_PUBLIC_KEY_LENGTH; i++)
+    public_key[i] = (uint8_t)(0x40 + i);
+  T_ASSERT_EQ_INT(
+      server_protocol_test_issue_login_challenge(player->token, public_key), 0);
+  T_ASSERT_EQ_INT(server_protocol_thread_pending_login_challenge_count(), 1);
+  network_init_thread_state();
+
+  char state_map[512];
+  int state_count = 0;
+  T_ASSERT_EQ_INT(profile_prepare_state_save_and_inherit(
+                      state_map, sizeof(state_map), &state_count),
                   PROFILE_EXPORT_NOT_READY);
   T_ASSERT_EQ_INT(state_count, 0);
+  server_protocol_test_clear_login_challenges();
+  T_ASSERT_EQ_INT(server_protocol_thread_pending_login_challenge_count(), 0);
 #endif
   return 0;
 }
@@ -708,7 +753,7 @@ WAMBLE_TEST(
     struct timeval tv;
     FD_ZERO(&rfds);
     FD_SET(cli, &rfds);
-    tv.tv_sec = 1;
+    tv.tv_sec = 3;
     tv.tv_usec = 0;
 #ifdef WAMBLE_PLATFORM_WINDOWS
     T_ASSERT(select(0, &rfds, NULL, NULL, &tv) > 0);
@@ -717,7 +762,7 @@ WAMBLE_TEST(
 #endif
     T_ASSERT(receive_message(cli, &rx, &from) > 0);
     T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SERVER_HELLO);
-    send_ack(cli, &rx, &from);
+    network_ack_received_message(cli, &rx, &from);
   }
 
   tx.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
@@ -732,7 +777,7 @@ WAMBLE_TEST(
     struct timeval tv;
     FD_ZERO(&rfds);
     FD_SET(cli, &rfds);
-    tv.tv_sec = 1;
+    tv.tv_sec = 3;
     tv.tv_usec = 0;
 #ifdef WAMBLE_PLATFORM_WINDOWS
     T_ASSERT(select(0, &rfds, NULL, NULL, &tv) > 0);
@@ -741,7 +786,7 @@ WAMBLE_TEST(
 #endif
     T_ASSERT(receive_message(cli, &rx, &from) > 0);
     T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SPECTATE_UPDATE);
-    send_ack(cli, &rx, &from);
+    network_ack_received_message(cli, &rx, &from);
   }
 
   const char *cfg_b = "(def rate-limit-requests-per-sec 100)\n"
@@ -756,7 +801,7 @@ WAMBLE_TEST(
   int saw_notice = 0;
   int saw_summary = 0;
   int saw_generation = 0;
-  uint64_t deadline_ms = wamble_now_mono_millis() + 2500;
+  uint64_t deadline_ms = wamble_now_mono_millis() + 6000;
   while (wamble_now_mono_millis() < deadline_ms &&
          !(saw_notice && saw_summary && saw_generation)) {
     fd_set rfds;
@@ -774,7 +819,7 @@ WAMBLE_TEST(
       continue;
     T_ASSERT(receive_message(cli, &rx, &from) > 0);
     if ((rx.flags & WAMBLE_FLAG_UNRELIABLE) == 0)
-      send_ack(cli, &rx, &from);
+      network_ack_received_message(cli, &rx, &from);
     if (rx.ctrl == WAMBLE_CTRL_SERVER_NOTIFICATION &&
         rx.session.notification_type ==
             WAMBLE_NOTIFICATION_TYPE_SPECTATE_ENDED) {
@@ -866,7 +911,7 @@ WAMBLE_TEST(profile_runtime_spectator_zero_cap_stops_with_reliable_idle) {
     struct timeval tv;
     FD_ZERO(&rfds);
     FD_SET(cli, &rfds);
-    tv.tv_sec = 1;
+    tv.tv_sec = 3;
     tv.tv_usec = 0;
 #ifdef WAMBLE_PLATFORM_WINDOWS
     T_ASSERT(select(0, &rfds, NULL, NULL, &tv) > 0);
@@ -875,7 +920,7 @@ WAMBLE_TEST(profile_runtime_spectator_zero_cap_stops_with_reliable_idle) {
 #endif
     T_ASSERT(receive_message(cli, &rx, &from) > 0);
     T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SERVER_HELLO);
-    send_ack(cli, &rx, &from);
+    network_ack_received_message(cli, &rx, &from);
   }
 
   tx.ctrl = WAMBLE_CTRL_SPECTATE_GAME;
@@ -890,7 +935,7 @@ WAMBLE_TEST(profile_runtime_spectator_zero_cap_stops_with_reliable_idle) {
     struct timeval tv;
     FD_ZERO(&rfds);
     FD_SET(cli, &rfds);
-    tv.tv_sec = 1;
+    tv.tv_sec = 3;
     tv.tv_usec = 0;
 #ifdef WAMBLE_PLATFORM_WINDOWS
     T_ASSERT(select(0, &rfds, NULL, NULL, &tv) > 0);
@@ -899,7 +944,7 @@ WAMBLE_TEST(profile_runtime_spectator_zero_cap_stops_with_reliable_idle) {
 #endif
     T_ASSERT(receive_message(cli, &rx, &from) > 0);
     T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SPECTATE_UPDATE);
-    send_ack(cli, &rx, &from);
+    network_ack_received_message(cli, &rx, &from);
   }
 
   const char *cfg_b =
@@ -931,7 +976,7 @@ WAMBLE_TEST(profile_runtime_spectator_zero_cap_stops_with_reliable_idle) {
       continue;
     T_ASSERT(receive_message(cli, &rx, &from) > 0);
     if ((rx.flags & WAMBLE_FLAG_UNRELIABLE) == 0)
-      send_ack(cli, &rx, &from);
+      network_ack_received_message(cli, &rx, &from);
     if (rx.ctrl == WAMBLE_CTRL_SERVER_NOTIFICATION &&
         rx.session.notification_type ==
             WAMBLE_NOTIFICATION_TYPE_SPECTATE_ENDED) {
@@ -1055,7 +1100,7 @@ WAMBLE_TEST(profile_runtime_reservation_timeout_emits_reliable_board_update) {
     struct timeval tv;
     FD_ZERO(&rfds);
     FD_SET(cli, &rfds);
-    tv.tv_sec = 1;
+    tv.tv_sec = 3;
     tv.tv_usec = 0;
 #ifdef WAMBLE_PLATFORM_WINDOWS
     T_ASSERT(select(0, &rfds, NULL, NULL, &tv) > 0);
@@ -1064,11 +1109,39 @@ WAMBLE_TEST(profile_runtime_reservation_timeout_emits_reliable_board_update) {
 #endif
     T_ASSERT(receive_message(cli, &rx, &from) > 0);
     T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SERVER_HELLO);
-    send_ack(cli, &rx, &from);
+    network_ack_received_message(cli, &rx, &from);
   }
 
+  uint8_t token[TOKEN_LENGTH];
+  memcpy(token, rx.token, TOKEN_LENGTH);
   WambleBoard *board = get_board_by_id(rx.board_id);
   T_ASSERT(board != NULL);
+
+  memset(&tx, 0, sizeof(tx));
+  tx.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  tx.header_version = WAMBLE_PROTO_VERSION;
+  tx.flags = WAMBLE_FLAG_UNRELIABLE;
+  memcpy(tx.token, token, TOKEN_LENGTH);
+  T_ASSERT_STATUS_OK(send_unreliable_packet(cli, &tx, &dst));
+  T_ASSERT_EQ_INT(profile_runtime_pump_inline(), 1);
+  {
+    fd_set rfds;
+    struct timeval tv;
+    FD_ZERO(&rfds);
+    FD_SET(cli, &rfds);
+    tv.tv_sec = 3;
+    tv.tv_usec = 0;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+    T_ASSERT(select(0, &rfds, NULL, NULL, &tv) > 0);
+#else
+    T_ASSERT(select(cli + 1, &rfds, NULL, NULL, &tv) > 0);
+#endif
+    T_ASSERT(receive_message(cli, &rx, &from) > 0);
+    T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+    T_ASSERT(tokens_equal(rx.token, token));
+    network_ack_received_message(cli, &rx, &from);
+  }
+
   board->reservation_time -= (get_config()->reservation_timeout + 1);
 
   int saw_update = 0;
@@ -1092,7 +1165,7 @@ WAMBLE_TEST(profile_runtime_reservation_timeout_emits_reliable_board_update) {
       continue;
     T_ASSERT(receive_message(cli, &rx, &from) > 0);
     if ((rx.flags & WAMBLE_FLAG_UNRELIABLE) == 0)
-      send_ack(cli, &rx, &from);
+      network_ack_received_message(cli, &rx, &from);
     if (rx.ctrl != WAMBLE_CTRL_BOARD_UPDATE)
       continue;
     const WambleMessageExtField *reserved_at =
@@ -1127,10 +1200,12 @@ WAMBLE_TESTS_BEGIN_NAMED(profile_runtime_tests) {
       profile_exec_snapshot_flushes_pending_create_session_intent,
       WAMBLE_SUITE_FUNCTIONAL, "profile_runtime", profile_test_setup,
       profile_test_teardown, 0);
-  WAMBLE_TESTS_ADD_EX_SM(
-      profile_exec_snapshot_blocks_while_reservation_in_flight,
-      WAMBLE_SUITE_FUNCTIONAL, "profile_runtime", profile_test_setup,
-      profile_test_teardown, 0);
+  WAMBLE_TESTS_ADD_EX_SM(profile_exec_snapshot_exports_logical_board_state,
+                         WAMBLE_SUITE_FUNCTIONAL, "profile_runtime",
+                         profile_test_setup, profile_test_teardown, 0);
+  WAMBLE_TESTS_ADD_EX_SM(profile_exec_snapshot_blocks_pending_login_challenge,
+                         WAMBLE_SUITE_FUNCTIONAL, "profile_runtime",
+                         profile_test_setup, profile_test_teardown, 0);
   WAMBLE_TESTS_ADD_EX_SM(profile_config_inheritance_child_uses_base_port,
                          WAMBLE_SUITE_FUNCTIONAL, "profile_runtime",
                          profile_test_setup, profile_test_teardown, 0);

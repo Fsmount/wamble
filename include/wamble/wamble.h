@@ -538,6 +538,7 @@ typedef struct WambleConfig {
   int experiment_seed;
   int timeout_ms;
   int max_retries;
+  int rto_cap_ms;
   int max_message_size;
   int buffer_size;
   int terminal_cache_ttl_ms;
@@ -1740,67 +1741,6 @@ NetworkStatus wamble_packet_deserialize(const uint8_t *buffer,
                                         uint8_t *out_flags);
 
 typedef enum {
-  WS_GATEWAY_OK = 0,
-  WS_GATEWAY_STATUS_UPGRADE_ACCEPTED = 1,
-  WS_GATEWAY_STATUS_ROUTE_REGISTERED = 2,
-  WS_GATEWAY_STATUS_STREAM_STARTED = 3,
-  WS_GATEWAY_STATUS_CLOSE_RECEIVED = 4,
-  WS_GATEWAY_STATUS_OUTBOUND_FLUSHED = 5,
-  WS_GATEWAY_STATUS_OUTBOUND_QUEUED = 6,
-  WS_GATEWAY_STATUS_STREAM_EXITED = 7,
-  WS_GATEWAY_STATUS_HANDSHAKE_READ_FAILED = 8,
-  WS_GATEWAY_STATUS_BAD_REQUEST_LINE = 9,
-  WS_GATEWAY_STATUS_PATH_MISMATCH = 10,
-  WS_GATEWAY_STATUS_UPGRADE_HEADER_INVALID = 11,
-  WS_GATEWAY_STATUS_SEND_101_FAILED = 12,
-  WS_GATEWAY_STATUS_ROUTE_REGISTER_FAILED = 13,
-  WS_GATEWAY_STATUS_WAIT_FAILED = 14,
-  WS_GATEWAY_STATUS_OUTBOUND_FLUSH_FAILED = 15,
-  WS_GATEWAY_STATUS_READ_FAILED = 16,
-  WS_GATEWAY_STATUS_CLOSE_TOO_LARGE = 17,
-  WS_GATEWAY_STATUS_NON_BINARY_OPCODE = 18,
-  WS_GATEWAY_STATUS_BINARY_REJECTED = 19,
-  WS_GATEWAY_STATUS_QUEUE_REJECTED = 20,
-  WS_GATEWAY_ERR_CONFIG = -1,
-  WS_GATEWAY_ERR_BIND = -2,
-  WS_GATEWAY_ERR_THREAD = -3,
-  WS_GATEWAY_ERR_ALLOC = -4,
-} WsGatewayStatus;
-
-typedef enum {
-  WAMBLE_FRAGMENT_INTEGRITY_UNKNOWN = 0,
-  WAMBLE_FRAGMENT_INTEGRITY_OK = 1,
-  WAMBLE_FRAGMENT_INTEGRITY_MISMATCH = 2,
-} WambleFragmentIntegrity;
-
-typedef enum {
-  WAMBLE_FRAGMENT_REASSEMBLY_ERR_INVALID = -2,
-  WAMBLE_FRAGMENT_REASSEMBLY_ERR_NOMEM = -1,
-  WAMBLE_FRAGMENT_REASSEMBLY_IGNORED = 0,
-  WAMBLE_FRAGMENT_REASSEMBLY_IN_PROGRESS = 1,
-  WAMBLE_FRAGMENT_REASSEMBLY_COMPLETE = 2,
-  WAMBLE_FRAGMENT_REASSEMBLY_COMPLETE_BAD_HASH = 3,
-} WambleFragmentReassemblyResult;
-
-typedef struct WambleFragmentReassembly {
-  uint8_t active;
-  uint8_t ctrl;
-  uint8_t hash_algo;
-  uint16_t chunk_count;
-  uint16_t received_chunks;
-  uint32_t total_len;
-  uint32_t transfer_id;
-  uint8_t expected_hash[WAMBLE_FRAGMENT_HASH_LENGTH];
-  WambleFragmentIntegrity integrity;
-  uint8_t *data;
-  size_t data_capacity;
-  uint8_t *chunk_seen;
-  size_t chunk_seen_capacity;
-} WambleFragmentReassembly;
-
-typedef struct WambleWsGateway WambleWsGateway;
-
-typedef enum {
   SPECTATOR_INIT_OK = 0,
   SPECTATOR_INIT_ERR_NO_CAPACITY = -1,
   SPECTATOR_INIT_ERR_ALLOC = -2,
@@ -1836,77 +1776,6 @@ typedef struct ExpiredSessionNotification {
   uint8_t token[TOKEN_LENGTH];
 } ExpiredSessionNotification;
 
-void network_init_thread_state(void);
-int network_get_session_treatment_group(const uint8_t *token, char *out_group,
-                                        size_t out_group_size);
-void cleanup_expired_sessions(void);
-
-int receive_message_packet(const uint8_t *packet, size_t packet_len,
-                           struct WambleMsg *msg,
-                           const struct sockaddr_in *cliaddr);
-int network_get_client_addr_by_token(const uint8_t *token,
-                                     struct sockaddr_in *out_addr);
-void network_bind_client_token(const struct sockaddr_in *addr,
-                               const uint8_t *token);
-int network_get_bound_token_for_addr(const struct sockaddr_in *addr,
-                                     uint8_t out_token[TOKEN_LENGTH]);
-void network_end_request(void);
-wamble_socket_t create_and_bind_socket(int port);
-int receive_message(wamble_socket_t sockfd, struct WambleMsg *msg,
-                    struct sockaddr_in *cliaddr);
-void wamble_fragment_reassembly_init(WambleFragmentReassembly *reassembly);
-void wamble_fragment_reassembly_reset(WambleFragmentReassembly *reassembly);
-void wamble_fragment_reassembly_free(WambleFragmentReassembly *reassembly);
-WambleFragmentReassemblyResult
-wamble_fragment_reassembly_push(WambleFragmentReassembly *reassembly,
-                                const struct WambleMsg *msg);
-void send_ack(wamble_socket_t sockfd, const struct WambleMsg *msg,
-              const struct sockaddr_in *cliaddr);
-int send_reliable_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
-                          const struct sockaddr_in *cliaddr, int timeout_ms,
-                          int max_retries);
-int send_replayable_terminal_message(wamble_socket_t sockfd,
-                                     const struct WambleMsg *msg,
-                                     const struct sockaddr_in *cliaddr);
-int send_reliable_payload_bytes(wamble_socket_t sockfd, uint8_t ctrl,
-                                const uint8_t *token, uint64_t board_id,
-                                const uint8_t *payload, size_t payload_len,
-                                const struct sockaddr_in *cliaddr,
-                                int timeout_ms, int max_retries,
-                                int force_fragment);
-int send_reliable_spectate_state_sync(wamble_socket_t sockfd,
-                                      const uint8_t *token,
-                                      const struct sockaddr_in *cliaddr);
-int send_reliable_board_state_sync(wamble_socket_t sockfd, const uint8_t *token,
-                                   const struct sockaddr_in *cliaddr);
-int send_unreliable_packet(wamble_socket_t sockfd, const struct WambleMsg *msg,
-                           const struct sockaddr_in *cliaddr);
-int wamble_socket_bound_port(wamble_socket_t sock);
-ServerStatus handle_message(wamble_socket_t sockfd, const struct WambleMsg *msg,
-                            const struct sockaddr_in *cliaddr, int trust_tier,
-                            const char *profile_name);
-
-WambleWsGateway *ws_gateway_start(const char *profile_name, int ws_port,
-                                  int udp_port, const char *ws_path,
-                                  WsGatewayStatus *out_status);
-void ws_gateway_stop(WambleWsGateway *gateway);
-int ws_gateway_matches(const WambleWsGateway *gateway, int ws_port,
-                       int udp_port, const char *ws_path);
-int ws_gateway_pop_packet(WambleWsGateway *gateway, uint8_t *packet,
-                          size_t packet_cap, size_t *out_packet_len,
-                          struct sockaddr_in *out_cliaddr);
-int ws_gateway_is_ws_client(const struct sockaddr_in *cliaddr);
-int ws_gateway_queue_packet(const struct sockaddr_in *cliaddr,
-                            const uint8_t *packet, size_t packet_len);
-void ws_gateway_flush_outbound(WambleWsGateway *gateway);
-int ws_gateway_flush_route(const struct sockaddr_in *cliaddr);
-int ws_gateway_active_client_count(WambleWsGateway *gateway);
-
-int network_protocol_thread_pending_packet_count(void);
-int network_protocol_thread_terminal_cache_packet_count(void);
-int server_protocol_thread_pending_login_challenge_count(void);
-int board_manager_count_active_or_reserved(void);
-
 SpectatorInitStatus spectator_manager_init(void);
 void spectator_manager_shutdown(void);
 void spectator_manager_tick(void);
@@ -1918,14 +1787,6 @@ int spectator_get_state_by_token(const uint8_t *token,
                                  SpectatorState *out_state,
                                  uint64_t *out_focus_board_id);
 void spectator_discard_by_token(const uint8_t *token);
-int spectator_collect_state_snapshot(const uint8_t *token,
-                                     struct SpectatorUpdate *out, int max);
-int spectator_collect_updates(struct SpectatorUpdate *out, int max);
-int spectator_collect_notifications(struct SpectatorUpdate *out, int max);
-int spectator_manager_active_count_for_port(int owner_port);
-int board_collect_reservation_release_notifications(
-    ReservationReleaseNotification *out, int max);
-
 #define WAMBLE_DUP_WINDOW 1024
 
 typedef struct WamblePlayer {

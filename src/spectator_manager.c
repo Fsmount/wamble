@@ -2,6 +2,23 @@
 #include <inttypes.h>
 #include <string.h>
 
+void profile_runtime_manager_event_signal(void);
+int server_protocol_resolve_profile_trust_tier(const uint8_t *token,
+                                               const char *profile_name);
+
+#define WAMBLE_SPECTATOR_STATE_RECORD_SIZE 44u
+
+typedef struct WambleSpectatorSnapshot {
+  uint8_t token[TOKEN_LENGTH];
+  SpectatorState state;
+  uint64_t focus_board_id;
+  double last_activity;
+  int owner_port;
+  unsigned int game_mode_filter;
+} WambleSpectatorSnapshot;
+
+int spectator_manager_import(const WambleSpectatorSnapshot *in, int count);
+
 typedef struct SpectatorEntry {
   struct sockaddr_in addr;
   uint8_t token[TOKEN_LENGTH];
@@ -37,12 +54,15 @@ static time_t summary_cache_built_wall = 0;
 static int is_board_eligible(const WambleBoard *b);
 static int cmp_boards(const void *a, const void *b);
 static int spectator_current_port(void);
-static int spectator_count_for_port_locked(int owner_port);
 static int spectator_active_count_for_port_locked(int owner_port);
 static int fill_focus_now(SpectatorEntry *e, SpectatorUpdate *out, int out_cap,
                           int *out_count);
 static int fill_summary_now(SpectatorEntry *e, SpectatorUpdate *out,
                             int out_cap, int *out_count);
+
+static int spectator_has_delivery_route(const SpectatorEntry *e) {
+  return e && e->addr.sin_addr.s_addr != 0 && e->addr.sin_port != 0;
+}
 
 static int token_has_any_byte(const uint8_t *token) {
   if (!token)
@@ -234,15 +254,6 @@ static int spectator_current_port(void) {
   return get_config() ? get_config()->port : 0;
 }
 
-static int spectator_count_for_port_locked(int owner_port) {
-  int count = 0;
-  for (int i = 0; i < spectators_count; i++) {
-    if (spectators[i].owner_port == owner_port)
-      count++;
-  }
-  return count;
-}
-
 static int spectator_active_count_for_port_locked(int owner_port) {
   int count = 0;
   for (int i = 0; i < spectators_count; i++) {
@@ -412,6 +423,7 @@ void spectator_manager_tick(void) {
               PROFILE_ADMIN_STATUS_SPECTATOR_FOCUS_DISABLED_FALLBACK};
           wamble_runtime_event_publish(runtime_status,
                                        wamble_runtime_profile_key(), NULL);
+          profile_runtime_manager_event_signal();
         }
         e->state = SPECTATOR_STATE_SUMMARY;
         e->focus_board_id = 0;
@@ -435,6 +447,7 @@ void spectator_manager_tick(void) {
                 PROFILE_ADMIN_STATUS_SPECTATOR_BOARD_FINISHED_FALLBACK};
             wamble_runtime_event_publish(runtime_status,
                                          wamble_runtime_profile_key(), NULL);
+            profile_runtime_manager_event_signal();
           }
           e->state = SPECTATOR_STATE_SUMMARY;
           e->focus_board_id = 0;
@@ -467,6 +480,7 @@ void spectator_manager_tick(void) {
           PROFILE_ADMIN_STATUS_SPECTATOR_STOPPED_BY_ZERO_CAP};
       wamble_runtime_event_publish(runtime_status, wamble_runtime_profile_key(),
                                    NULL);
+      profile_runtime_manager_event_signal();
       e->state = SPECTATOR_STATE_IDLE;
       e->focus_board_id = 0;
       e->last_focus_sent = 0.0;
@@ -502,7 +516,8 @@ int spectator_collect_notifications(struct SpectatorUpdate *out, int max) {
   int port = get_config() ? get_config()->port : 0;
   for (int i = 0; i < spectators_count && out_count < max; i++) {
     SpectatorEntry *e = &spectators[i];
-    if (!e->has_pending_notice || e->owner_port != port)
+    if (!e->has_pending_notice || e->owner_port != port ||
+        !spectator_has_delivery_route(e))
       continue;
     SpectatorUpdate *u = &out[out_count++];
     memcpy(u->token, e->token, TOKEN_LENGTH);
@@ -647,6 +662,260 @@ SpectatorRequestStatus spectator_handle_request(
   return rc;
 }
 
+int spectator_manager_export(WambleSpectatorSnapshot *out, int max,
+                             int *out_count) {
+  if (out_count)
+    *out_count = 0;
+  if (max < 0 || (!out && max > 0))
+    return -1;
+  if (!spectators || spectators_count <= 0)
+    return 0;
+  wamble_mutex_lock(&spectators_mutex);
+  int count = 0;
+  for (int i = 0; i < spectators_count; i++) {
+    SpectatorEntry *e = &spectators[i];
+    if (e->state == SPECTATOR_STATE_IDLE || !token_has_any_byte(e->token))
+      continue;
+    if (out && count < max) {
+      WambleSpectatorSnapshot *s = &out[count];
+      memset(s, 0, sizeof(*s));
+      memcpy(s->token, e->token, TOKEN_LENGTH);
+      s->state = e->state;
+      s->focus_board_id = e->focus_board_id;
+      s->last_activity = e->last_activity;
+      s->owner_port = e->owner_port;
+      s->game_mode_filter = e->game_mode_filter;
+    }
+    count++;
+  }
+  wamble_mutex_unlock(&spectators_mutex);
+  if (out && count > max)
+    return -1;
+  if (out_count)
+    *out_count = count;
+  return 0;
+}
+
+static int spectator_policy_allowed_ex(
+    const uint8_t *token, const char *profile_name, const char *action,
+    const char *resource, const char *context_key, const char *context_value,
+    int fallback_allowed, WamblePolicyDecision *out_decision) {
+  WamblePolicyDecision decision;
+  memset(&decision, 0, sizeof(decision));
+  DbStatus st = wamble_query_resolve_policy_decision(
+      token, profile_name, action, resource, context_key, context_value,
+      &decision);
+  if (st != DB_OK || decision.rule_id == 0)
+    return fallback_allowed ? 1 : 0;
+  if (out_decision)
+    *out_decision = decision;
+  return decision.allowed ? 1 : 0;
+}
+
+static void spectator_recalculate_import_policy(SpectatorEntry *e) {
+  if (!e)
+    return;
+  const char *profile_name = wamble_runtime_profile_key();
+  const char *spectate_mode =
+      (e->state == SPECTATOR_STATE_FOCUS) ? "focus" : "summary";
+  e->trust = server_protocol_resolve_profile_trust_tier(e->token, profile_name);
+  e->capacity_bypass = (e->state == SPECTATOR_STATE_FOCUS &&
+                        spectator_policy_allowed_ex(
+                            e->token, profile_name, "spectate.capacity_bypass",
+                            "focus", NULL, NULL, 0, NULL))
+                           ? 1
+                           : 0;
+  e->game_mode_visible =
+      spectator_policy_allowed_ex(e->token, profile_name, "game.mode", "view",
+                                  NULL, NULL, 1, NULL)
+          ? 1
+          : 0;
+  if (!e->game_mode_visible)
+    e->game_mode_filter = 0;
+  if (e->trust < get_config()->spectator_visibility ||
+      !spectator_policy_allowed_ex(e->token, profile_name, "spectate.access",
+                                   "view", "mode", spectate_mode, 1, NULL)) {
+    e->state = SPECTATOR_STATE_IDLE;
+    e->focus_board_id = 0;
+    e->capacity_bypass = 0;
+    e->game_mode_visible = 0;
+    e->game_mode_filter = 0;
+    return;
+  }
+  if (e->state == SPECTATOR_STATE_FOCUS) {
+    WambleBoard *target = get_board_by_id(e->focus_board_id);
+    if (get_config()->spectator_max_focus_per_session <= 0 || !target ||
+        !is_board_eligible(target)) {
+      e->state = SPECTATOR_STATE_SUMMARY;
+      e->focus_board_id = 0;
+      e->last_focus_sent = 0.0;
+      e->capacity_bypass = 0;
+    }
+  }
+}
+
+static void spectator_record_write_u32(uint8_t *dst, uint32_t value) {
+  uint32_t be = htonl(value);
+  memcpy(dst, &be, sizeof(be));
+}
+
+static void spectator_record_write_u64(uint8_t *dst, uint64_t value) {
+  uint64_t be = wamble_host_to_net64(value);
+  memcpy(dst, &be, sizeof(be));
+}
+
+static uint32_t spectator_record_read_u32(const uint8_t *src) {
+  uint32_t be = 0;
+  memcpy(&be, src, sizeof(be));
+  return ntohl(be);
+}
+
+static uint64_t spectator_record_read_u64(const uint8_t *src) {
+  uint64_t be = 0;
+  memcpy(&be, src, sizeof(be));
+  return wamble_net_to_host64(be);
+}
+
+size_t spectator_manager_state_record_size(void) {
+  return WAMBLE_SPECTATOR_STATE_RECORD_SIZE;
+}
+
+size_t spectator_manager_legacy_state_record_size(void) {
+  return sizeof(WambleSpectatorSnapshot);
+}
+
+int spectator_manager_export_state_records(uint8_t *out, size_t record_size,
+                                           int max, int *out_count) {
+  if (record_size != WAMBLE_SPECTATOR_STATE_RECORD_SIZE)
+    return -1;
+  int count = 0;
+  if (spectator_manager_export(NULL, 0, &count) != 0)
+    return -1;
+  if (out_count)
+    *out_count = count;
+  if (!out)
+    return count <= max ? 0 : -1;
+  if (max < count)
+    return -1;
+  WambleSpectatorSnapshot *snapshots = NULL;
+  if (count > 0) {
+    snapshots =
+        (WambleSpectatorSnapshot *)calloc((size_t)count, sizeof(*snapshots));
+    if (!snapshots)
+      return -1;
+    if (spectator_manager_export(snapshots, count, &count) != 0) {
+      free(snapshots);
+      return -1;
+    }
+  }
+  for (int i = 0; i < count; i++) {
+    const WambleSpectatorSnapshot *s = &snapshots[i];
+    uint8_t *record = out + ((size_t)i * record_size);
+    memset(record, 0, record_size);
+    memcpy(record, s->token, TOKEN_LENGTH);
+    spectator_record_write_u32(record + 16, (uint32_t)s->state);
+    spectator_record_write_u64(record + 20, s->focus_board_id);
+    uint64_t activity_ms = 0;
+    if (s->last_activity > 0.0)
+      activity_ms = (uint64_t)(s->last_activity * 1000.0);
+    spectator_record_write_u64(record + 28, activity_ms);
+    spectator_record_write_u32(record + 36, (uint32_t)s->owner_port);
+    spectator_record_write_u32(record + 40, (uint32_t)s->game_mode_filter);
+  }
+  free(snapshots);
+  if (out_count)
+    *out_count = count;
+  return 0;
+}
+
+int spectator_manager_import_legacy_state_records(const uint8_t *in,
+                                                  size_t record_size,
+                                                  int count) {
+  if ((!in && count > 0) || record_size != sizeof(WambleSpectatorSnapshot) ||
+      count < 0)
+    return -1;
+  return spectator_manager_import((const WambleSpectatorSnapshot *)in, count);
+}
+
+int spectator_manager_import_state_records(const uint8_t *in,
+                                           size_t record_size, int count) {
+  if ((!in && count > 0) || record_size != WAMBLE_SPECTATOR_STATE_RECORD_SIZE)
+    return -1;
+  if (count < 0)
+    return -1;
+  WambleSpectatorSnapshot *snapshots = NULL;
+  if (count > 0) {
+    snapshots =
+        (WambleSpectatorSnapshot *)calloc((size_t)count, sizeof(*snapshots));
+    if (!snapshots)
+      return -1;
+  }
+  for (int i = 0; i < count; i++) {
+    const uint8_t *record = in + ((size_t)i * record_size);
+    WambleSpectatorSnapshot *s = &snapshots[i];
+    memcpy(s->token, record, TOKEN_LENGTH);
+    s->state = (SpectatorState)spectator_record_read_u32(record + 16);
+    s->focus_board_id = spectator_record_read_u64(record + 20);
+    uint64_t activity_ms = spectator_record_read_u64(record + 28);
+    s->last_activity = (double)activity_ms / 1000.0;
+    s->owner_port = (int)spectator_record_read_u32(record + 36);
+    s->game_mode_filter = spectator_record_read_u32(record + 40);
+  }
+  int rc = spectator_manager_import(snapshots, count);
+  free(snapshots);
+  return rc;
+}
+
+int spectator_manager_import(const WambleSpectatorSnapshot *in, int count) {
+  if (!in && count > 0)
+    return -1;
+  if (count < 0)
+    return -1;
+  if (!spectators) {
+    if (spectator_manager_init() != SPECTATOR_INIT_OK)
+      return -1;
+  }
+  wamble_mutex_lock(&spectators_mutex);
+  if (count > spectators_capacity) {
+    SpectatorEntry *next =
+        (SpectatorEntry *)realloc(spectators, (size_t)count * sizeof(*next));
+    if (!next) {
+      wamble_mutex_unlock(&spectators_mutex);
+      return -1;
+    }
+    memset(next + spectators_capacity, 0,
+           (size_t)(count - spectators_capacity) * sizeof(*next));
+    spectators = next;
+    spectators_capacity = count;
+  }
+  for (int i = 0; i < spectators_capacity; i++) {
+    spectators[i].state = SPECTATOR_STATE_IDLE;
+    memset(spectators[i].token, 0, TOKEN_LENGTH);
+  }
+  int imported = 0;
+  for (int i = 0; i < count && imported < spectators_capacity; i++) {
+    const WambleSpectatorSnapshot *s = &in[i];
+    if (!token_has_any_byte(s->token) || s->state == SPECTATOR_STATE_IDLE)
+      continue;
+    SpectatorEntry *e = &spectators[imported++];
+    memset(e, 0, sizeof(*e));
+    memcpy(e->token, s->token, TOKEN_LENGTH);
+    e->state = s->state;
+    e->focus_board_id = s->focus_board_id;
+    e->last_summary_sent = 0.0;
+    e->last_focus_sent = 0.0;
+    e->last_activity = s->last_activity;
+    e->owner_port = s->owner_port;
+    e->game_mode_filter = s->game_mode_filter;
+    spectator_recalculate_import_policy(e);
+    if (e->state == SPECTATOR_STATE_IDLE)
+      imported--;
+  }
+  spectators_count = imported;
+  wamble_mutex_unlock(&spectators_mutex);
+  return 0;
+}
+
 int spectator_get_state_by_token(const uint8_t *token,
                                  SpectatorState *out_state,
                                  uint64_t *out_focus_board_id) {
@@ -691,6 +960,8 @@ int spectator_collect_state_snapshot(const uint8_t *token, SpectatorUpdate *out,
     if (e->owner_port != port || memcmp(e->token, token, TOKEN_LENGTH) != 0) {
       continue;
     }
+    if (!spectator_has_delivery_route(e))
+      break;
     if (e->state == SPECTATOR_STATE_SUMMARY) {
       if (fill_summary_now(e, out, max, &out_count) >= 0)
         e->last_summary_sent = now;
@@ -707,6 +978,8 @@ int spectator_collect_state_snapshot(const uint8_t *token, SpectatorUpdate *out,
 static int fill_focus_now(SpectatorEntry *e, SpectatorUpdate *out, int out_cap,
                           int *out_count) {
   if (!e || !out || !out_count)
+    return 0;
+  if (!spectator_has_delivery_route(e))
     return 0;
   if (*out_count >= out_cap)
     return -1;
@@ -749,6 +1022,8 @@ static int fill_summary_now(SpectatorEntry *e, SpectatorUpdate *out,
                             int out_cap, int *out_count) {
   if (!e || !out || !out_count || out_cap <= 0)
     return -1;
+  if (!spectator_has_delivery_route(e))
+    return 0;
   int start_count = *out_count;
   if (out_cap - *out_count < 1)
     return -1;
@@ -822,7 +1097,7 @@ int spectator_collect_updates(struct SpectatorUpdate *out, int max) {
           (e->last_summary_sent == 0.0) ||
           (sum_interval > 0.0 && (now - e->last_summary_sent) >= sum_interval);
       if (due) {
-        if (fill_summary_now(e, out, max, &out_count) >= 0)
+        if (fill_summary_now(e, out, max, &out_count) > 0)
           e->last_summary_sent = now;
         else
           retry = 1;
@@ -832,7 +1107,7 @@ int spectator_collect_updates(struct SpectatorUpdate *out, int max) {
           (e->last_focus_sent == 0.0) ||
           (foc_interval > 0.0 && (now - e->last_focus_sent) >= foc_interval);
       if (due) {
-        if (fill_focus_now(e, out, max, &out_count) >= 0)
+        if (fill_focus_now(e, out, max, &out_count) > 0)
           e->last_focus_sent = now;
         else
           retry = 1;

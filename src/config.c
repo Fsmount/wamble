@@ -1992,6 +1992,7 @@ static const ConfigVarMap config_map[] = {
     CONF_ITEM("experiment-seed", CONF_INT, experiment_seed),
     CONF_ITEM("timeout-ms", CONF_INT, timeout_ms),
     CONF_ITEM("max-retries", CONF_INT, max_retries),
+    CONF_ITEM("rto-cap-ms", CONF_INT, rto_cap_ms),
     CONF_ITEM("max-message-size", CONF_INT, max_message_size),
     CONF_ITEM("buffer-size", CONF_INT, buffer_size),
     CONF_ITEM("terminal-cache-ttl-ms", CONF_INT, terminal_cache_ttl_ms),
@@ -2113,6 +2114,7 @@ static void config_set_defaults(void) {
   g_config.experiment_seed = 0;
   g_config.timeout_ms = 100;
   g_config.max_retries = 3;
+  g_config.rto_cap_ms = 8000;
   g_config.max_message_size = 126;
   g_config.buffer_size = 32768;
   g_config.terminal_cache_ttl_ms = 2000;

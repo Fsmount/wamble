@@ -43,7 +43,12 @@ Board Assignment
   - `experienced-player-early-phase-mult`
   - `experienced-player-mid-phase-mult`
   - `experienced-player-end-phase-mult`
+- When experiments are enabled, treatment/pairing checks compare the player's
+  current session treatment group with the board's last-mover treatment group
+  before accepting the board as eligible. If either side has no assignment, the
+  board remains eligible and normal scoring decides whether it is chosen.
 - If no suitable board is found, a new one may be created if the pool is smaller than `max-boards`.
 
 References
 - Config (see docs/configuration.txt): `max-boards`, `min-boards`, `reservation-timeout`, `inactivity-timeout`, `new-player-early-phase-mult`, `new-player-mid-phase-mult`, `new-player-end-phase-mult`, `experienced-player-early-phase-mult`, `experienced-player-mid-phase-mult`, `experienced-player-end-phase-mult`.
+- Runtime/state (see docs/runtime_and_state.txt): hot-reload snapshot scope for board cache and reservation state.

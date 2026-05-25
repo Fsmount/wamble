@@ -17,11 +17,41 @@
 #define WS_FRAME_MAX 4096
 #define WS_PREFETCH_MAX (WS_FRAME_MAX + 14u)
 #define WS_INBOUND_QUEUE_CAP_DEFAULT 1024
+#define WS_OUTBOUND_QUEUE_CAP_DEFAULT 1024
 #define WS_ROUTE_ID_MASK 0x0FFFFFFFu
 #define WS_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+#define WS_CLOSE_GOING_AWAY 1001
 #define WS_CLOSE_PROTOCOL_ERROR 1002
 #define WS_CLOSE_MESSAGE_TOO_BIG 1009
 #define WS_CONTROL_PAYLOAD_MAX 125u
+
+typedef enum {
+  WS_GATEWAY_OK = 0,
+  WS_GATEWAY_STATUS_UPGRADE_ACCEPTED = 1,
+  WS_GATEWAY_STATUS_ROUTE_REGISTERED = 2,
+  WS_GATEWAY_STATUS_STREAM_STARTED = 3,
+  WS_GATEWAY_STATUS_CLOSE_RECEIVED = 4,
+  WS_GATEWAY_STATUS_OUTBOUND_FLUSHED = 5,
+  WS_GATEWAY_STATUS_OUTBOUND_QUEUED = 6,
+  WS_GATEWAY_STATUS_STREAM_EXITED = 7,
+  WS_GATEWAY_STATUS_HANDSHAKE_READ_FAILED = 8,
+  WS_GATEWAY_STATUS_BAD_REQUEST_LINE = 9,
+  WS_GATEWAY_STATUS_PATH_MISMATCH = 10,
+  WS_GATEWAY_STATUS_UPGRADE_HEADER_INVALID = 11,
+  WS_GATEWAY_STATUS_SEND_101_FAILED = 12,
+  WS_GATEWAY_STATUS_ROUTE_REGISTER_FAILED = 13,
+  WS_GATEWAY_STATUS_WAIT_FAILED = 14,
+  WS_GATEWAY_STATUS_OUTBOUND_FLUSH_FAILED = 15,
+  WS_GATEWAY_STATUS_READ_FAILED = 16,
+  WS_GATEWAY_STATUS_CLOSE_TOO_LARGE = 17,
+  WS_GATEWAY_STATUS_NON_BINARY_OPCODE = 18,
+  WS_GATEWAY_STATUS_BINARY_REJECTED = 19,
+  WS_GATEWAY_STATUS_QUEUE_REJECTED = 20,
+  WS_GATEWAY_ERR_CONFIG = -1,
+  WS_GATEWAY_ERR_BIND = -2,
+  WS_GATEWAY_ERR_THREAD = -3,
+  WS_GATEWAY_ERR_ALLOC = -4,
+} WsGatewayStatus;
 
 typedef enum WsOpcode {
   WS_OPCODE_CONTINUATION = 0x0u,
@@ -33,6 +63,8 @@ typedef enum WsOpcode {
 
 typedef struct WsClientSlot WsClientSlot;
 typedef struct WsInboundPacket WsInboundPacket;
+typedef struct WsOutboundFrame WsOutboundFrame;
+typedef struct WambleWsGateway WambleWsGateway;
 
 struct WambleWsGateway {
   char *profile_name;
@@ -75,12 +107,19 @@ struct WsClientSlot {
   int upgraded;
   uint32_t route_id;
   struct sockaddr_in virtual_addr;
-  uint8_t tx_batch[WS_FRAME_MAX];
-  size_t tx_batch_len;
+  WsOutboundFrame *tx_head;
+  WsOutboundFrame *tx_tail;
+  size_t tx_count;
 };
 
 struct WsInboundPacket {
   struct sockaddr_in addr;
+  size_t len;
+  uint8_t data[WAMBLE_MAX_PACKET_SIZE];
+};
+
+struct WsOutboundFrame {
+  WsOutboundFrame *next;
   size_t len;
   uint8_t data[WAMBLE_MAX_PACKET_SIZE];
 };
@@ -98,6 +137,15 @@ static size_t g_ws_routes_cap = 0;
 static uint32_t g_ws_route_seq = 1;
 static wamble_mutex_t g_ws_routes_mutex;
 static int g_ws_routes_mutex_ready = 0;
+typedef void (*WambleWsGatewayBeforeSendHook)(void *ctx);
+static WambleWsGatewayBeforeSendHook g_ws_gateway_before_send_hook = NULL;
+static void *g_ws_gateway_before_send_hook_ctx = NULL;
+
+void ws_gateway_test_set_before_send_hook(WambleWsGatewayBeforeSendHook hook,
+                                          void *ctx) {
+  g_ws_gateway_before_send_hook = hook;
+  g_ws_gateway_before_send_hook_ctx = ctx;
+}
 
 static void publish_ws_gateway_status_detail(WsGatewayStatus status,
                                              const WambleWsGateway *gw,
@@ -891,26 +939,107 @@ static int ws_enqueue_inbound_packet(WambleWsGateway *gw,
   return 0;
 }
 
-static int ws_slot_flush_locked(WambleWsGateway *gw, WsClientSlot *slot) {
-  if (!slot || slot->tcp_sock == WAMBLE_INVALID_SOCKET)
-    return -1;
-  if (slot->tx_batch_len == 0)
-    return 0;
-  uint8_t frame[WS_FRAME_MAX];
-  size_t frame_len = slot->tx_batch_len;
-  uint32_t route_id = slot->route_id;
-  memcpy(frame, slot->tx_batch, frame_len);
-  slot->tx_batch_len = 0;
-  if (ws_send_frame(slot->tcp_sock, WS_OPCODE_BINARY, frame, frame_len) != 0)
-    return -1;
-  {
-    char detail[96];
-    snprintf(detail, sizeof(detail), "route=%u bytes=%zu", (unsigned)route_id,
-             frame_len);
-    publish_ws_gateway_status_detail(WS_GATEWAY_STATUS_OUTBOUND_FLUSHED, gw,
-                                     detail);
+static void ws_free_outbound_frames(WsClientSlot *slot) {
+  if (!slot)
+    return;
+  WsOutboundFrame *frame = slot->tx_head;
+  while (frame) {
+    WsOutboundFrame *next = frame->next;
+    free(frame);
+    frame = next;
   }
+  slot->tx_head = NULL;
+  slot->tx_tail = NULL;
+  slot->tx_count = 0;
+}
+
+static int ws_slot_enqueue_outbound_locked(WsClientSlot *slot,
+                                           WsOutboundFrame *frame) {
+  if (!slot || !frame)
+    return -1;
+  if (slot->tx_count >= WS_OUTBOUND_QUEUE_CAP_DEFAULT)
+    return -1;
+  frame->next = NULL;
+  if (slot->tx_tail)
+    slot->tx_tail->next = frame;
+  else
+    slot->tx_head = frame;
+  slot->tx_tail = frame;
+  slot->tx_count++;
   return 0;
+}
+
+static WsOutboundFrame *ws_slot_pop_outbound_locked(WsClientSlot *slot) {
+  if (!slot || !slot->tx_head)
+    return NULL;
+  WsOutboundFrame *frame = slot->tx_head;
+  slot->tx_head = frame->next;
+  if (!slot->tx_head)
+    slot->tx_tail = NULL;
+  if (slot->tx_count > 0)
+    slot->tx_count--;
+  frame->next = NULL;
+  return frame;
+}
+
+static int ws_gateway_flush_slot(WambleWsGateway *gw, int slot_index,
+                                 uint32_t route_id,
+                                 const struct sockaddr_in *cliaddr,
+                                 const char *failure_detail) {
+  if (!gw || slot_index < 0)
+    return -1;
+  int rc = 0;
+  for (;;) {
+    wamble_socket_t tcp_sock = WAMBLE_INVALID_SOCKET;
+    WsOutboundFrame *frame = NULL;
+    wamble_mutex_lock(&gw->mutex);
+    if (gw->should_stop || slot_index >= gw->clients_capacity) {
+      wamble_mutex_unlock(&gw->mutex);
+      return -1;
+    }
+    WsClientSlot *slot = gw->clients[slot_index];
+    if (!slot || !slot->in_use || !slot->upgraded ||
+        slot->route_id != route_id ||
+        (cliaddr && !ws_sockaddr_equal(&slot->virtual_addr, cliaddr)) ||
+        slot->tcp_sock == WAMBLE_INVALID_SOCKET) {
+      wamble_mutex_unlock(&gw->mutex);
+      return -1;
+    }
+    frame = ws_slot_pop_outbound_locked(slot);
+    if (!frame) {
+      wamble_mutex_unlock(&gw->mutex);
+      return rc;
+    }
+    tcp_sock = slot->tcp_sock;
+    wamble_mutex_unlock(&gw->mutex);
+
+    if (g_ws_gateway_before_send_hook)
+      g_ws_gateway_before_send_hook(g_ws_gateway_before_send_hook_ctx);
+    if (ws_send_frame(tcp_sock, WS_OPCODE_BINARY, frame->data, frame->len) !=
+        0) {
+      free(frame);
+      wamble_mutex_lock(&gw->mutex);
+      if (slot_index < gw->clients_capacity) {
+        WsClientSlot *failed_slot = gw->clients[slot_index];
+        if (failed_slot && failed_slot->in_use &&
+            failed_slot->route_id == route_id)
+          failed_slot->should_stop = 1;
+      }
+      wamble_mutex_unlock(&gw->mutex);
+      publish_ws_gateway_status_detail(WS_GATEWAY_STATUS_OUTBOUND_FLUSH_FAILED,
+                                       gw, failure_detail);
+      return -1;
+    }
+    {
+      char detail[96];
+      snprintf(detail, sizeof(detail), "route=%u bytes=%zu", (unsigned)route_id,
+               frame->len);
+      publish_ws_gateway_status_detail(WS_GATEWAY_STATUS_OUTBOUND_FLUSHED, gw,
+                                       detail);
+    }
+    free(frame);
+    rc = 0;
+  }
 }
 
 static int ws_handle_binary_payload(WambleWsGateway *gw, WsClientSlot *slot,
@@ -936,8 +1065,8 @@ static int ws_handle_binary_payload(WambleWsGateway *gw, WsClientSlot *slot,
 }
 
 static int ws_process_client_stream(WambleWsGateway *gw, WsClientSlot *slot,
-                                    wamble_socket_t tcp_sock, uint8_t *prefetch,
-                                    size_t prefetch_len) {
+                                    int slot_index, wamble_socket_t tcp_sock,
+                                    uint8_t *prefetch, size_t prefetch_len) {
   if (!gw || !slot || !prefetch)
     return -1;
   uint8_t ws_payload[WS_FRAME_MAX];
@@ -957,14 +1086,11 @@ static int ws_process_client_stream(WambleWsGateway *gw, WsClientSlot *slot,
       return -1;
     }
     if (ready == 0) {
-      int flush_rc = 0;
-      wamble_mutex_lock(&gw->mutex);
-      if (slot->tx_batch_len > 0)
-        flush_rc = ws_slot_flush_locked(gw, slot);
-      wamble_mutex_unlock(&gw->mutex);
-      if (flush_rc != 0) {
+      uint32_t route_id = slot->route_id;
+      if (ws_gateway_flush_slot(gw, slot_index, route_id, &slot->virtual_addr,
+                                "stream_idle_flush") != 0) {
         char detail[64];
-        snprintf(detail, sizeof(detail), "route=%u", (unsigned)slot->route_id);
+        snprintf(detail, sizeof(detail), "route=%u", (unsigned)route_id);
         publish_ws_gateway_status_detail(
             WS_GATEWAY_STATUS_OUTBOUND_FLUSH_FAILED, gw, detail);
         return -1;
@@ -1031,17 +1157,16 @@ static int ws_process_client_stream(WambleWsGateway *gw, WsClientSlot *slot,
       (void)ws_send_close_code(tcp_sock, WS_CLOSE_PROTOCOL_ERROR);
       return -1;
     }
-    int flush_rc = 0;
-    wamble_mutex_lock(&gw->mutex);
-    if (slot->tx_batch_len > 0)
-      flush_rc = ws_slot_flush_locked(gw, slot);
-    wamble_mutex_unlock(&gw->mutex);
-    if (flush_rc != 0) {
-      char detail[64];
-      snprintf(detail, sizeof(detail), "route=%u", (unsigned)slot->route_id);
-      publish_ws_gateway_status_detail(WS_GATEWAY_STATUS_OUTBOUND_FLUSH_FAILED,
-                                       gw, detail);
-      return -1;
+    {
+      uint32_t route_id = slot->route_id;
+      if (ws_gateway_flush_slot(gw, slot_index, route_id, &slot->virtual_addr,
+                                "stream_read_flush") != 0) {
+        char detail[64];
+        snprintf(detail, sizeof(detail), "route=%u", (unsigned)route_id);
+        publish_ws_gateway_status_detail(
+            WS_GATEWAY_STATUS_OUTBOUND_FLUSH_FAILED, gw, detail);
+        return -1;
+      }
     }
   }
   {
@@ -1255,7 +1380,8 @@ static int ws_upgrade_and_serve(WambleWsGateway *gw, WsClientSlot *slot,
                                      detail);
   }
 
-  int rc = ws_process_client_stream(gw, slot, tcp_sock, prefetch, prefetch_len);
+  int rc = ws_process_client_stream(gw, slot, slot_index, tcp_sock, prefetch,
+                                    prefetch_len);
   {
     char detail[96];
     snprintf(detail, sizeof(detail), "route=%u rc=%d", (unsigned)slot->route_id,
@@ -1279,7 +1405,7 @@ static void ws_mark_client_slot_closed(WambleWsGateway *gw, int slot_index) {
       slot->should_stop = 0;
       slot->upgraded = 0;
       slot->route_id = 0;
-      slot->tx_batch_len = 0;
+      ws_free_outbound_frames(slot);
       memset(&slot->virtual_addr, 0, sizeof(slot->virtual_addr));
       slot->tcp_sock = WAMBLE_INVALID_SOCKET;
     }
@@ -1341,7 +1467,7 @@ static int ws_allocate_client_slot(WambleWsGateway *gw, wamble_socket_t sock,
       slot->should_stop = 0;
       slot->upgraded = 0;
       slot->route_id = 0;
-      slot->tx_batch_len = 0;
+      ws_free_outbound_frames(slot);
       memset(&slot->virtual_addr, 0, sizeof(slot->virtual_addr));
       slot->tcp_sock = sock;
       *out_slot = i;
@@ -1481,20 +1607,53 @@ static wamble_socket_t ws_create_listener(int port) {
   return sock;
 }
 
-static void ws_request_client_shutdowns(WambleWsGateway *gateway) {
-  if (!gateway || !gateway->clients)
+static void ws_shutdown_socket(wamble_socket_t sockfd, uint16_t close_code) {
+  if (sockfd == WAMBLE_INVALID_SOCKET)
     return;
-  for (int i = 0; i < gateway->clients_capacity; i++) {
-    WsClientSlot *slot = gateway->clients[i];
-    if (slot && slot->in_use && slot->tcp_sock != WAMBLE_INVALID_SOCKET) {
-      slot->should_stop = 1;
+  if (close_code != 0)
+    (void)ws_send_close_code(sockfd, close_code);
 #ifdef WAMBLE_PLATFORM_WINDOWS
-      (void)shutdown(slot->tcp_sock, SD_BOTH);
+  (void)shutdown(sockfd, SD_BOTH);
 #else
-      (void)shutdown(slot->tcp_sock, SHUT_RDWR);
+  (void)shutdown(sockfd, SHUT_RDWR);
 #endif
+}
+
+static void ws_request_client_shutdowns_with_code(WambleWsGateway *gateway,
+                                                  uint16_t close_code) {
+  if (!gateway)
+    return;
+  int capacity = 0;
+  wamble_socket_t *sockets = NULL;
+
+  wamble_mutex_lock(&gateway->mutex);
+  capacity = gateway->clients_capacity;
+  if (capacity > 0)
+    sockets = (wamble_socket_t *)malloc(sizeof(*sockets) * (size_t)capacity);
+  int count = 0;
+  if (gateway->clients) {
+    for (int i = 0; i < gateway->clients_capacity; i++) {
+      WsClientSlot *slot = gateway->clients[i];
+      if (slot && slot->in_use && slot->tcp_sock != WAMBLE_INVALID_SOCKET) {
+        slot->should_stop = 1;
+        if (sockets)
+          sockets[count++] = slot->tcp_sock;
+      }
     }
   }
+  wamble_mutex_unlock(&gateway->mutex);
+
+  for (int i = 0; i < count; i++)
+    ws_shutdown_socket(sockets[i], close_code);
+  free(sockets);
+}
+
+static void ws_request_client_shutdowns(WambleWsGateway *gateway) {
+  ws_request_client_shutdowns_with_code(gateway, 0);
+}
+
+void ws_gateway_request_restart_clients(WambleWsGateway *gateway) {
+  ws_request_client_shutdowns_with_code(gateway, WS_CLOSE_GOING_AWAY);
 }
 
 WambleWsGateway *ws_gateway_start(const char *profile_name, int ws_port,
@@ -1576,8 +1735,11 @@ fail:
     wamble_cond_destroy(&gw->clients_done);
     wamble_mutex_destroy(&gw->mutex);
   }
-  for (int i = 0; i < gw->clients_capacity; i++)
+  for (int i = 0; i < gw->clients_capacity; i++) {
+    if (gw->clients)
+      ws_free_outbound_frames(gw->clients[i]);
     free(gw->clients ? gw->clients[i] : NULL);
+  }
   free(gw->clients);
   free(gw->inbound_packets);
   free(gw->profile_name);
@@ -1596,17 +1758,15 @@ void ws_gateway_stop(WambleWsGateway *gateway) {
     gateway->listen_sock = WAMBLE_INVALID_SOCKET;
   }
 
-  wamble_mutex_lock(&gateway->mutex);
   ws_request_client_shutdowns(gateway);
-  wamble_mutex_unlock(&gateway->mutex);
 
   if (gateway->running) {
     (void)wamble_thread_join(gateway->thread, NULL);
     gateway->running = 0;
   }
 
-  wamble_mutex_lock(&gateway->mutex);
   ws_request_client_shutdowns(gateway);
+  wamble_mutex_lock(&gateway->mutex);
   while (gateway->active_client_threads > 0) {
     wamble_cond_wait(&gateway->clients_done, &gateway->mutex);
   }
@@ -1615,8 +1775,11 @@ void ws_gateway_stop(WambleWsGateway *gateway) {
 
   wamble_cond_destroy(&gateway->clients_done);
   wamble_mutex_destroy(&gateway->mutex);
-  for (int i = 0; i < gateway->clients_capacity; i++)
+  for (int i = 0; i < gateway->clients_capacity; i++) {
+    if (gateway->clients)
+      ws_free_outbound_frames(gateway->clients[i]);
     free(gateway->clients ? gateway->clients[i] : NULL);
+  }
   free(gateway->clients);
   free(gateway->inbound_packets);
   free(gateway->profile_name);
@@ -1681,7 +1844,7 @@ int ws_gateway_is_ws_client(const struct sockaddr_in *cliaddr) {
 int ws_gateway_queue_packet(const struct sockaddr_in *cliaddr,
                             const uint8_t *packet, size_t packet_len) {
   if (!cliaddr || !packet || packet_len == 0 ||
-      packet_len > WAMBLE_MAX_PACKET_SIZE) {
+      packet_len > WAMBLE_MAX_PACKET_SIZE || packet_len > WS_FRAME_MAX) {
     return -1;
   }
   WambleWsGateway *gw = NULL;
@@ -1691,6 +1854,8 @@ int ws_gateway_queue_packet(const struct sockaddr_in *cliaddr,
     return 0;
   if (!gw || slot_index < 0)
     return -1;
+
+  WsOutboundFrame *frame = NULL;
 
   int result = -1;
   wamble_mutex_lock(&gw->mutex);
@@ -1702,31 +1867,24 @@ int ws_gateway_queue_packet(const struct sockaddr_in *cliaddr,
       slot->tcp_sock == WAMBLE_INVALID_SOCKET) {
     goto done;
   }
-  if (packet_len > WS_FRAME_MAX)
-    goto done;
-  if (slot->tx_batch_len > 0 &&
-      slot->tx_batch_len + packet_len > sizeof(slot->tx_batch)) {
-    if (ws_slot_flush_locked(gw, slot) != 0) {
-      slot->should_stop = 1;
-      publish_ws_gateway_status_detail(WS_GATEWAY_STATUS_OUTBOUND_FLUSH_FAILED,
-                                       gw, "queue_flush");
+  if (slot->tx_tail && slot->tx_tail->len + packet_len <= WS_FRAME_MAX) {
+    memcpy(slot->tx_tail->data + slot->tx_tail->len, packet, packet_len);
+    slot->tx_tail->len += packet_len;
+  } else {
+    frame = (WsOutboundFrame *)calloc(1, sizeof(*frame));
+    if (!frame) {
+      publish_ws_gateway_status_detail(WS_GATEWAY_STATUS_QUEUE_REJECTED, gw,
+                                       "alloc");
       goto done;
     }
-  }
-  if (slot->tx_batch_len + packet_len > sizeof(slot->tx_batch)) {
-    publish_ws_gateway_status_detail(WS_GATEWAY_STATUS_QUEUE_REJECTED, gw,
-                                     "tx_batch_capacity");
-    goto done;
-  }
-  memcpy(slot->tx_batch + slot->tx_batch_len, packet, packet_len);
-  slot->tx_batch_len += packet_len;
-  if (slot->tx_batch_len == sizeof(slot->tx_batch)) {
-    if (ws_slot_flush_locked(gw, slot) != 0) {
-      slot->should_stop = 1;
-      publish_ws_gateway_status_detail(WS_GATEWAY_STATUS_OUTBOUND_FLUSH_FAILED,
-                                       gw, "full_batch_flush");
+    frame->len = packet_len;
+    memcpy(frame->data, packet, packet_len);
+    if (ws_slot_enqueue_outbound_locked(slot, frame) != 0) {
+      publish_ws_gateway_status_detail(WS_GATEWAY_STATUS_QUEUE_REJECTED, gw,
+                                       "tx_queue_capacity");
       goto done;
     }
+    frame = NULL;
   }
   {
     char detail[96];
@@ -1738,6 +1896,7 @@ int ws_gateway_queue_packet(const struct sockaddr_in *cliaddr,
   result = 1;
 done:
   wamble_mutex_unlock(&gw->mutex);
+  free(frame);
   return result;
 }
 
@@ -1751,43 +1910,37 @@ int ws_gateway_flush_route(const struct sockaddr_in *cliaddr) {
     return -1;
   if (!gw || slot_index < 0)
     return -1;
-  int rc = -1;
-  wamble_mutex_lock(&gw->mutex);
-  if (gw->should_stop || slot_index >= gw->clients_capacity)
-    goto done;
-  WsClientSlot *slot = gw->clients[slot_index];
-  if (!slot || !slot->in_use || !slot->upgraded || slot->route_id != route_id ||
-      !ws_sockaddr_equal(&slot->virtual_addr, cliaddr) ||
-      slot->tcp_sock == WAMBLE_INVALID_SOCKET) {
-    goto done;
-  }
-  if (ws_slot_flush_locked(gw, slot) != 0) {
-    slot->should_stop = 1;
-    publish_ws_gateway_status_detail(WS_GATEWAY_STATUS_OUTBOUND_FLUSH_FAILED,
-                                     gw, "flush_route");
-    goto done;
-  }
-  rc = 0;
-done:
-  wamble_mutex_unlock(&gw->mutex);
-  return rc;
+  return ws_gateway_flush_slot(gw, slot_index, route_id, cliaddr,
+                               "flush_route");
 }
 
 void ws_gateway_flush_outbound(WambleWsGateway *gateway) {
   if (!gateway)
     return;
-  wamble_mutex_lock(&gateway->mutex);
-  for (int i = 0; i < gateway->clients_capacity; i++) {
-    WsClientSlot *slot = gateway->clients[i];
-    if (!slot || !slot->in_use || !slot->upgraded || slot->should_stop ||
-        slot->tcp_sock == WAMBLE_INVALID_SOCKET || slot->tx_batch_len == 0) {
-      continue;
+  for (;;) {
+    int slot_index = -1;
+    uint32_t route_id = 0;
+    struct sockaddr_in cliaddr;
+    memset(&cliaddr, 0, sizeof(cliaddr));
+
+    wamble_mutex_lock(&gateway->mutex);
+    for (int i = 0; i < gateway->clients_capacity; i++) {
+      WsClientSlot *slot = gateway->clients[i];
+      if (!slot || !slot->in_use || !slot->upgraded || slot->should_stop ||
+          slot->tcp_sock == WAMBLE_INVALID_SOCKET || slot->tx_head == NULL) {
+        continue;
+      }
+      slot_index = i;
+      route_id = slot->route_id;
+      cliaddr = slot->virtual_addr;
+      break;
     }
-    if (ws_slot_flush_locked(gateway, slot) != 0) {
-      publish_ws_gateway_status_detail(WS_GATEWAY_STATUS_OUTBOUND_FLUSH_FAILED,
-                                       gateway, "flush_outbound");
-      slot->should_stop = 1;
-    }
+    wamble_mutex_unlock(&gateway->mutex);
+
+    if (slot_index < 0)
+      return;
+    if (ws_gateway_flush_slot(gateway, slot_index, route_id, &cliaddr,
+                              "flush_outbound") != 0)
+      return;
   }
-  wamble_mutex_unlock(&gateway->mutex);
 }

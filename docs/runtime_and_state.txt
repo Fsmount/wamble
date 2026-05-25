@@ -6,8 +6,8 @@ Overview
   - Advertised profiles: one UDP socket per profile.
   - No advertised profiles: a default runtime is created from top-level config.
 - Execution model:
-  - Single runtime: runs inline in the main thread (pumped by `profile_runtime_pump_inline()`).
-  - Multiple runtimes: one worker thread per runtime.
+  - With one runtime, the main thread pumps it inline via `profile_runtime_pump_inline()`.
+  - With multiple runtimes, each runtime runs on its own worker thread.
 - Supports config reload and exec handoff without dropping sockets.
 
 Profiles
@@ -27,9 +27,14 @@ Reconcile
   instead of leaving the process without a listener.
 
 Thread Loop
-- Per runtime (threaded or inline): set thread-local config, init network state,
-  players, boards, intent/query services.
-- Poll UDP socket with `select()`; on readable, `receive_message()` then `handle_message()`.
+- Each runtime, whether inline or threaded, installs its thread-local config
+  and initializes network state, players, boards, and intent/query services.
+- Network work is pumped through bounded budgets. UDP/websocket ingress,
+  dispatch, ACK classification, retries, and outbound flushes stay inside the
+  network runtime.
+- Managers wake the runtime with a bounded non-blocking signal. The profile
+  runtime drains spectator, reservation-release, and session-expiry events in
+  batches, then server protocol converts them to packets.
 - Every second: `board_manager_tick()`, `spectator_manager_tick()`.
 - Periodically: `cleanup_expired_sessions()`.
 - Sends `SPECTATE_UPDATE`/`SERVER_NOTIFICATION` for its own socket.
@@ -43,6 +48,20 @@ Exec Handoff
   - `profile_prepare_state_save_and_inherit()` asks threads to save a small
     per-profile state file, marks listener sockets inheritable, and reports a
     `name=path` CSV.
+  - The export waits for protocol-visible work that must not be lost, including
+    queued dispatch work, request ACKs, reliable terminal/bundle work, terminal
+    replay cache entries, and pending login challenges. Login challenge adoption
+    is intentionally not implemented yet, so a mid-login reload remains
+    `PROFILE_EXPORT_NOT_READY` until the challenge is completed or expires.
+    Raw inbound packets, unreliable packets, retry timers, and websocket routes
+    are runtime scheduling details and do not block export.
+  - The state file is an internal pre-production format, tracked by format
+    revision. Current revision 3 stores the board cache and fixed-width
+    spectator subscription intent records (token, state, focus, last-activity
+    milliseconds, owner port, game-mode filter). Revisions 1 (board-only) and 2
+    (legacy spectator records) remain loadable only for current hot-reload
+    compatibility; this does not establish a durable production compatibility
+    guarantee.
   - `profile_export_inherited_sockets()` reports `name=socket_handle` CSV.
 - Environment used by the new process:
   - `WAMBLE_HOT_RELOAD=1`
@@ -55,8 +74,11 @@ Exec Handoff
   - `build/wamble --hot-reload`
 
 State Files
-- Written by `state_save_to_file()` and read by `state_load_from_file()`.
-- Simple header + an array of `WambleBoard` from the board cache.
+- Written by `state_save_to_file()` and read by `state_from_file()`.
+- The file contains a magic header plus an internal format revision,
+  `WambleBoard` entries from the board cache, and spectator subscription intent
+  entries. Transport endpoint maps, retry timers, websocket routes, and
+  outbound queues are not serialized.
 
 DB and Config
 - Each runtime uses its active config to build its own `libpq` connection on demand.

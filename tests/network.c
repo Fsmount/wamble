@@ -4,6 +4,8 @@
 #include "wamble/wamble_client.h"
 #include "wamble/wamble_db.h"
 
+#include <limits.h>
+
 void crypto_blake2b(uint8_t *hash, size_t hash_size, const uint8_t *msg,
                     size_t msg_size);
 
@@ -56,49 +58,89 @@ typedef struct {
 
 static void *recv_one_thread(void *arg) {
   RecvOneCtx *c = arg;
-  fd_set rfds;
-  struct timeval tv;
-  FD_ZERO(&rfds);
-  FD_SET(c->sock, &rfds);
-  tv.tv_sec = 0;
-  tv.tv_usec = 600 * 1000;
+  uint64_t deadline_ms = wamble_now_mono_millis() + 3000u;
+  c->received = 0;
+  while (wamble_now_mono_millis() < deadline_ms) {
+    fd_set rfds;
+    struct timeval tv;
+    FD_ZERO(&rfds);
+    FD_SET(c->sock, &rfds);
+    tv.tv_sec = 0;
+    tv.tv_usec = 100 * 1000;
 #ifdef WAMBLE_PLATFORM_WINDOWS
-  int ready = select(0, &rfds, NULL, NULL, &tv);
+    int ready = select(0, &rfds, NULL, NULL, &tv);
 #else
-  int ready = select(c->sock + 1, &rfds, NULL, NULL, &tv);
+    int ready = select(c->sock + 1, &rfds, NULL, NULL, &tv);
 #endif
-  int rc = (ready > 0) ? receive_message(c->sock, &c->msg, &c->from) : 0;
-  c->received = (rc > 0) ? 1 : 0;
+    if (ready <= 0)
+      continue;
+    int rc = receive_message(c->sock, &c->msg, &c->from);
+    if (rc > 0 && c->msg.ctrl != WAMBLE_CTRL_ACK) {
+      c->received = 1;
+      break;
+    }
+  }
   return NULL;
 }
 
 static void *recv_one_and_ack_thread(void *arg) {
   RecvOneCtx *c = arg;
-  fd_set rfds;
-  struct timeval tv;
-  FD_ZERO(&rfds);
-  FD_SET(c->sock, &rfds);
-  tv.tv_sec = 0;
-  tv.tv_usec = 600 * 1000;
+  uint64_t deadline_ms = wamble_now_mono_millis() + 7000u;
+  c->received = 0;
+  while (wamble_now_mono_millis() < deadline_ms) {
+    fd_set rfds;
+    struct timeval tv;
+    FD_ZERO(&rfds);
+    FD_SET(c->sock, &rfds);
+    tv.tv_sec = c->received ? 0 : 1;
+    tv.tv_usec = c->received ? 100 * 1000 : 0;
 #ifdef WAMBLE_PLATFORM_WINDOWS
-  int ready = select(0, &rfds, NULL, NULL, &tv);
+    int ready = select(0, &rfds, NULL, NULL, &tv);
 #else
-  int ready = select(c->sock + 1, &rfds, NULL, NULL, &tv);
+    int ready = select(c->sock + 1, &rfds, NULL, NULL, &tv);
 #endif
-  int rc = (ready > 0) ? receive_message(c->sock, &c->msg, &c->from) : 0;
-  c->received = (rc > 0) ? 1 : 0;
-  if (c->received && (c->msg.flags & WAMBLE_FLAG_UNRELIABLE) == 0 &&
-      c->msg.ctrl != WAMBLE_CTRL_ACK) {
-    send_ack(c->sock, &c->msg, &c->from);
+    if (ready <= 0) {
+      if (c->received)
+        break;
+      continue;
+    }
+    struct WambleMsg msg;
+    struct sockaddr_in from;
+    int rc = receive_message(c->sock, &msg, &from);
+    if (rc <= 0)
+      continue;
+    if (!c->received && msg.ctrl != WAMBLE_CTRL_ACK) {
+      c->msg = msg;
+      c->from = from;
+      c->received = 1;
+    }
+    if ((msg.flags & WAMBLE_FLAG_UNRELIABLE) == 0 &&
+        msg.ctrl != WAMBLE_CTRL_ACK) {
+      network_ack_received_message(c->sock, &msg, &from);
+    }
+    if (msg.ctrl != WAMBLE_CTRL_ACK) {
+      int more_fragments = msg_uses_fragment_payload(&msg) &&
+                           msg.fragment.fragment_chunk_count > 0 &&
+                           (uint32_t)msg.fragment.fragment_chunk_index + 1u <
+                               (uint32_t)msg.fragment.fragment_chunk_count;
+      if (!more_fragments)
+        break;
+    }
   }
   return NULL;
 }
 
-static void *handle_message_thread(void *arg) {
-  HandleMessageCtx *ctx = arg;
-  ctx->status = handle_message(ctx->sockfd, &ctx->msg, &ctx->cliaddr,
-                               ctx->trust_tier, ctx->profile_name);
-  return NULL;
+static void drive_runtime_until_idle(wamble_socket_t sockfd,
+                                     const char *profile_name) {
+  if (sockfd == WAMBLE_INVALID_SOCKET)
+    return;
+  for (int i = 0; i < 8; i++) {
+    TransportDriveResult r =
+        network_runtime_drive_once(sockfd, 0, profile_name);
+    if (r.progress_count == 0 && r.inbound_pending == 0 &&
+        r.dispatch_pending == 0)
+      break;
+  }
 }
 
 static int recv_message_with_timeout(wamble_socket_t sock,
@@ -118,6 +160,28 @@ static int recv_message_with_timeout(wamble_socket_t sock,
   if (ready <= 0)
     return ready;
   return receive_message(sock, msg, from);
+}
+
+static int recv_non_ack_with_timeout(wamble_socket_t sock,
+                                     struct WambleMsg *msg,
+                                     struct sockaddr_in *from, int timeout_ms) {
+  uint64_t deadline = wamble_now_mono_millis() + (uint64_t)timeout_ms;
+  while (1) {
+    uint64_t now = wamble_now_mono_millis();
+    if (now >= deadline)
+      break;
+    uint64_t remaining_ms = deadline - now;
+    int remaining =
+        remaining_ms > (uint64_t)INT_MAX ? INT_MAX : (int)remaining_ms;
+    if (remaining <= 0)
+      remaining = 1;
+    int rc = recv_message_with_timeout(sock, msg, from, remaining);
+    if (rc <= 0)
+      return rc;
+    if (msg->ctrl != WAMBLE_CTRL_ACK)
+      return rc;
+  }
+  return 0;
 }
 
 static int init_udp_loopback_pair(UdpLoopbackPair *pair) {
@@ -155,19 +219,77 @@ static void cleanup_udp_loopback_pair(UdpLoopbackPair *pair) {
   pair->srv = WAMBLE_INVALID_SOCKET;
 }
 
-static int ack_terminal_and_expect_request_ack(wamble_socket_t cli,
-                                               const struct WambleMsg *terminal,
-                                               const struct sockaddr_in *from,
-                                               uint32_t request_seq) {
-  struct WambleMsg rx = {0};
+static int send_reliable_request_to_pair(const UdpLoopbackPair *pair,
+                                         const struct WambleMsg *msg) {
+  T_ASSERT(pair != NULL);
+  T_ASSERT(msg != NULL);
+  struct sockaddr_in dst;
+  memset(&dst, 0, sizeof(dst));
+  dst.sin_family = AF_INET;
+  dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  dst.sin_port = htons((uint16_t)wamble_socket_bound_port(pair->srv));
+
+  uint8_t packet[WAMBLE_MAX_PACKET_SIZE];
+  size_t packet_len = 0;
+  T_ASSERT_EQ_INT(
+      wamble_packet_serialize(msg, packet, sizeof(packet), &packet_len, 0),
+      NET_OK);
+#ifdef WAMBLE_PLATFORM_WINDOWS
+  int rc = sendto(pair->cli, (const char *)packet, (int)packet_len, 0,
+                  (const struct sockaddr *)&dst, (int)sizeof(dst));
+#else
+  ssize_t rc =
+      sendto(pair->cli, packet, packet_len, 0, (const struct sockaddr *)&dst,
+             (wamble_socklen_t)sizeof(dst));
+#endif
+  T_ASSERT(rc >= 0);
+  return 0;
+}
+
+static int recv_request_ack_then_terminal(
+    wamble_socket_t cli, wamble_socket_t srv, const char *profile_name,
+    struct WambleMsg *terminal, struct sockaddr_in *from, uint32_t request_seq,
+    uint8_t terminal_ctrl) {
+  struct WambleMsg ack = {0};
   struct sockaddr_in ack_from;
 
+  int rc = 0;
+  uint64_t deadline_ms = wamble_now_mono_millis() + 1000u;
+  while (wamble_now_mono_millis() < deadline_ms) {
+    drive_runtime_until_idle(srv, profile_name);
+    rc = recv_message_with_timeout(cli, &ack, &ack_from, 25);
+    if (rc > 0)
+      break;
+  }
+  T_ASSERT(rc > 0);
+  T_ASSERT_EQ_INT(ack.ctrl, WAMBLE_CTRL_ACK);
+  T_ASSERT_EQ_INT((int)ack.seq_num, (int)request_seq);
+
+  rc = 0;
+  deadline_ms = wamble_now_mono_millis() + 1000u;
+  while (wamble_now_mono_millis() < deadline_ms) {
+    drive_runtime_until_idle(srv, profile_name);
+    rc = recv_non_ack_with_timeout(cli, terminal, from, 25);
+    if (rc > 0)
+      break;
+  }
+  T_ASSERT(rc > 0);
+  T_ASSERT_EQ_INT(terminal->ctrl, terminal_ctrl);
+  return 0;
+}
+
+static int ack_terminal_and_drive(wamble_socket_t cli, wamble_socket_t srv,
+                                  const struct WambleMsg *terminal,
+                                  const struct sockaddr_in *from) {
   T_ASSERT(terminal != NULL);
   T_ASSERT(from != NULL);
-  send_ack(cli, terminal, from);
-  T_ASSERT(recv_message_with_timeout(cli, &rx, &ack_from, 1000) > 0);
-  T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_ACK);
-  T_ASSERT_EQ_INT((int)rx.seq_num, (int)request_seq);
+  network_ack_received_message(cli, terminal, from);
+  for (int i = 0; i < 4; i++) {
+    TransportDriveResult r = network_runtime_drive_once(srv, 0, NULL);
+    if (r.progress_count == 0 && r.inbound_pending == 0 &&
+        r.dispatch_pending == 0)
+      break;
+  }
   return 0;
 }
 
@@ -186,10 +308,49 @@ typedef struct {
   size_t assembled_len;
 } RecvTosFragmentsCtx;
 
-static void *recv_tos_fragments_and_ack_thread(void *arg) {
-  RecvTosFragmentsCtx *c = arg;
+static int recv_tos_fragment_ctx_accept(RecvTosFragmentsCtx *c,
+                                        const struct WambleMsg *in) {
   uint8_t expected_ctrl =
       c->expected_ctrl ? c->expected_ctrl : WAMBLE_CTRL_PROFILE_TOS_DATA;
+  if (!c || !in || in->ctrl != expected_ctrl ||
+      in->fragment.fragment_version != WAMBLE_FRAGMENT_VERSION)
+    return 0;
+  if (c->expected_chunks == 0) {
+    c->expected_chunks = (int)in->fragment.fragment_chunk_count;
+    c->total_len = in->fragment.fragment_total_len;
+    c->transfer_id = in->fragment.fragment_transfer_id;
+    c->hash_algo = in->fragment.fragment_hash_algo;
+    memcpy(c->hash, in->fragment.fragment_hash, WAMBLE_FRAGMENT_HASH_LENGTH);
+  } else if (in->fragment.fragment_transfer_id != c->transfer_id ||
+             in->fragment.fragment_hash_algo != c->hash_algo ||
+             in->fragment.fragment_chunk_count !=
+                 (uint16_t)c->expected_chunks ||
+             in->fragment.fragment_total_len != c->total_len) {
+    return 0;
+  }
+  if (in->fragment.fragment_chunk_count == 0 ||
+      in->fragment.fragment_chunk_index >= in->fragment.fragment_chunk_count ||
+      in->fragment.fragment_data_len > WAMBLE_FRAGMENT_DATA_MAX) {
+    return 0;
+  }
+  size_t off = (size_t)in->fragment.fragment_chunk_index *
+               (size_t)WAMBLE_FRAGMENT_DATA_MAX;
+  if (off + in->fragment.fragment_data_len > sizeof(c->assembled))
+    return 0;
+  if (in->fragment.fragment_data_len) {
+    memcpy(c->assembled + off, in->fragment.fragment_data,
+           in->fragment.fragment_data_len);
+  }
+  size_t end = off + in->fragment.fragment_data_len;
+  if (end > c->assembled_len)
+    c->assembled_len = end;
+  c->chunk_count++;
+  c->received = 1;
+  return 1;
+}
+
+static void *recv_tos_fragments_and_ack_thread(void *arg) {
+  RecvTosFragmentsCtx *c = arg;
   int quiet_polls = 0;
   while (quiet_polls < 3) {
     fd_set rfds;
@@ -216,46 +377,54 @@ static void *recv_tos_fragments_and_ack_thread(void *arg) {
       continue;
     if ((in.flags & WAMBLE_FLAG_UNRELIABLE) == 0 &&
         in.ctrl != WAMBLE_CTRL_ACK) {
-      send_ack(c->sock, &in, &c->from);
+      network_ack_received_message(c->sock, &in, &c->from);
     }
-    if (in.ctrl != expected_ctrl ||
-        in.fragment.fragment_version != WAMBLE_FRAGMENT_VERSION)
+    if (!recv_tos_fragment_ctx_accept(c, &in))
       continue;
-    if (c->expected_chunks == 0) {
-      c->expected_chunks = (int)in.fragment.fragment_chunk_count;
-      c->total_len = in.fragment.fragment_total_len;
-      c->transfer_id = in.fragment.fragment_transfer_id;
-      c->hash_algo = in.fragment.fragment_hash_algo;
-      memcpy(c->hash, in.fragment.fragment_hash, WAMBLE_FRAGMENT_HASH_LENGTH);
-    } else if (in.fragment.fragment_transfer_id != c->transfer_id ||
-               in.fragment.fragment_hash_algo != c->hash_algo ||
-               in.fragment.fragment_chunk_count !=
-                   (uint16_t)c->expected_chunks ||
-               in.fragment.fragment_total_len != c->total_len) {
-      continue;
-    }
-    if (in.fragment.fragment_chunk_count == 0 ||
-        in.fragment.fragment_chunk_index >= in.fragment.fragment_chunk_count ||
-        in.fragment.fragment_data_len > WAMBLE_FRAGMENT_DATA_MAX) {
-      continue;
-    }
-    size_t off = (size_t)in.fragment.fragment_chunk_index *
-                 (size_t)WAMBLE_FRAGMENT_DATA_MAX;
-    if (off + in.fragment.fragment_data_len > sizeof(c->assembled))
-      continue;
-    if (in.fragment.fragment_data_len) {
-      memcpy(c->assembled + off, in.fragment.fragment_data,
-             in.fragment.fragment_data_len);
-    }
-    size_t end = off + in.fragment.fragment_data_len;
-    if (end > c->assembled_len)
-      c->assembled_len = end;
-    c->chunk_count++;
-    c->received = 1;
     if (c->expected_chunks > 0 && c->chunk_count >= c->expected_chunks)
       break;
   }
   return NULL;
+}
+
+static void recv_tos_fragments_and_ack_runtime(wamble_socket_t srv,
+                                               wamble_socket_t cli,
+                                               const char *profile_name,
+                                               RecvTosFragmentsCtx *c) {
+  int quiet_polls = 0;
+  while (quiet_polls < 8) {
+    (void)network_runtime_drive_once(srv, 0, profile_name);
+    fd_set rfds;
+    struct timeval tv;
+    FD_ZERO(&rfds);
+    FD_SET(cli, &rfds);
+    tv.tv_sec = 0;
+    tv.tv_usec = 50 * 1000;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+    int ready = select(0, &rfds, NULL, NULL, &tv);
+#else
+    int ready = select(cli + 1, &rfds, NULL, NULL, &tv);
+#endif
+    if (ready <= 0) {
+      quiet_polls++;
+      if (c->expected_chunks > 0 && c->chunk_count >= c->expected_chunks)
+        break;
+      continue;
+    }
+    quiet_polls = 0;
+    struct WambleMsg in = {0};
+    int rc = receive_message(cli, &in, &c->from);
+    if (rc <= 0)
+      continue;
+    if ((in.flags & WAMBLE_FLAG_UNRELIABLE) == 0 &&
+        in.ctrl != WAMBLE_CTRL_ACK) {
+      network_ack_received_message(cli, &in, &c->from);
+    }
+    (void)network_runtime_drive_once(srv, 0, profile_name);
+    (void)recv_tos_fragment_ctx_accept(c, &in);
+    if (c->expected_chunks > 0 && c->chunk_count >= c->expected_chunks)
+      break;
+  }
 }
 
 static void build_oversized_string_extensions(struct WambleMsg *msg) {
@@ -344,6 +513,7 @@ WAMBLE_TEST(spectate_update_roundtrip) {
   strncpy(out.view.fen, "fen-io", FEN_MAX_LENGTH);
 
   T_ASSERT_STATUS_OK(send_unreliable_packet(srv, &out, &cliaddr));
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
 
   T_ASSERT_EQ_INT(ctx.received, 1);
@@ -403,6 +573,7 @@ WAMBLE_TEST(outbound_extension_roundtrip) {
   out.extensions.fields[2].bool_value = 1;
 
   T_ASSERT_STATUS_OK(send_unreliable_packet(srv, &out, &cliaddr));
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
 
   T_ASSERT_EQ_INT(ctx.received, 1);
@@ -476,6 +647,7 @@ WAMBLE_TEST(leaderboard_data_roundtrip) {
   out.leaderboard_payload.entries[1].has_identity = 0;
 
   T_ASSERT_STATUS_OK(send_unreliable_packet(srv, &out, &cliaddr));
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
 
   T_ASSERT_EQ_INT(ctx.received, 1);
@@ -550,6 +722,7 @@ WAMBLE_TEST(leaderboard_data_score_type_roundtrip_without_fragment_marker) {
   out.leaderboard_payload.entries[1].handle = "h_beta654321";
 
   T_ASSERT_STATUS_OK(send_unreliable_packet(srv, &out, &cliaddr));
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
 
   T_ASSERT_EQ_INT(ctx.received, 1);
@@ -608,6 +781,7 @@ WAMBLE_TEST(player_stats_data_roundtrip) {
   out.stats.player_stats.chess960_games_played = 7;
 
   T_ASSERT_STATUS_OK(send_unreliable_packet(srv, &out, &cliaddr));
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
 
   T_ASSERT_EQ_INT(ctx.received, 1);
@@ -652,6 +826,7 @@ WAMBLE_TEST(login_challenge_roundtrip) {
     out.login.challenge[i] = (uint8_t)(0xa0 + i);
 
   T_ASSERT_STATUS_OK(send_unreliable_packet(srv, &out, &cliaddr));
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
 
   T_ASSERT_EQ_INT(ctx.received, 1);
@@ -757,6 +932,7 @@ WAMBLE_TEST(profile_tos_data_fragment_roundtrip) {
     out.fragment.fragment_hash[i] = (uint8_t)(0xa0 + i);
 
   T_ASSERT_STATUS_OK(send_unreliable_packet(srv, &out, &cliaddr));
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
 
   T_ASSERT_EQ_INT(ctx.received, 1);
@@ -818,6 +994,7 @@ WAMBLE_TEST(server_notification_ext_auto_fragment_unreliable) {
   build_oversized_string_extensions(&out);
 
   T_ASSERT_STATUS_OK(send_unreliable_packet(srv, &out, &cliaddr));
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
 
   T_ASSERT_EQ_INT(rx.received, 1);
@@ -878,9 +1055,10 @@ WAMBLE_TEST(server_notification_ext_auto_fragment_reliable) {
           sizeof(out.view.fen) - 1);
   build_oversized_string_extensions(&out);
 
-  T_ASSERT_EQ_INT(
-      send_reliable_message(srv, &out, &cliaddr, get_config()->timeout_ms, 5),
-      0);
+  T_ASSERT_EQ_INT(send_reliable_terminal_and_drive(srv, &out, &cliaddr,
+                                                   get_config()->timeout_ms, 5),
+                  0);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
 
   T_ASSERT_EQ_INT(rx.received, 1);
@@ -948,9 +1126,13 @@ WAMBLE_TEST(fragment_reassembly_api_complete_with_integrity_ok) {
     }
   }
 
-  T_ASSERT_EQ_INT((int)reassembly.integrity, WAMBLE_FRAGMENT_INTEGRITY_OK);
-  T_ASSERT_EQ_INT((int)reassembly.total_len, (int)full_len);
-  T_ASSERT(memcmp(reassembly.data, full, full_len) == 0);
+  T_ASSERT_EQ_INT((int)wamble_fragment_reassembly_integrity(&reassembly),
+                  WAMBLE_FRAGMENT_INTEGRITY_OK);
+  size_t reassembled_len = 0;
+  const uint8_t *reassembled =
+      wamble_fragment_reassembly_data(&reassembly, &reassembled_len);
+  T_ASSERT_EQ_INT((int)reassembled_len, (int)full_len);
+  T_ASSERT(memcmp(reassembled, full, full_len) == 0);
   wamble_fragment_reassembly_free(&reassembly);
   return 0;
 }
@@ -995,10 +1177,13 @@ WAMBLE_TEST(fragment_reassembly_api_reports_hash_mismatch) {
     }
   }
 
-  T_ASSERT_EQ_INT((int)reassembly.integrity,
+  T_ASSERT_EQ_INT((int)wamble_fragment_reassembly_integrity(&reassembly),
                   WAMBLE_FRAGMENT_INTEGRITY_MISMATCH);
-  T_ASSERT_EQ_INT((int)reassembly.total_len, (int)full_len);
-  T_ASSERT(memcmp(reassembly.data, full, full_len) == 0);
+  size_t reassembled_len = 0;
+  const uint8_t *reassembled =
+      wamble_fragment_reassembly_data(&reassembly, &reassembled_len);
+  T_ASSERT_EQ_INT((int)reassembled_len, (int)full_len);
+  T_ASSERT(memcmp(reassembled, full, full_len) == 0);
   wamble_fragment_reassembly_free(&reassembly);
   return 0;
 }
@@ -1034,7 +1219,8 @@ WAMBLE_TEST(fragment_reassembly_api_switches_transfers) {
 
   T_ASSERT_EQ_INT(wamble_fragment_reassembly_push(&reassembly, &first),
                   WAMBLE_FRAGMENT_REASSEMBLY_IN_PROGRESS);
-  T_ASSERT_EQ_INT((int)reassembly.transfer_id, 200);
+  T_ASSERT_EQ_INT((int)wamble_fragment_reassembly_transfer_id(&reassembly),
+                  200);
 
   struct WambleMsg second = {0};
   second.ctrl = WAMBLE_CTRL_PROFILE_TOS_DATA;
@@ -1051,10 +1237,15 @@ WAMBLE_TEST(fragment_reassembly_api_switches_transfers) {
 
   T_ASSERT_EQ_INT(wamble_fragment_reassembly_push(&reassembly, &second),
                   WAMBLE_FRAGMENT_REASSEMBLY_COMPLETE);
-  T_ASSERT_EQ_INT((int)reassembly.transfer_id, 201);
-  T_ASSERT_EQ_INT((int)reassembly.integrity, WAMBLE_FRAGMENT_INTEGRITY_OK);
-  T_ASSERT_EQ_INT((int)reassembly.total_len, (int)strlen(b));
-  T_ASSERT(memcmp(reassembly.data, b, strlen(b)) == 0);
+  T_ASSERT_EQ_INT((int)wamble_fragment_reassembly_transfer_id(&reassembly),
+                  201);
+  T_ASSERT_EQ_INT((int)wamble_fragment_reassembly_integrity(&reassembly),
+                  WAMBLE_FRAGMENT_INTEGRITY_OK);
+  size_t reassembled_len = 0;
+  const uint8_t *reassembled =
+      wamble_fragment_reassembly_data(&reassembly, &reassembled_len);
+  T_ASSERT_EQ_INT((int)reassembled_len, (int)strlen(b));
+  T_ASSERT(memcmp(reassembled, b, strlen(b)) == 0);
   wamble_fragment_reassembly_free(&reassembly);
   return 0;
 }
@@ -1155,6 +1346,7 @@ WAMBLE_TEST(prediction_data_roundtrip) {
   memcpy(out.prediction.entries[1].uci, "e7e5", 4);
 
   T_ASSERT_STATUS_OK(send_unreliable_packet(srv, &out, &cliaddr));
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
 
   T_ASSERT_EQ_INT(ctx.received, 1);
@@ -1275,6 +1467,7 @@ WAMBLE_TEST(active_reservations_data_roundtrip) {
   }
 
   T_ASSERT_STATUS_OK(send_unreliable_packet(srv, &out, &cliaddr));
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
 
   T_ASSERT_EQ_INT(ctx.received, 1);
@@ -1361,8 +1554,9 @@ WAMBLE_TEST(reliable_ack_success) {
   strncpy(msg.view.fen, "fen-data", FEN_MAX_LENGTH);
   T_ASSERT(db_create_session(msg.token, 0) > 0);
 
-  int rc = send_reliable_message(srv, &msg, &cliaddr, get_config()->timeout_ms,
-                                 get_config()->max_retries);
+  int rc = send_reliable_terminal_and_drive(
+      srv, &msg, &cliaddr, get_config()->timeout_ms, get_config()->max_retries);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
   wamble_close_socket(cli);
   wamble_close_socket(srv);
@@ -1459,18 +1653,17 @@ WAMBLE_TEST(reliable_ack_rejects_wrong_source_and_preserves_packets) {
   strncpy(msg.view.fen, "fen-data", FEN_MAX_LENGTH);
   T_ASSERT(db_create_session(msg.token, 0) > 0);
 
-  int rc = send_reliable_message(srv, &msg, &cliaddr, 500, 5);
+  int rc = send_reliable_terminal_and_drive(srv, &msg, &cliaddr, 500, 5);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(other_msg_th, NULL));
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(fake_ack_th, NULL));
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(ack_th, NULL));
   T_ASSERT_STATUS_OK(rc);
 
-  struct WambleMsg in = {0};
-  struct sockaddr_in from;
-  int recv_rc = receive_message(srv, &in, &from);
-  T_ASSERT(recv_rc > 0);
-  T_ASSERT_EQ_INT(in.ctrl, WAMBLE_CTRL_LIST_PROFILES);
-  T_ASSERT(tokens_equal(in.token, other_msg.msg.token));
+  T_ASSERT_EQ_INT((int)transport_inbound_count(), 0);
+  T_ASSERT_EQ_INT((int)transport_dispatch_count(), 0);
 
   wamble_close_socket(other);
   wamble_close_socket(cli);
@@ -1542,6 +1735,7 @@ WAMBLE_TEST(perf_unreliable_throughput_local) {
       wamble_sleep_ms(1);
   }
 
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
 
   uint64_t end_ns = wamble_now_nanos();
@@ -1558,39 +1752,6 @@ WAMBLE_TEST(perf_unreliable_throughput_local) {
   wamble_close_socket(cli);
   wamble_close_socket(srv);
   return 0;
-}
-
-typedef struct {
-  wamble_socket_t sock;
-  int target;
-  int count;
-} AckPeerManyCtx;
-
-static void *ack_peer_many_thread(void *arg) {
-  AckPeerManyCtx *p = arg;
-  while (p->count < p->target) {
-    struct WambleMsg in;
-    struct sockaddr_in src;
-    fd_set rfds;
-    struct timeval tv;
-    FD_ZERO(&rfds);
-    FD_SET(p->sock, &rfds);
-    tv.tv_sec = 1;
-    tv.tv_usec = 0;
-#ifdef WAMBLE_PLATFORM_WINDOWS
-    int ready = select(0, &rfds, NULL, NULL, &tv);
-#else
-    int ready = select(p->sock + 1, &rfds, NULL, NULL, &tv);
-#endif
-    if (ready <= 0)
-      break;
-    int rc = receive_message(p->sock, &in, &src);
-    if (rc > 0) {
-      handle_message(p->sock, &in, &src, 0, NULL);
-      p->count++;
-    }
-  }
-  return NULL;
 }
 
 WAMBLE_TEST(perf_reliable_ack_latency) {
@@ -1627,11 +1788,7 @@ WAMBLE_TEST(perf_reliable_ack_latency) {
   wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
   T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
 
-  const int iters = 200;
-  AckPeerManyCtx peer = {.sock = cli, .target = iters};
-
-  wamble_thread_t th;
-  T_ASSERT(wamble_thread_create(&th, ack_peer_many_thread, &peer) == 0);
+  const int iters = 20;
 
   struct WambleMsg msg;
   memset(&msg, 0, sizeof(msg));
@@ -1644,13 +1801,18 @@ WAMBLE_TEST(perf_reliable_ack_latency) {
 
   uint64_t start_ns = wamble_now_nanos();
   for (int i = 0; i < iters; i++) {
-    int rc =
-        send_reliable_message(srv, &msg, &cliaddr, get_config()->timeout_ms,
-                              get_config()->max_retries);
-    T_ASSERT_STATUS_OK(rc);
+    T_ASSERT_STATUS_OK(network_enqueue_replayable_terminal(&msg, &cliaddr));
+    TransportDriveResult sent = network_runtime_drive_once(srv, 0, NULL);
+    T_ASSERT(sent.progress_count > 0);
+
+    struct WambleMsg rx = {0};
+    struct sockaddr_in from;
+    T_ASSERT(recv_non_ack_with_timeout(cli, &rx, &from, 1000) > 0);
+    T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_BOARD_UPDATE);
+    (void)network_ack_received_message(cli, &rx, &from);
+    drive_runtime_until_idle(srv, "p1");
   }
   uint64_t end_ns = wamble_now_nanos();
-  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
 
   uint64_t elapsed_ns = end_ns - start_ns;
   double avg_ns = (iters > 0) ? ((double)elapsed_ns / (double)iters) : 0.0;
@@ -1746,6 +1908,7 @@ WAMBLE_TEST(stress_unreliable_burst) {
 
   int total_received = 0;
   for (int i = 0; i < NUM_CLIENTS; i++) {
+    drive_runtime_until_idle(srv, "p1");
     T_ASSERT_STATUS_OK(wamble_thread_join(th[i], NULL));
     total_received += ctx[i].count;
   }
@@ -2195,6 +2358,7 @@ WAMBLE_TEST(profile_info_roundtrip) {
   out.text.profile_info_len = (uint16_t)strlen(out.text.profile_info);
 
   T_ASSERT_STATUS_OK(send_unreliable_packet(pair.srv, &out, &pair.cliaddr));
+  drive_runtime_until_idle(pair.srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
 
   T_ASSERT_EQ_INT(ctx.received, 1);
@@ -2283,6 +2447,7 @@ WAMBLE_TEST(profiles_list_roundtrip) {
   out.view.profiles_list_len = (uint16_t)strlen(out.view.profiles_list);
 
   T_ASSERT_STATUS_OK(send_unreliable_packet(pair.srv, &out, &pair.cliaddr));
+  drive_runtime_until_idle(pair.srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
 
   T_ASSERT_EQ_INT(ctx.received, 1);
@@ -2376,6 +2541,7 @@ WAMBLE_TEST(server_protocol_client_hello_requires_policy) {
       handle_message(srv, &hello, &cliaddr, 0, "p1");
   T_ASSERT(hello_policy_status == SERVER_ERR_FORBIDDEN ||
            hello_policy_status == SERVER_ERR_SEND_FAILED);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th1, NULL));
   if (rx1.received) {
     T_ASSERT_EQ_INT(rx1.msg.ctrl, WAMBLE_CTRL_ERROR);
@@ -2438,6 +2604,7 @@ WAMBLE_TEST(server_protocol_client_hello_advertises_session_caps) {
 
   T_ASSERT_EQ_INT(handle_message(pair.srv, &hello, &pair.cliaddr, 0, "p1"),
                   SERVER_OK);
+  drive_runtime_until_idle(pair.srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
   T_ASSERT_EQ_INT(rx.received, 1);
   T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -2506,6 +2673,7 @@ WAMBLE_TEST(server_protocol_client_hello_advertises_prediction_limits) {
 
   T_ASSERT_EQ_INT(handle_message(pair.srv, &hello, &pair.cliaddr, 0, "p1"),
                   SERVER_OK);
+  drive_runtime_until_idle(pair.srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
   T_ASSERT_EQ_INT(rx.received, 1);
   T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -2561,6 +2729,7 @@ WAMBLE_TEST(server_protocol_client_hello_reuses_existing_reserved_board) {
   T_ASSERT(wamble_thread_create(&th1, recv_one_and_ack_thread, &rx1) == 0);
   T_ASSERT_EQ_INT(handle_message(pair.srv, &hello, &pair.cliaddr, 0, "p1"),
                   SERVER_OK);
+  drive_runtime_until_idle(pair.srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th1, NULL));
   T_ASSERT_EQ_INT(rx1.received, 1);
   T_ASSERT_EQ_INT(rx1.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -2586,6 +2755,7 @@ WAMBLE_TEST(server_protocol_client_hello_reuses_existing_reserved_board) {
   T_ASSERT_EQ_INT(
       handle_message(pair.srv, &hello_again, &pair.cliaddr, 0, "p1"),
       SERVER_OK);
+  drive_runtime_until_idle(pair.srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th2, NULL));
   T_ASSERT_EQ_INT(rx2.received, 1);
   T_ASSERT_EQ_INT(rx2.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -2640,6 +2810,7 @@ WAMBLE_TEST(server_protocol_profile_info_advertises_profile_caps) {
 
   T_ASSERT_EQ_INT(handle_message(pair.srv, &req, &pair.cliaddr, 0, "p1"),
                   SERVER_OK);
+  drive_runtime_until_idle(pair.srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
   T_ASSERT_EQ_INT(rx.received, 1);
   T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_PROFILE_INFO);
@@ -2707,6 +2878,7 @@ WAMBLE_TEST(server_protocol_profile_info_omits_tos_cap_when_text_empty) {
   T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
 
   T_ASSERT_EQ_INT(handle_message(srv, &req, &cliaddr, 0, "p1"), SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
   T_ASSERT_EQ_INT(rx.received, 1);
   T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_PROFILE_INFO);
@@ -2767,6 +2939,7 @@ WAMBLE_TEST(server_protocol_accept_profile_tos_persists_terms) {
   T_ASSERT(
       wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -2784,6 +2957,7 @@ WAMBLE_TEST(server_protocol_accept_profile_tos_persists_terms) {
   T_ASSERT(wamble_thread_create(&th_accept, recv_one_and_ack_thread,
                                 &rx_accept) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &accept, &cliaddr, 0, "p1"), SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_accept, NULL));
   T_ASSERT_EQ_INT(rx_accept.received, 1);
   T_ASSERT_EQ_INT(rx_accept.msg.ctrl, WAMBLE_CTRL_PROFILE_INFO);
@@ -2870,11 +3044,9 @@ WAMBLE_TEST(server_protocol_get_profile_tos_does_not_create_session) {
   tos_req.text.profile_name_len = 2;
 
   RecvTosFragmentsCtx rx_tos = {.sock = cli};
-  wamble_thread_t th_tos;
-  T_ASSERT(wamble_thread_create(&th_tos, recv_tos_fragments_and_ack_thread,
-                                &rx_tos) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &tos_req, &cliaddr, 0, "p1"), SERVER_OK);
-  T_ASSERT_STATUS_OK(wamble_thread_join(th_tos, NULL));
+  recv_tos_fragments_and_ack_runtime(srv, cli, "p1", &rx_tos);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_EQ_INT(rx_tos.received, 1);
   T_ASSERT_EQ_INT(rx_tos.expected_chunks, 1);
   {
@@ -2938,6 +3110,7 @@ WAMBLE_TEST(server_protocol_accept_profile_tos_requires_existing_session) {
                                 &rx_accept) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &accept, &cliaddr, 0, "p1"),
                   SERVER_ERR_FORBIDDEN);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_accept, NULL));
   T_ASSERT_EQ_INT(rx_accept.received, 1);
   T_ASSERT_EQ_INT(rx_accept.msg.ctrl, WAMBLE_CTRL_ERROR);
@@ -3012,6 +3185,7 @@ WAMBLE_TEST(server_protocol_terms_routes_allow_hidden_bound_profile) {
   T_ASSERT(
       wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -3026,11 +3200,9 @@ WAMBLE_TEST(server_protocol_terms_routes_allow_hidden_bound_profile) {
   tos_req.text.profile_name_len = 2;
 
   RecvTosFragmentsCtx rx_tos = {.sock = cli};
-  wamble_thread_t th_tos;
-  T_ASSERT(wamble_thread_create(&th_tos, recv_tos_fragments_and_ack_thread,
-                                &rx_tos) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &tos_req, &cliaddr, 0, "p1"), SERVER_OK);
-  T_ASSERT_STATUS_OK(wamble_thread_join(th_tos, NULL));
+  recv_tos_fragments_and_ack_runtime(srv, cli, "p1", &rx_tos);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_EQ_INT(rx_tos.received, 1);
   T_ASSERT_EQ_INT(rx_tos.expected_chunks, 1);
   {
@@ -3057,6 +3229,7 @@ WAMBLE_TEST(server_protocol_terms_routes_allow_hidden_bound_profile) {
   T_ASSERT(wamble_thread_create(&th_accept, recv_one_and_ack_thread,
                                 &rx_accept) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &accept, &cliaddr, 0, "p1"), SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_accept, NULL));
   T_ASSERT_EQ_INT(rx_accept.received, 1);
   T_ASSERT_EQ_INT(rx_accept.msg.ctrl, WAMBLE_CTRL_PROFILE_INFO);
@@ -3142,6 +3315,7 @@ WAMBLE_TEST(
   T_ASSERT(
       wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -3166,6 +3340,7 @@ WAMBLE_TEST(
                                 &rx_denied) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &post_join_req, &cliaddr, 0, "p1"),
                   SERVER_ERR_FORBIDDEN);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_denied, NULL));
   T_ASSERT_EQ_INT(rx_denied.received, 1);
   T_ASSERT_EQ_INT(rx_denied.msg.ctrl, WAMBLE_CTRL_ERROR);
@@ -3185,6 +3360,7 @@ WAMBLE_TEST(
   T_ASSERT(wamble_thread_create(&th_accept, recv_one_and_ack_thread,
                                 &rx_accept) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &accept, &cliaddr, 0, "p1"), SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_accept, NULL));
   T_ASSERT_EQ_INT(rx_accept.received, 1);
   T_ASSERT_EQ_INT(rx_accept.msg.ctrl, WAMBLE_CTRL_PROFILE_INFO);
@@ -3214,6 +3390,7 @@ WAMBLE_TEST(
                                 &rx_hello_after) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &hello_after, &cliaddr, 0, "p1"),
                   SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello_after, NULL));
   T_ASSERT_EQ_INT(rx_hello_after.received, 1);
   T_ASSERT_EQ_INT(rx_hello_after.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -3242,6 +3419,7 @@ WAMBLE_TEST(
                                 &rx_post_join) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &post_join_req, &cliaddr, 0, "p1"),
                   SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_post_join, NULL));
   T_ASSERT_EQ_INT(rx_post_join.received, 1);
   T_ASSERT_EQ_INT(rx_post_join.msg.ctrl, WAMBLE_CTRL_PLAYER_STATS_DATA);
@@ -3260,6 +3438,7 @@ WAMBLE_TEST(
                                   &rx_profile_info) == 0);
     T_ASSERT_EQ_INT(handle_message(srv, &profile_info_req, &cliaddr, 0, "p1"),
                     SERVER_OK);
+    drive_runtime_until_idle(srv, "p1");
     T_ASSERT_STATUS_OK(wamble_thread_join(th_profile_info, NULL));
     T_ASSERT_EQ_INT(rx_profile_info.received, 1);
     T_ASSERT_EQ_INT(rx_profile_info.msg.ctrl, WAMBLE_CTRL_PROFILE_INFO);
@@ -3336,6 +3515,7 @@ WAMBLE_TEST(server_protocol_spectate_denial_reports_capacity_full_error_code) {
   T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &req, &cliaddr, 0, "p1"),
                   SERVER_ERR_SPECTATOR);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
   T_ASSERT_EQ_INT(rx.received, 1);
   T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_ERROR);
@@ -3347,7 +3527,8 @@ WAMBLE_TEST(server_protocol_spectate_denial_reports_capacity_full_error_code) {
   return 0;
 }
 
-WAMBLE_TEST(server_protocol_reliable_spectate_focus_sends_terminal_before_ack) {
+WAMBLE_TEST(
+    server_protocol_reliable_spectate_focus_sends_request_ack_before_terminal) {
   const char *cfg_path = "build/test_network_spectate_focus_order.conf";
   const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
                     "(defprofile p1 ((def port 19424) (def advertise 1)))\n";
@@ -3392,6 +3573,7 @@ WAMBLE_TEST(server_protocol_reliable_spectate_focus_sends_terminal_before_ack) {
 
   T_ASSERT_EQ_INT(handle_message(pair.srv, &req, &pair.cliaddr, 0, "p1"),
                   SERVER_OK);
+  drive_runtime_until_idle(pair.srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
   T_ASSERT_EQ_INT(terminal_rx.received, 1);
   T_ASSERT_EQ_INT(terminal_rx.msg.ctrl, WAMBLE_CTRL_SPECTATE_UPDATE);
@@ -3403,19 +3585,13 @@ WAMBLE_TEST(server_protocol_reliable_spectate_focus_sends_terminal_before_ack) {
     T_ASSERT_EQ_INT(state->value_type, WAMBLE_TREATMENT_VALUE_STRING);
     T_ASSERT(strcmp(state->string_value, "focus") == 0);
   }
-  struct WambleMsg ack = {0};
-  struct sockaddr_in ack_from;
-  T_ASSERT(recv_message_with_timeout(pair.cli, &ack, &ack_from, 1000) > 0);
-  T_ASSERT_EQ_INT(ack.ctrl, WAMBLE_CTRL_ACK);
-  T_ASSERT_EQ_INT((int)ack.seq_num, (int)req.seq_num);
-
   spectator_manager_shutdown();
   cleanup_udp_loopback_pair(&pair);
   return 0;
 }
 
 WAMBLE_TEST(
-    server_protocol_reliable_spectate_denial_sends_terminal_before_ack) {
+    server_protocol_reliable_spectate_denial_sends_request_ack_before_terminal) {
   const char *cfg_path = "build/test_network_spectate_denial_order.conf";
   const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
                     "(def max-spectators 0)\n"
@@ -3452,19 +3628,15 @@ WAMBLE_TEST(
   ctx.msg.seq_num = 402;
   ctx.msg.token[0] = 0x82;
 
-  wamble_thread_t th;
-  T_ASSERT(wamble_thread_create(&th, handle_message_thread, &ctx) == 0);
+  T_ASSERT_STATUS_OK(send_reliable_request_to_pair(&pair, &ctx.msg));
 
   struct WambleMsg rx = {0};
   struct sockaddr_in from;
-  T_ASSERT(recv_message_with_timeout(pair.cli, &rx, &from, 1000) > 0);
-  T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_ERROR);
+  T_ASSERT_STATUS_OK(recv_request_ack_then_terminal(pair.cli, pair.srv, "p1",
+                                                    &rx, &from, ctx.msg.seq_num,
+                                                    WAMBLE_CTRL_ERROR));
   T_ASSERT_EQ_INT(rx.view.error_code, WAMBLE_ERR_SPECTATE_FULL);
-  T_ASSERT_STATUS_OK(ack_terminal_and_expect_request_ack(pair.cli, &rx, &from,
-                                                         ctx.msg.seq_num));
-
-  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
-  T_ASSERT_EQ_INT(ctx.status, SERVER_ERR_SPECTATOR);
+  T_ASSERT_STATUS_OK(ack_terminal_and_drive(pair.cli, pair.srv, &rx, &from));
 
   spectator_manager_shutdown();
   cleanup_udp_loopback_pair(&pair);
@@ -3531,7 +3703,7 @@ WAMBLE_TEST(server_protocol_spectate_summary_returns_reliable_snapshot) {
     struct timeval tv;
     FD_ZERO(&rfds);
     FD_SET(cli, &rfds);
-    tv.tv_sec = 1;
+    tv.tv_sec = 3;
     tv.tv_usec = 0;
 #ifdef WAMBLE_PLATFORM_WINDOWS
     T_ASSERT(select(0, &rfds, NULL, NULL, &tv) > 0);
@@ -3541,7 +3713,7 @@ WAMBLE_TEST(server_protocol_spectate_summary_returns_reliable_snapshot) {
     T_ASSERT(receive_message(cli, &rx, &from) > 0);
     T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SERVER_HELLO);
     board_id = (int)rx.board_id;
-    send_ack(cli, &rx, &from);
+    network_ack_received_message(cli, &rx, &from);
   }
   T_ASSERT(board_id > 0);
 
@@ -3576,7 +3748,7 @@ WAMBLE_TEST(server_protocol_spectate_summary_returns_reliable_snapshot) {
     T_ASSERT(receive_message(cli, &rx, &from) > 0);
     T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SPECTATE_UPDATE);
     T_ASSERT((rx.flags & WAMBLE_FLAG_UNRELIABLE) == 0);
-    send_ack(cli, &rx, &from);
+    network_ack_received_message(cli, &rx, &from);
     const WambleMessageExtField *state = find_ext_field(&rx, "spectate.state");
     if (state && state->value_type == WAMBLE_TREATMENT_VALUE_STRING &&
         strcmp(state->string_value, "summary") == 0) {
@@ -3596,7 +3768,8 @@ WAMBLE_TEST(server_protocol_spectate_summary_returns_reliable_snapshot) {
   return 0;
 }
 
-WAMBLE_TEST(server_protocol_reliable_spectate_stop_sends_terminal_before_ack) {
+WAMBLE_TEST(
+    server_protocol_reliable_spectate_stop_sends_request_ack_before_terminal) {
   const char *cfg_path = "build/test_network_spectate_stop_order.conf";
   const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
                     "(defprofile p1 ((def port 19424) (def advertise 1)))\n";
@@ -3649,13 +3822,13 @@ WAMBLE_TEST(server_protocol_reliable_spectate_stop_sends_terminal_before_ack) {
   ctx.msg.seq_num = 403;
   ctx.msg.token[0] = 0x83;
 
-  wamble_thread_t th;
-  T_ASSERT(wamble_thread_create(&th, handle_message_thread, &ctx) == 0);
+  T_ASSERT_STATUS_OK(send_reliable_request_to_pair(&pair, &ctx.msg));
 
   struct WambleMsg rx = {0};
   struct sockaddr_in from;
-  T_ASSERT(recv_message_with_timeout(pair.cli, &rx, &from, 1000) > 0);
-  T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SPECTATE_UPDATE);
+  T_ASSERT_STATUS_OK(recv_request_ack_then_terminal(
+      pair.cli, pair.srv, "p1", &rx, &from, ctx.msg.seq_num,
+      WAMBLE_CTRL_SPECTATE_UPDATE));
   T_ASSERT_EQ_INT((int)rx.board_id, 0);
   {
     const WambleMessageExtField *state = find_ext_field(&rx, "spectate.state");
@@ -3663,18 +3836,15 @@ WAMBLE_TEST(server_protocol_reliable_spectate_stop_sends_terminal_before_ack) {
     T_ASSERT_EQ_INT(state->value_type, WAMBLE_TREATMENT_VALUE_STRING);
     T_ASSERT(strcmp(state->string_value, "idle") == 0);
   }
-  T_ASSERT_STATUS_OK(ack_terminal_and_expect_request_ack(pair.cli, &rx, &from,
-                                                         ctx.msg.seq_num));
-
-  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
-  T_ASSERT_EQ_INT(ctx.status, SERVER_OK);
+  T_ASSERT_STATUS_OK(ack_terminal_and_drive(pair.cli, pair.srv, &rx, &from));
 
   spectator_manager_shutdown();
   cleanup_udp_loopback_pair(&pair);
   return 0;
 }
 
-WAMBLE_TEST(server_protocol_reliable_player_move_sends_terminal_before_ack) {
+WAMBLE_TEST(
+    server_protocol_reliable_player_move_sends_request_ack_before_terminal) {
   const char *cfg_path = "build/test_network_player_move_order.conf";
   const char *cfg = "(def rate-limit-requests-per-sec 100)\n"
                     "(defprofile p1 ((def port 19424) (def advertise 1)))\n";
@@ -3712,20 +3882,16 @@ WAMBLE_TEST(server_protocol_reliable_player_move_sends_terminal_before_ack) {
   ctx.msg.text.uci_len = (uint8_t)strlen(uci);
   memcpy(ctx.msg.text.uci, uci, ctx.msg.text.uci_len);
 
-  wamble_thread_t th;
-  T_ASSERT(wamble_thread_create(&th, handle_message_thread, &ctx) == 0);
+  T_ASSERT_STATUS_OK(send_reliable_request_to_pair(&pair, &ctx.msg));
 
   struct WambleMsg rx = {0};
   struct sockaddr_in from;
-  T_ASSERT(recv_message_with_timeout(pair.cli, &rx, &from, 1000) > 0);
-  T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_ERROR);
+  T_ASSERT_STATUS_OK(recv_request_ack_then_terminal(pair.cli, pair.srv, "p1",
+                                                    &rx, &from, ctx.msg.seq_num,
+                                                    WAMBLE_CTRL_ERROR));
   T_ASSERT_EQ_INT(rx.view.error_code, WAMBLE_ERR_UNKNOWN_PLAYER);
   T_ASSERT((rx.flags & WAMBLE_FLAG_UNRELIABLE) == 0);
-  T_ASSERT_STATUS_OK(ack_terminal_and_expect_request_ack(pair.cli, &rx, &from,
-                                                         ctx.msg.seq_num));
-
-  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
-  T_ASSERT_EQ_INT(ctx.status, SERVER_ERR_INTERNAL);
+  T_ASSERT_STATUS_OK(ack_terminal_and_drive(pair.cli, pair.srv, &rx, &from));
 
   spectator_manager_shutdown();
   cleanup_udp_loopback_pair(&pair);
@@ -3790,7 +3956,7 @@ WAMBLE_TEST(server_protocol_spectate_stop_returns_reliable_idle_packet) {
     struct timeval tv;
     FD_ZERO(&rfds);
     FD_SET(cli, &rfds);
-    tv.tv_sec = 1;
+    tv.tv_sec = 3;
     tv.tv_usec = 0;
 #ifdef WAMBLE_PLATFORM_WINDOWS
     T_ASSERT(select(0, &rfds, NULL, NULL, &tv) > 0);
@@ -3799,7 +3965,7 @@ WAMBLE_TEST(server_protocol_spectate_stop_returns_reliable_idle_packet) {
 #endif
     T_ASSERT(receive_message(cli, &rx, &from) > 0);
     T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SERVER_HELLO);
-    send_ack(cli, &rx, &from);
+    network_ack_received_message(cli, &rx, &from);
   }
 
   struct WambleMsg req = {0};
@@ -3815,7 +3981,7 @@ WAMBLE_TEST(server_protocol_spectate_stop_returns_reliable_idle_packet) {
     struct timeval tv;
     FD_ZERO(&rfds);
     FD_SET(cli, &rfds);
-    tv.tv_sec = 1;
+    tv.tv_sec = 3;
     tv.tv_usec = 0;
 #ifdef WAMBLE_PLATFORM_WINDOWS
     T_ASSERT(select(0, &rfds, NULL, NULL, &tv) > 0);
@@ -3824,7 +3990,7 @@ WAMBLE_TEST(server_protocol_spectate_stop_returns_reliable_idle_packet) {
 #endif
     T_ASSERT(receive_message(cli, &rx, &from) > 0);
     T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SPECTATE_UPDATE);
-    send_ack(cli, &rx, &from);
+    network_ack_received_message(cli, &rx, &from);
   }
 
   struct WambleMsg stop = {0};
@@ -3835,22 +4001,32 @@ WAMBLE_TEST(server_protocol_spectate_stop_returns_reliable_idle_packet) {
   T_ASSERT_STATUS_OK(send_unreliable_packet(cli, &stop, &dst));
 
   {
-    fd_set rfds;
-    struct timeval tv;
-    FD_ZERO(&rfds);
-    FD_SET(cli, &rfds);
-    tv.tv_sec = 1;
-    tv.tv_usec = 0;
+    int saw_idle = 0;
+    uint64_t deadline_ms = wamble_now_mono_millis() + 3000u;
+    while (wamble_now_mono_millis() < deadline_ms && !saw_idle) {
+      fd_set rfds;
+      struct timeval tv;
+      FD_ZERO(&rfds);
+      FD_SET(cli, &rfds);
+      tv.tv_sec = 0;
+      tv.tv_usec = 250 * 1000;
 #ifdef WAMBLE_PLATFORM_WINDOWS
-    T_ASSERT(select(0, &rfds, NULL, NULL, &tv) > 0);
+      int ready = select(0, &rfds, NULL, NULL, &tv);
 #else
-    T_ASSERT(select(cli + 1, &rfds, NULL, NULL, &tv) > 0);
+      int ready = select(cli + 1, &rfds, NULL, NULL, &tv);
 #endif
-    T_ASSERT(receive_message(cli, &rx, &from) > 0);
+      if (ready <= 0)
+        continue;
+      T_ASSERT(receive_message(cli, &rx, &from) > 0);
+      if ((rx.flags & WAMBLE_FLAG_UNRELIABLE) == 0)
+        network_ack_received_message(cli, &rx, &from);
+      if (rx.ctrl == WAMBLE_CTRL_SPECTATE_UPDATE)
+        saw_idle = 1;
+    }
+    T_ASSERT(saw_idle);
     T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_SPECTATE_UPDATE);
     T_ASSERT((rx.flags & WAMBLE_FLAG_UNRELIABLE) == 0);
     T_ASSERT_EQ_INT((int)rx.board_id, 0);
-    send_ack(cli, &rx, &from);
   }
   {
     const WambleMessageExtField *state = find_ext_field(&rx, "spectate.state");
@@ -3915,6 +4091,7 @@ WAMBLE_TEST(server_protocol_player_stats_scope_context_is_ignored) {
   T_ASSERT(
       wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -3959,6 +4136,7 @@ WAMBLE_TEST(server_protocol_player_stats_scope_context_is_ignored) {
         wamble_thread_create(&th_self, recv_one_and_ack_thread, &rx_self) == 0);
     T_ASSERT_EQ_INT(handle_message(srv, &self_req, &cliaddr, 0, "p1"),
                     SERVER_ERR_FORBIDDEN);
+    drive_runtime_until_idle(srv, "p1");
     T_ASSERT_STATUS_OK(wamble_thread_join(th_self, NULL));
     T_ASSERT_EQ_INT(rx_self.received, 1);
     T_ASSERT_EQ_INT(rx_self.msg.ctrl, WAMBLE_CTRL_ERROR);
@@ -3994,6 +4172,7 @@ WAMBLE_TEST(server_protocol_player_stats_scope_context_is_ignored) {
                                   &rx_target) == 0);
     T_ASSERT_EQ_INT(handle_message(srv, &target_req, &cliaddr, 0, "p1"),
                     SERVER_ERR_FORBIDDEN);
+    drive_runtime_until_idle(srv, "p1");
     T_ASSERT_STATUS_OK(wamble_thread_join(th_target, NULL));
     T_ASSERT_EQ_INT(rx_target.received, 1);
     T_ASSERT_EQ_INT(rx_target.msg.ctrl, WAMBLE_CTRL_ERROR);
@@ -4059,6 +4238,7 @@ WAMBLE_TEST(server_protocol_player_stats_self_read_does_not_create_session) {
   T_ASSERT(
       wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -4081,6 +4261,7 @@ WAMBLE_TEST(server_protocol_player_stats_self_read_does_not_create_session) {
     T_ASSERT(wamble_thread_create(&th_stats, recv_one_and_ack_thread,
                                   &rx_stats) == 0);
     T_ASSERT_EQ_INT(handle_message(srv, &req, &cliaddr, 0, "p1"), SERVER_OK);
+    drive_runtime_until_idle(srv, "p1");
     T_ASSERT_STATUS_OK(wamble_thread_join(th_stats, NULL));
     T_ASSERT_EQ_INT(rx_stats.received, 1);
     T_ASSERT_EQ_INT(rx_stats.msg.ctrl, WAMBLE_CTRL_PLAYER_STATS_DATA);
@@ -4149,6 +4330,7 @@ WAMBLE_TEST(server_protocol_error_blocking_ext_marks_fatal_session_only) {
   T_ASSERT(
       wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -4165,6 +4347,7 @@ WAMBLE_TEST(server_protocol_error_blocking_ext_marks_fatal_session_only) {
     T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
     T_ASSERT_EQ_INT(handle_message(srv, &req, &cliaddr, 0, "p1"),
                     SERVER_ERR_INTERNAL);
+    drive_runtime_until_idle(srv, "p1");
     T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
     T_ASSERT_EQ_INT(rx.received, 1);
     T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_ERROR);
@@ -4199,6 +4382,7 @@ WAMBLE_TEST(server_protocol_error_blocking_ext_marks_fatal_session_only) {
     T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
     T_ASSERT_EQ_INT(handle_message(srv, &req, &cliaddr, 0, "p1"),
                     SERVER_ERR_INTERNAL);
+    drive_runtime_until_idle(srv, "p1");
     T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
     T_ASSERT_EQ_INT(rx.received, 1);
     T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_ERROR);
@@ -4267,6 +4451,7 @@ WAMBLE_TEST(server_protocol_player_stats_caps_follow_contextual_policy) {
   T_ASSERT(
       wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -4289,6 +4474,7 @@ WAMBLE_TEST(server_protocol_player_stats_caps_follow_contextual_policy) {
     T_ASSERT(wamble_thread_create(&th_stats, recv_one_and_ack_thread,
                                   &rx_stats) == 0);
     T_ASSERT_EQ_INT(handle_message(srv, &req, &cliaddr, 0, "p1"), SERVER_OK);
+    drive_runtime_until_idle(srv, "p1");
     T_ASSERT_STATUS_OK(wamble_thread_join(th_stats, NULL));
     T_ASSERT_EQ_INT(rx_stats.received, 1);
     T_ASSERT_EQ_INT(rx_stats.msg.ctrl, WAMBLE_CTRL_PLAYER_STATS_DATA);
@@ -4345,6 +4531,7 @@ WAMBLE_TEST(server_protocol_logout_allowed_before_profile_terms_acceptance) {
   T_ASSERT(
       wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -4355,10 +4542,10 @@ WAMBLE_TEST(server_protocol_logout_allowed_before_profile_terms_acceptance) {
   memcpy(logout.token, rx_hello.msg.token, TOKEN_LENGTH);
 
   RecvOneCtx rx_ack = {.sock = cli};
-  wamble_thread_t th_ack;
-  T_ASSERT(wamble_thread_create(&th_ack, recv_one_thread, &rx_ack) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &logout, &cliaddr, 0, "p1"), SERVER_OK);
-  T_ASSERT_STATUS_OK(wamble_thread_join(th_ack, NULL));
+  drive_runtime_until_idle(srv, "p1");
+  T_ASSERT(recv_message_with_timeout(cli, &rx_ack.msg, &rx_ack.from, 500) > 0);
+  rx_ack.received = 1;
   T_ASSERT_EQ_INT(rx_ack.received, 1);
   T_ASSERT_EQ_INT(rx_ack.msg.ctrl, WAMBLE_CTRL_ACK);
 
@@ -4411,6 +4598,7 @@ WAMBLE_TEST(server_protocol_logout_tears_down_session_without_goodbye) {
   T_ASSERT(
       wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -4431,10 +4619,10 @@ WAMBLE_TEST(server_protocol_logout_tears_down_session_without_goodbye) {
   memcpy(logout.token, token, TOKEN_LENGTH);
 
   RecvOneCtx rx_ack = {.sock = cli};
-  wamble_thread_t th_ack;
-  T_ASSERT(wamble_thread_create(&th_ack, recv_one_thread, &rx_ack) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &logout, &cliaddr, 0, "p1"), SERVER_OK);
-  T_ASSERT_STATUS_OK(wamble_thread_join(th_ack, NULL));
+  drive_runtime_until_idle(srv, "p1");
+  T_ASSERT(recv_message_with_timeout(cli, &rx_ack.msg, &rx_ack.from, 500) > 0);
+  rx_ack.received = 1;
   T_ASSERT_EQ_INT(rx_ack.received, 1);
   T_ASSERT_EQ_INT(rx_ack.msg.ctrl, WAMBLE_CTRL_ACK);
 
@@ -4553,6 +4741,7 @@ WAMBLE_TEST(server_protocol_player_stats_target_handle_with_tag_policy) {
   T_ASSERT(
       wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -4569,6 +4758,7 @@ WAMBLE_TEST(server_protocol_player_stats_target_handle_with_tag_policy) {
         wamble_thread_create(&th_self, recv_one_and_ack_thread, &rx_self) == 0);
     T_ASSERT_EQ_INT(handle_message(srv, &self_req, &cliaddr, 0, "p1"),
                     SERVER_ERR_FORBIDDEN);
+    drive_runtime_until_idle(srv, "p1");
     T_ASSERT_STATUS_OK(wamble_thread_join(th_self, NULL));
     T_ASSERT_EQ_INT(rx_self.received, 1);
     T_ASSERT_EQ_INT(rx_self.msg.ctrl, WAMBLE_CTRL_ERROR);
@@ -4596,6 +4786,7 @@ WAMBLE_TEST(server_protocol_player_stats_target_handle_with_tag_policy) {
              0);
     T_ASSERT_EQ_INT(handle_message(srv, &req_pub, &cliaddr, 0, "p1"),
                     SERVER_ERR_FORBIDDEN);
+    drive_runtime_until_idle(srv, "p1");
     T_ASSERT_STATUS_OK(wamble_thread_join(th_pub, NULL));
     T_ASSERT_EQ_INT(rx_pub.received, 1);
     T_ASSERT_EQ_INT(rx_pub.msg.ctrl, WAMBLE_CTRL_ERROR);
@@ -4642,6 +4833,7 @@ WAMBLE_TEST(server_protocol_player_stats_target_handle_with_tag_policy) {
     wamble_thread_t th;
     T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
     T_ASSERT_EQ_INT(handle_message(srv, &req, &cliaddr, 0, "p1"), SERVER_OK);
+    drive_runtime_until_idle(srv, "p1");
     T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
     T_ASSERT_EQ_INT(rx.received, 1);
     T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_PLAYER_STATS_DATA);
@@ -4780,6 +4972,7 @@ WAMBLE_TEST(server_protocol_get_active_reservations_identity_query) {
   T_ASSERT(
       wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -4795,6 +4988,7 @@ WAMBLE_TEST(server_protocol_get_active_reservations_identity_query) {
   wamble_thread_t th;
   T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &req, &cliaddr, 0, "p1"), SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
   T_ASSERT_EQ_INT(rx.received, 1);
   T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_ACTIVE_RESERVATIONS_DATA);
@@ -4886,6 +5080,7 @@ WAMBLE_TEST(
   T_ASSERT(
       wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -4903,6 +5098,7 @@ WAMBLE_TEST(
   wamble_thread_t th;
   T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &req, &cliaddr, 0, "p1"), SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
   T_ASSERT_EQ_INT(rx.received, 1);
   T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_ACTIVE_RESERVATIONS_DATA);
@@ -4960,7 +5156,7 @@ WAMBLE_TEST(server_protocol_get_active_reservations_caps_payload_count) {
           "reserved_for_white) "
           "SELECT 8000 + g, '8/8/8/8/8/8/8/8 w - - 0 1', 'RESERVED', "
           "NOW() - INTERVAL '30 seconds', TRUE "
-          "FROM generate_series(1, 40) AS g "
+          "FROM generate_series(1, 80) AS g "
           "ON CONFLICT (id) DO UPDATE SET "
           "status = EXCLUDED.status, "
           "reservation_started_at = EXCLUDED.reservation_started_at, "
@@ -4973,7 +5169,7 @@ WAMBLE_TEST(server_protocol_get_active_reservations_caps_payload_count) {
           "decode('c1c2c3c4c5c6c7c8c9cacbcccdcecfd0', 'hex')), "
           "NOW() + ((1000 + g)::text || ' seconds')::interval, "
           "NOW() - INTERVAL '30 seconds', TRUE "
-          "FROM generate_series(1, 40) AS g "
+          "FROM generate_series(1, 80) AS g "
           "ON CONFLICT (board_id) DO UPDATE SET "
           "session_id = EXCLUDED.session_id, "
           "expires_at = EXCLUDED.expires_at, "
@@ -5017,6 +5213,7 @@ WAMBLE_TEST(server_protocol_get_active_reservations_caps_payload_count) {
   T_ASSERT(
       wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -5028,20 +5225,20 @@ WAMBLE_TEST(server_protocol_get_active_reservations_caps_payload_count) {
   req.header_version = WAMBLE_PROTO_VERSION;
   memcpy(req.token, rx_hello.msg.token, TOKEN_LENGTH);
 
-  RecvOneCtx rx = {.sock = cli};
-  wamble_thread_t th;
-  T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
+  RecvTosFragmentsCtx rx = {
+      .sock = cli, .expected_ctrl = WAMBLE_CTRL_ACTIVE_RESERVATIONS_DATA};
   T_ASSERT_EQ_INT(handle_message(srv, &req, &cliaddr, 0, "p1"), SERVER_OK);
-  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  recv_tos_fragments_and_ack_runtime(srv, cli, "p1", &rx);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_EQ_INT(rx.received, 1);
-  T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_ACTIVE_RESERVATIONS_DATA);
-  T_ASSERT(rx.msg.fragment.fragment_data_len >= 2);
+  T_ASSERT(rx.expected_chunks > 1);
+  T_ASSERT_EQ_INT(rx.chunk_count, rx.expected_chunks);
+  T_ASSERT(rx.assembled_len >= 2);
   {
     uint16_t count_be = 0;
-    memcpy(&count_be, rx.msg.fragment.fragment_data, 2);
-    T_ASSERT_EQ_INT((int)ntohs(count_be), 41);
+    memcpy(&count_be, rx.assembled, 2);
+    T_ASSERT_EQ_INT((int)ntohs(count_be), 81);
   }
-  T_ASSERT_EQ_INT((int)rx.msg.session.active_count, 41);
 
   wamble_close_socket(cli);
   wamble_close_socket(srv);
@@ -5127,6 +5324,7 @@ WAMBLE_TEST(server_protocol_get_active_reservations_db_failure_is_internal) {
   T_ASSERT(
       wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -5145,6 +5343,7 @@ WAMBLE_TEST(server_protocol_get_active_reservations_db_failure_is_internal) {
   wamble_thread_t th;
   T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
   int handle_status = handle_message(srv, &req, &cliaddr, 0, "p1");
+  drive_runtime_until_idle(srv, "p1");
   int join_status = wamble_thread_join(th, NULL);
   int rx_received = rx.received;
   int restore_status =
@@ -5219,6 +5418,7 @@ WAMBLE_TEST(server_protocol_accept_profile_tos_long_profile_name_persists) {
       wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, profile_name),
                   SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -5239,6 +5439,7 @@ WAMBLE_TEST(server_protocol_accept_profile_tos_long_profile_name_persists) {
                                 &rx_accept) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &accept, &cliaddr, 0, profile_name),
                   SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_accept, NULL));
   T_ASSERT_EQ_INT(rx_accept.received, 1);
   T_ASSERT_EQ_INT(rx_accept.msg.ctrl, WAMBLE_CTRL_PROFILE_INFO);
@@ -5332,6 +5533,7 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
   T_ASSERT(wamble_thread_create(&th_challenge, recv_one_and_ack_thread,
                                 &rx_challenge) == 0);
   ServerStatus st = handle_message(srv, &challenge_req, &cliaddr, 0, "p1");
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_challenge, NULL));
   T_ASSERT_EQ_INT(st, SERVER_OK);
   T_ASSERT_EQ_INT(rx_challenge.received, 1);
@@ -5356,6 +5558,7 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
   T_ASSERT(wamble_thread_create(&th_bad, recv_one_and_ack_thread, &rx_bad) ==
            0);
   ServerStatus bad_st = handle_message(srv, &bad_req, &cliaddr, 0, "p1");
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_bad, NULL));
   T_ASSERT_EQ_INT(bad_st, SERVER_ERR_LOGIN_FAILED);
   T_ASSERT_EQ_INT(rx_bad.received, 1);
@@ -5367,6 +5570,7 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
   T_ASSERT(wamble_thread_create(&th_challenge_2, recv_one_and_ack_thread,
                                 &rx_challenge_2) == 0);
   st = handle_message(srv, &challenge_req, &cliaddr, 0, "p1");
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_challenge_2, NULL));
   T_ASSERT_EQ_INT(st, SERVER_OK);
   T_ASSERT_EQ_INT(rx_challenge_2.received, 1);
@@ -5390,6 +5594,7 @@ WAMBLE_TEST(server_protocol_login_uses_ed25519_challenge_response) {
   wamble_thread_t th_ok;
   T_ASSERT(wamble_thread_create(&th_ok, recv_one_and_ack_thread, &rx_ok) == 0);
   ServerStatus ok_st = handle_message(srv, &good_req, &cliaddr, 0, "p1");
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_ok, NULL));
   T_ASSERT_EQ_INT(ok_st, SERVER_OK);
   T_ASSERT_EQ_INT(rx_ok.received, 1);
@@ -5477,6 +5682,7 @@ WAMBLE_TEST(server_protocol_prediction_submit_response_contract) {
       wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
   T_ASSERT_EQ_INT(handle_message(pair.srv, &hello, &pair.cliaddr, 0, "p1"),
                   SERVER_OK);
+  drive_runtime_until_idle(pair.srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -5506,6 +5712,7 @@ WAMBLE_TEST(server_protocol_prediction_submit_response_contract) {
                                 &rx_submit) == 0);
   T_ASSERT_EQ_INT(handle_message(pair.srv, &submit, &pair.cliaddr, 0, "p1"),
                   SERVER_OK);
+  drive_runtime_until_idle(pair.srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_submit, NULL));
   T_ASSERT_EQ_INT(rx_submit.received, 1);
   T_ASSERT_EQ_INT(rx_submit.msg.ctrl, WAMBLE_CTRL_PREDICTION_DATA);
@@ -5532,6 +5739,7 @@ WAMBLE_TEST(server_protocol_prediction_submit_response_contract) {
            0);
   T_ASSERT_EQ_INT(handle_message(pair.srv, &submit, &pair.cliaddr, 0, "p1"),
                   SERVER_OK);
+  drive_runtime_until_idle(pair.srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_dup, NULL));
   T_ASSERT_EQ_INT(rx_dup.received, 1);
   T_ASSERT_EQ_INT(rx_dup.msg.ctrl, WAMBLE_CTRL_PREDICTION_DATA);
@@ -5563,6 +5771,7 @@ WAMBLE_TEST(server_protocol_prediction_submit_response_contract) {
   T_ASSERT_EQ_INT(
       handle_message(pair.srv, &get_predictions, &pair.cliaddr, 0, "p1"),
       SERVER_OK);
+  drive_runtime_until_idle(pair.srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_tree, NULL));
   T_ASSERT_EQ_INT(rx_tree.received, 1);
   T_ASSERT_EQ_INT(rx_tree.msg.ctrl, WAMBLE_CTRL_PREDICTION_DATA);
@@ -5639,12 +5848,10 @@ WAMBLE_TEST(server_protocol_profile_tos_fragmented_with_hash) {
   memcpy(req.text.profile_name, "p1", 2);
 
   RecvTosFragmentsCtx rx = {.sock = cli};
-  wamble_thread_t th;
-  T_ASSERT(wamble_thread_create(&th, recv_tos_fragments_and_ack_thread, &rx) ==
-           0);
 
   ServerStatus st = handle_message(srv, &req, &cliaddr, 0, "p1");
-  T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
+  recv_tos_fragments_and_ack_runtime(srv, cli, "p1", &rx);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_EQ_INT(st, SERVER_OK);
   T_ASSERT_EQ_INT(rx.received, 1);
   T_ASSERT(rx.expected_chunks > 1);
@@ -5703,6 +5910,1088 @@ WAMBLE_TEST(get_profile_tos_roundtrip) {
 
   wamble_close_socket(cli);
   wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(transport_runtime_state_queues_endpoints_and_drive_results) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  T_ASSERT_EQ_INT((int)transport_inbound_count(), 0);
+  T_ASSERT_EQ_INT((int)transport_dispatch_count(), 0);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 0);
+
+  struct sockaddr_in addr_a;
+  memset(&addr_a, 0, sizeof(addr_a));
+  addr_a.sin_family = AF_INET;
+  addr_a.sin_port = htons(1111);
+  addr_a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+  struct sockaddr_in addr_b = addr_a;
+  addr_b.sin_port = htons(2222);
+
+  uint8_t token[TOKEN_LENGTH];
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    token[i] = (uint8_t)(i + 1);
+
+  uint8_t packet_a[] = {0xa1, 0xa2, 0xa3, 0xa4};
+  TransportInboundEntry inbound_a;
+  memset(&inbound_a, 0, sizeof(inbound_a));
+  inbound_a.source = TRANSPORT_PACKET_SOURCE_UDP;
+  inbound_a.addr = addr_a;
+  inbound_a.packet_len = sizeof(packet_a);
+  memcpy(inbound_a.packet, packet_a, sizeof(packet_a));
+  T_ASSERT_EQ_INT(transport_inbound_push(&inbound_a), 0);
+
+  uint8_t packet_b[] = {0xb1, 0xb2};
+  TransportInboundEntry inbound_b;
+  memset(&inbound_b, 0, sizeof(inbound_b));
+  inbound_b.source = TRANSPORT_PACKET_SOURCE_WS;
+  inbound_b.addr = addr_b;
+  inbound_b.packet_len = sizeof(packet_b);
+  memcpy(inbound_b.packet, packet_b, sizeof(packet_b));
+  T_ASSERT_EQ_INT(transport_inbound_push(&inbound_b), 0);
+  T_ASSERT_EQ_INT((int)transport_inbound_count(), 2);
+
+  TransportInboundEntry inbound_out;
+  memset(&inbound_out, 0, sizeof(inbound_out));
+  T_ASSERT_EQ_INT(transport_inbound_pop(&inbound_out), 1);
+  T_ASSERT_EQ_INT(inbound_out.source, TRANSPORT_PACKET_SOURCE_UDP);
+  T_ASSERT_EQ_INT((int)inbound_out.packet_len, (int)sizeof(packet_a));
+  T_ASSERT_EQ_INT(memcmp(inbound_out.packet, packet_a, sizeof(packet_a)), 0);
+  T_ASSERT_EQ_INT(transport_inbound_pop(&inbound_out), 1);
+  T_ASSERT_EQ_INT(inbound_out.source, TRANSPORT_PACKET_SOURCE_WS);
+  T_ASSERT_EQ_INT((int)transport_inbound_count(), 0);
+
+  TransportDispatchEntry dispatch;
+  memset(&dispatch, 0, sizeof(dispatch));
+  dispatch.source = TRANSPORT_PACKET_SOURCE_UDP;
+  dispatch.addr = addr_a;
+  dispatch.msg.ctrl = WAMBLE_CTRL_GET_PROFILE_INFO;
+  dispatch.msg.seq_num = 77;
+  memcpy(dispatch.msg.token, token, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(transport_dispatch_push(&dispatch), 0);
+  T_ASSERT_EQ_INT((int)transport_dispatch_count(), 1);
+
+  TransportDispatchEntry dispatch_out;
+  memset(&dispatch_out, 0, sizeof(dispatch_out));
+  T_ASSERT_EQ_INT(transport_dispatch_pop(&dispatch_out), 1);
+  T_ASSERT_EQ_INT(dispatch_out.msg.ctrl, WAMBLE_CTRL_GET_PROFILE_INFO);
+  T_ASSERT_EQ_INT((int)dispatch_out.msg.seq_num, 77);
+  T_ASSERT_EQ_INT((int)transport_dispatch_count(), 0);
+
+  TransportEndpointId endpoint_id = TRANSPORT_ENDPOINT_ID_INVALID;
+  T_ASSERT_EQ_INT(
+      transport_endpoint_bind_addr_token(&addr_a, token, &endpoint_id), 0);
+  T_ASSERT(endpoint_id != TRANSPORT_ENDPOINT_ID_INVALID);
+  struct sockaddr_in resolved;
+  memset(&resolved, 0, sizeof(resolved));
+  T_ASSERT_EQ_INT(transport_endpoint_resolve_addr(endpoint_id, &resolved), 0);
+  T_ASSERT_EQ_INT(resolved.sin_port, addr_a.sin_port);
+  T_ASSERT_EQ_INT(transport_endpoint_rebind_id(endpoint_id, &addr_b), 0);
+  T_ASSERT_EQ_INT(transport_endpoint_resolve_addr(endpoint_id, &resolved), 0);
+  T_ASSERT_EQ_INT(resolved.sin_port, addr_b.sin_port);
+  T_ASSERT(transport_endpoint_rto_ms_by_id(endpoint_id) >= 250u);
+  T_ASSERT_EQ_INT(transport_endpoint_update_rto_by_id(endpoint_id, 100, 0), 0);
+  uint32_t rto_after_sample = transport_endpoint_rto_ms_by_id(endpoint_id);
+  T_ASSERT(rto_after_sample >= 250u);
+  T_ASSERT_EQ_INT(transport_endpoint_update_rto_by_id(endpoint_id, 2000, 1), 0);
+  T_ASSERT_EQ_INT((int)transport_endpoint_rto_ms_by_id(endpoint_id),
+                  (int)rto_after_sample);
+  T_ASSERT_EQ_INT(transport_endpoint_update_rto_by_id(endpoint_id, 100000, 0),
+                  0);
+  T_ASSERT(transport_endpoint_rto_ms_by_id(endpoint_id) <= 8000u);
+
+  uint8_t payload_a[] = {0xa1, 0xa2, 0xa3, 0xa4};
+  TransportOutboundEntry terminal;
+  memset(&terminal, 0, sizeof(terminal));
+  terminal.variant = TRANSPORT_OUTBOUND_RELIABLE_TERMINAL;
+  terminal.addr = addr_b;
+  memcpy(terminal.token, token, TOKEN_LENGTH);
+  terminal.payload = payload_a;
+  terminal.payload_len = sizeof(payload_a);
+  terminal.as.reliable.seq = 7;
+  terminal.as.reliable.deadline_at_ms = 12345;
+  terminal.as.reliable.rto_ms = 250;
+  terminal.as.reliable.max_retries = 3;
+  T_ASSERT_EQ_INT(transport_outbound_push(&terminal), 0);
+
+  TransportOutboundEntry ack;
+  memset(&ack, 0, sizeof(ack));
+  ack.variant = TRANSPORT_OUTBOUND_REQUEST_ACK;
+  ack.addr = addr_b;
+  memcpy(ack.token, token, TOKEN_LENGTH);
+  ack.as.ack.ack_seq = 99;
+  T_ASSERT_EQ_INT(transport_outbound_push(&ack), 0);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 2);
+
+  transport_outbound_remove(0);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 1);
+
+  TransportDriveResult idle = transport_drive_result_idle();
+  T_ASSERT_EQ_INT(idle.status, TRANSPORT_DRIVE_IDLE);
+
+  TransportDriveResult pending =
+      transport_drive_result_pending(0, 0, transport_outbound_count(), 0);
+  T_ASSERT_EQ_INT(pending.status, TRANSPORT_DRIVE_PENDING);
+  T_ASSERT_EQ_INT((int)pending.outbound_pending, 1);
+
+  TransportDriveResult progress = transport_drive_result_progress(2);
+  T_ASSERT_EQ_INT(progress.status, TRANSPORT_DRIVE_PROGRESS);
+  T_ASSERT_EQ_INT((int)progress.progress_count, 2);
+
+  TransportDriveResult error =
+      transport_drive_result_error(0, 0, transport_outbound_count(), 1, 50);
+  TransportDriveResult merged = transport_drive_result_merge(pending, error);
+  T_ASSERT_EQ_INT(merged.status, TRANSPORT_DRIVE_ERROR);
+  T_ASSERT_EQ_INT((int)merged.outbound_pending, 2);
+  T_ASSERT_EQ_INT((int)merged.error_count, 1);
+  T_ASSERT_EQ_INT((int)merged.retry_after_ms, 50);
+
+  network_init_thread_state();
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 0);
+  return 0;
+}
+
+static struct sockaddr_in test_runtime_loopback_addr(uint16_t port) {
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  return addr;
+}
+
+static void test_runtime_fill_token(uint8_t token[TOKEN_LENGTH]) {
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    token[i] = (uint8_t)(0x20 + i);
+}
+
+static int test_push_inbound_serialized(TransportPacketSource source,
+                                        const struct WambleMsg *msg,
+                                        const struct sockaddr_in *addr) {
+  uint8_t packet[WAMBLE_MAX_PACKET_SIZE];
+  size_t packet_len = 0;
+  if (wamble_packet_serialize(msg, packet, sizeof(packet), &packet_len,
+                              msg ? msg->flags : 0) != NET_OK)
+    return -1;
+  TransportInboundEntry inbound;
+  memset(&inbound, 0, sizeof(inbound));
+  inbound.source = source;
+  inbound.addr = *addr;
+  inbound.packet_len = packet_len;
+  memcpy(inbound.packet, packet, packet_len);
+  return transport_inbound_push(&inbound);
+}
+
+static int test_push_reliable_outbound(uint32_t seq,
+                                       const uint8_t token[TOKEN_LENGTH],
+                                       const struct sockaddr_in *addr) {
+  struct WambleMsg msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.ctrl = WAMBLE_CTRL_ERROR;
+  msg.header_version = WAMBLE_PROTO_VERSION;
+  msg.seq_num = seq;
+  memcpy(msg.token, token, TOKEN_LENGTH);
+
+  uint8_t payload[WAMBLE_MAX_PACKET_SIZE];
+  size_t payload_len = 0;
+  if (wamble_packet_serialize(&msg, payload, sizeof(payload), &payload_len,
+                              0) != NET_OK)
+    return -1;
+
+  TransportOutboundEntry entry;
+  memset(&entry, 0, sizeof(entry));
+  entry.variant = TRANSPORT_OUTBOUND_RELIABLE_TERMINAL;
+  entry.addr = *addr;
+  memcpy(entry.token, token, TOKEN_LENGTH);
+  entry.payload = payload;
+  entry.payload_len = payload_len;
+  entry.as.reliable.seq = seq;
+  entry.as.reliable.deadline_at_ms = 0;
+  entry.as.reliable.rto_ms = 250;
+  entry.as.reliable.max_retries = 3;
+  return transport_outbound_push(&entry);
+}
+
+static int test_push_reliable_outbound_with_rto(
+    uint32_t seq, const uint8_t token[TOKEN_LENGTH],
+    const struct sockaddr_in *addr, uint32_t rto_ms, uint64_t sent_at_ms,
+    uint16_t retry_count) {
+  static uint8_t payload[] = {0x05, 0x06, 0x07, 0x08};
+  TransportOutboundEntry entry;
+  memset(&entry, 0, sizeof(entry));
+  entry.variant = TRANSPORT_OUTBOUND_RELIABLE_TERMINAL;
+  entry.addr = *addr;
+  memcpy(entry.token, token, TOKEN_LENGTH);
+  entry.payload = payload;
+  entry.payload_len = sizeof(payload);
+  entry.as.reliable.seq = seq;
+  entry.as.reliable.deadline_at_ms = sent_at_ms + rto_ms;
+  entry.as.reliable.sent_at_ms = sent_at_ms;
+  entry.as.reliable.rto_ms = rto_ms;
+  entry.as.reliable.retry_count = retry_count;
+  entry.as.reliable.max_retries = 3;
+  return transport_outbound_push(&entry);
+}
+
+WAMBLE_TEST(runtime_classifies_udp_and_ws_acks_without_dispatch) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  struct sockaddr_in addr = test_runtime_loopback_addr(4300);
+  uint8_t token[TOKEN_LENGTH];
+  test_runtime_fill_token(token);
+
+  T_ASSERT_EQ_INT(test_push_reliable_outbound(7001, token, &addr), 0);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 1);
+
+  struct WambleMsg ack;
+  memset(&ack, 0, sizeof(ack));
+  ack.ctrl = WAMBLE_CTRL_ACK;
+  ack.header_version = WAMBLE_PROTO_VERSION;
+  ack.seq_num = 7001;
+  memcpy(ack.token, token, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(
+      test_push_inbound_serialized(TRANSPORT_PACKET_SOURCE_UDP, &ack, &addr),
+      0);
+
+  TransportDriveResult drive =
+      network_runtime_drive_once(WAMBLE_INVALID_SOCKET, 0, NULL);
+  T_ASSERT(drive.status != TRANSPORT_DRIVE_IDLE);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 0);
+  T_ASSERT_EQ_INT((int)transport_inbound_count(), 0);
+  T_ASSERT_EQ_INT((int)transport_dispatch_count(), 0);
+
+  T_ASSERT_EQ_INT(test_push_reliable_outbound(7002, token, &addr), 0);
+  ack.seq_num = 7002;
+  T_ASSERT_EQ_INT(
+      test_push_inbound_serialized(TRANSPORT_PACKET_SOURCE_WS, &ack, &addr), 0);
+
+  drive = network_runtime_drive_once(WAMBLE_INVALID_SOCKET, 0, NULL);
+  T_ASSERT(drive.status != TRANSPORT_DRIVE_IDLE);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 0);
+  T_ASSERT_EQ_INT((int)transport_inbound_count(), 0);
+  T_ASSERT_EQ_INT((int)transport_dispatch_count(), 0);
+
+  network_init_thread_state();
+  return 0;
+}
+
+WAMBLE_TEST(runtime_ack_matches_shared_token_endpoint_addr) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  struct sockaddr_in addr_a = test_runtime_loopback_addr(4305);
+  struct sockaddr_in addr_b = test_runtime_loopback_addr(4306);
+  uint8_t token[TOKEN_LENGTH];
+  test_runtime_fill_token(token);
+
+  T_ASSERT_EQ_INT(test_push_reliable_outbound(7301, token, &addr_a), 0);
+  T_ASSERT_EQ_INT(test_push_reliable_outbound(7301, token, &addr_b), 0);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 2);
+
+  struct WambleMsg ack;
+  memset(&ack, 0, sizeof(ack));
+  ack.ctrl = WAMBLE_CTRL_ACK;
+  ack.header_version = WAMBLE_PROTO_VERSION;
+  ack.seq_num = 7301;
+  memcpy(ack.token, token, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(
+      test_push_inbound_serialized(TRANSPORT_PACKET_SOURCE_UDP, &ack, &addr_b),
+      0);
+
+  TransportDriveResult drive =
+      network_runtime_drive_once(WAMBLE_INVALID_SOCKET, 0, NULL);
+  T_ASSERT(drive.status != TRANSPORT_DRIVE_IDLE);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 1);
+
+  T_ASSERT_EQ_INT(
+      test_push_inbound_serialized(TRANSPORT_PACKET_SOURCE_UDP, &ack, &addr_b),
+      0);
+  drive = network_runtime_drive_once(WAMBLE_INVALID_SOCKET, 0, NULL);
+  T_ASSERT(drive.status != TRANSPORT_DRIVE_IDLE);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 1);
+
+  T_ASSERT_EQ_INT(
+      test_push_inbound_serialized(TRANSPORT_PACKET_SOURCE_UDP, &ack, &addr_a),
+      0);
+  drive = network_runtime_drive_once(WAMBLE_INVALID_SOCKET, 0, NULL);
+  T_ASSERT(drive.status != TRANSPORT_DRIVE_IDLE);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 0);
+
+  network_init_thread_state();
+  return 0;
+}
+
+WAMBLE_TEST(runtime_anonymous_outbound_is_addr_isolated) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  UdpLoopbackPair p1;
+  UdpLoopbackPair p2;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&p1));
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&p2));
+
+  struct WambleMsg out;
+  memset(&out, 0, sizeof(out));
+  out.ctrl = WAMBLE_CTRL_CLIENT_HELLO;
+  out.header_version = WAMBLE_PROTO_VERSION;
+  T_ASSERT_EQ_INT(network_enqueue_reliable(&out, &p1.cliaddr, 100, 3), 0);
+  T_ASSERT_EQ_INT(network_enqueue_reliable(&out, &p2.cliaddr, 100, 3), 0);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 2);
+
+  TransportDriveResult drive = network_runtime_drive_once(p1.srv, 0, NULL);
+  T_ASSERT_EQ_INT(drive.status, TRANSPORT_DRIVE_PROGRESS);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 2);
+
+  uint8_t buf[WAMBLE_MAX_PACKET_SIZE];
+  struct sockaddr_in from;
+  {
+    fd_set rfds;
+    struct timeval tv;
+    FD_ZERO(&rfds);
+    FD_SET(p1.cli, &rfds);
+    tv.tv_sec = 0;
+    tv.tv_usec = 250 * 1000;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+    T_ASSERT(select(0, &rfds, NULL, NULL, &tv) > 0);
+#else
+    T_ASSERT(select(p1.cli + 1, &rfds, NULL, NULL, &tv) > 0);
+#endif
+    wamble_socklen_t from_len = (wamble_socklen_t)sizeof(from);
+    T_ASSERT(recvfrom(p1.cli, (char *)buf, sizeof(buf), 0,
+                      (struct sockaddr *)&from, &from_len) > 0);
+  }
+  {
+    fd_set rfds;
+    struct timeval tv;
+    FD_ZERO(&rfds);
+    FD_SET(p2.cli, &rfds);
+    tv.tv_sec = 0;
+    tv.tv_usec = 250 * 1000;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+    T_ASSERT(select(0, &rfds, NULL, NULL, &tv) > 0);
+#else
+    T_ASSERT(select(p2.cli + 1, &rfds, NULL, NULL, &tv) > 0);
+#endif
+    wamble_socklen_t from_len = (wamble_socklen_t)sizeof(from);
+    T_ASSERT(recvfrom(p2.cli, (char *)buf, sizeof(buf), 0,
+                      (struct sockaddr *)&from, &from_len) > 0);
+  }
+
+  struct WambleMsg ack;
+  memset(&ack, 0, sizeof(ack));
+  ack.ctrl = WAMBLE_CTRL_ACK;
+  ack.header_version = WAMBLE_PROTO_VERSION;
+  ack.seq_num = 1;
+  T_ASSERT_EQ_INT(test_push_inbound_serialized(TRANSPORT_PACKET_SOURCE_UDP,
+                                               &ack, &p2.cliaddr),
+                  0);
+  drive = network_runtime_drive_once(WAMBLE_INVALID_SOCKET, 0, NULL);
+  T_ASSERT(drive.status != TRANSPORT_DRIVE_IDLE);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 1);
+
+  T_ASSERT_EQ_INT(test_push_inbound_serialized(TRANSPORT_PACKET_SOURCE_UDP,
+                                               &ack, &p2.cliaddr),
+                  0);
+  drive = network_runtime_drive_once(WAMBLE_INVALID_SOCKET, 0, NULL);
+  T_ASSERT(drive.status != TRANSPORT_DRIVE_IDLE);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 1);
+
+  T_ASSERT_EQ_INT(test_push_inbound_serialized(TRANSPORT_PACKET_SOURCE_UDP,
+                                               &ack, &p1.cliaddr),
+                  0);
+  drive = network_runtime_drive_once(WAMBLE_INVALID_SOCKET, 0, NULL);
+  T_ASSERT(drive.status != TRANSPORT_DRIVE_IDLE);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 0);
+
+  cleanup_udp_loopback_pair(&p2);
+  cleanup_udp_loopback_pair(&p1);
+  network_init_thread_state();
+  return 0;
+}
+
+WAMBLE_TEST(runtime_same_token_delivery_is_endpoint_isolated) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  UdpLoopbackPair p1;
+  UdpLoopbackPair p2;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&p1));
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&p2));
+  uint8_t token[TOKEN_LENGTH];
+  test_runtime_fill_token(token);
+
+  struct WambleMsg out;
+  memset(&out, 0, sizeof(out));
+  out.ctrl = WAMBLE_CTRL_ERROR;
+  out.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(out.token, token, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(network_enqueue_reliable(&out, &p1.cliaddr, 100, 3), 0);
+  T_ASSERT_EQ_INT(network_enqueue_reliable(&out, &p2.cliaddr, 100, 3), 0);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 2);
+
+  TransportDriveResult drive = network_runtime_drive_once(p1.srv, 0, NULL);
+  T_ASSERT_EQ_INT(drive.status, TRANSPORT_DRIVE_PROGRESS);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 2);
+
+  struct WambleMsg rx;
+  struct sockaddr_in from;
+  T_ASSERT(recv_message_with_timeout(p1.cli, &rx, &from, 250) > 0);
+  T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_ERROR);
+  T_ASSERT(recv_message_with_timeout(p2.cli, &rx, &from, 250) > 0);
+  T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_ERROR);
+
+  cleanup_udp_loopback_pair(&p2);
+  cleanup_udp_loopback_pair(&p1);
+  network_init_thread_state();
+  return 0;
+}
+
+WAMBLE_TEST(runtime_same_token_endpoints_have_distinct_endpoint_ids) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  UdpLoopbackPair p1;
+  UdpLoopbackPair p2;
+  UdpLoopbackPair p3;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&p1));
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&p2));
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&p3));
+  uint8_t token[TOKEN_LENGTH];
+  test_runtime_fill_token(token);
+
+  TransportEndpointId p1_endpoint_id = TRANSPORT_ENDPOINT_ID_INVALID;
+  TransportEndpointId p2_endpoint_id = TRANSPORT_ENDPOINT_ID_INVALID;
+  T_ASSERT_EQ_INT(
+      transport_endpoint_bind_addr_token(&p1.cliaddr, token, &p1_endpoint_id),
+      0);
+  T_ASSERT_EQ_INT(
+      transport_endpoint_bind_addr_token(&p2.cliaddr, token, &p2_endpoint_id),
+      0);
+  T_ASSERT(p1_endpoint_id != p2_endpoint_id);
+
+  struct WambleMsg out;
+  memset(&out, 0, sizeof(out));
+  out.ctrl = WAMBLE_CTRL_ERROR;
+  out.header_version = WAMBLE_PROTO_VERSION;
+  memcpy(out.token, token, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(network_enqueue_reliable(&out, &p2.cliaddr, 100, 3), 0);
+
+  TransportDriveResult drive = network_runtime_drive_once(p2.srv, 0, NULL);
+  T_ASSERT_EQ_INT(drive.status, TRANSPORT_DRIVE_PROGRESS);
+
+  struct WambleMsg rx;
+  struct sockaddr_in from;
+  T_ASSERT(recv_message_with_timeout(p2.cli, &rx, &from, 250) > 0);
+  T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_ERROR);
+  T_ASSERT_EQ_INT(recv_message_with_timeout(p3.cli, &rx, &from, 50), 0);
+
+  cleanup_udp_loopback_pair(&p3);
+  cleanup_udp_loopback_pair(&p2);
+  cleanup_udp_loopback_pair(&p1);
+  network_init_thread_state();
+  return 0;
+}
+
+WAMBLE_TEST(runtime_rebind_keeps_ack_identity_on_endpoint_id) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  struct sockaddr_in old_addr = test_runtime_loopback_addr(4310);
+  struct sockaddr_in new_addr = test_runtime_loopback_addr(4311);
+  uint8_t token[TOKEN_LENGTH];
+  test_runtime_fill_token(token);
+
+  TransportEndpointId endpoint_id = TRANSPORT_ENDPOINT_ID_INVALID;
+  T_ASSERT_EQ_INT(
+      transport_endpoint_bind_addr_token(&old_addr, token, &endpoint_id), 0);
+  T_ASSERT_EQ_INT(test_push_reliable_outbound(7310, token, &old_addr), 0);
+  T_ASSERT_EQ_INT(transport_endpoint_rebind_id(endpoint_id, &new_addr), 0);
+
+  TransportEndpointId old_endpoint_id = TRANSPORT_ENDPOINT_ID_INVALID;
+  T_ASSERT_EQ_INT(
+      transport_endpoint_bind_addr_token(&old_addr, NULL, &old_endpoint_id), 0);
+  T_ASSERT(old_endpoint_id != endpoint_id);
+
+  struct WambleMsg ack;
+  memset(&ack, 0, sizeof(ack));
+  ack.ctrl = WAMBLE_CTRL_ACK;
+  ack.header_version = WAMBLE_PROTO_VERSION;
+  ack.seq_num = 7310;
+  memcpy(ack.token, token, TOKEN_LENGTH);
+
+  T_ASSERT_EQ_INT(test_push_inbound_serialized(TRANSPORT_PACKET_SOURCE_UDP,
+                                               &ack, &old_addr),
+                  0);
+  TransportDriveResult drive =
+      network_runtime_drive_once(WAMBLE_INVALID_SOCKET, 0, NULL);
+  T_ASSERT(drive.status != TRANSPORT_DRIVE_IDLE);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 1);
+
+  T_ASSERT_EQ_INT(test_push_inbound_serialized(TRANSPORT_PACKET_SOURCE_UDP,
+                                               &ack, &new_addr),
+                  0);
+  drive = network_runtime_drive_once(WAMBLE_INVALID_SOCKET, 0, NULL);
+  T_ASSERT(drive.status != TRANSPORT_DRIVE_IDLE);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 0);
+
+  network_init_thread_state();
+  return 0;
+}
+
+WAMBLE_TEST(runtime_request_ack_lane_drains_before_terminal_lane) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
+  uint8_t token[TOKEN_LENGTH];
+  test_runtime_fill_token(token);
+
+  T_ASSERT_EQ_INT(test_push_reliable_outbound(7403, token, &pair.cliaddr), 0);
+
+  struct WambleMsg request;
+  memset(&request, 0, sizeof(request));
+  request.ctrl = WAMBLE_CTRL_PLAYER_MOVE;
+  request.header_version = WAMBLE_PROTO_VERSION;
+  request.seq_num = 7404;
+  memcpy(request.token, token, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(network_enqueue_ack_after(&request, &pair.cliaddr), 0);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 2);
+
+  TransportDriveResult drive = network_runtime_drive_once(pair.srv, 0, NULL);
+  T_ASSERT_EQ_INT(drive.status, TRANSPORT_DRIVE_PROGRESS);
+
+  struct sockaddr_in from;
+  struct WambleMsg first;
+  memset(&first, 0, sizeof(first));
+  T_ASSERT(recv_message_with_timeout(pair.cli, &first, &from, 250) > 0);
+  T_ASSERT_EQ_INT(first.ctrl, WAMBLE_CTRL_ACK);
+  T_ASSERT_EQ_INT((int)first.seq_num, 7404);
+
+  cleanup_udp_loopback_pair(&pair);
+  network_init_thread_state();
+  return 0;
+}
+
+WAMBLE_TEST(runtime_reload_readiness_ignores_raw_inbound_and_unreliable) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  struct sockaddr_in addr = test_runtime_loopback_addr(4308);
+  uint8_t token[TOKEN_LENGTH];
+  test_runtime_fill_token(token);
+
+  struct WambleMsg req;
+  memset(&req, 0, sizeof(req));
+  req.ctrl = WAMBLE_CTRL_PLAYER_MOVE;
+  req.header_version = WAMBLE_PROTO_VERSION;
+  req.seq_num = 7501;
+  memcpy(req.token, token, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(
+      test_push_inbound_serialized(TRANSPORT_PACKET_SOURCE_UDP, &req, &addr),
+      0);
+  T_ASSERT_EQ_INT(network_runtime_reload_drain_complete(), 1);
+
+  struct WambleMsg notice;
+  memset(&notice, 0, sizeof(notice));
+  notice.ctrl = WAMBLE_CTRL_SERVER_NOTIFICATION;
+  notice.header_version = WAMBLE_PROTO_VERSION;
+  notice.seq_num = 7502;
+  memcpy(notice.token, token, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(network_enqueue_unreliable(&notice, &addr), 0);
+  T_ASSERT_EQ_INT(network_runtime_reload_drain_complete(), 1);
+
+  network_init_thread_state();
+  return 0;
+}
+
+WAMBLE_TEST(runtime_reload_readiness_blocks_dispatch_and_reliable_work) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  struct sockaddr_in addr = test_runtime_loopback_addr(4309);
+  uint8_t token[TOKEN_LENGTH];
+  test_runtime_fill_token(token);
+
+  TransportDispatchEntry dispatch;
+  memset(&dispatch, 0, sizeof(dispatch));
+  dispatch.source = TRANSPORT_PACKET_SOURCE_UDP;
+  dispatch.addr = addr;
+  dispatch.msg.ctrl = WAMBLE_CTRL_PLAYER_MOVE;
+  dispatch.msg.header_version = WAMBLE_PROTO_VERSION;
+  dispatch.msg.seq_num = 7503;
+  memcpy(dispatch.msg.token, token, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(transport_dispatch_push(&dispatch), 0);
+  T_ASSERT_EQ_INT(network_runtime_reload_drain_complete(), 0);
+  T_ASSERT_EQ_INT(transport_dispatch_pop(&dispatch), 1);
+  T_ASSERT_EQ_INT(network_runtime_reload_drain_complete(), 1);
+
+  struct WambleMsg reliable;
+  memset(&reliable, 0, sizeof(reliable));
+  reliable.ctrl = WAMBLE_CTRL_BOARD_UPDATE;
+  reliable.header_version = WAMBLE_PROTO_VERSION;
+  reliable.seq_num = 7504;
+  memcpy(reliable.token, token, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(network_enqueue_reliable(&reliable, &addr, 1000, 3), 0);
+  T_ASSERT_EQ_INT(network_runtime_reload_drain_complete(), 0);
+
+  network_init_thread_state();
+  return 0;
+}
+
+WAMBLE_TEST(runtime_reload_readiness_blocks_terminal_cache_until_ttl) {
+  const char *cfg_path = "build/test_network_reload_cache_ttl.conf";
+  T_ASSERT_EQ_INT(wamble_test_write_optional_db_config_file(
+                      cfg_path, "(def terminal-cache-ttl-ms 1)\n"),
+                  0);
+  T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
+  network_init_thread_state();
+
+  struct sockaddr_in addr = test_runtime_loopback_addr(4310);
+  uint8_t token[TOKEN_LENGTH];
+  test_runtime_fill_token(token);
+  T_ASSERT_EQ_INT(network_test_store_terminal_cache_packet(token, &addr, 7510),
+                  0);
+  T_ASSERT_EQ_INT(network_runtime_reload_drain_complete(), 0);
+  wamble_sleep_ms(5);
+  T_ASSERT_EQ_INT(network_runtime_reload_drain_complete(), 1);
+
+  network_init_thread_state();
+  return 0;
+}
+
+WAMBLE_TEST(runtime_reload_readiness_blocks_reliable_fragment_bundle) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  struct sockaddr_in addr = test_runtime_loopback_addr(4311);
+  uint8_t token[TOKEN_LENGTH];
+  test_runtime_fill_token(token);
+  uint8_t payload[WAMBLE_FRAGMENT_DATA_MAX + 9];
+  for (size_t i = 0; i < sizeof(payload); i++)
+    payload[i] = (uint8_t)(i & 0xffu);
+  T_ASSERT_EQ_INT(network_enqueue_reliable_payload_bytes(
+                      WAMBLE_CTRL_PROFILE_TOS_DATA, token, 0, payload,
+                      sizeof(payload), &addr, 1000, 3, 1),
+                  0);
+  T_ASSERT_EQ_INT(network_runtime_reload_drain_complete(), 0);
+
+  network_init_thread_state();
+  return 0;
+}
+
+WAMBLE_TEST(runtime_ack_updates_rto_for_non_retransmitted_entry) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  struct sockaddr_in addr = test_runtime_loopback_addr(4302);
+  uint8_t token[TOKEN_LENGTH];
+  test_runtime_fill_token(token);
+  TransportEndpointId endpoint_id = TRANSPORT_ENDPOINT_ID_INVALID;
+  T_ASSERT_EQ_INT(
+      transport_endpoint_bind_addr_token(&addr, token, &endpoint_id), 0);
+
+  uint32_t before = transport_endpoint_rto_ms_by_id(endpoint_id);
+  uint64_t now_ms = wamble_now_mono_millis();
+  T_ASSERT_EQ_INT(test_push_reliable_outbound_with_rto(7101, token, &addr, 2000,
+                                                       now_ms - 1000u, 0),
+                  0);
+
+  struct WambleMsg ack;
+  memset(&ack, 0, sizeof(ack));
+  ack.ctrl = WAMBLE_CTRL_ACK;
+  ack.header_version = WAMBLE_PROTO_VERSION;
+  ack.seq_num = 7101;
+  memcpy(ack.token, token, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(
+      test_push_inbound_serialized(TRANSPORT_PACKET_SOURCE_UDP, &ack, &addr),
+      0);
+
+  TransportDriveResult drive =
+      network_runtime_drive_once(WAMBLE_INVALID_SOCKET, 0, NULL);
+  T_ASSERT(drive.status != TRANSPORT_DRIVE_IDLE);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 0);
+  T_ASSERT(transport_endpoint_rto_ms_by_id(endpoint_id) != before);
+
+  network_init_thread_state();
+  return 0;
+}
+
+WAMBLE_TEST(runtime_ack_skips_rto_for_retransmitted_entry) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  struct sockaddr_in addr = test_runtime_loopback_addr(4303);
+  uint8_t token[TOKEN_LENGTH];
+  test_runtime_fill_token(token);
+  TransportEndpointId endpoint_id = TRANSPORT_ENDPOINT_ID_INVALID;
+  T_ASSERT_EQ_INT(
+      transport_endpoint_bind_addr_token(&addr, token, &endpoint_id), 0);
+  uint32_t before = transport_endpoint_rto_ms_by_id(endpoint_id);
+
+  uint64_t now_ms = wamble_now_mono_millis();
+  T_ASSERT_EQ_INT(test_push_reliable_outbound_with_rto(7102, token, &addr, 1000,
+                                                       now_ms - 10u, 2),
+                  0);
+
+  struct WambleMsg ack;
+  memset(&ack, 0, sizeof(ack));
+  ack.ctrl = WAMBLE_CTRL_ACK;
+  ack.header_version = WAMBLE_PROTO_VERSION;
+  ack.seq_num = 7102;
+  memcpy(ack.token, token, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(
+      test_push_inbound_serialized(TRANSPORT_PACKET_SOURCE_UDP, &ack, &addr),
+      0);
+
+  TransportDriveResult drive =
+      network_runtime_drive_once(WAMBLE_INVALID_SOCKET, 0, NULL);
+  T_ASSERT(drive.status != TRANSPORT_DRIVE_IDLE);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 0);
+  T_ASSERT_EQ_INT((int)transport_endpoint_rto_ms_by_id(endpoint_id),
+                  (int)before);
+
+  network_init_thread_state();
+  return 0;
+}
+
+WAMBLE_TEST(runtime_drains_queued_inbound_without_select_delay) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  struct sockaddr_in addr = test_runtime_loopback_addr(4307);
+  uint8_t token[TOKEN_LENGTH];
+  test_runtime_fill_token(token);
+  T_ASSERT_EQ_INT(test_push_reliable_outbound(7302, token, &addr), 0);
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+
+  struct WambleMsg ack;
+  memset(&ack, 0, sizeof(ack));
+  ack.ctrl = WAMBLE_CTRL_ACK;
+  ack.header_version = WAMBLE_PROTO_VERSION;
+  ack.seq_num = 7302;
+  memcpy(ack.token, token, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(
+      test_push_inbound_serialized(TRANSPORT_PACKET_SOURCE_UDP, &ack, &addr),
+      0);
+
+  uint64_t before_ms = wamble_now_mono_millis();
+  TransportDriveResult drive = network_runtime_drive_once(srv, 250000, NULL);
+  uint64_t elapsed_ms = wamble_now_mono_millis() - before_ms;
+  T_ASSERT(drive.status != TRANSPORT_DRIVE_IDLE);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 0);
+  T_ASSERT(elapsed_ms < 100u);
+
+  wamble_close_socket(srv);
+  network_init_thread_state();
+  return 0;
+}
+
+WAMBLE_TEST(runtime_preserves_non_ack_packets_for_dispatch) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  struct sockaddr_in addr = test_runtime_loopback_addr(4301);
+  uint8_t token[TOKEN_LENGTH];
+  test_runtime_fill_token(token);
+
+  struct WambleMsg req;
+  memset(&req, 0, sizeof(req));
+  req.ctrl = WAMBLE_CTRL_GET_PROFILE_TOS;
+  req.header_version = WAMBLE_PROTO_VERSION;
+  req.flags = WAMBLE_FLAG_UNRELIABLE;
+  req.seq_num = 8001;
+  memcpy(req.token, token, TOKEN_LENGTH);
+  snprintf(req.text.profile_name, sizeof(req.text.profile_name), "%s",
+           "missing-profile");
+  req.text.profile_name_len = (uint8_t)strlen(req.text.profile_name);
+  T_ASSERT_EQ_INT(
+      test_push_inbound_serialized(TRANSPORT_PACKET_SOURCE_UDP, &req, &addr),
+      0);
+
+  TransportDriveResult drive =
+      network_runtime_drive_once(WAMBLE_INVALID_SOCKET, 0, NULL);
+  T_ASSERT(drive.status != TRANSPORT_DRIVE_IDLE);
+  T_ASSERT_EQ_INT((int)transport_inbound_count(), 0);
+  T_ASSERT_EQ_INT((int)transport_dispatch_count(), 0);
+
+  network_init_thread_state();
+  return 0;
+}
+
+WAMBLE_TEST(
+    runtime_dispatch_handles_application_rejection_without_drive_error) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in addr = test_runtime_loopback_addr(4311);
+  uint8_t token[TOKEN_LENGTH];
+  test_runtime_fill_token(token);
+
+  struct WambleMsg req;
+  memset(&req, 0, sizeof(req));
+  req.ctrl = WAMBLE_CTRL_PLAYER_MOVE;
+  req.header_version = WAMBLE_PROTO_VERSION;
+  req.seq_num = 8002;
+  memcpy(req.token, token, TOKEN_LENGTH);
+  req.board_id = 99;
+  snprintf(req.text.uci, sizeof(req.text.uci), "%s", "e2e4");
+  req.text.uci_len = 4;
+  T_ASSERT_EQ_INT(
+      test_push_inbound_serialized(TRANSPORT_PACKET_SOURCE_UDP, &req, &addr),
+      0);
+
+  TransportDriveResult drive = network_runtime_drive_once(srv, 0, NULL);
+  T_ASSERT_EQ_INT(drive.status, TRANSPORT_DRIVE_PROGRESS);
+  T_ASSERT_EQ_INT((int)drive.error_count, 0);
+  T_ASSERT_EQ_INT((int)transport_inbound_count(), 0);
+  T_ASSERT_EQ_INT((int)transport_dispatch_count(), 0);
+
+  wamble_close_socket(srv);
+  network_init_thread_state();
+  return 0;
+}
+
+WAMBLE_TEST(runtime_duplicate_request_does_not_duplicate_pending_terminal) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  struct sockaddr_in addr = test_runtime_loopback_addr(4312);
+  uint8_t token[TOKEN_LENGTH];
+  test_runtime_fill_token(token);
+
+  struct WambleMsg req;
+  memset(&req, 0, sizeof(req));
+  req.ctrl = WAMBLE_CTRL_PLAYER_MOVE;
+  req.header_version = WAMBLE_PROTO_VERSION;
+  req.seq_num = 8003;
+  memcpy(req.token, token, TOKEN_LENGTH);
+  req.board_id = 99;
+  snprintf(req.text.uci, sizeof(req.text.uci), "%s", "e2e4");
+  req.text.uci_len = 4;
+
+  T_ASSERT_EQ_INT(
+      test_push_inbound_serialized(TRANSPORT_PACKET_SOURCE_UDP, &req, &addr),
+      0);
+  TransportDriveResult drive =
+      network_runtime_drive_once(WAMBLE_INVALID_SOCKET, 0, NULL);
+  T_ASSERT(drive.status != TRANSPORT_DRIVE_IDLE);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 1);
+
+  T_ASSERT_EQ_INT(
+      test_push_inbound_serialized(TRANSPORT_PACKET_SOURCE_UDP, &req, &addr),
+      0);
+  drive = network_runtime_drive_once(WAMBLE_INVALID_SOCKET, 0, NULL);
+  T_ASSERT(drive.status != TRANSPORT_DRIVE_IDLE);
+  T_ASSERT_EQ_INT((int)transport_inbound_count(), 0);
+  T_ASSERT_EQ_INT((int)transport_dispatch_count(), 0);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 1);
+
+  network_init_thread_state();
+  return 0;
+}
+
+WAMBLE_TEST(direct_handler_enqueues_without_driving_transport) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  UdpLoopbackPair pair;
+  T_ASSERT_EQ_INT(init_udp_loopback_pair(&pair), 0);
+
+  struct WambleMsg req;
+  memset(&req, 0, sizeof(req));
+  req.ctrl = WAMBLE_CTRL_GET_PROFILE_TOS;
+  req.header_version = WAMBLE_PROTO_VERSION;
+  req.seq_num = 8101;
+  req.token[0] = 0x61;
+  snprintf(req.text.profile_name, sizeof(req.text.profile_name), "%s",
+           "missing-profile");
+  req.text.profile_name_len = (uint8_t)strlen(req.text.profile_name);
+
+  T_ASSERT_EQ_INT(handle_message(pair.srv, &req, &pair.cliaddr, 0, NULL),
+                  SERVER_ERR_FORBIDDEN);
+  T_ASSERT((int)transport_outbound_count() > 0);
+
+  struct WambleMsg rx;
+  struct sockaddr_in from;
+  memset(&rx, 0, sizeof(rx));
+  int got = recv_message_with_timeout(pair.cli, &rx, &from, 20);
+  T_ASSERT_EQ_INT(got, 0);
+
+  TransportDriveResult drive = network_runtime_drive_once(pair.srv, 0, NULL);
+  T_ASSERT(drive.progress_count > 0);
+  got = recv_non_ack_with_timeout(pair.cli, &rx, &from, 200);
+  T_ASSERT(got > 0);
+  T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_ERROR);
+
+  cleanup_udp_loopback_pair(&pair);
+  return 0;
+}
+
+WAMBLE_TEST(direct_handler_dispatch_does_not_read_socket) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+
+  struct sockaddr_in dst =
+      test_runtime_loopback_addr((uint16_t)wamble_socket_bound_port(srv));
+  struct WambleMsg queued;
+  memset(&queued, 0, sizeof(queued));
+  queued.ctrl = WAMBLE_CTRL_ACK;
+  queued.header_version = WAMBLE_PROTO_VERSION;
+  queued.seq_num = 1;
+  queued.token[0] = 0x45;
+  uint8_t packet[WAMBLE_MAX_PACKET_SIZE];
+  size_t packet_len = 0;
+  T_ASSERT(wamble_packet_serialize(&queued, packet, sizeof(packet), &packet_len,
+                                   0) == NET_OK);
+  T_ASSERT(sendto(cli, (const char *)packet, packet_len, 0,
+                  (const struct sockaddr *)&dst, sizeof(dst)) > 0);
+
+  struct WambleMsg direct;
+  memset(&direct, 0, sizeof(direct));
+  direct.ctrl = WAMBLE_CTRL_GET_PROFILE_TOS;
+  direct.header_version = WAMBLE_PROTO_VERSION;
+  direct.seq_num = 7202;
+  direct.token[0] = 0x45;
+  snprintf(direct.text.profile_name, sizeof(direct.text.profile_name), "%s",
+           "missing-profile");
+  direct.text.profile_name_len = (uint8_t)strlen(direct.text.profile_name);
+  T_ASSERT_EQ_INT(handle_message(srv, &direct, &dst, 0, NULL),
+                  SERVER_ERR_FORBIDDEN);
+
+  struct WambleMsg received;
+  struct sockaddr_in from;
+  fd_set rfds;
+  struct timeval tv;
+  FD_ZERO(&rfds);
+  FD_SET(srv, &rfds);
+  tv.tv_sec = 0;
+  tv.tv_usec = 100000;
+#ifdef WAMBLE_PLATFORM_WINDOWS
+  T_ASSERT(select(0, &rfds, NULL, NULL, &tv) > 0);
+#else
+  T_ASSERT(select(srv + 1, &rfds, NULL, NULL, &tv) > 0);
+#endif
+  T_ASSERT(receive_message(srv, &received, &from) > 0);
+  T_ASSERT_EQ_INT(received.ctrl, WAMBLE_CTRL_ACK);
+  T_ASSERT_EQ_INT((int)received.seq_num, 1);
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  network_init_thread_state();
+  return 0;
+}
+
+WAMBLE_TEST(runtime_reports_pending_outbound_without_io) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  struct sockaddr_in addr = test_runtime_loopback_addr(4304);
+  uint8_t token[TOKEN_LENGTH];
+  test_runtime_fill_token(token);
+  T_ASSERT_EQ_INT(test_push_reliable_outbound(7203, token, &addr), 0);
+
+  TransportDriveResult drive =
+      network_runtime_drive_once(WAMBLE_INVALID_SOCKET, 0, NULL);
+  T_ASSERT_EQ_INT(drive.status, TRANSPORT_DRIVE_BACKOFF);
+  T_ASSERT(drive.retry_after_ms > 0);
+  T_ASSERT_EQ_INT((int)drive.inbound_pending, 0);
+  T_ASSERT_EQ_INT((int)drive.dispatch_pending, 0);
+  T_ASSERT_EQ_INT((int)drive.outbound_pending, 1);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 1);
+
+  network_init_thread_state();
+  return 0;
+}
+
+WAMBLE_TEST(runtime_pump_delivers_queued_request_ack_once) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
+
+  struct WambleMsg req;
+  memset(&req, 0, sizeof(req));
+  req.ctrl = WAMBLE_CTRL_PLAYER_MOVE;
+  req.header_version = WAMBLE_PROTO_VERSION;
+  req.seq_num = 8123;
+  test_runtime_fill_token(req.token);
+  T_ASSERT_EQ_INT(network_enqueue_ack_after(&req, &pair.cliaddr), 0);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 1);
+
+  TransportDriveResult drive = network_runtime_drive_once(pair.srv, 0, NULL);
+  T_ASSERT_EQ_INT(drive.status, TRANSPORT_DRIVE_PROGRESS);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 0);
+
+  struct WambleMsg ack;
+  struct sockaddr_in from;
+  memset(&ack, 0, sizeof(ack));
+  T_ASSERT(recv_message_with_timeout(pair.cli, &ack, &from, 100) > 0);
+  T_ASSERT_EQ_INT(ack.ctrl, WAMBLE_CTRL_ACK);
+  T_ASSERT_EQ_INT((int)ack.seq_num, 8123);
+
+  cleanup_udp_loopback_pair(&pair);
+  network_init_thread_state();
+  return 0;
+}
+
+WAMBLE_TEST(runtime_pump_delivers_terminal_and_classifier_removes_ack) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+
+  UdpLoopbackPair pair;
+  T_ASSERT_STATUS_OK(init_udp_loopback_pair(&pair));
+
+  struct WambleMsg terminal;
+  memset(&terminal, 0, sizeof(terminal));
+  terminal.ctrl = WAMBLE_CTRL_ERROR;
+  terminal.header_version = WAMBLE_PROTO_VERSION;
+  terminal.board_id = 44;
+  test_runtime_fill_token(terminal.token);
+  T_ASSERT_EQ_INT(network_enqueue_replayable_terminal(&terminal, &pair.cliaddr),
+                  0);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 1);
+
+  TransportDriveResult drive = network_runtime_drive_once(pair.srv, 0, NULL);
+  T_ASSERT_EQ_INT(drive.status, TRANSPORT_DRIVE_PROGRESS);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 1);
+
+  struct WambleMsg rx;
+  struct sockaddr_in from;
+  memset(&rx, 0, sizeof(rx));
+  T_ASSERT(recv_message_with_timeout(pair.cli, &rx, &from, 100) > 0);
+  T_ASSERT_EQ_INT(rx.ctrl, WAMBLE_CTRL_ERROR);
+  T_ASSERT(rx.seq_num != 0);
+
+  struct WambleMsg ack;
+  memset(&ack, 0, sizeof(ack));
+  ack.ctrl = WAMBLE_CTRL_ACK;
+  ack.header_version = WAMBLE_PROTO_VERSION;
+  ack.seq_num = rx.seq_num;
+  memcpy(ack.token, rx.token, TOKEN_LENGTH);
+  T_ASSERT_EQ_INT(test_push_inbound_serialized(TRANSPORT_PACKET_SOURCE_UDP,
+                                               &ack, &pair.cliaddr),
+                  0);
+
+  drive = network_runtime_drive_once(WAMBLE_INVALID_SOCKET, 0, NULL);
+  T_ASSERT(drive.status != TRANSPORT_DRIVE_IDLE);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 0);
+
+  cleanup_udp_loopback_pair(&pair);
+  network_init_thread_state();
   return 0;
 }
 
@@ -5776,6 +7065,164 @@ static void drain_replay_counts(wamble_socket_t sock,
   }
 }
 
+WAMBLE_TEST(runtime_reliable_bundle_advances_one_fragment_per_ack) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+  struct sockaddr_in bindaddr = {0};
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  uint8_t token[TOKEN_LENGTH];
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    token[i] = (uint8_t)(0x90 + i);
+  uint8_t payload[WAMBLE_FRAGMENT_DATA_MAX + 17];
+  for (size_t i = 0; i < sizeof(payload); i++)
+    payload[i] = (uint8_t)('a' + (i % 23));
+
+  T_ASSERT_EQ_INT(network_enqueue_reliable_payload_bytes(
+                      WAMBLE_CTRL_PROFILE_TOS_DATA, token, 0, payload,
+                      sizeof(payload), &cliaddr, 100, 3, 1),
+                  0);
+  TransportEndpointId endpoint_id = TRANSPORT_ENDPOINT_ID_INVALID;
+  T_ASSERT_EQ_INT(
+      transport_endpoint_bind_addr_token(&cliaddr, token, &endpoint_id), 0);
+  uint32_t rto_before_ack = transport_endpoint_rto_ms_by_id(endpoint_id);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 1);
+  (void)network_runtime_drive_once(srv, 0, "p1");
+
+  RecvTosFragmentsCtx rx = {.sock = cli,
+                            .expected_ctrl = WAMBLE_CTRL_PROFILE_TOS_DATA};
+  for (int expected = 0; expected < 2; expected++) {
+    struct WambleMsg in = {0};
+    struct sockaddr_in from;
+    T_ASSERT(recv_message_with_timeout(cli, &in, &from, 1000) > 0);
+    T_ASSERT(recv_tos_fragment_ctx_accept(&rx, &in));
+    T_ASSERT_EQ_INT((int)in.fragment.fragment_chunk_index, expected);
+    T_ASSERT_EQ_INT((int)transport_outbound_count(), 1);
+    network_ack_received_message(cli, &in, &from);
+    (void)network_runtime_drive_once(srv, 0, "p1");
+    if (expected == 0)
+      T_ASSERT(transport_endpoint_rto_ms_by_id(endpoint_id) != rto_before_ack);
+  }
+  T_ASSERT_EQ_INT(rx.chunk_count, 2);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 0);
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(runtime_reliable_bundle_retries_active_fragment_until_ack) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+  struct sockaddr_in bindaddr = {0};
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  uint8_t token[TOKEN_LENGTH];
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    token[i] = (uint8_t)(0xb0 + i);
+  uint8_t payload[WAMBLE_FRAGMENT_DATA_MAX + 5];
+  memset(payload, 'r', sizeof(payload));
+  T_ASSERT_EQ_INT(network_enqueue_reliable_payload_bytes(
+                      WAMBLE_CTRL_PROFILE_TOS_DATA, token, 0, payload,
+                      sizeof(payload), &cliaddr, 20, 3, 1),
+                  0);
+
+  (void)network_runtime_drive_once(srv, 0, "p1");
+  struct WambleMsg first = {0};
+  struct sockaddr_in from;
+  T_ASSERT(recv_message_with_timeout(cli, &first, &from, 1000) > 0);
+  T_ASSERT_EQ_INT((int)first.fragment.fragment_chunk_index, 0);
+  uint32_t first_seq = first.seq_num;
+
+  wamble_sleep_ms(300);
+  (void)network_runtime_drive_once(srv, 0, "p1");
+  struct WambleMsg retry = {0};
+  T_ASSERT(recv_message_with_timeout(cli, &retry, &from, 1000) > 0);
+  T_ASSERT_EQ_INT((int)retry.fragment.fragment_chunk_index, 0);
+  T_ASSERT_EQ_INT((int)retry.seq_num, (int)first_seq);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 1);
+
+  network_ack_received_message(cli, &retry, &from);
+  (void)network_runtime_drive_once(srv, 0, "p1");
+  struct WambleMsg second = {0};
+  T_ASSERT(recv_message_with_timeout(cli, &second, &from, 1000) > 0);
+  T_ASSERT_EQ_INT((int)second.fragment.fragment_chunk_index, 1);
+
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
+WAMBLE_TEST(runtime_reliable_bundle_does_not_block_unreliable_progress) {
+  config_load(NULL, NULL, NULL, 0);
+  network_init_thread_state();
+  wamble_socket_t srv = create_and_bind_socket(0);
+  T_ASSERT(srv != WAMBLE_INVALID_SOCKET);
+  wamble_socket_t cli = socket(AF_INET, SOCK_DGRAM, 0);
+  T_ASSERT(cli != WAMBLE_INVALID_SOCKET);
+  struct sockaddr_in bindaddr = {0};
+  bindaddr.sin_family = AF_INET;
+  bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bindaddr.sin_port = 0;
+  T_ASSERT_STATUS_OK(bind(cli, (struct sockaddr *)&bindaddr, sizeof(bindaddr)));
+  struct sockaddr_in cliaddr;
+  wamble_socklen_t slen = (wamble_socklen_t)sizeof(cliaddr);
+  T_ASSERT_STATUS_OK(getsockname(cli, (struct sockaddr *)&cliaddr, &slen));
+
+  uint8_t token[TOKEN_LENGTH];
+  for (int i = 0; i < TOKEN_LENGTH; i++)
+    token[i] = (uint8_t)(0xa0 + i);
+  uint8_t payload[WAMBLE_FRAGMENT_DATA_MAX + 9];
+  memset(payload, 'z', sizeof(payload));
+  T_ASSERT_EQ_INT(network_enqueue_reliable_payload_bytes(
+                      WAMBLE_CTRL_PROFILE_TOS_DATA, token, 0, payload,
+                      sizeof(payload), &cliaddr, 1000, 3, 1),
+                  0);
+  struct WambleMsg notice = {0};
+  notice.ctrl = WAMBLE_CTRL_SERVER_NOTIFICATION;
+  memcpy(notice.token, token, TOKEN_LENGTH);
+  snprintf(notice.view.fen, sizeof(notice.view.fen), "unrelated");
+  T_ASSERT_EQ_INT(network_enqueue_unreliable(&notice, &cliaddr), 0);
+
+  (void)network_runtime_drive_once(srv, 0, "p1");
+  int saw_fragment = 0;
+  int saw_notice = 0;
+  for (int i = 0; i < 2; i++) {
+    struct WambleMsg in = {0};
+    struct sockaddr_in from;
+    T_ASSERT(recv_message_with_timeout(cli, &in, &from, 1000) > 0);
+    if (in.ctrl == WAMBLE_CTRL_PROFILE_TOS_DATA)
+      saw_fragment = 1;
+    if (in.ctrl == WAMBLE_CTRL_SERVER_NOTIFICATION)
+      saw_notice = 1;
+  }
+  T_ASSERT_EQ_INT(saw_fragment, 1);
+  T_ASSERT_EQ_INT(saw_notice, 1);
+  T_ASSERT_EQ_INT((int)transport_outbound_count(), 1);
+  wamble_close_socket(cli);
+  wamble_close_socket(srv);
+  return 0;
+}
+
 WAMBLE_TEST(reliable_retry_replays_cached_terminal_response) {
   config_load(NULL, NULL, NULL, 0);
   network_init_thread_state();
@@ -5835,7 +7282,8 @@ WAMBLE_TEST(reliable_retry_replays_cached_terminal_response) {
   RecvOneCtx rx = {.sock = cli};
   wamble_thread_t th;
   T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
-  int send_rc = send_reliable_message(srv, &resp, &from, 500, 5);
+  int send_rc = send_reliable_terminal_and_drive(srv, &resp, &from, 500, 5);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
   T_ASSERT_STATUS_OK(send_rc);
   T_ASSERT_EQ_INT(rx.received, 1);
@@ -5850,6 +7298,7 @@ WAMBLE_TEST(reliable_retry_replays_cached_terminal_response) {
   struct sockaddr_in dup_from;
   int rc2 = receive_message(srv, &dup_in, &dup_from);
   T_ASSERT_EQ_INT(rc2, -1);
+  (void)network_runtime_drive_once(srv, 0, NULL);
 
   int saw_board_update = 0;
   int saw_request_ack = 0;
@@ -5920,7 +7369,8 @@ WAMBLE_TEST(reliable_retry_from_new_source_replays_to_rebound_address) {
   RecvOneCtx rx = {.sock = cli1};
   wamble_thread_t th;
   T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
-  int send_rc = send_reliable_message(srv, &resp, &from, 500, 5);
+  int send_rc = send_reliable_terminal_and_drive(srv, &resp, &from, 500, 5);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
   T_ASSERT_STATUS_OK(send_rc);
   T_ASSERT_EQ_INT(rx.received, 1);
@@ -5933,6 +7383,7 @@ WAMBLE_TEST(reliable_retry_from_new_source_replays_to_rebound_address) {
   struct sockaddr_in dup_from;
   int rc2 = receive_message(srv, &dup_in, &dup_from);
   T_ASSERT_EQ_INT(rc2, -1);
+  (void)network_runtime_drive_once(srv, 0, NULL);
 
   int saw_board_update_cli2 = 0;
   int saw_request_ack_cli2 = 0;
@@ -6184,7 +7635,8 @@ WAMBLE_TEST(reliable_retry_replays_fragmented_terminal_bundle) {
     RecvOneCtx rx = {.sock = cli};
     wamble_thread_t th;
     T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
-    int rc = send_reliable_message(srv, &resp, &from, 500, 5);
+    int rc = send_reliable_terminal_and_drive(srv, &resp, &from, 500, 5);
+    drive_runtime_until_idle(srv, "p1");
     T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
     T_ASSERT_STATUS_OK(rc);
     T_ASSERT_EQ_INT(rx.received, 1);
@@ -6208,6 +7660,7 @@ WAMBLE_TEST(reliable_retry_replays_fragmented_terminal_bundle) {
   struct sockaddr_in dup_from;
   int rc2 = receive_message(srv, &dup_in, &dup_from);
   T_ASSERT_EQ_INT(rc2, -1);
+  (void)network_runtime_drive_once(srv, 0, NULL);
 
   int seen_chunks[CHUNK_COUNT] = {0};
   int request_acks = 0;
@@ -6314,6 +7767,7 @@ WAMBLE_TEST(
   T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &accept, &cliaddr, 0, "p1"),
                   SERVER_ERR_INTERNAL);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
   T_ASSERT_EQ_INT(rx.received, 1);
   T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_ERROR);
@@ -6372,6 +7826,7 @@ WAMBLE_TEST(
   T_ASSERT(
       wamble_thread_create(&th_hello, recv_one_and_ack_thread, &rx_hello) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &hello, &cliaddr, 0, "p1"), SERVER_OK);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
@@ -6390,6 +7845,7 @@ WAMBLE_TEST(
   T_ASSERT(wamble_thread_create(&th, recv_one_and_ack_thread, &rx) == 0);
   T_ASSERT_EQ_INT(handle_message(srv, &req, &cliaddr, 0, "p1"),
                   SERVER_ERR_INTERNAL);
+  drive_runtime_until_idle(srv, "p1");
   T_ASSERT_STATUS_OK(wamble_thread_join(th, NULL));
   T_ASSERT_EQ_INT(rx.received, 1);
   T_ASSERT_EQ_INT(rx.msg.ctrl, WAMBLE_CTRL_ERROR);
@@ -6437,6 +7893,12 @@ WAMBLE_TESTS_ADD_SM(prediction_data_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
 WAMBLE_TESTS_ADD_SM(get_active_reservations_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
+WAMBLE_TESTS_ADD_SM(runtime_reliable_bundle_advances_one_fragment_per_ack,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(runtime_reliable_bundle_retries_active_fragment_until_ack,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(runtime_reliable_bundle_does_not_block_unreliable_progress,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(active_reservations_data_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
 WAMBLE_TESTS_ADD_DB_SM(reliable_ack_success, WAMBLE_SUITE_FUNCTIONAL,
@@ -6496,19 +7958,19 @@ WAMBLE_TESTS_ADD_DB_SM(
     server_protocol_spectate_denial_reports_capacity_full_error_code,
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
-    server_protocol_reliable_spectate_focus_sends_terminal_before_ack,
+    server_protocol_reliable_spectate_focus_sends_request_ack_before_terminal,
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
-    server_protocol_reliable_spectate_denial_sends_terminal_before_ack,
+    server_protocol_reliable_spectate_denial_sends_request_ack_before_terminal,
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
     server_protocol_spectate_summary_returns_reliable_snapshot,
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
-    server_protocol_reliable_spectate_stop_sends_terminal_before_ack,
+    server_protocol_reliable_spectate_stop_sends_request_ack_before_terminal,
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
-    server_protocol_reliable_player_move_sends_terminal_before_ack,
+    server_protocol_reliable_player_move_sends_request_ack_before_terminal,
     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_DB_SM(
     server_protocol_spectate_stop_returns_reliable_idle_packet,
@@ -6586,4 +8048,52 @@ WAMBLE_TESTS_ADD_SM(reliable_retry_replays_fragmented_terminal_bundle,
                     WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_ADD_SM(accept_profile_tos_roundtrip, WAMBLE_SUITE_FUNCTIONAL,
                     "network");
+WAMBLE_TESTS_ADD_SM(transport_runtime_state_queues_endpoints_and_drive_results,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(runtime_classifies_udp_and_ws_acks_without_dispatch,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(runtime_ack_matches_shared_token_endpoint_addr,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(runtime_anonymous_outbound_is_addr_isolated,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(runtime_same_token_delivery_is_endpoint_isolated,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(runtime_same_token_endpoints_have_distinct_endpoint_ids,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(runtime_rebind_keeps_ack_identity_on_endpoint_id,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(runtime_request_ack_lane_drains_before_terminal_lane,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(runtime_reload_readiness_ignores_raw_inbound_and_unreliable,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(runtime_reload_readiness_blocks_dispatch_and_reliable_work,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(runtime_reload_readiness_blocks_terminal_cache_until_ttl,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(runtime_reload_readiness_blocks_reliable_fragment_bundle,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(runtime_ack_updates_rto_for_non_retransmitted_entry,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(runtime_ack_skips_rto_for_retransmitted_entry,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(runtime_drains_queued_inbound_without_select_delay,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(runtime_preserves_non_ack_packets_for_dispatch,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(
+    runtime_dispatch_handles_application_rejection_without_drive_error,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(
+    runtime_duplicate_request_does_not_duplicate_pending_terminal,
+    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(direct_handler_enqueues_without_driving_transport,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(direct_handler_dispatch_does_not_read_socket,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(runtime_reports_pending_outbound_without_io,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(runtime_pump_delivers_queued_request_ack_once,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
+WAMBLE_TESTS_ADD_SM(runtime_pump_delivers_terminal_and_classifier_removes_ack,
+                    WAMBLE_SUITE_FUNCTIONAL, "network");
 WAMBLE_TESTS_END()

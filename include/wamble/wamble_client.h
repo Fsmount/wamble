@@ -13,6 +13,30 @@ int decode_token_from_url(const char *url_string, uint8_t *token_buffer);
 #define WAMBLE_CLIENT_DEFAULT_TIMEOUT_MS 500
 #define WAMBLE_CLIENT_DEFAULT_MAX_RETRIES 4
 
+typedef enum {
+  WAMBLE_FRAGMENT_INTEGRITY_UNKNOWN = 0,
+  WAMBLE_FRAGMENT_INTEGRITY_OK = 1,
+  WAMBLE_FRAGMENT_INTEGRITY_MISMATCH = 2,
+} WambleFragmentIntegrity;
+
+typedef enum {
+  WAMBLE_FRAGMENT_REASSEMBLY_ERR_INVALID = -2,
+  WAMBLE_FRAGMENT_REASSEMBLY_ERR_NOMEM = -1,
+  WAMBLE_FRAGMENT_REASSEMBLY_IGNORED = 0,
+  WAMBLE_FRAGMENT_REASSEMBLY_IN_PROGRESS = 1,
+  WAMBLE_FRAGMENT_REASSEMBLY_COMPLETE = 2,
+  WAMBLE_FRAGMENT_REASSEMBLY_COMPLETE_BAD_HASH = 3,
+} WambleFragmentReassemblyResult;
+
+/* Public helper for clients decoding the documented fragment wire envelope.
+ * Initialize zeroed or uninitialized storage once with init(), reuse with
+ * reset(), and release hidden storage with free(). Calling init() again on an
+ * initialized object without free() first is invalid.
+ */
+typedef struct WambleFragmentReassembly {
+  void *impl;
+} WambleFragmentReassembly;
+
 #define WAMBLE_CLIENT_MNEMONIC_WORDLIST_COUNT 2048
 #define WAMBLE_CLIENT_MNEMONIC_WORD_COUNT 12
 #define WAMBLE_CLIENT_MNEMONIC_WORD_MIN 2
@@ -195,6 +219,19 @@ WambleClientStatus wamble_client_connect_udp(wamble_client_t *c,
                                              const char *host, uint16_t port);
 WambleClientStatus wamble_client_connect_web(wamble_client_t *c,
                                              const char *url);
+void wamble_fragment_reassembly_init(WambleFragmentReassembly *reassembly);
+void wamble_fragment_reassembly_reset(WambleFragmentReassembly *reassembly);
+void wamble_fragment_reassembly_free(WambleFragmentReassembly *reassembly);
+WambleFragmentIntegrity wamble_fragment_reassembly_integrity(
+    const WambleFragmentReassembly *reassembly);
+uint32_t wamble_fragment_reassembly_transfer_id(
+    const WambleFragmentReassembly *reassembly);
+const uint8_t *
+wamble_fragment_reassembly_data(const WambleFragmentReassembly *reassembly,
+                                size_t *out_len);
+WambleFragmentReassemblyResult
+wamble_fragment_reassembly_push(WambleFragmentReassembly *reassembly,
+                                const struct WambleMsg *msg);
 int wamble_client_connected(const wamble_client_t *c);
 int wamble_client_closed(const wamble_client_t *c);
 WambleClientStatus wamble_client_send(wamble_client_t *c,

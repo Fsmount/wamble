@@ -159,6 +159,15 @@ Fragment Payload Envelope (version 1)
 - Chunk payload max is 1154 bytes (`WAMBLE_MAX_PAYLOAD - 46`).
 - The chunk byte stream is the exact original payload byte stream (including
   any extension trailer bytes if present).
+- Reliable delivery treats all chunks for one response as one ordered bundle:
+  one active chunk is in flight at a time, later chunks are sent only after the
+  current chunk is acknowledged, and retry/drop policy is applied per chunk.
+- Replayable terminal fragmented responses are stored as the exact fragment
+  packet sequence that was first accepted for delivery, so retries replay the
+  same transfer id, hash, chunk count, and chunk bytes.
+- Clients must reassemble fragmented `PROFILES_LIST`, `PROFILE_TOS_DATA`, and
+  `ACTIVE_RESERVATIONS_DATA` before applying directory/profile state; single
+  fragment previews are only progress observations and are not authoritative.
 
 Control Codes
 - `0x01` CLIENT_HELLO (client to server): Initial connection request.
@@ -172,9 +181,9 @@ Control Codes
   - Payload: `uint8 uci_len; char uci[uci_len]` (max 6 bytes).
   - Terminal result: reliable `BOARD_UPDATE` for the player's next assigned
     board on success, or a reliable `ERROR` describing the rejection.
-  - Reliable-request ordering: the terminal `BOARD_UPDATE` or `ERROR` is sent
-    before the request's wire-level `ACK`. On retry within the terminal-cache
-    TTL, the cached terminal packet is replayed before the request `ACK`.
+  - The request's wire-level `ACK` is sent before the terminal `BOARD_UPDATE`
+    or `ERROR`. On retry within the terminal-cache TTL, the request `ACK` is
+    resent before any cached terminal replay.
 - `0x04` BOARD_UPDATE (server to client): Board state has changed.
   - Payload: `char fen[]`.
   - `flags`: server sets `0x01` when the assigned board is Chess960 *and*
@@ -241,7 +250,7 @@ Control Codes
   - Server discards spectator and player state for the token; no terminal
     response packet is sent.
   - Reliable-request ordering: the handler completes its work before the
-    request's wire-level `ACK` is sent. On retry the duplicate is detected
+    request's wire-level `ACK` is enqueued. On retry the duplicate is detected
     against the original request and only the request `ACK` is replayed (the
     work is not performed twice).
 - `0x0B` SPECTATE_GAME (client to server): Request to watch a game.
@@ -264,13 +273,12 @@ Control Codes
       `SPECTATE_UPDATE` snapshot with `spectate.state=focus` for that board.
       After that, the server pushes periodic mostly-unreliable
       `SPECTATE_UPDATE` packets for that board at `spectate-focus-hz`.
-  - Reliable-request ordering: the terminal `SPECTATE_UPDATE` or denial
-    `ERROR` is sent before the request's wire-level `ACK`.
+  - The request's wire-level `ACK` is sent before the terminal
+    `SPECTATE_UPDATE` or denial `ERROR`.
 - `0x16` SPECTATE_STOP (client to server): Stop spectating.
   - Payload: empty.
   - Terminal result: reliable `SPECTATE_UPDATE` with `spectate.state=idle`.
-  - Reliable-request ordering: the idle `SPECTATE_UPDATE` is sent before the
-    request's wire-level `ACK`.
+  - The request's wire-level `ACK` is sent before the idle `SPECTATE_UPDATE`.
 - `0x0C` SPECTATE_UPDATE (server to client): Board update for spectators.
   - Header: `board_id` identifies the board for this update (authoritative).
   - Payload: `char fen[]`.
@@ -313,9 +321,9 @@ Control Codes
     record is discarded (which abandons any held board reservation to its
     timer). No terminal response packet is sent beyond the request `ACK`.
   - Reliable-request ordering: the handler completes its work before the
-    request's wire-level `ACK` is sent. On retry the duplicate is detected
-    against the original request and only the request `ACK` is replayed
-    from the terminal cache; the discard is not re-run.
+    request's wire-level `ACK` is enqueued. On retry the duplicate is detected
+    against the original request and only the request `ACK` is replayed;
+    the discard is not re-run.
 - `0x10` LOGIN_SUCCESS (server to client): Successful login.
   - Payload: empty.
   - May include extension fields: `session.caps`, `prediction.source`,
@@ -447,20 +455,30 @@ Control Codes
 Reliability
 - Reliable messages are sent with a sequence number (`seq_num`).
 - Receiver must respond with an `ACK` packet with the same `seq_num`.
-- Sender retries if `ACK` is not received within `timeout-ms`.
-  - Retries up to `max-retries` times, with exponential backoff.
+- Sender retries if `ACK` is not received within the current retry timeout.
+  - The first send uses `timeout-ms` as the conservative startup RTO before
+    ACK latency samples exist.
+  - Later retry deadlines use endpoint/session ACK-latency estimates, clamped
+    by `rto-cap-ms`, and retry up to `max-retries` times.
+- Runtime packet classification intercepts inbound ACK packets before normal
+  control dispatch. ACK packets do not enter request handlers.
+- Transport delivery state is keyed by (`runtime_endpoint_id`, `seq_num`).
+  Tokens are used to bind or rebind sessions/endpoints for request traffic, but
+  ACK removal does not use a token/address pair as the authoritative outbox
+  identity and ACK packets do not perform token-based rebinding. This keeps
+  anonymous endpoints and same-token endpoints isolated when their sequence
+  numbers overlap.
 - Duplicate detection: A sliding window (`W=1024`) of received sequence numbers is
   maintained per session to drop duplicate or old packets.
 - Terminal replay: when a reliable request is served successfully, the server
   caches the serialized terminal response packet keyed by the request's
   (token, seq_num). If the same reliable request arrives again (client retry,
   including retries that arrive after NAT rebind from a new source address),
-  the server replays the cached terminal packet to the current source and
-  resends the request ACK without re-dispatching the handler. The session's
+  the server resends the request ACK and replays the cached terminal packet to
+  the current source without re-dispatching the handler. The session's
   stored transport target is updated to the retry's source address in the same
   step, so the reliable replay goes to the new address. Terminal replay covers
-  single-packet reliable responses; fragmented responses are regenerated on
-  retry.
+  both single-packet reliable responses and fragmented terminal bundles.
 
 Unreliable Messages
 - Marked by setting the high bit of the `flags` field (`0x80`).
@@ -482,7 +500,11 @@ Spectator Policy
   by an internal "attractiveness" score aligned with board assignment logic.
 
 Sessions
-- A session is identified by a `token` and the client's address:port.
+Protocol session identity (`token`, request sequence, terminal replay cache) is
+separate from transport endpoint identity (runtime endpoint id and current
+delivery address). Multiple endpoint ids may carry the same token, and anonymous
+endpoints are address-scoped.
+
 - Session tables grow on demand per listener and expire inactive entries using
   `session-timeout`.
 - Request throughput can be limited per token using
@@ -491,10 +513,21 @@ Sessions
 - NAT rebinding: The address:port for a session can be updated if a valid
   packet arrives with the same token and a valid `seq_num`. A reliable retry
   that arrives from a new source address is matched to the existing session by
-  token; the transport target is rebound to the new address and the cached
-  terminal response (if any) is replayed to that address together with the
-  request ACK.
+  token; the endpoint record is rebound to the new address without rewriting
+  protocol/session identity, and the cached request ACK is resent to that
+  address together with any cached terminal response replay. ACKs from the old
+  endpoint id cannot remove packets queued for a different rebound endpoint.
 - Idle sessions are removed after `session-timeout` seconds.
+
+Delivery and Hot Reload
+- Server protocol explicitly chooses among request ACKs, reliable terminal
+  responses, reliable server-push snapshots, fragmented bundles, and
+  unreliable transient notices.
+- Hot reload preserves protocol guarantees by waiting until dispatch work,
+  request ACKs, reliable terminal/bundle entries, and terminal replay cache
+  entries have drained. Runtime-only transport scheduling machinery is not part
+  of the saved state; see docs/runtime_and_state.txt for the complete reload
+  boundary.
 
 Profiles
 - The server runs one UDP listener thread per advertised profile.
@@ -538,7 +571,20 @@ WebSocket Bridge
   - Gateway optimization: for reliable server->client packets, the bridge
     emits protocol ACKs locally after successful websocket frame write.
   - The websocket layer is strictly a transport adapter over the existing
-    protocol.
+    protocol. During hot reload, websocket connections may close and reconnect;
+    already-linked sessions continue by sending the next normal packet with
+    their existing token. Endpoint/route binding is reconstructed below the
+    protocol layer.
   - The adapter creates a loopback UDP socket per websocket client; server-side
     session address/port therefore reflects the local bridge socket (not the
     browser's remote IP/port).
+- Login challenges are protocol handshake state. Current hot-reload readiness
+  blocks while fresh challenges are pending rather than serializing/adopting
+  them; already-linked token-bearing reconnects do not require a new challenge.
+
+Delivery Ownership Boundary
+- New handlers must choose delivery from documented protocol meaning, including
+  terminal replayable response, reliable state sync/push, transient unreliable
+  push, request ACK companion, and token fanout vs single endpoint.
+- Server protocol must not drive transport progress or inspect/mutate transport
+  queues, websocket routes, retry state, or endpoint maps directly.

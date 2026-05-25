@@ -1328,35 +1328,96 @@ int decode_token_from_url(const char *url_string, uint8_t *token_buffer) {
 void crypto_blake2b(uint8_t *hash, size_t hash_size, const uint8_t *msg,
                     size_t msg_size);
 
+typedef struct WambleFragmentReassemblyState {
+  uint8_t active;
+  uint8_t ctrl;
+  uint8_t hash_algo;
+  uint16_t chunk_count;
+  uint16_t received_chunks;
+  uint32_t total_len;
+  uint32_t transfer_id;
+  uint8_t expected_hash[WAMBLE_FRAGMENT_HASH_LENGTH];
+  WambleFragmentIntegrity integrity;
+  uint8_t *data;
+  size_t data_capacity;
+  uint8_t *chunk_seen;
+  size_t chunk_seen_capacity;
+} WambleFragmentReassemblyState;
+
+static WambleFragmentReassemblyState *
+reassembly_state(const WambleFragmentReassembly *reassembly) {
+  return reassembly ? (WambleFragmentReassemblyState *)reassembly->impl : NULL;
+}
+
+static WambleFragmentReassemblyState *
+reassembly_state_ensure(WambleFragmentReassembly *reassembly) {
+  if (!reassembly)
+    return NULL;
+  WambleFragmentReassemblyState *state = reassembly_state(reassembly);
+  if (state)
+    return state;
+  state = (WambleFragmentReassemblyState *)calloc(1, sizeof(*state));
+  if (!state)
+    return NULL;
+  state->integrity = WAMBLE_FRAGMENT_INTEGRITY_UNKNOWN;
+  reassembly->impl = state;
+  return state;
+}
+
 void wamble_fragment_reassembly_init(WambleFragmentReassembly *reassembly) {
   if (!reassembly)
     return;
   memset(reassembly, 0, sizeof(*reassembly));
-  reassembly->integrity = WAMBLE_FRAGMENT_INTEGRITY_UNKNOWN;
 }
 
 void wamble_fragment_reassembly_reset(WambleFragmentReassembly *reassembly) {
-  if (!reassembly)
+  WambleFragmentReassemblyState *state = reassembly_state(reassembly);
+  if (!state)
     return;
-  reassembly->active = 0;
-  reassembly->ctrl = 0;
-  reassembly->hash_algo = 0;
-  reassembly->chunk_count = 0;
-  reassembly->received_chunks = 0;
-  reassembly->total_len = 0;
-  reassembly->transfer_id = 0;
-  memset(reassembly->expected_hash, 0, WAMBLE_FRAGMENT_HASH_LENGTH);
-  reassembly->integrity = WAMBLE_FRAGMENT_INTEGRITY_UNKNOWN;
-  if (reassembly->chunk_seen && reassembly->chunk_seen_capacity > 0)
-    memset(reassembly->chunk_seen, 0, reassembly->chunk_seen_capacity);
+  state->active = 0;
+  state->ctrl = 0;
+  state->hash_algo = 0;
+  state->chunk_count = 0;
+  state->received_chunks = 0;
+  state->total_len = 0;
+  state->transfer_id = 0;
+  memset(state->expected_hash, 0, WAMBLE_FRAGMENT_HASH_LENGTH);
+  state->integrity = WAMBLE_FRAGMENT_INTEGRITY_UNKNOWN;
+  if (state->chunk_seen && state->chunk_seen_capacity > 0)
+    memset(state->chunk_seen, 0, state->chunk_seen_capacity);
 }
 
 void wamble_fragment_reassembly_free(WambleFragmentReassembly *reassembly) {
+  WambleFragmentReassemblyState *state = reassembly_state(reassembly);
   if (!reassembly)
     return;
-  free(reassembly->data);
-  free(reassembly->chunk_seen);
+  if (state) {
+    free(state->data);
+    free(state->chunk_seen);
+    free(state);
+  }
   wamble_fragment_reassembly_init(reassembly);
+}
+
+WambleFragmentIntegrity wamble_fragment_reassembly_integrity(
+    const WambleFragmentReassembly *reassembly) {
+  WambleFragmentReassemblyState *state = reassembly_state(reassembly);
+  return state ? state->integrity : WAMBLE_FRAGMENT_INTEGRITY_UNKNOWN;
+}
+
+uint32_t wamble_fragment_reassembly_transfer_id(
+    const WambleFragmentReassembly *reassembly) {
+  WambleFragmentReassemblyState *state = reassembly_state(reassembly);
+  return state ? state->transfer_id : 0;
+}
+
+const uint8_t *
+wamble_fragment_reassembly_data(const WambleFragmentReassembly *reassembly,
+                                size_t *out_len) {
+  WambleFragmentReassemblyState *state = reassembly_state(reassembly);
+  if (out_len)
+    *out_len = state ? (size_t)state->total_len : 0;
+  return state ? state->data : NULL;
 }
 
 static int reassembly_ensure_capacity(uint8_t **buf, size_t *capacity,
@@ -1411,33 +1472,33 @@ static int reassembly_fragment_shape_valid(const struct WambleMsg *msg,
   return 1;
 }
 
-static int reassembly_begin_transfer(WambleFragmentReassembly *reassembly,
+static int reassembly_begin_transfer(WambleFragmentReassemblyState *state,
                                      const struct WambleMsg *msg) {
-  if (!reassembly || !msg)
+  if (!state || !msg)
     return -1;
   size_t total_len = (size_t)msg->fragment.fragment_total_len;
   size_t chunk_count = (size_t)msg->fragment.fragment_chunk_count;
-  if (reassembly_ensure_capacity(&reassembly->data, &reassembly->data_capacity,
-                                 total_len, 0) != 0) {
+  if (reassembly_ensure_capacity(&state->data, &state->data_capacity, total_len,
+                                 0) != 0) {
     return -1;
   }
-  if (reassembly_ensure_capacity(&reassembly->chunk_seen,
-                                 &reassembly->chunk_seen_capacity, chunk_count,
+  if (reassembly_ensure_capacity(&state->chunk_seen,
+                                 &state->chunk_seen_capacity, chunk_count,
                                  1) != 0) {
     return -1;
   }
 
-  memset(reassembly->chunk_seen, 0, chunk_count);
-  reassembly->active = 1;
-  reassembly->ctrl = msg->ctrl;
-  reassembly->hash_algo = msg->fragment.fragment_hash_algo;
-  reassembly->chunk_count = msg->fragment.fragment_chunk_count;
-  reassembly->received_chunks = 0;
-  reassembly->total_len = msg->fragment.fragment_total_len;
-  reassembly->transfer_id = msg->fragment.fragment_transfer_id;
-  memcpy(reassembly->expected_hash, msg->fragment.fragment_hash,
+  memset(state->chunk_seen, 0, chunk_count);
+  state->active = 1;
+  state->ctrl = msg->ctrl;
+  state->hash_algo = msg->fragment.fragment_hash_algo;
+  state->chunk_count = msg->fragment.fragment_chunk_count;
+  state->received_chunks = 0;
+  state->total_len = msg->fragment.fragment_total_len;
+  state->transfer_id = msg->fragment.fragment_transfer_id;
+  memcpy(state->expected_hash, msg->fragment.fragment_hash,
          WAMBLE_FRAGMENT_HASH_LENGTH);
-  reassembly->integrity = WAMBLE_FRAGMENT_INTEGRITY_UNKNOWN;
+  state->integrity = WAMBLE_FRAGMENT_INTEGRITY_UNKNOWN;
   return 0;
 }
 
@@ -1468,54 +1529,57 @@ wamble_fragment_reassembly_push(WambleFragmentReassembly *reassembly,
   if (!reassembly_fragment_shape_valid(msg, &offset, &len))
     return WAMBLE_FRAGMENT_REASSEMBLY_ERR_INVALID;
 
+  WambleFragmentReassemblyState *state = reassembly_state_ensure(reassembly);
+  if (!state)
+    return WAMBLE_FRAGMENT_REASSEMBLY_ERR_NOMEM;
+
   int same_transfer =
-      reassembly->active && reassembly->ctrl == msg->ctrl &&
-      reassembly->hash_algo == msg->fragment.fragment_hash_algo &&
-      reassembly->chunk_count == msg->fragment.fragment_chunk_count &&
-      reassembly->total_len == msg->fragment.fragment_total_len &&
-      reassembly->transfer_id == msg->fragment.fragment_transfer_id &&
-      memcmp(reassembly->expected_hash, msg->fragment.fragment_hash,
+      state->active && state->ctrl == msg->ctrl &&
+      state->hash_algo == msg->fragment.fragment_hash_algo &&
+      state->chunk_count == msg->fragment.fragment_chunk_count &&
+      state->total_len == msg->fragment.fragment_total_len &&
+      state->transfer_id == msg->fragment.fragment_transfer_id &&
+      memcmp(state->expected_hash, msg->fragment.fragment_hash,
              WAMBLE_FRAGMENT_HASH_LENGTH) == 0;
   if (!same_transfer) {
-    if (reassembly_begin_transfer(reassembly, msg) != 0)
+    if (reassembly_begin_transfer(state, msg) != 0)
       return WAMBLE_FRAGMENT_REASSEMBLY_ERR_NOMEM;
   }
 
   uint16_t idx = msg->fragment.fragment_chunk_index;
-  if (reassembly->chunk_seen[idx]) {
-    if (len && memcmp(reassembly->data + offset, msg->fragment.fragment_data,
-                      len) != 0) {
+  if (state->chunk_seen[idx]) {
+    if (len &&
+        memcmp(state->data + offset, msg->fragment.fragment_data, len) != 0) {
       return WAMBLE_FRAGMENT_REASSEMBLY_ERR_INVALID;
     }
   } else {
     if (len)
-      memcpy(reassembly->data + offset, msg->fragment.fragment_data, len);
-    reassembly->chunk_seen[idx] = 1;
-    reassembly->received_chunks++;
+      memcpy(state->data + offset, msg->fragment.fragment_data, len);
+    state->chunk_seen[idx] = 1;
+    state->received_chunks++;
   }
 
-  if (reassembly->received_chunks < reassembly->chunk_count)
+  if (state->received_chunks < state->chunk_count)
     return WAMBLE_FRAGMENT_REASSEMBLY_IN_PROGRESS;
 
   uint8_t computed_hash[WAMBLE_FRAGMENT_HASH_LENGTH] = {0};
   static const uint8_t empty_payload[1] = {0};
-  const uint8_t *hash_input =
-      reassembly->data ? reassembly->data : empty_payload;
+  const uint8_t *hash_input = state->data ? state->data : empty_payload;
   crypto_blake2b(computed_hash, WAMBLE_FRAGMENT_HASH_LENGTH, hash_input,
-                 (size_t)reassembly->total_len);
-  if (memcmp(computed_hash, reassembly->expected_hash,
+                 (size_t)state->total_len);
+  if (memcmp(computed_hash, state->expected_hash,
              WAMBLE_FRAGMENT_HASH_LENGTH) == 0) {
-    reassembly->integrity = WAMBLE_FRAGMENT_INTEGRITY_OK;
-    if (reassembly->ctrl == WAMBLE_CTRL_PROFILE_TOS_DATA) {
+    state->integrity = WAMBLE_FRAGMENT_INTEGRITY_OK;
+    if (state->ctrl == WAMBLE_CTRL_PROFILE_TOS_DATA) {
       size_t base_len = 0;
-      if (reassembly_payload_base_len(
-              reassembly->data, (size_t)reassembly->total_len, &base_len) &&
+      if (reassembly_payload_base_len(state->data, (size_t)state->total_len,
+                                      &base_len) &&
           base_len <= UINT32_MAX) {
-        reassembly->total_len = (uint32_t)base_len;
+        state->total_len = (uint32_t)base_len;
       }
     }
     return WAMBLE_FRAGMENT_REASSEMBLY_COMPLETE;
   }
-  reassembly->integrity = WAMBLE_FRAGMENT_INTEGRITY_MISMATCH;
+  state->integrity = WAMBLE_FRAGMENT_INTEGRITY_MISMATCH;
   return WAMBLE_FRAGMENT_REASSEMBLY_COMPLETE_BAD_HASH;
 }
