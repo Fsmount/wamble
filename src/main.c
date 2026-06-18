@@ -14,7 +14,12 @@
 #endif
 
 void cleanup_expired_sessions(void);
+typedef struct WambleIntentBuffer WambleIntentBuffer;
+WambleIntentBuffer *wamble_intents_create(void);
+void wamble_intents_destroy(WambleIntentBuffer *buf);
+void wamble_set_intent_buffer(WambleIntentBuffer *buf);
 
+static WambleIntentBuffer *g_intents_main;
 static volatile sig_atomic_t g_reload_requested = 0;
 static volatile sig_atomic_t g_shutdown_requested = 0;
 static volatile sig_atomic_t g_exec_reload_requested = 0;
@@ -290,6 +295,8 @@ static void process_config_reload_request(
     return;
   }
 
+  profile_runtime_config_reload_begin();
+
   LOG_INFO("Config reload: loading candidate config");
   ConfigLoadStatus rcfg =
       config_load(config_file, profile, cfg_status, cfg_status_size);
@@ -315,6 +322,7 @@ static void process_config_reload_request(
         LOG_WARN("DB snapshot restore failed; keeping in-memory previous "
                  "config");
         (void)config_restore_snapshot(cfg_snapshot);
+        profile_runtime_config_reload_end();
         free(db_cfg);
         config_free_snapshot(cfg_snapshot);
         free(attempt_cfg_text);
@@ -326,6 +334,7 @@ static void process_config_reload_request(
                "keeping previous config",
                (int)rcfg);
       (void)config_restore_snapshot(cfg_snapshot);
+      profile_runtime_config_reload_end();
       config_free_snapshot(cfg_snapshot);
       free(attempt_cfg_text);
       return;
@@ -340,6 +349,7 @@ static void process_config_reload_request(
     (void)db_record_config_event(profile_key, attempt_cfg_text, "file",
                                  "rejected", topology_err);
     (void)config_restore_snapshot(cfg_snapshot);
+    profile_runtime_config_reload_end();
     config_free_snapshot(cfg_snapshot);
     free(attempt_cfg_text);
     return;
@@ -357,6 +367,7 @@ static void process_config_reload_request(
                                   global_conn_str_size) != 0) {
       LOG_WARN("Failed to rebind policy after rejected config reload");
     }
+    profile_runtime_config_reload_end();
     config_free_snapshot(cfg_snapshot);
     free(attempt_cfg_text);
     return;
@@ -380,6 +391,7 @@ static void process_config_reload_request(
     if (reconcile_profile_listeners() != PROFILE_START_OK) {
       LOG_FATAL("Failed to reapply runtime state back to previous config");
     }
+    profile_runtime_config_reload_end();
     config_free_snapshot(cfg_snapshot);
     free(attempt_cfg_text);
     return;
@@ -402,6 +414,7 @@ static void process_config_reload_request(
     }
   }
 
+  profile_runtime_config_reload_end();
   config_free_snapshot(cfg_snapshot);
   free(attempt_cfg_text);
 }
@@ -735,11 +748,14 @@ static int initialize_services(void) {
   }
   LOG_INFO("Database initialized successfully");
 
-  static WambleIntentBuffer g_intents_main;
-  wamble_intents_init(&g_intents_main);
+  g_intents_main = wamble_intents_create();
+  if (!g_intents_main) {
+    LOG_FATAL("Failed to allocate persistence intent buffer");
+    return 1;
+  }
   const WambleQueryService *qs = wamble_get_db_query_service();
   wamble_set_query_service(qs);
-  wamble_set_intent_buffer(&g_intents_main);
+  wamble_set_intent_buffer(g_intents_main);
   if (!wamble_get_query_service()) {
     LOG_FATAL("Query service not configured");
     return 1;
@@ -1040,6 +1056,9 @@ static void run_main_loop(const char *config_file, const char *profile,
 static void shutdown_services(void) {
   stop_profile_listeners();
   spectator_manager_shutdown();
+  wamble_set_intent_buffer(NULL);
+  wamble_intents_destroy(g_intents_main);
+  g_intents_main = NULL;
   db_cleanup();
   wamble_net_cleanup();
 }
