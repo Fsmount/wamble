@@ -1,5 +1,19 @@
 #include "../include/wamble/wamble.h"
 #include "../include/wamble/wamble_db.h"
+
+typedef struct WambleIntentBuffer WambleIntentBuffer;
+void wamble_set_intent_buffer(WambleIntentBuffer *buf);
+WambleIntentBuffer *wamble_intents_create(void);
+void wamble_intents_destroy(WambleIntentBuffer *buf);
+int wamble_intents_count(const WambleIntentBuffer *buf);
+WambleIntentBuffer *wamble_intents_clone(const WambleIntentBuffer *src);
+int wamble_intents_replace_flushed_prefix(WambleIntentBuffer *dst,
+                                          WambleIntentBuffer *remaining,
+                                          int copied_count);
+int wamble_persistence_flush_buffer(WambleIntentBuffer *buf,
+                                    const WambleQueryService *qs,
+                                    int max_batches, int max_intents,
+                                    int max_payload_bytes);
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,7 +50,15 @@ typedef struct RunningProfile {
   int ready_for_exec;
   int run_inline;
   int runtime_ready;
-  WambleIntentBuffer intents_buf;
+  WambleIntentBuffer *intents_buf;
+  wamble_mutex_t async_flush_mutex;
+  int async_flush_mutex_ready;
+  int async_flush_in_progress;
+  int async_flush_ready;
+  int async_flush_copied_count;
+  WambleIntentBuffer *async_flush_result;
+  wamble_thread_t async_flush_thread;
+  int async_flush_thread_joinable;
   const WambleQueryService *qs;
   time_t last_cleanup;
   time_t last_tick;
@@ -53,10 +75,13 @@ static int g_running_count = 0;
 static wamble_mutex_t g_mutex;
 static int g_mutex_initialized = 0;
 static int g_prepare_exec = 0;
+static int g_config_reload_in_progress = 0;
 static WAMBLE_THREAD_LOCAL char g_runtime_profile_key[128];
+static WAMBLE_THREAD_LOCAL RunningProfile *g_current_profile_runtime;
 
 void network_init_thread_state(void);
 void cleanup_expired_sessions(void);
+void profile_runtime_manager_event_signal(void);
 wamble_socket_t create_and_bind_socket(int port);
 int wamble_socket_bound_port(wamble_socket_t sock);
 WambleWsGateway *ws_gateway_start(const char *profile_name, int ws_port,
@@ -122,8 +147,15 @@ const char *wamble_runtime_profile_key(void) {
 }
 
 static void profile_runtime_set_profile_key(const char *profile_name) {
-  snprintf(g_runtime_profile_key, sizeof(g_runtime_profile_key), "%s",
-           (profile_name && profile_name[0]) ? profile_name : "__default__");
+  const char *value =
+      (profile_name && profile_name[0]) ? profile_name : "__default__";
+  size_t n = strnlen(value, sizeof(g_runtime_profile_key) - 1);
+  memcpy(g_runtime_profile_key, value, n);
+  g_runtime_profile_key[n] = '\0';
+}
+
+void wamble_set_runtime_profile_key(const char *profile_name) {
+  profile_runtime_set_profile_key(profile_name);
 }
 
 void wamble_runtime_event_publish(WambleRuntimeStatus status,
@@ -164,6 +196,30 @@ static void profile_runtime_wake_socket(wamble_socket_t sockfd) {
                sizeof(byte),
 #endif
                0, (const struct sockaddr *)&wake_addr, sizeof(wake_addr));
+}
+
+void profile_runtime_config_reload_begin(void) {
+  ensure_mutex_init();
+  wamble_mutex_lock(&g_mutex);
+  g_config_reload_in_progress = 1;
+  wamble_mutex_unlock(&g_mutex);
+  profile_runtime_manager_event_signal();
+}
+
+void profile_runtime_config_reload_end(void) {
+  ensure_mutex_init();
+  wamble_mutex_lock(&g_mutex);
+  g_config_reload_in_progress = 0;
+  wamble_mutex_unlock(&g_mutex);
+  profile_runtime_manager_event_signal();
+}
+
+static int profile_runtime_config_reload_in_progress(void) {
+  ensure_mutex_init();
+  wamble_mutex_lock(&g_mutex);
+  int in_progress = g_config_reload_in_progress;
+  wamble_mutex_unlock(&g_mutex);
+  return in_progress;
 }
 
 void profile_runtime_manager_event_signal(void) {
@@ -268,32 +324,175 @@ static int profile_runtime_config_max_payload_bytes(const RunningProfile *rp) {
 static int profile_runtime_flush_intents(RunningProfile *rp, int max_batches) {
   if (!rp || max_batches <= 0)
     return 1;
-  wamble_set_query_service(rp->qs);
-  wamble_set_intent_buffer(&rp->intents_buf);
-  uint64_t now_ms = wamble_now_mono_millis();
-  for (int i = 0; i < max_batches; i++) {
-    int attempted = 0;
-    int failures = 0;
-    int batch_limit =
-        profile_runtime_config_max_intents(rp, rp->intents_buf.count);
-    int payload_limit = profile_runtime_config_max_payload_bytes(rp);
-    wamble_persistence_clear_status();
-    PersistenceStatus st = wamble_apply_intents_with_db_checked(
-        &rp->intents_buf, batch_limit, payload_limit, NULL, &attempted,
-        &failures);
-    int pending = rp->intents_buf.count;
-    rp->last_flush_ms = now_ms;
-    if (pending <= 0)
-      return 1;
-    if (st == PERSISTENCE_STATUS_OK || st == PERSISTENCE_STATUS_EMPTY) {
-      if (pending <= 0 || attempted <= 0)
-        break;
-      continue;
-    }
-    if (attempted <= 0 || st == PERSISTENCE_STATUS_APPLY_FAIL)
-      break;
+  int batch_limit = profile_runtime_config_max_intents(
+      rp, wamble_intents_count(rp->intents_buf));
+  int payload_limit = profile_runtime_config_max_payload_bytes(rp);
+  int drained = wamble_persistence_flush_buffer(
+      rp->intents_buf, rp->qs, max_batches, batch_limit, payload_limit);
+  rp->last_flush_ms = wamble_now_mono_millis();
+  return drained;
+}
+
+typedef struct AsyncFlushJob {
+  RunningProfile *rp;
+  WambleIntentBuffer *buf;
+  const WambleQueryService *qs;
+  int max_batches;
+  int max_intents;
+  int max_payload_bytes;
+  int copied_count;
+  char profile_name[PROFILE_NAME_MAX_LENGTH];
+  char profile_conn[512];
+  char global_conn[512];
+} AsyncFlushJob;
+
+static void *profile_runtime_async_flush_worker(void *arg) {
+  AsyncFlushJob *job = (AsyncFlushJob *)arg;
+  if (!job)
+    return NULL;
+  wamble_set_runtime_profile_key(job->profile_name);
+  wamble_set_query_service(job->qs);
+  if (db_set_global_store_connection(job->global_conn) == 0 &&
+      db_init(job->profile_conn) == 0) {
+    wamble_persistence_flush_buffer(job->buf, job->qs, job->max_batches,
+                                    job->max_intents, job->max_payload_bytes);
   }
-  return rp->intents_buf.count <= 0;
+  db_cleanup_thread();
+  wamble_set_query_service(NULL);
+  wamble_set_runtime_profile_key(NULL);
+  RunningProfile *rp = job->rp;
+  if (rp && rp->async_flush_mutex_ready) {
+    wamble_mutex_lock(&rp->async_flush_mutex);
+    wamble_intents_destroy(rp->async_flush_result);
+    rp->async_flush_result = job->buf;
+    job->buf = NULL;
+    rp->async_flush_copied_count = job->copied_count;
+    rp->async_flush_ready = 1;
+    rp->async_flush_in_progress = 0;
+    wamble_mutex_unlock(&rp->async_flush_mutex);
+    profile_runtime_manager_event_signal();
+  } else {
+    wamble_intents_destroy(job->buf);
+  }
+  free(job);
+  return NULL;
+}
+
+static void profile_runtime_async_flush_consume(RunningProfile *rp) {
+  if (!rp || !rp->async_flush_mutex_ready)
+    return;
+  WambleIntentBuffer *remaining = NULL;
+  int copied_count = 0;
+  wamble_thread_t completed_thread = 0;
+  int join_completed_thread = 0;
+  wamble_mutex_lock(&rp->async_flush_mutex);
+  if (rp->async_flush_ready) {
+    remaining = rp->async_flush_result;
+    rp->async_flush_result = NULL;
+    copied_count = rp->async_flush_copied_count;
+    rp->async_flush_copied_count = 0;
+    rp->async_flush_ready = 0;
+    if (rp->async_flush_thread_joinable) {
+      completed_thread = rp->async_flush_thread;
+      rp->async_flush_thread = 0;
+      rp->async_flush_thread_joinable = 0;
+      join_completed_thread = 1;
+    }
+  }
+  wamble_mutex_unlock(&rp->async_flush_mutex);
+  if (join_completed_thread)
+    (void)wamble_thread_join(completed_thread, NULL);
+  if (copied_count > 0 && wamble_intents_replace_flushed_prefix(
+                              rp->intents_buf, remaining, copied_count) != 0) {
+    wamble_intents_destroy(remaining);
+    return;
+  }
+  wamble_intents_destroy(remaining);
+}
+
+int profile_runtime_persistence_barrier(void) {
+  RunningProfile *rp = g_current_profile_runtime;
+  if (!rp)
+    return -2;
+  if (rp->async_flush_mutex_ready) {
+    wamble_thread_t thread = 0;
+    int join_thread = 0;
+    wamble_mutex_lock(&rp->async_flush_mutex);
+    if (rp->async_flush_thread_joinable) {
+      thread = rp->async_flush_thread;
+      rp->async_flush_thread = 0;
+      rp->async_flush_thread_joinable = 0;
+      join_thread = 1;
+    }
+    wamble_mutex_unlock(&rp->async_flush_mutex);
+    if (join_thread)
+      (void)wamble_thread_join(thread, NULL);
+    profile_runtime_async_flush_consume(rp);
+  }
+  return profile_runtime_flush_intents(rp, 64) ? 0 : -1;
+}
+
+static void profile_runtime_flush_intents_async(RunningProfile *rp,
+                                                int max_batches) {
+  if (!rp || max_batches <= 0 || wamble_intents_count(rp->intents_buf) <= 0 ||
+      !rp->async_flush_mutex_ready)
+    return;
+  profile_runtime_async_flush_consume(rp);
+  wamble_mutex_lock(&rp->async_flush_mutex);
+  int busy = rp->async_flush_in_progress || rp->async_flush_ready;
+  if (!busy)
+    rp->async_flush_in_progress = 1;
+  wamble_mutex_unlock(&rp->async_flush_mutex);
+  if (busy)
+    return;
+  AsyncFlushJob *job = (AsyncFlushJob *)calloc(1, sizeof(*job));
+  if (!job) {
+    wamble_mutex_lock(&rp->async_flush_mutex);
+    rp->async_flush_in_progress = 0;
+    wamble_mutex_unlock(&rp->async_flush_mutex);
+    return;
+  }
+  job->rp = rp;
+  job->qs = rp->qs;
+  job->max_batches = max_batches;
+  job->max_intents = profile_runtime_config_max_intents(
+      rp, wamble_intents_count(rp->intents_buf));
+  job->max_payload_bytes = profile_runtime_config_max_payload_bytes(rp);
+  job->copied_count = wamble_intents_count(rp->intents_buf);
+  snprintf(job->profile_name, sizeof(job->profile_name), "%s",
+           rp->name ? rp->name : "__default__");
+  if (db_format_connection_string(&rp->cfg, 0, job->profile_conn,
+                                  sizeof(job->profile_conn)) != 0 ||
+      db_format_connection_string(&rp->cfg, 1, job->global_conn,
+                                  sizeof(job->global_conn)) != 0) {
+    wamble_mutex_lock(&rp->async_flush_mutex);
+    rp->async_flush_in_progress = 0;
+    wamble_mutex_unlock(&rp->async_flush_mutex);
+    free(job);
+    return;
+  }
+  job->buf = wamble_intents_clone(rp->intents_buf);
+  if (!job->buf) {
+    wamble_mutex_lock(&rp->async_flush_mutex);
+    rp->async_flush_in_progress = 0;
+    wamble_mutex_unlock(&rp->async_flush_mutex);
+    free(job);
+    return;
+  }
+  wamble_thread_t thread;
+  wamble_mutex_lock(&rp->async_flush_mutex);
+  if (wamble_thread_create(&thread, profile_runtime_async_flush_worker, job) !=
+      0) {
+    rp->async_flush_in_progress = 0;
+    wamble_mutex_unlock(&rp->async_flush_mutex);
+    wamble_intents_destroy(job->buf);
+    free(job);
+    return;
+  }
+  rp->async_flush_thread = thread;
+  rp->async_flush_thread_joinable = 1;
+  wamble_mutex_unlock(&rp->async_flush_mutex);
+  rp->last_flush_ms = wamble_now_mono_millis();
 }
 
 static char *wamble_strndup_local(const char *src, size_t len) {
@@ -1348,13 +1547,27 @@ static int profile_runtime_init(RunningProfile *rp) {
   network_init_thread_state();
   ensure_mutex_init();
 
-  wamble_intents_init(&rp->intents_buf);
+  rp->intents_buf = wamble_intents_create();
+  rp->async_flush_result = NULL;
+  if (!rp->intents_buf)
+    return -1;
+  if (!rp->async_flush_mutex_ready &&
+      wamble_mutex_init(&rp->async_flush_mutex) == 0) {
+    rp->async_flush_mutex_ready = 1;
+  }
   rp->qs = wamble_get_db_query_service();
   wamble_set_query_service(rp->qs);
-  wamble_set_intent_buffer(&rp->intents_buf);
+  wamble_set_intent_buffer(rp->intents_buf);
 
   if (!wamble_get_query_service()) {
-    wamble_intents_free(&rp->intents_buf);
+    wamble_intents_destroy(rp->intents_buf);
+    rp->intents_buf = NULL;
+    wamble_intents_destroy(rp->async_flush_result);
+    rp->async_flush_result = NULL;
+    if (rp->async_flush_mutex_ready) {
+      wamble_mutex_destroy(&rp->async_flush_mutex);
+      rp->async_flush_mutex_ready = 0;
+    }
     wamble_set_intent_buffer(NULL);
     return -1;
   }
@@ -1383,12 +1596,20 @@ static int profile_runtime_init(RunningProfile *rp) {
   }
   if (rp->sockfd == WAMBLE_INVALID_SOCKET) {
     profile_runtime_flush_intents(rp, 64);
-    wamble_intents_free(&rp->intents_buf);
+    wamble_intents_destroy(rp->intents_buf);
+    rp->intents_buf = NULL;
+    wamble_intents_destroy(rp->async_flush_result);
+    rp->async_flush_result = NULL;
+    if (rp->async_flush_mutex_ready) {
+      wamble_mutex_destroy(&rp->async_flush_mutex);
+      rp->async_flush_mutex_ready = 0;
+    }
     wamble_set_intent_buffer(NULL);
     return -1;
   }
   (void)profile_ws_reconcile(rp);
   rp->runtime_ready = 1;
+  g_current_profile_runtime = rp;
   return 0;
 }
 
@@ -1396,9 +1617,44 @@ static void profile_runtime_shutdown(RunningProfile *rp) {
   if (!rp || !rp->runtime_ready)
     return;
   wamble_set_query_service(rp->qs);
-  wamble_set_intent_buffer(&rp->intents_buf);
+  wamble_set_intent_buffer(rp->intents_buf);
+  for (int i = 0; i < 100 && rp->async_flush_mutex_ready; i++) {
+    int busy = 0;
+    wamble_mutex_lock(&rp->async_flush_mutex);
+    busy = rp->async_flush_in_progress;
+    wamble_mutex_unlock(&rp->async_flush_mutex);
+    if (!busy)
+      break;
+    wamble_sleep_ms(1);
+  }
+  profile_runtime_async_flush_consume(rp);
+  if (rp->async_flush_mutex_ready) {
+    wamble_thread_t async_thread = 0;
+    int join_async_thread = 0;
+    wamble_mutex_lock(&rp->async_flush_mutex);
+    if (rp->async_flush_thread_joinable) {
+      async_thread = rp->async_flush_thread;
+      rp->async_flush_thread = 0;
+      rp->async_flush_thread_joinable = 0;
+      join_async_thread = 1;
+    }
+    wamble_mutex_unlock(&rp->async_flush_mutex);
+    if (join_async_thread) {
+      (void)wamble_thread_join(async_thread, NULL);
+      profile_runtime_async_flush_consume(rp);
+    }
+  }
   profile_runtime_flush_intents(rp, 64);
-  wamble_intents_free(&rp->intents_buf);
+  board_manager_persistence_shutdown();
+  profile_runtime_flush_intents(rp, 64);
+  wamble_intents_destroy(rp->intents_buf);
+  rp->intents_buf = NULL;
+  wamble_intents_destroy(rp->async_flush_result);
+  rp->async_flush_result = NULL;
+  if (rp->async_flush_mutex_ready) {
+    wamble_mutex_destroy(&rp->async_flush_mutex);
+    rp->async_flush_mutex_ready = 0;
+  }
   wamble_set_intent_buffer(NULL);
   if (rp->ws_gateway) {
     ws_gateway_stop(rp->ws_gateway);
@@ -1406,6 +1662,7 @@ static void profile_runtime_shutdown(RunningProfile *rp) {
   }
   network_runtime_reset_thread_state();
   db_cleanup_thread();
+  g_current_profile_runtime = NULL;
   rp->runtime_ready = 0;
 }
 
@@ -1430,6 +1687,10 @@ static void profile_runtime_step(RunningProfile *rp) {
     network_runtime_drive_reload_drain(rp->sockfd, rp->ws_gateway, rp->name, 4);
     profile_runtime_flush_intents(rp, PERSIST_FLUSH_MAX_BATCHES_PER_CYCLE);
     profile_runtime_prepare_exec_snapshot(rp);
+    return;
+  }
+  if (profile_runtime_config_reload_in_progress()) {
+    profile_runtime_flush_intents(rp, PERSIST_FLUSH_MAX_BATCHES_PER_CYCLE);
     return;
   }
   if (rp->needs_update) {
@@ -1468,11 +1729,13 @@ static void profile_runtime_step(RunningProfile *rp) {
   }
   {
     uint64_t now_ms = wamble_now_mono_millis();
-    int pending = rp->intents_buf.count;
+    int pending = wamble_intents_count(rp->intents_buf);
+    profile_runtime_async_flush_consume(rp);
     if (pending > 0 &&
         (pending >= PERSIST_FLUSH_EAGER_COUNT ||
          (now_ms - rp->last_flush_ms) >= PERSIST_FLUSH_INTERVAL_MS)) {
-      profile_runtime_flush_intents(rp, PERSIST_FLUSH_MAX_BATCHES_PER_CYCLE);
+      profile_runtime_flush_intents_async(rp,
+                                          PERSIST_FLUSH_MAX_BATCHES_PER_CYCLE);
     }
   }
   profile_runtime_send_spectator_updates(rp);
