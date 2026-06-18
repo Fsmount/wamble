@@ -74,6 +74,22 @@
   WAMBLE_STATIC_ASSERT2(name, __LINE__, expr)
 #endif
 
+typedef enum WambleAuditEventKind {
+  WAMBLE_AUDIT_EVENT_DB_SQL = 1,
+} WambleAuditEventKind;
+
+typedef struct WambleAuditEvent {
+  WambleAuditEventKind kind;
+  const char *subsystem;
+  const char *operation;
+  const char *detail;
+} WambleAuditEvent;
+
+typedef void (*WambleAuditSinkFn)(const WambleAuditEvent *event, void *userdata);
+
+void wamble_audit_set_sink(WambleAuditSinkFn sink, void *userdata);
+void wamble_audit_emit(const WambleAuditEvent *event);
+
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
 static inline uint64_t wamble_host_to_net64(uint64_t x) { return x; }
 static inline uint64_t wamble_net_to_host64(uint64_t x) { return x; }
@@ -887,11 +903,14 @@ typedef struct WambleRuntimeEvent {
 ProfileStartStatus start_profile_listeners(int *out_started);
 void stop_profile_listeners(void);
 ProfileStartStatus reconcile_profile_listeners(void);
+void profile_runtime_config_reload_begin(void);
+void profile_runtime_config_reload_end(void);
 int profile_runtime_pump_inline(void);
 void wamble_runtime_event_publish(WambleRuntimeStatus status,
                                   const char *profile_name, const char *detail);
 int wamble_runtime_event_take(WambleRuntimeEvent *out_event);
 const char *wamble_runtime_profile_key(void);
+void wamble_set_runtime_profile_key(const char *profile_name);
 typedef enum {
   PROFILE_ADMIN_STATUS_NONE = 0,
   PROFILE_ADMIN_STATUS_SPECTATOR_FOCUS_DISABLED_FALLBACK = 1,
@@ -1787,6 +1806,7 @@ int spectator_get_state_by_token(const uint8_t *token,
                                  SpectatorState *out_state,
                                  uint64_t *out_focus_board_id);
 void spectator_discard_by_token(const uint8_t *token);
+int wamble_architecture_spectator_lock_held(void);
 #define WAMBLE_DUP_WINDOW 1024
 
 typedef struct WamblePlayer {
@@ -2084,6 +2104,10 @@ WambleBoard *find_board_for_player(WamblePlayer *player);
 void board_move_played(uint64_t board_id, const uint8_t *player_token,
                        const char *uci_move);
 void board_game_completed(uint64_t board_id, GameResult result);
+int board_game_completion_defer(uint64_t board_id, GameResult result,
+                                const uint8_t *player_token);
+void board_manager_persistence_shutdown(void);
+int profile_runtime_persistence_barrier(void);
 bool board_is_reserved_for_player(uint64_t board_id,
                                   const uint8_t *player_token);
 void board_release_reservation(uint64_t board_id);
@@ -2095,8 +2119,14 @@ WambleBoard *get_board_by_id(uint64_t board_id);
 int board_manager_export(WambleBoard *out, int max, int *out_count,
                          uint64_t *out_next_id);
 int board_manager_import(const WambleBoard *in, int count, uint64_t next_id);
+int wamble_architecture_board_lock_held(void);
+void wamble_architecture_board_scoring_pause_for_tests(int pause);
+void wamble_architecture_board_scoring_counters_for_tests(int *out_started,
+                                                          int *out_completed);
 
 ScoringStatus calculate_and_distribute_pot(uint64_t board_id);
+ScoringStatus calculate_and_distribute_pot_for_completed_board(uint64_t board_id,
+                                                               GameResult result);
 int scoring_apply_prediction_points(const uint8_t *token, double points);
 
 void player_manager_init(void);
@@ -2111,6 +2141,7 @@ int player_collect_expired_session_notifications(
 WamblePlayer *get_player_by_token(const uint8_t *token);
 int get_player_snapshot_by_token(const uint8_t *token, WamblePlayer *out);
 void discard_player_by_token(const uint8_t *token);
+int wamble_architecture_player_lock_held(void);
 
 void rng_init(void);
 void rng_bytes(uint8_t *out, size_t len);
@@ -2145,51 +2176,7 @@ int prediction_get_runtime_counts(uint64_t board_id, const uint8_t *token,
                                   int *out_pending_count,
                                   int *out_failed_count);
 void prediction_expire_board(uint64_t board_id);
-
-typedef enum {
-  PERSISTENCE_STATUS_OK = 0,
-  PERSISTENCE_STATUS_NO_BUFFER = 1,
-  PERSISTENCE_STATUS_ALLOC_FAIL = 2,
-  PERSISTENCE_STATUS_APPLY_FAIL = 3,
-  PERSISTENCE_STATUS_EMPTY = 4,
-} PersistenceStatus;
-
-void wamble_emit_update_board(uint64_t board_id, const char *fen,
-                              const char *status);
-void wamble_emit_update_board_assignment_time(uint64_t board_id);
-void wamble_emit_create_reservation(uint64_t board_id, const uint8_t *token,
-                                    int timeout_seconds,
-                                    bool reserved_for_white);
-void wamble_emit_remove_reservation(uint64_t board_id);
-void wamble_emit_record_game_result(uint64_t board_id, char winning_side,
-                                    int move_count, int duration_seconds,
-                                    const char *termination_reason);
-void wamble_emit_update_board_move_meta(uint64_t board_id,
-                                        const char *group_key);
-void wamble_emit_record_last_move_shown(uint64_t board_id, const uint8_t *token,
-                                        const char *shown_uci);
-void wamble_emit_update_board_reservation_meta(uint64_t board_id,
-                                               time_t reservation_time,
-                                               bool reserved_for_white);
-void wamble_emit_update_session_last_seen(const uint8_t *token);
-void wamble_emit_create_session(const uint8_t *token, uint64_t player_id);
-void wamble_emit_link_session_to_pubkey(const uint8_t *token,
-                                        const uint8_t *public_key);
-void wamble_emit_unlink_session_identity(const uint8_t *token);
-void wamble_emit_record_payout(uint64_t board_id, const uint8_t *token,
-                               double points);
-void wamble_emit_record_payout_with_canonical(uint64_t board_id,
-                                              const uint8_t *token,
-                                              double points,
-                                              double canonical_points);
-void wamble_emit_update_player_rating(const uint8_t *token, double rating);
-void wamble_emit_resolve_prediction(uint64_t board_id, const uint8_t *token,
-                                    int move_number, const char *status,
-                                    double points_awarded);
-void wamble_emit_create_board(uint64_t board_id, const char *fen,
-                              const char *status, int mode_variant_id);
-void wamble_emit_record_move(uint64_t board_id, const uint8_t *token,
-                             const char *move_uci, int move_number);
+int wamble_architecture_prediction_lock_held(void);
 
 DbBoardIdList wamble_query_list_boards_by_status(const char *status);
 DbBoardResult wamble_query_get_board(uint64_t board_id);
@@ -2200,23 +2187,15 @@ DbStatus wamble_query_get_active_session_count(int *out_count);
 DbStatus wamble_query_get_max_board_id(uint64_t *out_max_id);
 DbStatus wamble_query_get_session_by_token(const uint8_t *token,
                                            uint64_t *out_session);
-DbStatus wamble_query_create_session(const uint8_t *token, uint64_t player_id,
-                                     uint64_t *out_session);
-DbStatus wamble_query_record_profile_terms_acceptance(
-    const uint8_t *token, const char *profile_name,
-    const uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH], const char *tos_text,
-    uint64_t *out_acceptance_id);
 DbStatus wamble_query_has_profile_terms_acceptance(
     const uint8_t *token, const char *profile_name,
+    const uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH], int *out_accepted);
+DbStatus wamble_query_has_profile_terms_acceptance_for_config(
+    const WambleConfig *cfg, const uint8_t *token, const char *profile_name,
     const uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH], int *out_accepted);
 DbStatus wamble_query_get_latest_profile_terms_acceptance(
     const uint8_t *token, const char *profile_name,
     WambleProfileTermsAcceptance *out);
-DbStatus wamble_query_create_prediction(uint64_t board_id, uint64_t session_id,
-                                        uint64_t parent_prediction_id,
-                                        const char *predicted_move_uci,
-                                        int move_number, int correct_streak,
-                                        uint64_t *out_prediction_id);
 DbStatus wamble_query_get_persistent_session_by_token(const uint8_t *token,
                                                       uint64_t *out_session);
 DbStatus wamble_query_get_player_total_score(uint64_t session_id,
@@ -2229,6 +2208,9 @@ DbStatus wamble_query_get_session_games_played(uint64_t session_id,
                                                int *out_games);
 DbStatus wamble_query_get_session_chess960_games_played(uint64_t session_id,
                                                         int *out_games);
+DbStatus
+wamble_query_get_session_player_stats(uint64_t session_id,
+                                      WamblePersistentPlayerStats *out_stats);
 DbStatus wamble_query_get_identity_total_score(uint64_t global_identity_id,
                                                double *out_total);
 DbStatus wamble_query_get_identity_games_played(uint64_t global_identity_id,
@@ -2236,6 +2218,9 @@ DbStatus wamble_query_get_identity_games_played(uint64_t global_identity_id,
 DbStatus
 wamble_query_get_identity_chess960_games_played(uint64_t global_identity_id,
                                                 int *out_games);
+DbStatus
+wamble_query_get_identity_player_stats(uint64_t global_identity_id,
+                                       WamblePersistentPlayerStats *out_stats);
 DbStatus wamble_query_get_session_global_identity_id(uint64_t session_id,
                                                      uint64_t *out_identity_id);
 DbStatus wamble_query_get_identity_tags_csv(uint64_t global_identity_id,
@@ -2249,6 +2234,8 @@ wamble_query_get_global_identity_id_by_handle(const char *handle,
 DbStatus wamble_query_get_session_public_key(uint64_t session_id,
                                              uint8_t out_public_key[32],
                                              int *out_has_identity);
+DbStatus wamble_query_get_session_public_key_by_token(
+    const uint8_t *token, uint8_t out_public_key[32], int *out_has_identity);
 DbStatus wamble_query_get_latest_session_by_global_identity_id(
     uint64_t global_identity_id, uint64_t *out_session_id);
 DbStatus wamble_query_get_latest_session_by_public_key(
@@ -2260,6 +2247,10 @@ DbStatus wamble_query_get_session_treatment_group(uint64_t session_id,
                                                   char *out_group,
                                                   size_t out_group_size);
 DbActiveReservationsResult wamble_query_get_active_reservations_by_public_key(
+    const uint8_t public_key[WAMBLE_PUBLIC_KEY_LENGTH]);
+DbActiveReservationsResult
+wamble_query_get_active_reservations_by_public_key_for_config(
+    const WambleConfig *cfg,
     const uint8_t public_key[WAMBLE_PUBLIC_KEY_LENGTH]);
 DbStatus wamble_query_get_persistent_player_stats(
     const uint8_t *public_key, WamblePersistentPlayerStats *out_stats);
