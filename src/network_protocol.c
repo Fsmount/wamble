@@ -154,6 +154,8 @@ int network_enqueue_reliable(const struct WambleMsg *msg,
 int send_unreliable_packet(wamble_socket_t sockfd, const struct WambleMsg *msg,
                            const struct sockaddr_in *cliaddr);
 
+#define CLIENT_SESSION_TREATMENT_CACHE_TTL_MS 3000ULL
+
 typedef struct WambleTerminalCachePacket {
   size_t len;
   uint32_t seq;
@@ -177,6 +179,7 @@ typedef struct WambleClientSession {
   time_t last_seen;
   uint32_t next_seq_num;
   char treatment_group_key[128];
+  uint64_t treatment_group_cached_at_ms;
   WambleTerminalCacheSlot *terminal_cache;
   int terminal_cache_count;
 } WambleClientSession;
@@ -1677,16 +1680,25 @@ static void sync_client_session_treatment_group(WambleClientSession *session,
                                                 const uint8_t *token) {
   if (!session || !token)
     return;
+  uint64_t now_ms = wamble_now_mono_millis();
+  if (session->treatment_group_cached_at_ms > 0 &&
+      now_ms - session->treatment_group_cached_at_ms <=
+          CLIENT_SESSION_TREATMENT_CACHE_TTL_MS) {
+    return;
+  }
   WambleTreatmentAssignment assignment = {0};
   DbStatus status =
       wamble_query_get_session_treatment_assignment(token, &assignment);
   if (status == DB_OK) {
     snprintf(session->treatment_group_key, sizeof(session->treatment_group_key),
              "%s", assignment.group_key);
+    session->treatment_group_cached_at_ms = now_ms;
     return;
   }
-  if (status == DB_NOT_FOUND)
+  if (status == DB_NOT_FOUND) {
     session->treatment_group_key[0] = '\0';
+    session->treatment_group_cached_at_ms = now_ms;
+  }
 }
 
 static void update_client_session(const struct sockaddr_in *addr,
@@ -1707,6 +1719,8 @@ static void update_client_session(const struct sockaddr_in *addr,
     if (token_has_any_byte(session->token))
       token_session_map_remove(session->token, index);
     memcpy(session->token, token, TOKEN_LENGTH);
+    session->treatment_group_key[0] = '\0';
+    session->treatment_group_cached_at_ms = 0;
     if (token_valid)
       token_session_map_put(session->token, index);
   }
@@ -1714,6 +1728,7 @@ static void update_client_session(const struct sockaddr_in *addr,
     sync_client_session_treatment_group(session, token);
   } else {
     session->treatment_group_key[0] = '\0';
+    session->treatment_group_cached_at_ms = 0;
   }
 }
 

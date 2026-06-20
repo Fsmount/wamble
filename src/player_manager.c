@@ -4,16 +4,46 @@
 #include <sys/random.h>
 #endif
 
+void wamble_emit_update_session_last_seen(const uint8_t *token);
+void wamble_emit_create_session(const uint8_t *token, uint64_t player_id);
+void wamble_emit_link_session_to_pubkey(const uint8_t *token,
+                                        const uint8_t *public_key);
+void wamble_emit_unlink_session_identity(const uint8_t *token);
 void profile_runtime_manager_event_signal(void);
 
 static WAMBLE_THREAD_LOCAL WamblePlayer *player_pool;
 static WAMBLE_THREAD_LOCAL int num_players = 0;
 static WAMBLE_THREAD_LOCAL wamble_mutex_t player_mutex;
+static WAMBLE_THREAD_LOCAL int player_manager_mutex_held_depth = 0;
+
+static int player_manager_mutex_lock(void) {
+  int rc = wamble_mutex_lock(&player_mutex);
+  if (rc == 0)
+    player_manager_mutex_held_depth++;
+  return rc;
+}
+
+static int player_manager_mutex_unlock(void) {
+  if (player_manager_mutex_held_depth > 0)
+    player_manager_mutex_held_depth--;
+  return wamble_mutex_unlock(&player_mutex);
+}
+
+int wamble_architecture_player_lock_held(void) {
+  return player_manager_mutex_held_depth > 0;
+}
 
 static WAMBLE_THREAD_LOCAL wamble_mutex_t rng_mutex;
 static WAMBLE_THREAD_LOCAL int rng_initialized = 0;
 static WAMBLE_THREAD_LOCAL uint64_t pcg_state = 0x853c49e6748fea9bULL;
 static WAMBLE_THREAD_LOCAL uint64_t pcg_inc = 0xda3e39cb94b95bdbULL;
+
+#define WAMBLE_LAST_SEEN_PERSIST_INTERVAL_SECONDS 60
+
+static int should_persist_last_seen(time_t previous_seen, time_t now) {
+  return previous_seen <= 0 ||
+         (now - previous_seen) >= WAMBLE_LAST_SEEN_PERSIST_INTERVAL_SECONDS;
+}
 
 static inline uint32_t pcg32_random_r(void) {
   uint64_t oldstate = pcg_state;
@@ -159,7 +189,7 @@ int player_collect_expired_session_notifications(
     ExpiredSessionNotification *out, int max) {
   if (!out || max <= 0 || !player_manager_ready_flag)
     return 0;
-  wamble_mutex_lock(&player_mutex);
+  player_manager_mutex_lock();
   int n = expired_session_notification_count;
   if (n > max)
     n = max;
@@ -174,43 +204,29 @@ int player_collect_expired_session_notifications(
         expired_session_notification_cap;
     expired_session_notification_count -= n;
   }
-  wamble_mutex_unlock(&player_mutex);
+  player_manager_mutex_unlock();
   return n;
 }
+
+static void
+apply_persistent_player_stats(WamblePlayer *player,
+                              const WamblePersistentPlayerStats *stats);
 
 static void hydrate_player_from_session(WamblePlayer *player,
                                         uint64_t session_id) {
   if (!player || session_id == 0)
     return;
 
-  double score = 0.0;
-  if (wamble_query_get_player_total_score(session_id, &score) == DB_OK)
-    player->score = score;
-
-  double prediction_score = 0.0;
-  if (wamble_query_get_player_prediction_score(session_id, &prediction_score) ==
-      DB_OK)
-    player->prediction_score = prediction_score;
-
-  double rating = 0.0;
-  if (wamble_query_get_player_rating(session_id, &rating) == DB_OK)
-    player->rating =
-        (rating > 0.0) ? rating : (double)get_config()->default_rating;
-  else
-    player->rating = (double)get_config()->default_rating;
-
-  int games_played = 0;
-  if (wamble_query_get_session_games_played(session_id, &games_played) == DB_OK)
-    player->games_played = games_played;
-  else
-    player->games_played = 0;
-
-  int chess960_games_played = 0;
-  if (wamble_query_get_session_chess960_games_played(
-          session_id, &chess960_games_played) == DB_OK)
-    player->chess960_games_played = chess960_games_played;
-  else
-    player->chess960_games_played = 0;
+  WamblePersistentPlayerStats stats = {0};
+  if (wamble_query_get_session_player_stats(session_id, &stats) == DB_OK) {
+    apply_persistent_player_stats(player, &stats);
+    return;
+  }
+  player->score = 0.0;
+  player->prediction_score = 0.0;
+  player->rating = (double)get_config()->default_rating;
+  player->games_played = 0;
+  player->chess960_games_played = 0;
 }
 
 static void
@@ -375,50 +391,69 @@ WamblePlayer *get_player_by_token(const uint8_t *token) {
   if (!token || !player_manager_ready_flag)
     return NULL;
 
-  wamble_mutex_lock(&player_mutex);
+  player_manager_mutex_lock();
 
   int idx = player_map_get(token);
   if (idx >= 0) {
-    player_pool[idx].last_seen_time = wamble_now_wall();
-    wamble_emit_update_session_last_seen(token);
-    wamble_mutex_unlock(&player_mutex);
+    time_t now = wamble_now_wall();
+    time_t previous_seen = player_pool[idx].last_seen_time;
+    player_pool[idx].last_seen_time = now;
+    if (should_persist_last_seen(previous_seen, now))
+      wamble_emit_update_session_last_seen(token);
+    player_manager_mutex_unlock();
     return &player_pool[idx];
   }
+  player_manager_mutex_unlock();
 
   uint64_t session_id = 0;
   DbStatus st =
       wamble_query_get_persistent_session_by_token(token, &session_id);
-  if (st == DB_OK && session_id > 0) {
-    uint8_t session_pubkey[WAMBLE_PUBLIC_KEY_LENGTH] = {0};
-    int session_has_identity = 0;
-    DbStatus pk_st = wamble_query_get_session_public_key(
-        session_id, session_pubkey, &session_has_identity);
-    if (pk_st != DB_OK && pk_st != DB_NOT_FOUND) {
-      wamble_mutex_unlock(&player_mutex);
-      return NULL;
-    }
-    WamblePlayer *player = find_empty_player_slot();
-    if (player) {
-      memcpy(player->token, token, TOKEN_LENGTH);
-      if (session_has_identity) {
-        memcpy(player->public_key, session_pubkey, WAMBLE_PUBLIC_KEY_LENGTH);
-        player->has_persistent_identity = true;
-      } else {
-        memset(player->public_key, 0, WAMBLE_PUBLIC_KEY_LENGTH);
-        player->has_persistent_identity = false;
-      }
-      player->last_seen_time = wamble_now_wall();
-      hydrate_player_from_session(player, session_id);
-      player_map_put(player->token, (int)(player - player_pool));
-      wamble_emit_update_session_last_seen(token);
+  if (st != DB_OK || session_id == 0)
+    return NULL;
 
-      wamble_mutex_unlock(&player_mutex);
-      return player;
-    }
+  uint8_t session_pubkey[WAMBLE_PUBLIC_KEY_LENGTH] = {0};
+  int session_has_identity = 0;
+  DbStatus pk_st = wamble_query_get_session_public_key(
+      session_id, session_pubkey, &session_has_identity);
+  if (pk_st != DB_OK && pk_st != DB_NOT_FOUND)
+    return NULL;
+
+  WamblePlayer hydrated;
+  memset(&hydrated, 0, sizeof(hydrated));
+  memcpy(hydrated.token, token, TOKEN_LENGTH);
+  if (session_has_identity) {
+    memcpy(hydrated.public_key, session_pubkey, WAMBLE_PUBLIC_KEY_LENGTH);
+    hydrated.has_persistent_identity = true;
+  } else {
+    hydrated.has_persistent_identity = false;
+  }
+  hydrated.last_seen_time = wamble_now_wall();
+  hydrate_player_from_session(&hydrated, session_id);
+
+  player_manager_mutex_lock();
+  idx = player_map_get(token);
+  if (idx >= 0) {
+    WamblePlayer *existing = &player_pool[idx];
+    time_t now = wamble_now_wall();
+    time_t previous_seen = existing->last_seen_time;
+    existing->last_seen_time = now;
+    if (should_persist_last_seen(previous_seen, now))
+      wamble_emit_update_session_last_seen(token);
+    player_manager_mutex_unlock();
+    return existing;
   }
 
-  wamble_mutex_unlock(&player_mutex);
-  return NULL;
+  WamblePlayer *player = find_empty_player_slot();
+  if (!player) {
+    player_manager_mutex_unlock();
+    return NULL;
+  }
+  *player = hydrated;
+  player_map_put(player->token, (int)(player - player_pool));
+  wamble_emit_update_session_last_seen(token);
+
+  player_manager_mutex_unlock();
+  return player;
 }
 
 int get_player_snapshot_by_token(const uint8_t *token, WamblePlayer *out) {
@@ -426,12 +461,12 @@ int get_player_snapshot_by_token(const uint8_t *token, WamblePlayer *out) {
     return -1;
 
   memset(out, 0, sizeof(*out));
-  wamble_mutex_lock(&player_mutex);
+  player_manager_mutex_lock();
 
   int idx = player_map_get(token);
   if (idx >= 0) {
     *out = player_pool[idx];
-    wamble_mutex_unlock(&player_mutex);
+    player_manager_mutex_unlock();
     return 0;
   }
 
@@ -450,12 +485,12 @@ int get_player_snapshot_by_token(const uint8_t *token, WamblePlayer *out) {
         out->has_persistent_identity = true;
       }
       hydrate_player_from_session(out, session_id);
-      wamble_mutex_unlock(&player_mutex);
+      player_manager_mutex_unlock();
       return 0;
     }
   }
 
-  wamble_mutex_unlock(&player_mutex);
+  player_manager_mutex_unlock();
   memset(out, 0, sizeof(*out));
   return -1;
 }
@@ -465,11 +500,11 @@ WamblePlayer *create_new_player(void) {
     return NULL;
   for (int global_attempt = 0;
        global_attempt < get_config()->max_token_attempts; global_attempt++) {
-    wamble_mutex_lock(&player_mutex);
+    player_manager_mutex_lock();
 
     WamblePlayer *player = find_empty_player_slot();
     if (!player) {
-      wamble_mutex_unlock(&player_mutex);
+      player_manager_mutex_unlock();
       return NULL;
     }
 
@@ -495,7 +530,7 @@ WamblePlayer *create_new_player(void) {
     } while (local_attempts < get_config()->max_token_local_attempts);
 
     if (local_attempts >= get_config()->max_token_local_attempts) {
-      wamble_mutex_unlock(&player_mutex);
+      player_manager_mutex_unlock();
       continue;
     }
 
@@ -510,7 +545,7 @@ WamblePlayer *create_new_player(void) {
     player->chess960_games_played = 0;
     wamble_emit_create_session(candidate_token, 0);
     player_map_put(player->token, (int)(player - player_pool));
-    wamble_mutex_unlock(&player_mutex);
+    player_manager_mutex_unlock();
     return player;
   }
   return NULL;
@@ -526,10 +561,10 @@ WamblePlayer *attach_persistent_identity(const uint8_t *token,
   if (stats_status != DB_OK && stats_status != DB_NOT_FOUND)
     return NULL;
 
-  wamble_mutex_lock(&player_mutex);
+  player_manager_mutex_lock();
   int idx = player_map_get(token);
   if (idx < 0) {
-    wamble_mutex_unlock(&player_mutex);
+    player_manager_mutex_unlock();
     return NULL;
   }
   WamblePlayer *player = &player_pool[idx];
@@ -538,7 +573,7 @@ WamblePlayer *attach_persistent_identity(const uint8_t *token,
   if (stats_status == DB_OK)
     apply_persistent_player_stats(player, &stats);
   wamble_emit_link_session_to_pubkey(player->token, public_key);
-  wamble_mutex_unlock(&player_mutex);
+  player_manager_mutex_unlock();
   (void)board_emit_persistent_reservation_for_token(token);
   return player;
 }
@@ -546,10 +581,10 @@ WamblePlayer *attach_persistent_identity(const uint8_t *token,
 int detach_persistent_identity(const uint8_t *token) {
   if (!token || !player_manager_ready_flag)
     return -1;
-  wamble_mutex_lock(&player_mutex);
+  player_manager_mutex_lock();
   int idx = player_map_get(token);
   if (idx < 0) {
-    wamble_mutex_unlock(&player_mutex);
+    player_manager_mutex_unlock();
     return -1;
   }
   WamblePlayer *player = &player_pool[idx];
@@ -558,7 +593,7 @@ int detach_persistent_identity(const uint8_t *token) {
     player->has_persistent_identity = false;
     wamble_emit_unlink_session_identity(player->token);
   }
-  wamble_mutex_unlock(&player_mutex);
+  player_manager_mutex_unlock();
   return 0;
 }
 
@@ -567,7 +602,7 @@ void player_manager_tick(void) {
     return;
   time_t now = wamble_now_wall();
 
-  wamble_mutex_lock(&player_mutex);
+  player_manager_mutex_lock();
 
   for (int i = 0; i < num_players; i++) {
     if (!player_slot_is_empty(&player_pool[i]) &&
@@ -583,13 +618,13 @@ void player_manager_tick(void) {
   while (num_players > 0 && player_slot_is_empty(&player_pool[num_players - 1]))
     num_players--;
 
-  wamble_mutex_unlock(&player_mutex);
+  player_manager_mutex_unlock();
 }
 
 void discard_player_by_token(const uint8_t *token) {
   if (!token || !player_manager_ready_flag)
     return;
-  wamble_mutex_lock(&player_mutex);
+  player_manager_mutex_lock();
   int idx = player_map_get(token);
   if (idx >= 0) {
     uint8_t old_token[TOKEN_LENGTH];
@@ -601,5 +636,5 @@ void discard_player_by_token(const uint8_t *token) {
       num_players--;
     }
   }
-  wamble_mutex_unlock(&player_mutex);
+  player_manager_mutex_unlock();
 }

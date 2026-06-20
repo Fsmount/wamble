@@ -1,6 +1,8 @@
 #include "wamble/wamble.h"
 #include <string.h>
 
+void wamble_emit_update_player_rating(const uint8_t *token, double rating);
+
 static int rating_seen_map_index(const uint8_t *map_tokens,
                                  const int *map_slots, int map_size,
                                  const uint8_t *token) {
