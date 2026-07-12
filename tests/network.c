@@ -3189,8 +3189,7 @@ WAMBLE_TEST(server_protocol_terms_routes_allow_hidden_bound_profile) {
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
-  T_ASSERT_EQ_INT(wamble_query_create_session(rx_hello.msg.token, 0, NULL),
-                  DB_OK);
+  T_ASSERT(db_create_session(rx_hello.msg.token, 0) > 0);
 
   struct WambleMsg tos_req = {0};
   tos_req.ctrl = WAMBLE_CTRL_GET_PROFILE_TOS;
@@ -3326,8 +3325,7 @@ WAMBLE_TEST(
     T_ASSERT_EQ_INT(caps->value_type, WAMBLE_TREATMENT_VALUE_INT);
     T_ASSERT_EQ_INT((int)caps->int_value, 0);
   }
-  T_ASSERT_EQ_INT(wamble_query_create_session(rx_hello.msg.token, 0, NULL),
-                  DB_OK);
+  T_ASSERT(db_create_session(rx_hello.msg.token, 0) > 0);
 
   struct WambleMsg post_join_req = {0};
   post_join_req.ctrl = WAMBLE_CTRL_GET_PLAYER_STATS;
@@ -4104,17 +4102,16 @@ WAMBLE_TEST(server_protocol_player_stats_scope_context_is_ignored) {
   }
 
   uint64_t self_session_id = 0;
-  T_ASSERT_EQ_INT(
-      wamble_query_create_session(rx_hello.msg.token, 0, &self_session_id),
-      DB_OK);
+  self_session_id = db_create_session(rx_hello.msg.token, 0);
+  T_ASSERT(self_session_id > 0);
   T_ASSERT(self_session_id > 0);
 
   uint8_t target_token[TOKEN_LENGTH] = {0};
   target_token[0] = 0x91;
   target_token[1] = 0x33;
   uint64_t target_session_id = 0;
-  T_ASSERT_EQ_INT(
-      wamble_query_create_session(target_token, 0, &target_session_id), DB_OK);
+  target_session_id = db_create_session(target_token, 0);
+  T_ASSERT(target_session_id > 0);
   T_ASSERT(target_session_id > 0);
   T_ASSERT(target_session_id != self_session_id);
 
@@ -4710,7 +4707,11 @@ WAMBLE_TEST(server_protocol_player_stats_target_handle_with_tag_policy) {
           "INSERT INTO global_identity_tags (global_identity_id, tag) VALUES "
           "((SELECT global_identity_id FROM sessions WHERE token = "
           "decode('a1a2a3a4a5a6a7a8a9aaabacadaeaf10', 'hex')), 'vip') "
-          "ON CONFLICT DO NOTHING;") != 0) {
+          "ON CONFLICT DO NOTHING;"
+          "INSERT INTO global_identity_handles (global_identity_id, handle) "
+          "VALUES ((SELECT global_identity_id FROM sessions WHERE token = "
+          "decode('a1a2a3a4a5a6a7a8a9aaabacadaeaf10', 'hex')), "
+          "'h_stats_target') ON CONFLICT DO NOTHING;") != 0) {
     T_FAIL_SIMPLE("wamble_test_prepare_db failed");
   }
 
@@ -5422,8 +5423,7 @@ WAMBLE_TEST(server_protocol_accept_profile_tos_long_profile_name_persists) {
   T_ASSERT_STATUS_OK(wamble_thread_join(th_hello, NULL));
   T_ASSERT_EQ_INT(rx_hello.received, 1);
   T_ASSERT_EQ_INT(rx_hello.msg.ctrl, WAMBLE_CTRL_SERVER_HELLO);
-  T_ASSERT_EQ_INT(wamble_query_create_session(rx_hello.msg.token, 0, NULL),
-                  DB_OK);
+  T_ASSERT(db_create_session(rx_hello.msg.token, 0) > 0);
 
   struct WambleMsg accept = {0};
   accept.ctrl = WAMBLE_CTRL_ACCEPT_PROFILE_TOS;
@@ -7757,7 +7757,7 @@ WAMBLE_TEST(
   accept.header_version = WAMBLE_PROTO_VERSION;
   accept.seq_num = 7777;
   accept.token[0] = 0xAB;
-  T_ASSERT_EQ_INT(wamble_query_create_session(accept.token, 0, NULL), DB_OK);
+  T_ASSERT(db_create_session(accept.token, 0) > 0);
   const char *pname = "p1";
   accept.text.profile_name_len = (uint8_t)strlen(pname);
   memcpy(accept.text.profile_name, pname, accept.text.profile_name_len);

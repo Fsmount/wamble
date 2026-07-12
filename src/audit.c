@@ -1,3 +1,7 @@
+// Temporary audit layer made for persistence tests, is likely to be
+// fully rewritten when it is implemented for modules other than the
+// db connection which is why it is simple and sloppy.
+
 #include "../include/wamble/wamble.h"
 
 static WAMBLE_THREAD_LOCAL WambleAuditSinkFn g_wamble_audit_sink = NULL;
