@@ -27,6 +27,33 @@ WAMBLE_TEST(player_token_expiration_removes_entry) {
   return 0;
 }
 
+WAMBLE_TEST(player_cached_lookup_throttles_last_seen_intents) {
+  WambleIntentBuffer intents = {0};
+  config_load(NULL, NULL, NULL, 0);
+  player_manager_init();
+  wamble_intents_init(&intents);
+  wamble_set_intent_buffer(&intents);
+
+  WamblePlayer *p = create_new_player();
+  T_ASSERT(p != NULL);
+  uint8_t tok[TOKEN_LENGTH];
+  memcpy(tok, p->token, TOKEN_LENGTH);
+  wamble_intents_clear(&intents);
+
+  T_ASSERT(get_player_by_token(tok) != NULL);
+  T_ASSERT_EQ_INT(intents.count, 0);
+
+  p->last_seen_time = wamble_now_wall() - 61;
+  T_ASSERT(get_player_by_token(tok) != NULL);
+  T_ASSERT_EQ_INT(intents.count, 1);
+  T_ASSERT_EQ_INT(intents.items[0].type,
+                  WAMBLE_INTENT_UPDATE_SESSION_LAST_SEEN);
+
+  wamble_set_intent_buffer(NULL);
+  wamble_intents_free(&intents);
+  return 0;
+}
+
 WAMBLE_TEST(login_rehydrates_cached_player_from_persistent_stats) {
   const char *cfg_path = "build/test_player_manager_db.conf";
   const char *sql_path = "build/test_player_manager_seed.sql";
@@ -331,6 +358,8 @@ WAMBLE_TEST(anonymous_session_in_db_does_not_rehydrate_identity_flag) {
 WAMBLE_TESTS_BEGIN_NAMED(wamble_register_tests_player_manager)
 WAMBLE_TESTS_ADD_FM(player_pool_capacity_limit, "player_manager");
 WAMBLE_TESTS_ADD_FM(player_token_expiration_removes_entry, "player_manager");
+WAMBLE_TESTS_ADD_FM(player_cached_lookup_throttles_last_seen_intents,
+                    "player_manager");
 WAMBLE_TESTS_ADD_FM(
     player_token_expiration_enqueues_session_expired_notification,
     "player_manager");
