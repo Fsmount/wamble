@@ -3,41 +3,81 @@ Wamble Database
 
 Overview
 - Backend: PostgreSQL.
-- Purpose: Persist players/sessions, boards, moves, reservations, results, payouts, and predictions.
-- Profiles: Each advertised profile uses its own per-thread database connection.
-- Access: Runtime code reads via a small `WambleQueryService` interface and writes by enqueueing persistence intents which are flushed to the database in batches.
+- Purpose: Persist players/sessions, boards, moves, reservations, results,
+  payouts, predictions, identity/policy facts, treatment state, and runtime
+  config attempts.
+- Profiles: Each advertised profile owns gameplay state in its own profile DB.
+- Global store: identity, policy, treatment definitions, identity tags/handles,
+  and runtime config revision history live in the configured global DB.
+- Access model: runtime code reads through the thread-local `WambleQueryService`
+  and writes by enqueueing explicitly named persistence intents or by calling an
+  explicitly named materialization API.
+
+Persistence Runtime Boundaries
+- Profile DB ownership is profile-scoped. A request served by one listener must
+  not read another profile's gameplay tables through the current listener's DB
+  connection; cross-profile reads route through that target profile's config.
+- Global DB ownership is process-wide but connection overrides are thread-local,
+  so profile runtimes and reload validation do not accidentally share a mutable
+  global-store connection owner.
+- Read-named query functions are expected to be pure: they return existing DB
+  facts or `DB_NOT_FOUND`. Functions that create, update, or assign durable
+  state use materializing names such as `assign`, `materialize`, `apply`, or
+  emit a persistence intent.
+- Treatment assignment is a materialization boundary. Treatment action reads use
+  the stable profile-scoped assignment row for `(session_id, profile_name)`;
+  they do not assign or rewrite session treatment state while rendering policy,
+  stats, board views, predictions, scoring, or spectator output.
+- Hot request paths should consume one response-local or short-TTL snapshot for
+  capability, ToS, treatment, leaderboard/profile metadata, and projection
+  decisions instead of re-deriving the same persistence facts for different
+  fields of one response.
+- Synchronous DB work should not run while board/player/prediction/spectator
+  locks are held. Cold reads, treatment lookups, dormant-board hydration,
+  scoring, and supply refreshes are staged outside those critical sections or
+  moved to bounded async workers with revalidation on re-entry.
 
 Connections
 - Per-thread per-listener game DB: Each listener thread opens its own profile DB
   connection using `db-host`, `db-user`, `db-pass`, `db-name`.
-- Shared global DB: Identity and policy resolution uses a separate shared store
-  connection configured by `global-db-host`, `global-db-user`,
-  `global-db-pass`, `global-db-name`.
+- Shared global DB: Identity, policy, treatment definitions, identity handles,
+  tags, and config revision history use the global store configured by
+  `global-db-host`, `global-db-user`, `global-db-pass`, `global-db-name`.
 
 Read Path Caching
-- Token-indexed reads are cached in thread-local memory to reduce repeated DB lookups
-  during hot loops (session lookup, persistent-session lookup).
+- Token-indexed and policy/treatment-oriented reads are cached in thread-local
+  memory to reduce repeated DB lookups during hot loops.
 - Cache characteristics:
-  - Capacity: 256 entries per cache type per runtime thread.
-  - TTL: 500ms per entry.
   - Scope: thread-local; no cross-thread sharing.
-- Cache entries include both successful and failure statuses (`DB_OK`, `DB_NOT_FOUND`,
-  connection/exec/bad-data errors), so repeated failures are also throttled within TTL.
-- Session-linking updates invalidate the persistent-session cache for correctness.
+  - TTL: short-lived and keyed by the facts that make the answer stable
+    (token/session, profile, board id, last-move time, config identity, ToS
+    hash, pagination, or treatment hook as applicable).
+  - Entries include both successful and failure statuses (`DB_OK`,
+    `DB_NOT_FOUND`, connection/exec/bad-data errors), so repeated failures are
+    also throttled within TTL.
+- Session-linking and token changes invalidate token-derived cached facts for
+  correctness.
 
-Write Batching and Transactions
-- Intent flushes are applied in bounded batches (intent count and estimated payload bytes;
-  see `persistence-max-intents` and `persistence-max-payload-bytes` in config).
-- The selected batch is attempted inside an explicit DB transaction (`BEGIN`/`COMMIT`).
-- If transactional apply fails, the runtime rolls back and retries selected intents in
-  non-transactional per-intent mode, requeuing only failed intents.
+Write Batching, Transactions, and Async Flush
+- Intent flushes are selected in bounded batches (intent count and estimated
+  payload bytes; see `persistence-max-intents` and
+  `persistence-max-payload-bytes` in config).
+- Normal profile-runtime ticks hand selected intents to an async flush worker;
+  init, shutdown, reload drains, and explicit recovery paths may still flush
+  synchronously so lifecycle boundaries are durable.
+- The selected batch is attempted inside an explicit DB transaction
+  (`BEGIN`/`COMMIT`).
+- If transactional apply fails, the runtime rolls back and retries selected
+  intents in non-transactional per-intent mode, requeuing only failed intents.
 - Intent selection/coalescing rules reduce redundant writes before execution:
-  - Keep only the newest per key for `UPDATE_BOARD`, `UPDATE_BOARD_ASSIGNMENT_TIME`,
-    `UPDATE_SESSION_LAST_SEEN`, and `REMOVE_RESERVATION`.
-  - `RECORD_MOVE` and `RECORD_PAYOUT` intents are grouped and sorted for append-friendly
-    write locality.
-- Flush cadence is runtime-driven and can perform multiple batches per cycle when backlog
-  is high.
+  - Keep only the newest per key for `UPDATE_BOARD`,
+    `UPDATE_BOARD_ASSIGNMENT_TIME`, `UPDATE_SESSION_LAST_SEEN`, and
+    `REMOVE_RESERVATION`.
+  - `RECORD_MOVE` and `RECORD_PAYOUT` intents are grouped and sorted for
+    append-friendly write locality.
+- Flush cadence is runtime-driven and can process multiple batches per cycle
+  when backlog is high; worker failures are returned to the owning profile
+  runtime's intent buffer for retry.
 
 Tables
 - players
@@ -56,13 +96,25 @@ Tables
   - `total_score DECIMAL(10,4) NOT NULL DEFAULT 0`
   - `total_prediction_score DECIMAL(10,4) NOT NULL DEFAULT 0`
   - `games_played INTEGER NOT NULL DEFAULT 0`
-  - `treatment_group_key VARCHAR(128)`
-  - `treatment_rule_id BIGINT`
-  - `treatment_snapshot_revision_id BIGINT`
-  - `treatment_assigned_at TIMESTAMPTZ`
+  - Legacy treatment columns may exist from migration 011 for upgrade
+    compatibility, but current treatment reads/writes use
+    `session_treatment_assignments`.
   - `created_at TIMESTAMPTZ DEFAULT NOW()`
   - `last_seen_at TIMESTAMPTZ DEFAULT NOW()`
-  - Indexes: `idx_sessions_token` on `(token)`, `idx_sessions_identity_id` on `(global_identity_id)`, `idx_sessions_treatment_group` on `(treatment_group_key)`
+  - Indexes: `idx_sessions_token` on `(token)`, `idx_sessions_identity_id` on `(global_identity_id)`
+
+- session_treatment_assignments (profile DB)
+  - `session_id BIGINT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE`
+  - `profile_name VARCHAR(256) NOT NULL`
+  - `treatment_group_key VARCHAR(128) NOT NULL`
+  - `treatment_rule_id BIGINT`
+  - `treatment_snapshot_revision_id BIGINT`
+  - `treatment_assigned_at TIMESTAMPTZ DEFAULT NOW()`
+  - Primary key: `(session_id, profile_name)`
+  - Index: `(profile_name, treatment_group_key)`
+  - Purpose: stable, profile-scoped treatment assignment snapshot. Profile
+    discovery for one target profile must not overwrite another profile's
+    current session treatment state.
 
 - global_identities (shared global DB)
   - `id BIGSERIAL PRIMARY KEY`
@@ -268,6 +320,9 @@ Migrations
   stats targeting.
 - 016_profile_last_move_shown.sql: adds append-only emitted shown history table
   (`board_last_move_shown_events`) and indexes.
+- 017_profile_session_treatment_assignments.sql: adds profile-scoped treatment
+  assignment rows keyed by `(session_id, profile_name)` and backfills existing
+  legacy session treatment columns into the default profile scope.
 
 Trust and Visibility
 - Client trust resolves from identity-scoped policy only, in deterministic
@@ -285,8 +340,12 @@ Trust and Visibility
 
 Operational Notes
 - Multiple advertised profiles within one process may point to different databases.
-- Persistence intents are applied from the runtime loop (threaded for multi-profile, inline
-  in main thread for single-runtime mode).
+- Profile runtimes own their persistence queues. Normal hot ticks offload flush
+  work to a bounded async worker; lifecycle drains keep synchronous durability
+  points for startup, shutdown, and reload.
+- Config reload gates profile runtime dispatch while global policy/config state
+  and per-profile runtime config are being reconciled, avoiding mixed snapshots
+  where a request uses new global policy with old profile runtime config.
 - On startup/reload, the server records config attempts into
   `global_runtime_config_revisions`.
 - Config restore queries the newest row where `result='active'`, while

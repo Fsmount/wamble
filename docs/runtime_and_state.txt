@@ -39,9 +39,12 @@ Thread Loop
 - Periodically: `cleanup_expired_sessions()`.
 - Sends `SPECTATE_UPDATE`/`SERVER_NOTIFICATION` for its own socket.
 - Persistence flushing:
-  - Flushes queued intents in bounded batches (config + adaptive limits).
+  - Selects queued intents in bounded batches (config + adaptive limits).
+  - Normal hot ticks offload selected batches to an async flush worker; init,
+    shutdown, and reload drains keep synchronous durability boundaries.
   - Eager flush when queue is large; periodic flush otherwise.
-  - Can process multiple batches per cycle under backlog.
+  - Can process multiple batches per cycle under backlog, with worker failures
+    returned to the owning runtime for retry.
 
 Exec Handoff
 - Export phase:
@@ -82,6 +85,10 @@ State Files
 
 DB and Config
 - Each runtime uses its active config to build its own `libpq` connection on demand.
+- Profile DB reads are owned by the target profile config; cross-profile gameplay
+  reads route to the target profile store rather than the current listener's DB.
+- Shared global-store connection overrides are thread-local, so profile runtimes
+  and reload validation do not share a mutable connection owner.
 - Runtime config supports persistence tuning:
   - `persistence-max-intents`
   - `persistence-max-payload-bytes`
