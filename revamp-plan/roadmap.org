@@ -1,0 +1,204 @@
+* Wamble Revamp Roadmap
+
+** Purpose
+- Preserve the design/research work before implementation branches
+  diverge.
+
+** Detailed plans
+- Phase 2: ~phase-2-thread-local-persistence.org~
+- Phase 3: ~phase-3-global-actors.org~
+
+** Phase 1: Clean Current Branch
+*** Goal
+- Clean up the current branch history and merge it to master.
+- Research the current branch and surrounding code to determine what
+  additional work in the same vein is needed before merge. That work
+  is intentionally not enumerated in advance; its scope must follow
+  from the research.
+- Keep the current topology.
+- Do not touch anything from next phases.
+- History cleanup must preserve the valid work of the branch as a
+  whole; the roadmap does not preselect a list of changes to retain or
+  prescribe their final commit decomposition.
+
+*** Current topology retained
+#+begin_src text
+profile runtime thread
+  -> managers / server protocol
+  -> TLS QueryService
+  -> TLS active WambleIntentBuffer
+  -> persistence flush/apply
+  -> DB
+#+end_src
+
+*** Possible branch name
+- ~persistence-boundary-hardening~
+- ~persistence-runtime-boundaries~
+
+** Phase 2: Correct Thread-local Persistence Model
+*** Goal
+Make persistence semantics correct before globalization.
+
+*** Explicit non-goal
+- Changing topology.
+- Treating TLS buffer as final topology.
+- Treating profile-owned persistence runner as the final topology.
+
+*** Read side
+- QueryService remains the read capability.
+- QueryService reads existing durable/materialized state only.
+- QueryService does not create, assign, materialize, emit, flush,
+  apply, retry, or compensate writes.
+- QueryService slots are generated from read-only programs in the
+  described shared relational Lisp language.
+- Target: no handwritten slot bodies, no handwritten slot
+  registration, no handwritten SQL text in QueryService specs.
+- Truthful language tests that prove the QueryService programs are
+  read-only are created.
+- Truthful tests use the Lisp language's homoiconicity, including
+  expansion and evaluation rather than superficial source-head checks.
+- Truthful runtime read-purity tests are created as backstops.
+
+*** Write side
+- IntentBuffer remains the capture transport.
+- IntentBuffer payloads must move from low-level fragments toward
+  semantic durable write messages described in the shared relational
+  Lisp language.
+- The write planner evaluates received messages and uses the semantics
+  exposed by the language to derive an execution plan.
+- The planner may preserve, combine, supersede, or reorder messages
+  only when the language establishes that the resulting plan is
+  lifecycle-equivalent.
+- Messages without a proven lifecycle-equivalent transformation remain
+  FIFO and are neither combined nor reordered. Exact scope/lane
+  mechanics follow from the write-message inventory.
+- Failure behavior is explicit. The current proposed taxonomy, to
+  confirm or refine from the inventory, is:
+  - retryable
+  - permanent failure
+  - already satisfied
+  - intentionally best effort
+  - fatal/invariant violation
+
+*** Relational Lisp language
+- QueryService reads and persistence writes use the same Lisp
+  language.
+- This is an evaluated, homoiconic Lisp language.
+- The language describes data relationally and represents why and how
+  data moves.
+- QueryService programs are defined by that without moving/mutating
+  durable data, then they are compiled into C code without losing
+  those guarnetees.
+- For write messages, the language must expose lifecycle transitions,
+  ordering scope, causal dependencies, equivalence, commutativity,
+  idempotency, supersession/merging, and observable outcomes.
+- The language must represent the conditions under which received
+  messages may be preserved, combined, superseded, or reordered.
+- The language must make lifecycle equivalence expressible and
+  inspectable. It includes the intended durable result, required
+  transitions and intermediate facts, causal behavior,
+  acknowledgements, failure behavior, and externally observable
+  history. Matching final durable state alone is insufficient.
+- Functions, macros, evaluation, and environments are not ruled
+  out. The exact evaluator/compiler organization remains TBD.
+- Read/write capability enforcement operates on program semantics
+  rather than pretending reads and writes are different DSLs.
+- Homoiconicity supports inspection, transformation, optimization, and
+  truthful tests of evaluated/expanded relational programs.
+- Walk backward from current QueryService slots and current
+  persistence intents; do not invent a complete language in the
+  abstract.
+
+*** Phase two standalone plan
+Extra details may be found at ~phase-2-thread-local-persistence.org~.
+
+*** Possible branch name
+- ~thread-local-persistence-runtime~
+- ~persistence-sql-dsl-threadlocal~
+
+** Phase 3: Global Actors / Globalization
+*** Goal
+- Start after the thread-local persistence model works and is merged.
+- Globalize network and persistence runtimes.
+- Make actor/runtime provenance explicit.
+
+*** Shared actor model
+- Actors may send arbitrary messages.
+- Authority is not permission to send a fixed vocabulary.
+- Authority is authenticated provenance: the runtime knows which actor
+  sent the message.
+- Payload fields do not establish authority.
+- Runtime/transport attaches provenance; actor-specific payloads
+  remain data.
+- Do not over-specify the envelope shape yet.
+
+*** Global network runtime
+- Current code: each profile runtime pumps its own network runtime
+  instance; the network module is global-looking but thread-local
+  internally.
+- Target: global network actor/runtime owns ingress, endpoint state,
+  dispatch, ACK/retry/replay, websocket routing, and outbound flush.
+- Global protocol commands should not be accidentally handled by
+  whichever profile thread happened to receive them.
+
+*** Global persistence runtime
+- Current code: thread-local QueryService and thread-local active
+  WambleIntentBuffer; each RunningProfile owns buffers and async flush
+  state.
+- Target: one logical global persistence runtime with fast in-memory
+  ingress and an explicit acceptance/durability boundary, with
+  separated capabilities:
+  - read side: QueryService / read actor
+  - write side: persistence actor / apply actor
+- QueryService never escalates to write internally.
+- Write-then-read is coordinated by caller/workflow actors, not hidden
+  in QueryService branches.
+
+*** Phase three standalone plan
+- ~phase-3-global-actors.org~
+- It contains the consolidated actor/provenance, TLS transport,
+  network, persistence, thread/runtime, migration-hazard, and
+  verification research.
+
+** Design separations to preserve
+*** Topology vs transport
+- Topology: which actors exist and who talks to whom.
+- Transport: TLS, explicit handles, mailboxes, global queues, staging
+  queues.
+- TLS message buffers are specifically one candidate route from
+  local/thread/worker actors to global actors: actors append to
+  runtime-installed per-thread outgoing buffers, which are
+  drained/forwarded to the global actors.
+- Do not use a transport argument to settle the topology argument:
+  selecting a global actor does not imply that TLS must disappear.
+
+*** QueryService vs persistence actor
+- QueryService is read capability.
+- Persistence actor is write/apply capability.
+- They may live in one global persistence runtime later, but the
+  capabilities stay separate.
+
+*** Relational Lisp vs runtime transport
+- The relational Lisp language describes read/write durable state
+  semantics.
+- It does not decide how threads register as actors or how messages
+  are carried.
+
+** Current high-value observations
+- TLS active write buffer today is:
+  #+begin_src text
+    current thread -> WambleIntentBuffer *
+  #+end_src
+- TLS QueryService today is:
+  #+begin_src text
+    current thread -> WambleQueryService *
+  #+end_src
+- Current network runtime is also global-looking module state with
+  thread-local transport queues/state.
+- Current global-scoped protocol commands are still handled by the
+  profile runtime that received the packet.
+- RunningProfile is a scope/lifecycle carrier, not necessarily the
+  author of submodule writes.
+- If persistence becomes global, routing every write through the
+  profile thread is extra work unless the profile actor actually needs
+  to mediate.

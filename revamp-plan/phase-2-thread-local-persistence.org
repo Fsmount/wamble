@@ -1,0 +1,487 @@
+#+title: Phase 2 — Correct Thread-local Persistence
+
+* Overview
+Phase 2 starts after Phase 1 is merged. It makes persistence semantics
+correct while retaining the existing thread-local topology.
+
+The central model is:
+
+- QueryService evaluates read-only programs in the relational Lisp
+  language.
+- The write runtime evaluates semantic write messages in the
+  relational Lisp language and derives a lifecycle-valid execution
+  plan.
+- Thread-local QueryService and message-buffer selection remain the
+  local transport until Phase 3 globalizes persistence and network
+  ownership.
+
+Phase 2 changes what persistence messages mean and how they are
+planned and executed.
+
+* Thread-local topology
+The phase retains this topology inherited from existing code:
+
+#+begin_src text
+profile runtime thread
+  -> managers / protocol
+  -> TLS QueryService / TLS active IntentBuffer
+  -> persistence planning and apply
+  -> profile or global DB
+#+end_src
+
+~src/persistence.c~ currently selects the active ~WambleQueryService
+*~ through TLS with a process-global fallback. It selects the active
+~WambleIntentBuffer *~ through TLS. Each ~RunningProfile~ owns a
+message buffer and asynchronous flush state.
+
+Additionally ~src/main.c~ unconditionally creates ~g_intents_main~ and
+installs it on the process entry thread before profile listeners
+start. The runtime inventory must identify which startup or
+non-profile paths rely on it.
+
+These mechanisms remain transport in Phase 2.
+
+* Persistence capabilities
+QueryService is the read capability. Its evaluated programs describe
+existing durable relations and have no durable-data movement effect.
+
+The write runtime is the durable-movement capability. It receives
+semantic messages, derives legal relational mutations, applies them,
+and reports their outcomes. All durable mutations pass through its
+apply boundary.
+
+A workflow that requires both capabilities coordinates them in its own
+abstraction.
+
+* Relational Lisp language
+QueryService reads and persistence writes use one evaluated,
+homoiconic Lisp language. The language describes data relationally and
+represents why and how it moves.
+
+Programs may use ordinary Lisp evaluation, functions, macros, and
+environments. The language's relational semantics must remain visible
+after evaluation and macro expansion so programs can be inspected,
+transformed, optimized, and verified.
+
+The language is schema-agnostic being independent from Wamble's
+schema, tables, columns, constraints, and database placement. The
+language then operate on a declared logical relational schema and are
+validated against the active physical one. A physical schema change
+does not redefine lifecycle semantics when the declared relational
+meaning remains unchanged.
+
+Read and write are effects within the same language, not separate
+DSLs. QueryService programs have read-only relational effects. Write
+programs may describe durable movement and the semantics that govern
+it.
+
+Opaque SQL or host-language operations cannot bypass this model. Any
+host operation that affects read/write authority, planning, or
+optimization must expose its relational effects through the language.
+
+** Relational meaning
+Programs describe durable facts and relations, their inputs and
+results, and the movement that connects lifecycle states. Planning
+semantics describe transition preconditions, causal/order scope,
+dependencies, equivalence, commutativity, idempotency, supersession,
+merge/reorder conditions, and observable outcomes.
+
+This meaning is used by both generated reads and write planning. The
+exact syntax, evaluator/compiler organization, module system, internal
+representation, and schema metadata format remain to be designed from
+the current operations.
+
+~src/config.c~ already implements Lisp parsing, evaluation, functions,
+macros, and environments. The persistence language may share or extend
+that language implementation, but runtime persistence invocation
+always uses the compiled pipeline rather than reparsing or
+re-expanding Lisp.
+
+** Shared compilation pipeline
+QueryService slots and write programs use one relational Lisp
+compilation/generation pipeline:
+
+#+begin_src text
+Lisp program
+  -> evaluate and expand
+  -> resolve logical schema
+  -> analyze relational effects and lifecycle semantics
+  -> compile and cache semantic artifact
+  -> bind physical schema generation and durable-store placement
+       |-> QueryService read artifact
+       `-> write-runtime artifact
+  -> prepare physical operations on an owning connection
+#+end_src
+
+A semantic artifact contains the evaluated relational meaning and is
+keyed by normalized program identity, language generation, and logical
+schema-contract generation. A physical artifact binds that meaning to
+the physical schema-generation tuple of the stores it
+uses. QueryService read artifacts and write-runtime artifacts are
+physical artifacts; their internal representations remain
+implementation details.
+
+Programs known at build, startup, or configuration load are compiled
+before runtime messages arrive. An arbitrary program first seen at
+runtime is compiled once and admitted to the bounded cache. Concurrent
+requests for the same missing artifact share that work.
+
+Runtime messages carry an immutable write-artifact reference and
+packed values rather than parsed or expanded Lisp. The reference pins
+both the semantic meaning and the physical schema generation under
+which the message was accepted.
+
+A physical schema change rebinds semantic artifacts without repeating
+Lisp evaluation, macro expansion, or lifecycle analysis when the
+logical contract is unchanged. A language or logical-contract change
+creates a new semantic artifact generation. Referenced artifacts are
+retired after use; they are never invalidated while messages or
+queries still hold them.
+
+** Performance requirements
+Compilation, invocation, and database lowering form one final runtime
+path rather than a succession of slower and faster implementations.
+Every program is semantically compiled once for a given program,
+language, and logical-contract generation. Each semantic artifact is
+physically bound once for a physical schema generation.
+
+A cached invocation performs no parsing, macro expansion, symbol-name
+lookup, or general-purpose Lisp allocation. Compiled artifacts are
+immutable and shared across messages.
+
+Physical database operations are prepared once for an operation,
+physical schema generation, and connection generation. Semantic,
+physical, and prepared-operation caches and message buffers have fixed
+memory budgets and explicit full behavior.
+
+These requirements are part of Phase 2 completion. They are not
+post-implementation optimization targets.
+
+** Schema-change hot reload
+A physical schema generation is identified by an authoritative,
+checksummed migration/schema manifest.
+
+whatever whatever whatever whatever.
+Just think about this when implementing compilation.
+
+** Lifecycle equivalence
+The language must make lifecycle equivalence expressible and
+inspectable.  Matching final durable state alone does not establish
+that two message sequences are equivalent.
+
+Lifecycle equivalence preserves the required transition history and
+all of its observable consequences. This includes anything on which
+causality, invariants, acknowledgement, recovery, audit/history,
+protocol behavior, or the final durable result depends.
+
+An intermediate message or write may be removed or merged only when
+its lifecycle contribution is equivalent under the evaluated
+program. If another transition, invariant, acknowledgement, or
+observer depends on it, it remains part of the write plan.
+
+#+begin_src text
+received message lifecycle ~= transformed lifecycle
+#+end_src
+
+The equivalence relation is defined by the language, not by comparing
+final rows or SQL statements.
+
+* Durable stores
+Wamble stores profile-scoped relations in profile databases and shared
+relations in the global database. Schema definitions assign each
+relation to its durable store.
+
+Relational programs operate on those declared relations. Callers and
+message emitters do not select database connections or encode physical
+table operations. The evaluator/planner resolves relation placement
+when it generates a read or durable movement plan.
+
+Phase 2 retains the current per-thread database connections and makes
+relation-to-store resolution explicit.
+
+* QueryService
+** Contract
+QueryService queries (and filters, paginates, etc) existing durable
+data without creating any durable-data movement. In particular,
+QueryService does not create, assign, materialize, emit, flush, apply,
+retry, or compensate durable writes. Any program with a durable-data
+movement effect belongs to the write capability.
+
+Domain or policy decisions that perform one or several reads remain
+centralized above QueryService.
+
+** Generated interface
+QueryService definition contain no handwritten SQL text, handwritten
+adapter bodies, or handwritten registration. Each QueryService
+operation is defined by a read-only relational Lisp program. The
+shared pipeline produces the registered C adapter and a manifest
+describing the public operation, parameters, result/cardinality
+contract, durable scope, and generated artifacts.
+
+The final interface satisfies:
+
+#+begin_src text
+public QueryService operations = relational read programs = generated
+adapters = generated manifest entries
+#+end_src
+
+Adapters and registration are generated rather than
+handwritten. Generic runtime code performs evaluation, parameter
+binding, row decoding, cardinality handling, pagination, and error
+cleanup.
+
+The shared pipeline validates declared inputs/results against schema
+metadata, prepares plans against the test schema, limits adapter
+dependencies to the read runtime, and emits reproducible
+manifests/hashes. The exact generated C types, manifest
+representation, evaluator/compiler split, and object-inspection tools
+remain implementation decisions.
+
+** Read inventory
+Before the language interface is frozen for the implementation of the
+language and reimplementation of the persistence runtime, every
+current QueryService operation is researched for:
+- input, result shape, cardinality, and absence behavior;
+- durable relations and scope;
+- ordering, pagination, joins, and aggregation;
+- caches and wrappers around the operation;
+- domain/policy decisions mixed into the current implementation;
+- current paths that can move durable data;
+- relational language behavior required to replace it.
+
+The complete inventory is checked exhaustively. Each entry identifies
+its current source symbol and any unresolved ownership or language
+requirement. Hard operations shape the design rather than being hidden
+behind an opaque host callback.
+
+** Verification
+Read-purity proof operates on evaluated and expanded programs. It
+verifies that generated QueryService programs expose only read
+effects, that host operations cannot hide movement, and that every
+public operation has a generated definition.
+
+Runtime tests remain backstops. Representative operations run against
+real test schemas and leave durable snapshots unchanged. A read-only
+database role may be used as an additional boundary when practical.
+
+* Write runtime
+** Semantic messages
+Runtime and domain code emit the knowledge available at their
+authority boundary. A message may carry an observation, request a
+durable change, or report a transition already decided by the
+domain. Its semantics state what the producer knows and what remains
+for persistence to derive or validate.
+
+The planner may consult current profile/global facts, validate
+lifecycle preconditions, and expand one semantic message into several
+durable mutations. The ownership of each decision is recorded in the
+write-message definition.
+
+** Planning and transformation
+The write planner evaluates received messages in the relational Lisp
+and uses their exposed semantics to derive an execution plan. The
+identity transformation, which preserves every message in capture
+order, is the default. Every non-identity transformation of the
+received messages must produce a lifecycle-equivalent plan. Combining,
+superseding, merging, reordering, splitting, expansion, and elision
+are examples of transformations governed by this rule.
+
+Those rules may use lifecycle, causal, and ordering scopes;
+dependencies; commutativity; idempotency and replay semantics;
+supersession; and observable outcomes. Sharing an identity or final
+durable result alone does not authorize the transformation.
+
+*** Placement and lifetime
+The TLS IntentBuffer remains the sole owner of message payloads until
+a terminal outcome or committed lifecycle-equivalent transformation
+accounts for them. Planning uses a bounded window of references into
+that buffer rather than copying the messages into a second sequence.
+
+#+begin_src text
+TLS IntentBuffer
+  -> bounded planning window (references / indexes)
+  -> lifecycle-equivalent execution iterator
+  -> immediate apply in the writer execution window / transaction
+  -> commit outcome, then remove / acknowledge input messages
+#+end_src
+
+The transformed sequence is compact planning metadata. The execution
+plan is apply-worker scratch state and is consumed as it is produced;
+nothing here should be queued as another long-lived representation.
+
+Planning begins only when the writer has an execution window in which
+the required facts and versions can be validated. If a writer,
+transaction, dependency, or ordering scope is unavailable, the
+semantic messages remain pending and no execution plan is retained.
+
+Future-timed work remains a semantic message or scheduled lifecycle
+fact until it is eligible to execute. If it must survive restart, that
+pending semantic state is made durable rather than preserving a
+snapshot-dependent execution plan.
+
+Planning memory is bounded by the configured batch size. Message
+payloads are not duplicated. The planner uses reusable indexes, flags,
+and group descriptors and streams execution from that metadata.
+Scratch allocation is released after commit, rollback, or
+cancellation.
+
+The planner indexes semantic keys and explicit dependencies once per
+batch. Pairwise scans and sorting are used only when required by the
+program's declared semantics.
+
+Pending-message memory has fixed count and byte budgets. The selected
+full-buffer outcome preserves the workflow's acceptance contract and
+prevents unbounded growth. Work acknowledged beyond the in-memory
+budget requires durable queueing.
+
+Current coalescing and sorting behavior needs validation, and it is
+not semantics in itself. Phase 2 either expresses each transformation
+in the language after determining its correctness or completely
+removes it.
+
+Capture-before-apply remains the write-runtime invariant, and no
+message may be discarded without declared semantics and an observable
+outcome.
+
+** Outcomes
+A write definition specifies the semantic outcomes of its execution,
+the witnesses required to establish each outcome, and the handling and
+acknowledgement consequences of that outcome. The current outcome
+model distinguishes retryable failure, permanent failure,
+already-satisfied success, intentional best effort, and fatal
+invariant violation. The migration audit may expose another observable
+outcome required by a current lifecycle.
+
+SQL execution without an error is not sufficient when the lifecycle
+requires a more concrete witness. No message is acknowledged,
+discarded, or removed from pending work without a declared terminal
+outcome or a recorded lifecycle-equivalent transformation into work
+whose outcome accounts for it.
+
+What happens on each unhappy outcome is TBD.
+
+** Database execution
+The migration authority establishes physical schemas outside request
+and write execution. Startup and hot-reload validation verify the
+manifest selected for each store. Runtime reads and writes execute no
+schema DDL.
+
+The shared compiler emits parameterized database operations. A
+long-lived connection prepares each operation once for its connection
+and physical schema generation. Connection reset invalidates its
+prepared state and the current execution attempt. Before retry, the
+writer recreates operations required by resident generations without
+repeating semantic compilation.
+
+The executor batches prerequisite reads, such as session resolution,
+across the planning window. Repeated compatible writes use set-based
+operations, and independent operations use libpq pipeline execution.
+Declared dependencies and lifecycle witnesses form pipeline barriers.
+Database round trips therefore follow semantic batches and barriers
+rather than individual messages.
+
+Execution returns an outcome for each input message. Affected-row,
+returned-identity, and version witnesses are decoded directly from the
+operation that establishes them. Transaction failure follows declared
+retry semantics instead of replaying the entire batch individually.
+
+Profile and global stores use separate connections. A program spanning
+both stores cannot claim one PostgreSQL transaction; its lifecycle
+semantics define the staged durable outcomes.
+
+** Current write-path migration audit
+Write messages are arbitrary relational Lisp programs and do not form
+a closed vocabulary to inventory.
+
+Phase 2 instead audits the finite current implementation, including:
+existing emitters, direct database mutations, host write operations,
+raw persistence authority, and current transformations. The audit
+exists to migrate or deliberately isolate every legacy write path; it
+does not define which future messages the language permits.
+
+* Current IntentBuffer behavior
+~WambleIntentBuffer~ is a growable array of ~WamblePersistenceIntent~
+records. The current intent kinds are the current migration surface:
+
+#+begin_src text
+UPDATE_BOARD
+UPDATE_BOARD_ASSIGNMENT_TIME
+CREATE_RESERVATION
+REMOVE_RESERVATION
+RECORD_GAME_RESULT
+UPDATE_SESSION_LAST_SEEN
+CREATE_SESSION
+LINK_SESSION_TO_PUBKEY
+RECORD_PAYOUT
+CREATE_BOARD
+RECORD_MOVE
+UPDATE_BOARD_MOVE_META
+UPDATE_BOARD_RESERVATION_META
+RECORD_PREDICTION
+RESOLVE_PREDICTION
+UNLINK_SESSION_IDENTITY
+UPDATE_PLAYER_RATING
+RECORD_LAST_MOVE_SHOWN
+RECORD_PROFILE_TERMS_ACCEPTANCE
+ASSIGN_SESSION_TREATMENT
+#+end_src
+
+Flush currently applies count/payload limits, transaction batching,
+session resolution caching, retry retention, and asynchronous prefix
+reconciliation.  These behaviors must be represented by the final
+runtime contract or removed deliberately.
+
+** Current rewrites
+The current apply path keeps the latest matching message for these
+keys:
+
+- board update by board ID;
+- board assignment-time update by board ID;
+- board move/reservation metadata update by board ID;
+- session last-seen update by token;
+- reservation removal by board ID.
+
+Move and payout records are sorted before application. Transaction
+batching is disabled for session creation, profile-terms acceptance,
+and treatment assignment.
+
+The relational semantics must establish the lifecycle equivalence of
+each rule. Until then, these are implementation behaviors rather than
+valid language-level transformations.
+
+** Asynchronous flush
+A profile flush currently clones the captured prefix, continues
+appending to the original buffer, applies the clone on a worker, and
+reconciles retry remnants ahead of later messages.
+
+The Phase 2 target transfers or swaps ownership of a bounded buffer
+instead of duplicating its message payloads. Emission continues into a
+fresh buffer while the worker owns and drains the detached buffer.
+Retry remnants return ahead of later messages. Allocation, worker,
+apply, and reconciliation failures remain observable.
+
+* Thread-local runtime
+Each profile owns one long-lived writer execution context for Phase 2.
+Flushes reuse that writer and its database connections; each
+connection remains on its owner thread.
+
+A flush swaps the profile's bounded active buffer for an empty one and
+transfers ownership of the detached buffer to the writer without
+copying payloads. Retry remnants return ahead of messages captured
+after the swap.
+
+* Metrics and benchmarks
+Performance work uses the existing test runner, suite classifications,
+and ~wamble_metric()~ output. Benchmarks also verify committed rows,
+outcomes, ordering, and lifecycle behavior so lost or skipped work
+cannot appear as throughput.
+
+Required metrics cover duration, throughput, p50/p95/p99
+capture-to-commit latency, allocations, copied bytes, cache behavior,
+database calls and round trips, connection opens and resets, batch and
+queue depth, retries, and planning and cache memory high-water marks.
+Stress tests verify fixed memory bounds and full-buffer behavior.
+
+Performance budgets and regression thresholds are checked into the
+test suite with the implementation. Phase 2 is not complete while any
+required fast path lacks a metric.

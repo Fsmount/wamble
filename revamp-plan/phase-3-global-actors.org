@@ -1,0 +1,495 @@
+#+title: Phase 3 — Global Network and Persistence Actors
+
+* Overview
+Phase 3 starts after the correct thread-local persistence model is merged. It
+moves network and persistence ownership from profile/thread-local runtimes to
+logical global actors.
+
+#+begin_src text
+profile / submodule / thread / worker actors
+  |-> global network actor
+  `-> global persistence actor
+#+end_src
+
+The phase establishes actor identity, provenance, transport, lifecycle, and
+global ownership. QueryService remains generated and read-only. Durable writes
+remain capture-before-apply semantic messages whose transformations require
+declared lifecycle equivalence and whose outcomes remain explicit.
+
+* Starting topology
+At the start of Phase 3:
+
+- each ~RunningProfile~ owns a socket and websocket gateway;
+- each profile runtime drives network ingress, dispatch, retries, and outbound
+  flush through ~network_runtime_drive_budget()~;
+- network endpoint and queue state is thread-local;
+- QueryService and IntentBuffer selection is thread-local;
+- each profile owns persistence buffer and asynchronous flush state.
+
+This topology remains correct through Phase 2. Phase 3 replaces its ownership
+without redesigning persistence semantics at the same time.
+
+* Actor model
+Profiles, their running submodules/processes, and executing threads are actors.
+The exact decomposition of modules into independent actors follows from the
+runtime/concurrency inventory.
+
+The first global actors are:
+
+- GlobalNetworkRuntime
+- GlobalPersistenceRuntime
+
+A profile actor carries profile lifecycle, configuration, and supervision. It is
+not presumed to author every submodule message and is not a mandatory relay to a
+global actor.
+
+** Arbitrary messages
+Every actor may send arbitrary messages. Authority does not restrict an actor to
+a fixed vocabulary.
+
+A receiver interprets and validates messages according to its own contract. The
+persistence actor, for example, applies only messages with valid relational Lisp
+semantics, but that is receiver behavior rather than sender permission.
+
+** Thread actors
+Every executing thread has a runtime-registered actor identity. The runtime
+installs the binding before actor code runs and invalidates it on thread exit or
+reload.
+
+Only the trusted runtime creates or changes actor bindings. Application payloads
+cannot select their sender identity. Duplicate, stale, or unauthorized bindings
+are rejected.
+
+Profiles and submodules may have identities distinct from the thread executing a
+particular turn. The representation of that relationship is part of actor
+runtime design; the executing thread remains identifiable.
+
+C and OS thread IDs identify an execution carrier, not a Wamble actor or its
+domain authority. IDs may be reused and thread names are diagnostic only. A
+private runtime registry, opaque actor records, and runtime-installed TLS are
+available implementation mechanisms for binding the observed thread to its actor
+identity.
+
+** Provenance
+Global actors receive a runtime-attached provenance envelope and an
+actor-supplied payload:
+
+#+begin_src text
+runtime provenance + actor payload
+#+end_src
+
+Payload fields do not establish sender identity or profile authority. Repeated
+scope fields may be checked against runtime provenance and durable state.
+
+The envelope must carry the information required for routing, lifecycle, and
+stale-generation checks. Its exact fields and representation remain intentionally
+unspecified until the transport and actor-lifecycle design establish what is
+needed.
+
+This is an architectural trust boundary inside the C runtime, not a claim of
+cryptographic isolation from arbitrary memory corruption. Stronger process/OS
+isolation may be introduced if the threat model requires it.
+
+** Message ordering
+The actor model does not guarantee the order in which sent messages are
+delivered. A selected runtime may define scoped ordering guarantees, but Phase 3
+cannot assume them in advance.
+
+Three orders are distinct:
+
+#+begin_src text
+domain / causal order
+transport acceptance / delivery order
+execution / commit / wire order
+#+end_src
+
+A receiving actor may buffer messages and select an execution order. That
+creates an order after receipt; it cannot recover a causal/send order that was
+neither preserved by transport nor represented by trusted message semantics.
+
+Possible ordering evidence includes sender-local sequence, explicit dependency,
+expected lifecycle version, request/ack causality, or runtime acceptance
+sequence. Phase 3 must decide which evidence and guarantees exist, at what
+scope, and what happens when noncommuting messages arrive without enough
+information to establish a valid order.
+
+* Actor transport
+Transport carries messages from local/profile/submodule/thread/worker actors to
+global actors. Topology does not select the transport mechanism.
+
+Candidate mechanisms include mailboxes, process-global queues, explicit actor
+references, per-thread staging, TLS message buffers, and process IPC. Per-thread
+staging can strand work at thread exit; lock-free queues must reconcile memory
+reclamation with actor generations; synchronous send-and-wait can deadlock or
+re-enter a global actor. These constraints apply when the corresponding
+mechanism is considered.
+
+A selected transport defines:
+
+- provenance attachment;
+- message and byte capacity;
+- backpressure and failure behavior;
+- acceptance and acknowledgement boundaries;
+- ordering guarantees and their scope;
+- thread/actor shutdown and reload behavior.
+
+No transport is selected by this plan.
+
+** Option: TLS message buffers
+*** Model
+Each participating execution thread has an outgoing message buffer selected
+through TLS. Actor code appends to that buffer; batches are drained or forwarded
+to the addressed global actors.
+
+#+begin_src text
+local/thread/worker actor
+  -> append to TLS message buffer
+  -> drain / forward / merge
+  -> global actor
+#+end_src
+
+The TLS buffer is a local outgoing-message stage. It is not merely a pointer to
+the global actor and it does not own persistence or network behavior.
+
+*** Evidence
+The current IntentBuffer demonstrates this transport shape:
+
+#+begin_src c
+typedef struct WambleIntentBuffer {
+  struct WamblePersistenceIntent *items;
+  int count;
+  int capacity;
+} WambleIntentBuffer;
+
+static WAMBLE_THREAD_LOCAL WambleIntentBuffer *g_intents_tls = NULL;
+
+void wamble_set_intent_buffer(WambleIntentBuffer *buf) {
+  g_intents_tls = buf;
+}
+
+WambleIntentBuffer *wamble_get_intent_buffer(void) {
+  return g_intents_tls;
+}
+#+end_src
+
+~intents_push()~ resolves this buffer and appends a message record. Emitters such
+as ~wamble_emit_update_session_last_seen(token)~ therefore capture messages
+without receiving a buffer parameter.
+
+~src/main.c~ and ~src/profile_runtime.c~ install buffers for different execution
+threads. ~server_protocol_flush_intents_now()~ and
+~prediction_flush_intents_now()~ temporarily install a fresh buffer, run an
+existing call tree, flush its messages, and restore the previous buffer.
+
+The asynchronous profile flush detaches a captured prefix, applies it on another
+thread, and reconciles retry remnants ahead of later messages. Tests substitute a
+capture buffer and inspect emitted records without changing emitter signatures.
+When no buffer is installed, ~intents_push()~ records
+~PERSISTENCE_STATUS_NO_BUFFER~; the current void-emitter path does not report
+that failure directly to its caller.
+
+This evidence establishes that TLS can select an appendable per-thread message
+buffer, that a batch can be detached and transferred, and that callers need not
+receive a buffer parameter. It does not establish the future actor-message
+format, drain ownership, cross-thread ordering, provenance, backpressure, or
+recovery model.
+
+*** Buffer forms
+A TLS-buffer transport could use:
+
+- one generic outgoing buffer with runtime routing metadata;
+- one buffer per global actor in a private thread transport context;
+- swapped/double buffers so emission continues while a batch drains;
+- bounded producer rings drained by global actors;
+- temporary capture buffers for tests or bounded workflows.
+
+These are variants of the same option, not selected designs.
+
+*** Properties
+Local append avoids shared-queue contention on each send and supports batching.
+It also creates explicit producer-buffer lifecycle:
+
+- every emitting thread must install a buffer before actor code runs;
+- new/detached threads do not inherit another thread's TLS state;
+- full and missing buffers must fail visibly;
+- thread exit must drain or transfer pending messages;
+- nested capture must restore the previous buffer on every path;
+- drain triggers, capacity, wakeups, and shutdown must be defined.
+
+The trusted runtime owns buffer installation and provenance attachment. The
+buffer stores transport messages; arbitrary payload fields cannot forge origin.
+
+*** Ordering limitation
+A TLS message buffer preserves append order within one thread's buffer. It does
+not establish order between threads or between batches drained at different
+times.
+
+When several buffers feed one global actor, drain/merge order may differ from
+emission or causal order. The receiver cannot infer missing cross-thread order
+from batch arrival.
+
+Selecting this option therefore requires an explicit decision about ordering
+evidence and ambiguous noncommuting messages. TLS buffering itself is not an
+ordering solution.
+
+*** Open decisions
+- Generic buffer versus one buffer per global actor.
+- Buffer representation and swap/drain protocol.
+- Drain ownership and notification.
+- Capacity, flush triggers, and backpressure.
+- Provenance attachment at append or acceptance.
+- Cross-buffer ordering and retry reconciliation.
+- Thread exit, reload, cancellation, and global shutdown.
+
+* Global network actor
+** Current boundary
+~network_runtime_drive_budget()~ receives the profile socket, websocket gateway,
+and profile name. The current path is:
+
+#+begin_src text
+profile runtime
+  -> socket / websocket ingress
+  -> TLS inbound queue
+  -> TLS dispatch queue
+  -> handle_message(..., profile_name)
+  -> TLS outbound queue
+  -> socket / websocket flush
+#+end_src
+
+~network_protocol.c~ also keeps the current reliable request, endpoint/session
+indexes, sequence and fragment IDs, ACK state, reliable bundles, and retry
+schedules in TLS. The receiving profile thread supplies handler scope and sends
+the response through its local transport.
+
+Websocket ownership includes accept threads, detached client threads, gateway
+ingress, and per-client outbound state. Moving only the gateway pointer does not
+globalize the network runtime.
+
+** Current protocol scope
+~ctrl_scope()~ currently classifies these controls as global:
+
+#+begin_src text
+ACK, CLIENT_HELLO, CLIENT_GOODBYE, LIST_PROFILES, GET_PROFILE_INFO,
+GET_PROFILE_TOS, ACCEPT_PROFILE_TOS, GET_ACTIVE_RESERVATIONS,
+LOGIN_REQUEST, LOGOUT
+#+end_src
+
+It classifies these controls as profile-scoped:
+
+#+begin_src text
+PLAYER_MOVE, SPECTATE_GAME, SPECTATE_STOP, GET_PLAYER_STATS,
+GET_LEGAL_MOVES, GET_LEADERBOARD, SUBMIT_PREDICTION, GET_PREDICTIONS
+#+end_src
+
+This classification currently gates handling but does not provide a separate
+global transport. Global controls still arrive through and respond from the
+profile runtime that received them.
+
+** Target
+GlobalNetworkRuntime owns network intake and delivery:
+
+- UDP and websocket ingress;
+- packet classification and protocol dispatch;
+- endpoint/session routing;
+- reliable-delivery, ACK, retry, replay, and fragmentation state;
+- outbound queues, timers, and flush policy.
+
+Profile, protocol, and submodule actors exchange messages with this runtime.
+Profile scope is routing/validation data rather than an implication of the
+thread that received a packet. Global protocol operations route to global
+handlers instead of executing in whichever profile runtime received them.
+
+** Ordering
+The network actor can define ordering after its intake boundary, such as a
+reliable endpoint/stream sequence. It cannot recover an actor's intended send
+order if upstream actor transport neither preserved nor represented it.
+
+Network design must distinguish actor-message order, protocol sequence,
+endpoint/stream order, and wire delivery. Acknowledgement and replay guarantees
+apply only at their declared boundary.
+
+** Open decisions
+- Physical socket/port ownership behind the logical global actor.
+- Websocket gateway and client-thread migration.
+- Endpoint/session state partitioning and recovery.
+- Routing ownership for global and profile protocol operations.
+- Backpressure between network intake and receiving actors.
+- Reload/shutdown treatment of accepted outbound and retry work.
+
+* Global persistence actor
+GlobalPersistenceRuntime exposes two capabilities backed by the Phase 2
+relational Lisp model:
+
+#+begin_src text
+actor -> Read(QueryService program) -> read result
+actor -> Write(semantic message)     -> durable outcome
+#+end_src
+
+** Read capability
+The global QueryService evaluates read-only relational Lisp programs. It does not
+escalate to durable movement when data is absent. Workflows coordinate explicit
+write-then-read sequences.
+
+** Write capability
+The write side receives Phase 2 semantic messages and runtime provenance. It
+evaluates lifecycle semantics, derives an execution plan, applies durable
+movement, retries according to message semantics, and reports the resulting
+outcome.
+
+It preserves every lifecycle/order constraint established by the language and
+any trusted ordering evidence supplied by transport. It does not claim to
+reconstruct a pre-intake order that transport did not guarantee and messages did
+not represent.
+
+When concurrent messages commute, the runtime may choose a linearization. When
+they have explicit dependencies, the plan follows those constraints. Ambiguous
+noncommuting messages require an explicit conflict, delay, retry, or resolution
+policy; intake FIFO is not proof of lifecycle order.
+
+** Direct access
+Profile and submodule actors may address global persistence directly. The
+profile actor mediates only workflows whose semantics require profile
+coordination.
+
+Profile scope and sender provenance come from the runtime and durable facts, not
+from routing every message through a profile thread.
+
+** Logical and physical ownership
+The target has one logical global persistence destination. Physical queues,
+workers, connection pools, and DB/profile/order-lane shards may exist behind that
+boundary.
+
+The preferred developer model is one obvious global destination. Whether its
+physical ingress is singular, staged through TLS buffers, sharded, or otherwise
+implemented remains a transport decision.
+
+** Durability
+In-memory ingress does not itself make accepted work durable. The runtime defines
+acceptance, commit, acknowledgement, crash recovery, replay, and shutdown drain.
+
+Profile and global database connections move under the global persistence
+runtime. Cross-store workflows define ordering, atomicity/compensation, and the
+version of global facts used by profile-local decisions.
+
+** Open decisions
+- Profile/global DB connection ownership and physical sharding.
+- Ordering and compensation across profile and global stores.
+- Read/write worker and connection-pool topology.
+- Accepted-message recovery and replay.
+- Commit acknowledgement required by protocol workflows.
+- Write-then-read coordination.
+- Backpressure and bounded ingress.
+- Reload generations and shutdown drain.
+
+* Runtime migration inventory
+Phase 3 inventories every actor/thread creation, message producer, global-runtime
+caller, queue, cache, DB owner, and reload/shutdown path before changing
+ownership.
+
+** Thread actors
+The current thread set includes the main thread, profile runtimes, async
+persistence workers, board-supply/scoring workers, websocket accept threads, and
+websocket client threads. Inline profile execution represents both the executing
+thread actor and logical profile context without allowing either identity to be
+forged.
+
+~board_scoring_worker()~ calls scoring code that emits payout messages. Its
+registration and outgoing-message transport must be explicit rather than relying
+on inherited TLS state.
+
+** Persistence state
+The main thread and profile runtimes install separate IntentBuffers.
+~intents_push()~ records ~PERSISTENCE_STATUS_NO_BUFFER~ when no buffer is present,
+but void emitters do not return that failure to their callers. Persistence status
+is TLS and retains allocation, missing-buffer, and apply failures until cleared.
+
+~wamble_set_query_service()~ updates both the TLS service and process-global
+fallback. ~wamble_persistence_flush_buffer()~ installs ambient QueryService and
+IntentBuffer state without restoring both values itself. Immediate-flush wrappers
+restore the previous IntentBuffer but do not restore QueryService state.
+
+Async flush preserves retry remnants ahead of messages appended after prefix
+cloning. Prefix-replacement allocation failure needs an explicit recovery and
+visibility rule.
+
+** Network state
+Current TLS network state includes endpoint/session indexes, inbound/dispatch/
+outbound queues, sequence and fragment IDs, reliable bundles, and retry
+schedules. Protocol caches include leaderboard, terms, prediction, trust,
+session-capability, profile-list, and profile-info state; globalization assigns
+each cache an owner, invalidation rule, and profile-isolation contract.
+
+Websocket ownership includes gateway state, accept threads, detached client
+threads, bounded ingress, and per-client outbound state.
+
+* Implementation
+1. Inventory actors, threads, message paths, network state, persistence state,
+   stores, and lifecycle/shutdown ownership.
+2. Define actor registration, identity lifetime, provenance attachment, and
+   arbitrary-message send/receive contracts.
+3. Research transport ordering and define every ordering guarantee and boundary.
+4. Evaluate actor transport options, including TLS message buffers, against
+   provenance, capacity, ordering, lifecycle, and shutdown requirements.
+5. Introduce logical global network and persistence boundaries behind temporary
+   adapters.
+6. Move network intake, reliable-delivery state, websocket routing, dispatch, and
+   outbound delivery out of profile runtime ownership.
+7. Move QueryService access and semantic write intake/apply out of profile-owned
+   persistence state.
+8. Enable direct profile/submodule/thread/worker communication with global
+   actors.
+9. Implement backpressure, acknowledgement, recovery, reload generation, and
+   shutdown drain.
+10. Remove obsolete per-profile owners and migration adapters.
+
+Network and persistence may migrate separately, but Phase 3 is complete only
+when both have global ownership.
+
+* Verification
+Actor/runtime tests establish that provenance is runtime-attached, payloads
+cannot forge origin, stale actors cannot send as a current generation, and every
+actor can send arbitrary messages.
+
+Ordering tests distinguish causal, transport, and execution order. They cover
+multiple producers, reordered batch arrival, explicit dependencies, commuting
+messages, and ambiguous noncommuting messages without treating intake FIFO as
+causal proof.
+
+Network tests cover global/profile routing, endpoint isolation, UDP/websocket
+responses, reliable delivery, replay, fragmentation, backpressure, reload, and
+shutdown.
+
+Persistence tests preserve Phase 2 read purity, lifecycle equivalence,
+idempotency, outcomes, retry, direct profile scope, profile/global store rules,
+recovery, and drain behavior after transport migration.
+
+Migration tests establish one logical owner for each network and persistence
+responsibility. Any retained TLS message buffer stages outgoing actor messages;
+it does not remain a hidden persistence/network owner.
+
+** Selected regressions
+- Nested temporary capture restores TLS message-buffer and QueryService context
+  after success, allocation failure, emit failure, flush failure, and early exit.
+- Async reconciliation keeps retry remnants ahead of later messages and reports
+  prefix-replacement failure.
+- Endpoint rebinding, sequence rollover, fragmented reliable delivery, and
+  terminal replay preserve their protocol contracts.
+- Protocol-cache invalidation and profile isolation survive ownership migration.
+
+* Completion
+Phase 3 is complete when:
+
+- network and persistence each have one logical global actor boundary;
+- actor identity and provenance are installed by the trusted runtime;
+- actors can send arbitrary messages without payload-controlled authority;
+- profile threads are not mandatory relays to global actors;
+- transport capacity, failure, ordering guarantees, and ordering limitations are
+  explicit;
+- ambiguous unordered messages have defined handling rather than accidental FIFO;
+- QueryService and write capabilities preserve Phase 2 semantics;
+- profile-owned network pumping and persistence apply ownership are removed;
+- DB, websocket, worker, reload, recovery, and shutdown ownership are defined and
+  tested;
+- every open transport, network, and persistence decision that affects
+  correctness has a defined contract;
+- no legacy TLS/local state remains an accidental second owner.
