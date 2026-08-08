@@ -277,8 +277,9 @@ Treatment Groups
   - `(match fact-key op value)`
 - Supported ops: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `exists`, `absent`
 - Resolution model:
-  config DSL materializes into DB rows, sessions persist their assigned
-  `treatment_group_key`, and runtime consumers query actions by hook.
+  config DSL materializes into DB rows, session treatment assignment is
+  explicitly materialized per `(session_id, profile_name)`, and runtime
+  consumers query actions by hook from that stable profile-scoped snapshot.
 - Outputs:
   - `tag`: persistent `global_identity_tags` upsert
   - `feature`, `context`, `behavior`, `meta`: hook-scoped outputs returned by

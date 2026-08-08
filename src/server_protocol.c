@@ -1,5 +1,52 @@
 #include "../include/wamble/wamble.h"
+#include "../include/wamble/wamble_db.h"
 typedef struct WambleWsGateway WambleWsGateway;
+void wamble_emit_record_last_move_shown(uint64_t board_id, const uint8_t *token,
+                                        const char *shown_uci);
+void wamble_emit_record_move(uint64_t board_id, const uint8_t *token,
+                             const char *move_uci, int move_number);
+struct WambleIntentBuffer *wamble_intents_create(void);
+void wamble_intents_destroy(struct WambleIntentBuffer *buf);
+void wamble_set_intent_buffer(struct WambleIntentBuffer *buf);
+struct WambleIntentBuffer *wamble_get_intent_buffer(void);
+int wamble_persistence_flush_buffer(struct WambleIntentBuffer *buf,
+                                    const WambleQueryService *qs,
+                                    int max_batches, int max_intents,
+                                    int max_payload_bytes);
+void wamble_emit_create_session(const uint8_t *token, uint64_t player_id);
+void wamble_emit_assign_session_treatment(const uint8_t *token,
+                                          const char *profile_name);
+void wamble_emit_record_profile_terms_acceptance(
+    const uint8_t *token, const char *profile_name,
+    const uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH], const char *tos_text);
+
+static int server_protocol_flush_current_intents_now(void) {
+  int barrier_status = profile_runtime_persistence_barrier();
+  if (barrier_status != -2)
+    return barrier_status;
+  struct WambleIntentBuffer *buf = wamble_get_intent_buffer();
+  if (!buf)
+    return -1;
+  const WambleQueryService *qs = wamble_get_query_service();
+  if (!qs)
+    qs = wamble_get_db_query_service();
+  return wamble_persistence_flush_buffer(buf, qs, 8, 64, 65536) ? 0 : -1;
+}
+
+static int server_protocol_flush_intents_now(void (*emit_fn)(void *),
+                                             void *ctx) {
+  struct WambleIntentBuffer *previous = wamble_get_intent_buffer();
+  struct WambleIntentBuffer *buf = wamble_intents_create();
+  if (!buf)
+    return -1;
+  wamble_set_intent_buffer(buf);
+  emit_fn(ctx);
+  int drained = wamble_persistence_flush_buffer(
+      buf, wamble_get_db_query_service(), 8, 64, 65536);
+  wamble_set_intent_buffer(previous);
+  wamble_intents_destroy(buf);
+  return drained ? 0 : -1;
+}
 
 void crypto_blake2b(uint8_t *hash, size_t hash_size, const uint8_t *msg,
                     size_t msg_size);
@@ -53,6 +100,524 @@ static WAMBLE_THREAD_LOCAL LoginChallengeEntry *g_login_challenge_entries =
     NULL;
 static WAMBLE_THREAD_LOCAL int g_login_challenge_capacity = 0;
 
+#define LEADERBOARD_CACHE_TTL_MS 5000ULL
+#define LEADERBOARD_CACHE_HANDLE_MAX 64
+
+typedef struct {
+  int valid;
+  uint64_t requester_session_id;
+  uint8_t type;
+  int limit;
+  int offset;
+  uint64_t cached_at_ms;
+  DbLeaderboardEntry rows[WAMBLE_MAX_LEADERBOARD_ENTRIES];
+  char row_handles[WAMBLE_MAX_LEADERBOARD_ENTRIES]
+                  [LEADERBOARD_CACHE_HANDLE_MAX];
+  DbLeaderboardEntry self;
+  char self_handle[LEADERBOARD_CACHE_HANDLE_MAX];
+  int count;
+  uint32_t self_rank;
+  int self_in_rows;
+  uint32_t total_count;
+} LeaderboardCacheEntry;
+
+#define PROFILE_TERMS_CACHE_TTL_MS 5000ULL
+#define PROFILE_TERMS_CACHE_MAX 64
+#define PROFILE_TERMS_CACHE_NAME_MAX 64
+
+typedef struct {
+  int valid;
+  uint8_t token[TOKEN_LENGTH];
+  char profile_name[PROFILE_TERMS_CACHE_NAME_MAX];
+  uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH];
+  int accepted;
+  uint64_t cached_at_ms;
+} ProfileTermsCacheEntry;
+
+#define PREDICTION_MOVE_PROJECTION_CACHE_TTL_MS 3000ULL
+#define PREDICTION_MOVE_PROJECTION_CACHE_MAX 16
+
+typedef struct {
+  int valid;
+  uint64_t board_id;
+  time_t board_last_move_time;
+  int max_out;
+  WamblePredictionView rows[WAMBLE_MAX_PREDICTION_ENTRIES];
+  int count;
+  uint64_t cached_at_ms;
+} PredictionMoveProjectionCacheEntry;
+
+#define TRUST_TIER_CACHE_TTL_MS 3000ULL
+#define TRUST_TIER_CACHE_MAX 64
+
+typedef struct {
+  int valid;
+  uint8_t token[TOKEN_LENGTH];
+  char profile_name[PROFILE_TERMS_CACHE_NAME_MAX];
+  int trust_tier;
+  uint64_t cached_at_ms;
+} TrustTierCacheEntry;
+
+#define SESSION_CAPS_CACHE_TTL_MS 1000ULL
+#define SESSION_CAPS_CACHE_MAX 64
+
+typedef struct {
+  int valid;
+  uint8_t token[TOKEN_LENGTH];
+  char profile_name[PROFILE_TERMS_CACHE_NAME_MAX];
+  uint64_t board_id;
+  time_t board_last_move_time;
+  time_t reservation_time;
+  uint32_t caps;
+  int max_pending;
+  char prediction_source[16];
+  uint64_t cached_at_ms;
+} SessionCapsCacheEntry;
+
+#define PROFILE_INFO_CACHE_TTL_MS 5000ULL
+#define PROFILE_INFO_CACHE_MAX 64
+
+typedef struct {
+  int valid;
+  uint8_t token[TOKEN_LENGTH];
+  uintptr_t config_identity;
+  int effective_trust_tier;
+  char *payload;
+  size_t payload_len;
+  uint64_t cached_at_ms;
+} ProfilesListCacheEntry;
+
+typedef struct {
+  int valid;
+  uint8_t token[TOKEN_LENGTH];
+  char profile_name[PROFILE_TERMS_CACHE_NAME_MAX];
+  char bound_profile_name[PROFILE_TERMS_CACHE_NAME_MAX];
+  int effective_trust_tier;
+  struct WambleMsg response;
+  uint64_t cached_at_ms;
+} ProfileInfoCacheEntry;
+
+typedef struct ServerProtocolCaches {
+  LeaderboardCacheEntry leaderboard;
+  ProfileTermsCacheEntry profile_terms[PROFILE_TERMS_CACHE_MAX];
+  int profile_terms_next;
+  PredictionMoveProjectionCacheEntry
+      prediction_move_projection[PREDICTION_MOVE_PROJECTION_CACHE_MAX];
+  int prediction_move_projection_next;
+  TrustTierCacheEntry trust_tiers[TRUST_TIER_CACHE_MAX];
+  int trust_tiers_next;
+  SessionCapsCacheEntry session_caps[SESSION_CAPS_CACHE_MAX];
+  int session_caps_next;
+  ProfilesListCacheEntry profiles_list[PROFILE_INFO_CACHE_MAX];
+  int profiles_list_next;
+  ProfileInfoCacheEntry profile_info[PROFILE_INFO_CACHE_MAX];
+  int profile_info_next;
+} ServerProtocolCaches;
+
+static WAMBLE_THREAD_LOCAL ServerProtocolCaches g_server_protocol_caches;
+
+static int profiles_list_cache_lookup(const uint8_t *token,
+                                      uintptr_t config_identity,
+                                      int effective_trust_tier,
+                                      const uint8_t **payload_out,
+                                      size_t *payload_len_out) {
+  if (!token || !payload_out || !payload_len_out)
+    return 0;
+  uint64_t now_ms = wamble_now_mono_millis();
+  for (int i = 0; i < PROFILE_INFO_CACHE_MAX; i++) {
+    ProfilesListCacheEntry *e = &g_server_protocol_caches.profiles_list[i];
+    if (!e->valid)
+      continue;
+    if (now_ms - e->cached_at_ms > PROFILE_INFO_CACHE_TTL_MS) {
+      free(e->payload);
+      memset(e, 0, sizeof(*e));
+      continue;
+    }
+    if (e->config_identity == config_identity &&
+        e->effective_trust_tier == effective_trust_tier &&
+        memcmp(e->token, token, TOKEN_LENGTH) == 0) {
+      *payload_out = (const uint8_t *)e->payload;
+      *payload_len_out = e->payload_len;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void profiles_list_cache_store(const uint8_t *token,
+                                      uintptr_t config_identity,
+                                      int effective_trust_tier,
+                                      const uint8_t *payload,
+                                      size_t payload_len) {
+  if (!token || (payload_len > 0 && !payload))
+    return;
+  char *copy = NULL;
+  if (payload_len > 0) {
+    copy = (char *)malloc(payload_len + 1u);
+    if (!copy)
+      return;
+    memcpy(copy, payload, payload_len);
+    copy[payload_len] = '\0';
+  }
+  int slot =
+      g_server_protocol_caches.profiles_list_next++ % PROFILE_INFO_CACHE_MAX;
+  ProfilesListCacheEntry *e = &g_server_protocol_caches.profiles_list[slot];
+  free(e->payload);
+  memset(e, 0, sizeof(*e));
+  e->valid = 1;
+  memcpy(e->token, token, TOKEN_LENGTH);
+  e->config_identity = config_identity;
+  e->effective_trust_tier = effective_trust_tier;
+  e->payload = copy;
+  e->payload_len = payload_len;
+  e->cached_at_ms = wamble_now_mono_millis();
+}
+
+static int profile_info_cache_lookup(const uint8_t *token, const char *name,
+                                     const char *bound_profile_name,
+                                     int effective_trust_tier,
+                                     struct WambleMsg *out) {
+  if (!token || !name || !out)
+    return 0;
+  uint64_t now_ms = wamble_now_mono_millis();
+  const char *bound = bound_profile_name ? bound_profile_name : "";
+  for (int i = 0; i < PROFILE_INFO_CACHE_MAX; i++) {
+    ProfileInfoCacheEntry *e = &g_server_protocol_caches.profile_info[i];
+    if (!e->valid)
+      continue;
+    if (now_ms - e->cached_at_ms > PROFILE_INFO_CACHE_TTL_MS) {
+      e->valid = 0;
+      continue;
+    }
+    if (e->effective_trust_tier == effective_trust_tier &&
+        memcmp(e->token, token, TOKEN_LENGTH) == 0 &&
+        strcmp(e->profile_name, name) == 0 &&
+        strcmp(e->bound_profile_name, bound) == 0) {
+      *out = e->response;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void profile_info_cache_store(const uint8_t *token, const char *name,
+                                     const char *bound_profile_name,
+                                     int effective_trust_tier,
+                                     const struct WambleMsg *resp) {
+  if (!token || !name || !resp)
+    return;
+  int slot =
+      g_server_protocol_caches.profile_info_next++ % PROFILE_INFO_CACHE_MAX;
+  ProfileInfoCacheEntry *e = &g_server_protocol_caches.profile_info[slot];
+  memset(e, 0, sizeof(*e));
+  e->valid = 1;
+  memcpy(e->token, token, TOKEN_LENGTH);
+  snprintf(e->profile_name, sizeof(e->profile_name), "%s", name);
+  snprintf(e->bound_profile_name, sizeof(e->bound_profile_name), "%s",
+           bound_profile_name ? bound_profile_name : "");
+  e->effective_trust_tier = effective_trust_tier;
+  e->response = *resp;
+  e->cached_at_ms = wamble_now_mono_millis();
+}
+
+static void profile_info_cache_invalidate(const uint8_t *token,
+                                          const char *name) {
+  if (!token || !name)
+    return;
+  for (int i = 0; i < PROFILE_INFO_CACHE_MAX; i++) {
+    ProfileInfoCacheEntry *e = &g_server_protocol_caches.profile_info[i];
+    if (e->valid && memcmp(e->token, token, TOKEN_LENGTH) == 0 &&
+        strcmp(e->profile_name, name) == 0) {
+      e->valid = 0;
+    }
+  }
+}
+
+static int session_caps_cache_lookup(const uint8_t *token,
+                                     const char *profile_name,
+                                     const WambleBoard *board,
+                                     uint32_t *out_caps,
+                                     const char **out_prediction_source,
+                                     int *out_max_pending) {
+  if (!token || !profile_name || !board || !out_caps || !out_max_pending)
+    return 0;
+  uint64_t now_ms = wamble_now_mono_millis();
+  for (int i = 0; i < SESSION_CAPS_CACHE_MAX; i++) {
+    SessionCapsCacheEntry *e = &g_server_protocol_caches.session_caps[i];
+    if (!e->valid)
+      continue;
+    if (now_ms - e->cached_at_ms > SESSION_CAPS_CACHE_TTL_MS) {
+      e->valid = 0;
+      continue;
+    }
+    if (memcmp(e->token, token, TOKEN_LENGTH) == 0 &&
+        strcmp(e->profile_name, profile_name) == 0 &&
+        e->board_id == board->id &&
+        e->board_last_move_time == board->last_move_time &&
+        e->reservation_time == board->reservation_time) {
+      *out_caps = e->caps;
+      *out_max_pending = e->max_pending;
+      if (out_prediction_source)
+        *out_prediction_source = e->prediction_source;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void session_caps_cache_store(const uint8_t *token,
+                                     const char *profile_name,
+                                     const WambleBoard *board, uint32_t caps,
+                                     const char *prediction_source,
+                                     int max_pending) {
+  if (!token || !profile_name || !board)
+    return;
+  int slot =
+      g_server_protocol_caches.session_caps_next++ % SESSION_CAPS_CACHE_MAX;
+  SessionCapsCacheEntry *e = &g_server_protocol_caches.session_caps[slot];
+  memset(e, 0, sizeof(*e));
+  e->valid = 1;
+  memcpy(e->token, token, TOKEN_LENGTH);
+  snprintf(e->profile_name, sizeof(e->profile_name), "%s", profile_name);
+  e->board_id = board->id;
+  e->board_last_move_time = board->last_move_time;
+  e->reservation_time = board->reservation_time;
+  e->caps = caps;
+  e->max_pending = max_pending;
+  snprintf(e->prediction_source, sizeof(e->prediction_source), "%s",
+           prediction_source ? prediction_source : "tree");
+  e->cached_at_ms = wamble_now_mono_millis();
+}
+
+static void session_caps_cache_invalidate(const uint8_t *token,
+                                          const char *profile_name) {
+  if (!token || !profile_name)
+    return;
+  for (int i = 0; i < SESSION_CAPS_CACHE_MAX; i++) {
+    SessionCapsCacheEntry *e = &g_server_protocol_caches.session_caps[i];
+    if (e->valid && memcmp(e->token, token, TOKEN_LENGTH) == 0 &&
+        strcmp(e->profile_name, profile_name) == 0) {
+      e->valid = 0;
+    }
+  }
+}
+
+static int trust_tier_cache_lookup(const uint8_t *token,
+                                   const char *profile_name,
+                                   int *out_trust_tier) {
+  if (!token || !profile_name || !out_trust_tier)
+    return 0;
+  uint64_t now_ms = wamble_now_mono_millis();
+  for (int i = 0; i < TRUST_TIER_CACHE_MAX; i++) {
+    TrustTierCacheEntry *e = &g_server_protocol_caches.trust_tiers[i];
+    if (!e->valid)
+      continue;
+    if (now_ms - e->cached_at_ms > TRUST_TIER_CACHE_TTL_MS) {
+      e->valid = 0;
+      continue;
+    }
+    if (memcmp(e->token, token, TOKEN_LENGTH) == 0 &&
+        strcmp(e->profile_name, profile_name ? profile_name : "") == 0) {
+      *out_trust_tier = e->trust_tier;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void trust_tier_cache_store(const uint8_t *token,
+                                   const char *profile_name, int trust_tier) {
+  if (!token || !profile_name)
+    return;
+  int slot = g_server_protocol_caches.trust_tiers_next++ % TRUST_TIER_CACHE_MAX;
+  TrustTierCacheEntry *e = &g_server_protocol_caches.trust_tiers[slot];
+  memset(e, 0, sizeof(*e));
+  e->valid = 1;
+  memcpy(e->token, token, TOKEN_LENGTH);
+  snprintf(e->profile_name, sizeof(e->profile_name), "%s",
+           profile_name ? profile_name : "");
+  e->trust_tier = trust_tier;
+  e->cached_at_ms = wamble_now_mono_millis();
+}
+
+static int prediction_move_projection_cache_lookup(uint64_t board_id,
+                                                   time_t board_last_move_time,
+                                                   int max_out,
+                                                   WamblePredictionView *out,
+                                                   int *out_count) {
+  if (!out || max_out <= 0 || !out_count)
+    return 0;
+  uint64_t now_ms = wamble_now_mono_millis();
+  for (int i = 0; i < PREDICTION_MOVE_PROJECTION_CACHE_MAX; i++) {
+    PredictionMoveProjectionCacheEntry *e =
+        &g_server_protocol_caches.prediction_move_projection[i];
+    if (!e->valid)
+      continue;
+    if (now_ms - e->cached_at_ms > PREDICTION_MOVE_PROJECTION_CACHE_TTL_MS) {
+      e->valid = 0;
+      continue;
+    }
+    if (e->board_id == board_id &&
+        e->board_last_move_time == board_last_move_time &&
+        e->max_out == max_out) {
+      int count = e->count;
+      if (count > max_out)
+        count = max_out;
+      memcpy(out, e->rows, sizeof(WamblePredictionView) * (size_t)count);
+      *out_count = count;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void prediction_move_projection_cache_store(
+    uint64_t board_id, time_t board_last_move_time, int max_out,
+    const WamblePredictionView *rows, int count) {
+  if (!rows || max_out <= 0 || count < 0)
+    return;
+  if (count > WAMBLE_MAX_PREDICTION_ENTRIES)
+    count = WAMBLE_MAX_PREDICTION_ENTRIES;
+  int slot = g_server_protocol_caches.prediction_move_projection_next++ %
+             PREDICTION_MOVE_PROJECTION_CACHE_MAX;
+  PredictionMoveProjectionCacheEntry *e =
+      &g_server_protocol_caches.prediction_move_projection[slot];
+  memset(e, 0, sizeof(*e));
+  e->valid = 1;
+  e->board_id = board_id;
+  e->board_last_move_time = board_last_move_time;
+  e->max_out = max_out;
+  e->count = count;
+  memcpy(e->rows, rows, sizeof(WamblePredictionView) * (size_t)count);
+  e->cached_at_ms = wamble_now_mono_millis();
+}
+
+static int profile_terms_cache_lookup(const uint8_t *token,
+                                      const char *profile_name,
+                                      const uint8_t *tos_hash,
+                                      int *out_accepted) {
+  if (!token || !profile_name || !tos_hash || !out_accepted)
+    return 0;
+  uint64_t now_ms = wamble_now_mono_millis();
+  for (int i = 0; i < PROFILE_TERMS_CACHE_MAX; i++) {
+    ProfileTermsCacheEntry *e = &g_server_protocol_caches.profile_terms[i];
+    if (!e->valid)
+      continue;
+    if (now_ms - e->cached_at_ms > PROFILE_TERMS_CACHE_TTL_MS) {
+      e->valid = 0;
+      continue;
+    }
+    if (memcmp(e->token, token, TOKEN_LENGTH) == 0 &&
+        strcmp(e->profile_name, profile_name) == 0 &&
+        memcmp(e->tos_hash, tos_hash, WAMBLE_FRAGMENT_HASH_LENGTH) == 0) {
+      *out_accepted = e->accepted;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void profile_terms_cache_store(const uint8_t *token,
+                                      const char *profile_name,
+                                      const uint8_t *tos_hash, int accepted) {
+  if (!token || !profile_name || !tos_hash)
+    return;
+  int slot =
+      g_server_protocol_caches.profile_terms_next++ % PROFILE_TERMS_CACHE_MAX;
+  ProfileTermsCacheEntry *e = &g_server_protocol_caches.profile_terms[slot];
+  memset(e, 0, sizeof(*e));
+  e->valid = 1;
+  memcpy(e->token, token, TOKEN_LENGTH);
+  snprintf(e->profile_name, sizeof(e->profile_name), "%s", profile_name);
+  memcpy(e->tos_hash, tos_hash, WAMBLE_FRAGMENT_HASH_LENGTH);
+  e->accepted = accepted ? 1 : 0;
+  e->cached_at_ms = wamble_now_mono_millis();
+}
+
+static void profile_terms_cache_invalidate(const uint8_t *token,
+                                           const char *profile_name,
+                                           const uint8_t *tos_hash) {
+  if (!token || !profile_name || !tos_hash)
+    return;
+  for (int i = 0; i < PROFILE_TERMS_CACHE_MAX; i++) {
+    ProfileTermsCacheEntry *e = &g_server_protocol_caches.profile_terms[i];
+    if (e->valid && memcmp(e->token, token, TOKEN_LENGTH) == 0 &&
+        strcmp(e->profile_name, profile_name) == 0 &&
+        memcmp(e->tos_hash, tos_hash, WAMBLE_FRAGMENT_HASH_LENGTH) == 0) {
+      e->valid = 0;
+    }
+  }
+}
+
+static void leaderboard_cache_store(uint64_t requester_session_id, uint8_t type,
+                                    int limit, int offset,
+                                    const DbLeaderboardResult *src) {
+  if (!src || src->status != DB_OK)
+    return;
+  memset(&g_server_protocol_caches.leaderboard, 0,
+         sizeof(g_server_protocol_caches.leaderboard));
+  g_server_protocol_caches.leaderboard.valid = 1;
+  g_server_protocol_caches.leaderboard.requester_session_id =
+      requester_session_id;
+  g_server_protocol_caches.leaderboard.type = type;
+  g_server_protocol_caches.leaderboard.limit = limit;
+  g_server_protocol_caches.leaderboard.offset = offset;
+  g_server_protocol_caches.leaderboard.cached_at_ms = wamble_now_mono_millis();
+  g_server_protocol_caches.leaderboard.count = src->count;
+  if (g_server_protocol_caches.leaderboard.count < 0)
+    g_server_protocol_caches.leaderboard.count = 0;
+  if (g_server_protocol_caches.leaderboard.count >
+      WAMBLE_MAX_LEADERBOARD_ENTRIES)
+    g_server_protocol_caches.leaderboard.count = WAMBLE_MAX_LEADERBOARD_ENTRIES;
+  for (int i = 0; i < g_server_protocol_caches.leaderboard.count; i++) {
+    g_server_protocol_caches.leaderboard.rows[i] = src->rows[i];
+    if (src->rows[i].handle) {
+      snprintf(g_server_protocol_caches.leaderboard.row_handles[i],
+               sizeof(g_server_protocol_caches.leaderboard.row_handles[i]),
+               "%s", src->rows[i].handle);
+      g_server_protocol_caches.leaderboard.rows[i].handle =
+          g_server_protocol_caches.leaderboard.row_handles[i];
+    }
+  }
+  g_server_protocol_caches.leaderboard.self_rank = src->self_rank;
+  g_server_protocol_caches.leaderboard.self_in_rows = src->self_in_rows;
+  g_server_protocol_caches.leaderboard.total_count = src->total_count;
+  g_server_protocol_caches.leaderboard.self = src->self;
+  if (src->self.handle) {
+    snprintf(g_server_protocol_caches.leaderboard.self_handle,
+             sizeof(g_server_protocol_caches.leaderboard.self_handle), "%s",
+             src->self.handle);
+    g_server_protocol_caches.leaderboard.self.handle =
+        g_server_protocol_caches.leaderboard.self_handle;
+  }
+}
+
+static int leaderboard_cache_lookup(uint64_t requester_session_id, uint8_t type,
+                                    int limit, int offset,
+                                    DbLeaderboardResult *out) {
+  if (!out || !g_server_protocol_caches.leaderboard.valid)
+    return 0;
+  uint64_t now_ms = wamble_now_mono_millis();
+  if (now_ms - g_server_protocol_caches.leaderboard.cached_at_ms >
+      LEADERBOARD_CACHE_TTL_MS)
+    return 0;
+  if (g_server_protocol_caches.leaderboard.requester_session_id !=
+          requester_session_id ||
+      g_server_protocol_caches.leaderboard.type != type ||
+      g_server_protocol_caches.leaderboard.limit != limit ||
+      g_server_protocol_caches.leaderboard.offset != offset)
+    return 0;
+  memset(out, 0, sizeof(*out));
+  out->status = DB_OK;
+  out->rows = g_server_protocol_caches.leaderboard.rows;
+  out->count = g_server_protocol_caches.leaderboard.count;
+  out->self_rank = g_server_protocol_caches.leaderboard.self_rank;
+  out->self_in_rows = g_server_protocol_caches.leaderboard.self_in_rows;
+  out->self = g_server_protocol_caches.leaderboard.self;
+  out->total_count = g_server_protocol_caches.leaderboard.total_count;
+  return 1;
+}
+
 static void publish_server_protocol_status(int status_code,
                                            const char *profile_name);
 static void publish_server_protocol_status_detail(int status_code,
@@ -65,6 +630,8 @@ static int compare_cstr_ptrs(const void *a, const void *b);
 static int stats_read_allowed(const uint8_t *token, const char *profile_name,
                               uint64_t target_session_id,
                               uint64_t target_identity_id);
+static int collect_board_read_treatment_facts(const WambleBoard *board,
+                                              WambleFact *facts, int max_facts);
 static void write_visible_board_fen(const uint8_t *token,
                                     const char *profile_name,
                                     const WambleBoard *board, char *out_fen,
@@ -529,7 +1096,32 @@ static int policy_check(const uint8_t *token, const char *profile_name,
                         const char *context_key, const char *context_value,
                         WamblePolicyDecision *out_decision);
 
-static int policy_check_with_session_create(
+typedef struct SessionTreatmentIntentCtx {
+  const uint8_t *token;
+  const char *profile_name;
+} SessionTreatmentIntentCtx;
+
+static void emit_create_session_and_treatment(void *ctx) {
+  SessionTreatmentIntentCtx *c = (SessionTreatmentIntentCtx *)ctx;
+  wamble_emit_create_session(c->token, 0);
+  wamble_emit_assign_session_treatment(c->token, c->profile_name);
+}
+
+typedef struct TermsAcceptanceIntentCtx {
+  const uint8_t *token;
+  const char *profile_name;
+  const uint8_t *tos_hash;
+  const char *tos_text;
+} TermsAcceptanceIntentCtx;
+
+static void emit_existing_session_terms_acceptance(void *ctx) {
+  TermsAcceptanceIntentCtx *c = (TermsAcceptanceIntentCtx *)ctx;
+  wamble_emit_create_session(c->token, 0);
+  wamble_emit_record_profile_terms_acceptance(c->token, c->profile_name,
+                                              c->tos_hash, c->tos_text);
+}
+
+static int policy_check_materializing_session(
     const uint8_t *token, const char *profile_name, const char *action,
     const char *resource, const char *context_key, const char *context_value,
     WamblePolicyDecision *out_decision, int create_session_on_missing) {
@@ -545,7 +1137,9 @@ static int policy_check_with_session_create(
       token, profile_name, action, resource, context_key, context_value,
       &decision);
   if (st == DB_NOT_FOUND && token_nonzero && create_session_on_missing) {
-    (void)wamble_query_create_session(token, 0, NULL);
+    SessionTreatmentIntentCtx ctx = {token, profile_name ? profile_name : ""};
+    (void)server_protocol_flush_intents_now(emit_create_session_and_treatment,
+                                            &ctx);
     st = wamble_query_resolve_policy_decision(token, profile_name, action,
                                               resource, context_key,
                                               context_value, &decision);
@@ -561,13 +1155,21 @@ static int policy_check(const uint8_t *token, const char *profile_name,
                         const char *action, const char *resource,
                         const char *context_key, const char *context_value,
                         WamblePolicyDecision *out_decision) {
-  return policy_check_with_session_create(token, profile_name, action, resource,
-                                          context_key, context_value,
-                                          out_decision, 1);
+  return policy_check_materializing_session(token, profile_name, action,
+                                            resource, context_key,
+                                            context_value, out_decision, 0);
 }
 
 int server_protocol_resolve_profile_trust_tier(const uint8_t *token,
                                                const char *profile_name) {
+  int cached_trust_tier = 0;
+  if (trust_tier_cache_lookup(token, profile_name ? profile_name : "",
+                              &cached_trust_tier)) {
+    WambleRuntimeStatus cached_status = {WAMBLE_RUNTIME_STATUS_TRUST_DECISION,
+                                         PROFILE_TRUST_DECISION_ALLOWED};
+    wamble_runtime_event_publish(cached_status, profile_name, NULL);
+    return cached_trust_tier;
+  }
   WamblePolicyDecision trust_decision;
   DbStatus st = wamble_query_resolve_policy_decision(
       token, profile_name, "trust.tier", "tier", NULL, NULL, &trust_decision);
@@ -633,6 +1235,7 @@ int server_protocol_resolve_profile_trust_tier(const uint8_t *token,
   }
   if (trust_tier < 0)
     trust_tier = 0;
+  trust_tier_cache_store(token, profile_name ? profile_name : "", trust_tier);
   return trust_tier;
 }
 
@@ -646,52 +1249,8 @@ static void write_visible_board_fen(const uint8_t *token,
   if (!board)
     return;
   wamble_strip_fen_history(board->fen, out_fen, out_fen_size);
-  if (!token)
-    return;
-
-  WambleFact facts[24];
-  memset(facts, 0, sizeof(facts));
-  int fact_count = wamble_collect_board_treatment_facts(board, facts, 24);
-  if (token_has_any_byte(board->last_mover_token) && fact_count + 2 <= 24) {
-    WamblePlayer prev;
-    if (get_player_snapshot_by_token(board->last_mover_token, &prev) == 0) {
-      snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
-               "previous_player.rating");
-      facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
-      facts[fact_count].double_value = prev.rating;
-      fact_count++;
-
-      snprintf(facts[fact_count].key, sizeof(facts[fact_count].key), "%s",
-               "previous_player.score");
-      facts[fact_count].value_type = WAMBLE_TREATMENT_VALUE_DOUBLE;
-      facts[fact_count].double_value = prev.score;
-      fact_count++;
-    }
-  }
-  WambleTreatmentAction actions[8];
-  int action_count = 0;
-  DbStatus treatment_status = wamble_query_resolve_treatment_actions(
-      token, profile_name ? profile_name : "", "board.read",
-      board->last_mover_treatment_group, facts, fact_count, actions, 8,
-      &action_count);
-  if (treatment_status != DB_OK) {
-    publish_treatment_audit_status(TREATMENT_AUDIT_STATUS_QUERY_FAILED,
-                                   profile_name);
-    return;
-  }
-  publish_treatment_audit_status(action_count > 0
-                                     ? TREATMENT_AUDIT_STATUS_TREATED
-                                     : TREATMENT_AUDIT_STATUS_UNTREATED,
-                                 profile_name);
-  for (int i = 0; i < action_count; i++) {
-    if (strcmp(actions[i].output_kind, "view") != 0 ||
-        strcmp(actions[i].output_key, "board.fen") != 0 ||
-        actions[i].value_type != WAMBLE_TREATMENT_VALUE_STRING ||
-        !actions[i].string_value[0]) {
-      continue;
-    }
-    snprintf(out_fen, out_fen_size, "%s", actions[i].string_value);
-  }
+  (void)token;
+  (void)profile_name;
 }
 
 static int prediction_read_uses_move_projection(const uint8_t *token,
@@ -744,13 +1303,16 @@ static int prediction_read_uses_move_projection(const uint8_t *token,
   return 0;
 }
 
-static PredictionStatus
-prediction_collect_move_projection(uint64_t board_id, WamblePredictionView *out,
-                                   int max_out, int *out_count) {
+static PredictionStatus prediction_collect_move_projection(
+    uint64_t board_id, time_t board_last_move_time, WamblePredictionView *out,
+    int max_out, int *out_count) {
   if (out_count)
     *out_count = 0;
   if (!out || max_out <= 0)
     return PREDICTION_ERR_INVALID;
+  if (prediction_move_projection_cache_lookup(board_id, board_last_move_time,
+                                              max_out, out, out_count))
+    return PREDICTION_OK;
   DbMovesResult mres = wamble_query_get_moves_for_board(board_id);
   if (mres.status != DB_OK)
     return PREDICTION_ERR_NOT_FOUND;
@@ -775,6 +1337,8 @@ prediction_collect_move_projection(uint64_t board_id, WamblePredictionView *out,
   }
   if (out_count)
     *out_count = count;
+  prediction_move_projection_cache_store(board_id, board_last_move_time,
+                                         max_out, out, count);
   return PREDICTION_OK;
 }
 
@@ -1244,6 +1808,9 @@ static void fill_profile_info_response(struct WambleMsg *resp,
   int wrote = 0;
   if (!resp || !token || !name)
     return;
+  if (profile_info_cache_lookup(token, name, bound_profile_name,
+                                effective_trust_tier, resp))
+    return;
   resp->ctrl = WAMBLE_CTRL_PROFILE_INFO;
   memcpy(resp->token, token, TOKEN_LENGTH);
   p = config_find_profile(name);
@@ -1283,6 +1850,23 @@ static void fill_profile_info_response(struct WambleMsg *resp,
       wrote = FEN_MAX_LENGTH - 1;
     resp->text.profile_info_len = (uint16_t)wrote;
   }
+  profile_info_cache_store(token, name, bound_profile_name,
+                           effective_trust_tier, resp);
+}
+
+static int set_ext_int_if_present(struct WambleMsg *msg, const char *key,
+                                  int64_t value) {
+  if (!msg || !key)
+    return 0;
+  for (uint8_t i = 0; i < msg->extensions.count; i++) {
+    WambleMessageExtField *field = &msg->extensions.fields[i];
+    if (strcmp(field->key, key) == 0) {
+      field->value_type = WAMBLE_TREATMENT_VALUE_INT;
+      field->int_value = value;
+      return 1;
+    }
+  }
+  return 0;
 }
 
 static void append_profile_session_snapshot(struct WambleMsg *resp,
@@ -1301,6 +1885,8 @@ static void append_profile_session_snapshot(struct WambleMsg *resp,
     return;
   session_caps =
       append_session_capability_extensions(resp, token, profile_name, board);
+  if (session_caps == 0)
+    set_ext_int_if_present(resp, "session.caps", 1);
   resp->board_id = board->id;
   write_visible_board_fen(token, profile_name, board, resp->view.fen,
                           sizeof(resp->view.fen));
@@ -1396,9 +1982,7 @@ static int resolve_last_move_indices(const uint8_t *token,
                                      int *to_idx, char *shown_uci,
                                      size_t shown_uci_size) {
   WambleFact facts[32];
-  WambleTreatmentAction actions[16];
   int fact_count = 0;
-  int action_count = 0;
   int max_age_ms = 0;
   char type[64] = "factual";
   char data_path[256] = {0};
@@ -1413,48 +1997,10 @@ static int resolve_last_move_indices(const uint8_t *token,
     return 0;
   }
   shown_uci[0] = '\0';
-
   fact_count = collect_board_read_treatment_facts(board, facts, 32);
-  DbStatus treatment_status = wamble_query_resolve_treatment_actions(
-      token, profile_name, "board.read", board->last_mover_treatment_group,
-      facts, fact_count, actions, 16, &action_count);
-  if (treatment_status != DB_OK) {
-    publish_treatment_audit_status(TREATMENT_AUDIT_STATUS_QUERY_FAILED,
-                                   profile_name);
-    return 0;
-  }
-  publish_treatment_audit_status(action_count > 0
-                                     ? TREATMENT_AUDIT_STATUS_TREATED
-                                     : TREATMENT_AUDIT_STATUS_UNTREATED,
-                                 profile_name);
 
-  for (int i = 0; i < action_count; i++) {
-    int ok_num = 0;
-    if (strcmp(actions[i].output_kind, "view") != 0)
-      continue;
-    if (strcmp(actions[i].output_key, "last_move.type") == 0 &&
-        actions[i].value_type == WAMBLE_TREATMENT_VALUE_STRING &&
-        actions[i].string_value[0]) {
-      snprintf(type, sizeof(type), "%s", actions[i].string_value);
-    } else if (strcmp(actions[i].output_key, "last_move.mode") == 0 &&
-               actions[i].value_type == WAMBLE_TREATMENT_VALUE_STRING &&
-               actions[i].string_value[0]) {
-      snprintf(type, sizeof(type), "%s",
-               strcmp(actions[i].string_value, "off") == 0 ? "off" : "factual");
-    } else if (strcmp(actions[i].output_key, "last_move.max_age_ms") == 0) {
-      max_age_ms = (int)wamble_treatment_action_number(&actions[i], &ok_num);
-      if (!ok_num)
-        max_age_ms = 0;
-    } else if ((strcmp(actions[i].output_key, "last_move.data.path") == 0 ||
-                strcmp(actions[i].output_key, "last_move.path") == 0) &&
-               actions[i].value_type == WAMBLE_TREATMENT_VALUE_STRING) {
-      snprintf(data_path, sizeof(data_path), "%s", actions[i].string_value);
-    } else if (strcmp(actions[i].output_key, "last_move.data.fact_key") == 0 &&
-               actions[i].value_type == WAMBLE_TREATMENT_VALUE_STRING) {
-      snprintf(data_fact_key, sizeof(data_fact_key), "%s",
-               actions[i].string_value);
-    }
-  }
+  publish_treatment_audit_status(TREATMENT_AUDIT_STATUS_UNTREATED,
+                                 profile_name);
 
   if (max_age_ms > 0 && board->last_move_time > 0) {
     int64_t now_ms = (int64_t)wamble_now_wall() * 1000;
@@ -1539,10 +2085,14 @@ static int profile_terms_currently_accepted(const uint8_t *token,
     return 1;
   crypto_blake2b(tos_hash, sizeof(tos_hash), (const uint8_t *)profile->tos_text,
                  strlen(profile->tos_text));
-  if (wamble_query_has_profile_terms_acceptance(token, profile_name, tos_hash,
-                                                &accepted) != DB_OK) {
+  if (profile_terms_cache_lookup(token, profile_name, tos_hash, &accepted))
+    return accepted ? 1 : 0;
+  if (wamble_query_has_profile_terms_acceptance_for_config(
+          &profile->config, token, profile_name, tos_hash, &accepted) !=
+      DB_OK) {
     return 0;
   }
+  profile_terms_cache_store(token, profile_name, tos_hash, accepted);
   return accepted ? 1 : 0;
 }
 
@@ -1769,18 +2319,25 @@ static uint32_t append_session_capability_extensions(struct WambleMsg *msg,
                                                      const WambleBoard *board) {
   const char *prediction_source = "tree";
   uint32_t caps = 0;
+  int max_pending = 0;
   if (!msg || !token || !profile_name || !profile_name[0] || !board)
     return 0;
-  caps =
-      compute_session_ui_caps(token, profile_name, board, &prediction_source);
-  (void)append_ext_int(msg, "session.caps", (int64_t)caps);
+  if (!session_caps_cache_lookup(token, profile_name, board, &caps,
+                                 &prediction_source, &max_pending)) {
+    caps =
+        compute_session_ui_caps(token, profile_name, board, &prediction_source);
+    if ((caps & WAMBLE_SESSION_UI_CAP_PREDICTION_SUBMIT) != 0)
+      max_pending = prediction_max_pending_for_player(board, token);
+    session_caps_cache_store(token, profile_name, board, caps,
+                             prediction_source, max_pending);
+  }
+  if (!set_ext_int_if_present(msg, "session.caps", (int64_t)caps))
+    (void)append_ext_int(msg, "session.caps", (int64_t)caps);
   if ((caps & WAMBLE_SESSION_UI_CAP_PREDICTION_READ) != 0) {
     (void)append_ext_string(msg, "prediction.source", prediction_source);
   }
   if ((caps & WAMBLE_SESSION_UI_CAP_PREDICTION_SUBMIT) != 0) {
-    (void)append_ext_int(
-        msg, "prediction.max_pending",
-        (int64_t)prediction_max_pending_for_player(board, token));
+    (void)append_ext_int(msg, "prediction.max_pending", (int64_t)max_pending);
   }
   if (board->reservation_time > 0) {
     (void)append_ext_int(msg, "reservation.reserved_at",
@@ -1802,14 +2359,17 @@ static void append_last_move_extensions(struct WambleMsg *msg,
                                  shown_uci, sizeof(shown_uci)))
     return;
 
-  if (strncmp(board->last_move_shown_uci, shown_uci, MAX_UCI_LENGTH) != 0) {
+  int shown_changed =
+      strncmp(board->last_move_shown_uci, shown_uci, MAX_UCI_LENGTH) != 0;
+  if (shown_changed) {
     snprintf(board->last_move_shown_uci, sizeof(board->last_move_shown_uci),
              "%s", shown_uci);
   }
 
   (void)append_ext_int(msg, "last_move.from", (int64_t)from_idx);
   (void)append_ext_int(msg, "last_move.to", (int64_t)to_idx);
-  wamble_emit_record_last_move_shown(board->id, token, shown_uci);
+  if (shown_changed)
+    wamble_emit_record_last_move_shown(board->id, token, shown_uci);
 }
 
 static uint8_t prediction_status_code(const char *status) {
@@ -1920,7 +2480,10 @@ static ServerStatus handle_client_hello(wamble_socket_t sockfd,
         "no board available for assignment", NULL, 0, 1);
   }
 
-  if (wamble_query_create_session(player->token, 0, NULL) != DB_OK) {
+  SessionTreatmentIntentCtx session_ctx = {player->token,
+                                           profile_name ? profile_name : ""};
+  if (server_protocol_flush_intents_now(emit_create_session_and_treatment,
+                                        &session_ctx) != 0) {
     return send_error_terminal(sockfd, cliaddr, msg->token, WAMBLE_ERR_INTERNAL,
                                "could not persist player session", NULL, 0);
   }
@@ -2023,6 +2586,12 @@ static ServerStatus handle_player_move(wamble_socket_t sockfd,
   board_release_reservation(board->id);
 
   if (board->result != GAME_RESULT_IN_PROGRESS) {
+    if (server_protocol_flush_current_intents_now() != 0) {
+      (void)board_game_completion_defer(board->id, board->result, msg->token);
+      return send_error_terminal(sockfd, cliaddr, msg->token,
+                                 WAMBLE_ERR_INTERNAL,
+                                 "failed to persist terminal move", NULL, 0);
+    }
     board_game_completed(board->id, board->result);
   }
 
@@ -2110,8 +2679,8 @@ static ServerStatus handle_get_predictions(wamble_socket_t sockfd,
   WambleBoard *board = get_board_by_id(msg->board_id);
   PredictionStatus st =
       prediction_read_uses_move_projection(msg->token, profile_name, board)
-          ? prediction_collect_move_projection(msg->board_id, rows, limit,
-                                               &count)
+          ? prediction_collect_move_projection(
+                msg->board_id, board->last_move_time, rows, limit, &count)
           : prediction_collect_tree(msg->board_id, msg->token, 0, depth, rows,
                                     limit, &count);
   if (st != PREDICTION_OK) {
@@ -2137,6 +2706,22 @@ static ServerStatus handle_list_profiles(wamble_socket_t sockfd,
   publish_server_protocol_status_detail(
       SERVER_PROTOCOL_STATUS_PROFILES_LIST_SERVED, wamble_runtime_profile_key(),
       detail);
+
+  const uint8_t *cached_payload = NULL;
+  size_t cached_payload_len = 0;
+  uintptr_t config_identity = (uintptr_t)cfg;
+  if (profiles_list_cache_lookup(msg->token, config_identity,
+                                 effective_trust_tier, &cached_payload,
+                                 &cached_payload_len)) {
+    (void)sockfd;
+    if (network_enqueue_reliable_payload_bytes(
+            WAMBLE_CTRL_PROFILES_LIST, msg->token, 0, cached_payload,
+            cached_payload_len, cliaddr, cfg->timeout_ms, cfg->max_retries,
+            cached_payload_len > (size_t)(FEN_MAX_LENGTH - 1)) != 0) {
+      return SERVER_ERR_SEND_FAILED;
+    }
+    return SERVER_OK;
+  }
 
   int count = config_profile_count();
   const char **names =
@@ -2177,6 +2762,9 @@ static ServerStatus handle_list_profiles(wamble_socket_t sockfd,
   }
   if (payload)
     payload[written] = '\0';
+
+  profiles_list_cache_store(msg->token, config_identity, effective_trust_tier,
+                            (const uint8_t *)payload, written);
 
   (void)sockfd;
   if (network_enqueue_reliable_payload_bytes(
@@ -2458,6 +3046,32 @@ static int merge_live_reservation_row(const uint8_t *token,
   return 1;
 }
 
+static int
+append_active_reservation_rows(DbActiveReservationEntry **rows, int *count,
+                               const DbActiveReservationEntry *add_rows,
+                               int add_count,
+                               const char *fallback_profile_name) {
+  if (!rows || !count || add_count < 0)
+    return -1;
+  if (add_count == 0)
+    return 0;
+  if (!add_rows)
+    return -1;
+  if (*count < 0)
+    return -1;
+  DbActiveReservationEntry *merged = (DbActiveReservationEntry *)realloc(
+      *rows, sizeof(**rows) * (size_t)(*count + add_count));
+  if (!merged)
+    return -1;
+  (void)fallback_profile_name;
+  for (int i = 0; i < add_count; i++) {
+    merged[*count + i] = add_rows[i];
+  }
+  *rows = merged;
+  *count += add_count;
+  return 0;
+}
+
 static ServerStatus handle_get_active_reservations(
     wamble_socket_t sockfd, const struct sockaddr_in *cliaddr,
     const struct WambleMsg *msg, const char *profile_name) {
@@ -2465,68 +3079,66 @@ static ServerStatus handle_get_active_reservations(
     return SERVER_ERR_INTERNAL;
   uint8_t public_key[WAMBLE_PUBLIC_KEY_LENGTH] = {0};
   int has_identity = 0;
-  WamblePlayer *player = NULL;
-  uint64_t session_id = 0;
-  DbStatus session_st =
-      wamble_query_get_session_by_token(msg->token, &session_id);
-  if (session_st != DB_OK && session_st != DB_NOT_FOUND) {
+  DbStatus pubkey_st = wamble_query_get_session_public_key_by_token(
+      msg->token, public_key, &has_identity);
+  if ((pubkey_st == DB_NOT_FOUND || !has_identity)) {
+    WamblePlayer live_player;
+    memset(&live_player, 0, sizeof(live_player));
+    if (get_player_snapshot_by_token(msg->token, &live_player) == 0 &&
+        live_player.has_persistent_identity) {
+      memcpy(public_key, live_player.public_key, WAMBLE_PUBLIC_KEY_LENGTH);
+      has_identity = 1;
+      pubkey_st = DB_OK;
+    }
+  }
+  if (pubkey_st != DB_OK && pubkey_st != DB_NOT_FOUND) {
     return send_error_terminal(sockfd, cliaddr, msg->token,
                                WAMBLE_ERR_RESERVATIONS_FAILED,
-                               "session lookup failed", NULL, 0);
-  }
-  if (session_st == DB_OK && session_id > 0) {
-    DbStatus pubkey_st = wamble_query_get_session_public_key(
-        session_id, public_key, &has_identity);
-    if (pubkey_st != DB_OK && pubkey_st != DB_NOT_FOUND) {
-      return send_error_terminal(sockfd, cliaddr, msg->token,
-                                 WAMBLE_ERR_RESERVATIONS_FAILED,
-                                 "identity lookup failed", NULL, 0);
-    }
-  }
-  if (!has_identity) {
-    player = get_player_by_token(msg->token);
-    if (player && player->has_persistent_identity) {
-      memcpy(public_key, player->public_key, WAMBLE_PUBLIC_KEY_LENGTH);
-      has_identity = 1;
-    }
+                               "identity lookup failed", NULL, 0);
   }
 
-  DbActiveReservationsResult reservations = {0};
   int encode_count = 0;
   const DbActiveReservationEntry *encode_rows = NULL;
+  DbActiveReservationEntry *aggregate_rows = NULL;
   DbActiveReservationEntry *merged_rows = NULL;
   if (has_identity) {
-    reservations =
-        wamble_query_get_active_reservations_by_public_key(public_key);
-    if (reservations.status != DB_OK) {
-      return send_error_terminal(sockfd, cliaddr, msg->token,
-                                 WAMBLE_ERR_RESERVATIONS_FAILED,
-                                 "reservations query failed", NULL, 0);
-    }
-    encode_count = reservations.count;
-  } else {
-    reservations.status = DB_OK;
-    reservations.rows = NULL;
-    reservations.count = 0;
-    encode_count = 0;
-  }
-
-  encode_rows = reservations.rows;
-  if (has_identity) {
-    if (!player)
-      player = get_player_by_token(msg->token);
-    if (player && player->has_persistent_identity) {
-      int merge_rc = merge_live_reservation_row(msg->token, profile_name,
-                                                reservations.rows,
-                                                &encode_count, &merged_rows);
-      if (merge_rc < 0) {
+    int profile_count = config_profile_count();
+    for (int i = 0; i < profile_count; i++) {
+      const WambleProfile *p = config_get_profile(i);
+      if (!p || p->abstract)
+        continue;
+      DbActiveReservationsResult reservations =
+          wamble_query_get_active_reservations_by_public_key_for_config(
+              &p->config, public_key);
+      if (reservations.status != DB_OK) {
+        free(aggregate_rows);
+        return send_error_terminal(sockfd, cliaddr, msg->token,
+                                   WAMBLE_ERR_RESERVATIONS_FAILED,
+                                   "reservations query failed", NULL, 0);
+      }
+      if (append_active_reservation_rows(&aggregate_rows, &encode_count,
+                                         reservations.rows, reservations.count,
+                                         p->name) != 0) {
+        free(aggregate_rows);
         return send_error_terminal(sockfd, cliaddr, msg->token,
                                    WAMBLE_ERR_INTERNAL,
                                    "reservations alloc failed", NULL, 0);
       }
-      if (merge_rc > 0) {
-        encode_rows = merged_rows;
-      }
+    }
+  }
+
+  encode_rows = aggregate_rows;
+  if (has_identity) {
+    int merge_rc = merge_live_reservation_row(
+        msg->token, profile_name, encode_rows, &encode_count, &merged_rows);
+    if (merge_rc < 0) {
+      free(aggregate_rows);
+      return send_error_terminal(sockfd, cliaddr, msg->token,
+                                 WAMBLE_ERR_INTERNAL,
+                                 "reservations alloc failed", NULL, 0);
+    }
+    if (merge_rc > 0) {
+      encode_rows = merged_rows;
     }
   }
 
@@ -2538,6 +3150,7 @@ static ServerStatus handle_get_active_reservations(
       encode_active_reservations_payload(encode_rows, encode_count, NULL, 0);
   if (payload_cap == 0) {
     free(merged_rows);
+    free(aggregate_rows);
     return send_error_terminal(sockfd, cliaddr, msg->token,
                                WAMBLE_ERR_RESERVATIONS_FAILED,
                                "reservations payload overflow", NULL, 0);
@@ -2545,6 +3158,7 @@ static ServerStatus handle_get_active_reservations(
   uint8_t *payload = (uint8_t *)malloc(payload_cap);
   if (!payload) {
     free(merged_rows);
+    free(aggregate_rows);
     return send_error_terminal(sockfd, cliaddr, msg->token, WAMBLE_ERR_INTERNAL,
                                "reservations alloc failed", NULL, 0);
   }
@@ -2552,6 +3166,7 @@ static ServerStatus handle_get_active_reservations(
       encode_rows, encode_count, payload, payload_cap);
   if (payload_len == 0 && encode_count > 0) {
     free(merged_rows);
+    free(aggregate_rows);
     free(payload);
     return send_error_terminal(sockfd, cliaddr, msg->token,
                                WAMBLE_ERR_RESERVATIONS_FAILED,
@@ -2561,6 +3176,7 @@ static ServerStatus handle_get_active_reservations(
       sockfd, cliaddr, WAMBLE_CTRL_ACTIVE_RESERVATIONS_DATA, msg->token,
       payload, payload_len, profile_name);
   free(merged_rows);
+  free(aggregate_rows);
   free(payload);
   return st;
 }
@@ -2662,13 +3278,10 @@ static ServerStatus handle_accept_profile_tos(wamble_socket_t sockfd,
         "access denied");
   }
 
-  uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH] = {0};
-  const char *tos = p->tos_text;
-  uint64_t acceptance_id = 0;
-  crypto_blake2b(tos_hash, sizeof(tos_hash), (const uint8_t *)tos, strlen(tos));
-  DbStatus st = wamble_query_record_profile_terms_acceptance(
-      msg->token, name, tos_hash, tos, &acceptance_id);
-  if (st != DB_OK) {
+  uint64_t existing_session_id = 0;
+  DbStatus existing_session_status =
+      wamble_query_get_session_by_token(msg->token, &existing_session_id);
+  if (existing_session_status != DB_OK || existing_session_id == 0) {
     publish_server_protocol_status(
         SERVER_PROTOCOL_STATUS_PROFILE_TOS_ACCEPT_FAILED, name);
     struct WambleMsg out = {0};
@@ -2676,19 +3289,41 @@ static ServerStatus handle_accept_profile_tos(wamble_socket_t sockfd,
     memcpy(out.token, msg->token, TOKEN_LENGTH);
     out.view.error_code = WAMBLE_ERR_ACCESS_DENIED;
     snprintf(out.view.error_reason, sizeof(out.view.error_reason), "%s",
-             st == DB_NOT_FOUND ? "session not found"
-                                : "failed to persist terms acceptance");
+             "session not found");
     (void)append_request_seq_ext(&out, msg->seq_num);
     if (network_enqueue_replayable_terminal(&out, cliaddr) != 0)
       return SERVER_ERR_SEND_FAILED;
-    return st == DB_NOT_FOUND ? SERVER_ERR_FORBIDDEN : SERVER_ERR_INTERNAL;
+    return SERVER_ERR_FORBIDDEN;
   }
 
+  uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH] = {0};
+  const char *tos = p->tos_text;
+  crypto_blake2b(tos_hash, sizeof(tos_hash), (const uint8_t *)tos, strlen(tos));
+  TermsAcceptanceIntentCtx terms_ctx = {msg->token, name, tos_hash, tos};
+  int persisted_terms = server_protocol_flush_intents_now(
+      emit_existing_session_terms_acceptance, &terms_ctx);
+  if (persisted_terms != 0) {
+    publish_server_protocol_status(
+        SERVER_PROTOCOL_STATUS_PROFILE_TOS_ACCEPT_FAILED, name);
+    struct WambleMsg out = {0};
+    out.ctrl = WAMBLE_CTRL_ERROR;
+    memcpy(out.token, msg->token, TOKEN_LENGTH);
+    out.view.error_code = WAMBLE_ERR_ACCESS_DENIED;
+    snprintf(out.view.error_reason, sizeof(out.view.error_reason), "%s",
+             "failed to persist terms acceptance");
+    (void)append_request_seq_ext(&out, msg->seq_num);
+    if (network_enqueue_replayable_terminal(&out, cliaddr) != 0)
+      return SERVER_ERR_SEND_FAILED;
+    return SERVER_ERR_INTERNAL;
+  }
+
+  profile_terms_cache_invalidate(msg->token, name, tos_hash);
+  profile_info_cache_invalidate(msg->token, name);
+  session_caps_cache_invalidate(msg->token, name);
   {
     char detail[160];
-    snprintf(detail, sizeof(detail),
-             "profile=%.48s trust_tier=%d acceptance_id=%llu", name,
-             effective_trust_tier, (unsigned long long)acceptance_id);
+    snprintf(detail, sizeof(detail), "profile=%.48s trust_tier=%d", name,
+             effective_trust_tier);
     publish_server_protocol_status_detail(
         SERVER_PROTOCOL_STATUS_PROFILE_TOS_ACCEPTED, name, detail);
   }
@@ -2800,7 +3435,7 @@ static ServerStatus enforce_message_access_policies(
     const char *ctrl_res = ctrl_policy_resource(msg->ctrl);
     int create_session_for_policy =
         ctrl_uses_pre_accept_profile_route(msg->ctrl) ? 0 : 1;
-    int bypass_rate_limit = policy_check_with_session_create(
+    int bypass_rate_limit = policy_check_materializing_session(
         msg->token, profile_name, "rate_limit.bypass", "request", "ctrl",
         ctrl_res, &bypass, create_session_for_policy);
     int max_per_sec = get_config()->rate_limit_requests_per_sec;
@@ -2825,9 +3460,9 @@ static ServerStatus enforce_message_access_policies(
     const char *ctrl_res = ctrl_policy_resource(msg->ctrl);
     int create_session_for_policy =
         ctrl_uses_pre_accept_profile_route(msg->ctrl) ? 0 : 1;
-    if (!policy_check_with_session_create(msg->token, profile_name,
-                                          "protocol.ctrl", ctrl_res, NULL, NULL,
-                                          NULL, create_session_for_policy)) {
+    if (!policy_check_materializing_session(
+            msg->token, profile_name, "protocol.ctrl", ctrl_res, NULL, NULL,
+            NULL, create_session_for_policy)) {
       return send_policy_denied(sockfd, cliaddr, msg->token, profile_name);
     }
   }
@@ -3114,48 +3749,35 @@ static ServerStatus handle_message_impl(wamble_socket_t sockfd,
 
     {
       uint8_t target_public_key[32] = {0};
-      DbStatus score_st = DB_ERR_EXEC;
-      DbStatus games_st = DB_ERR_EXEC;
-      DbStatus games960_st = DB_ERR_EXEC;
+      DbStatus stats_st = DB_ERR_EXEC;
+      WamblePersistentPlayerStats stats = {0};
       if (wamble_query_get_session_public_key(target_session_id,
                                               target_public_key,
                                               &target_has_identity) != DB_OK) {
         target_has_identity = 0;
       }
       if (target_has_identity && target_identity_id > 0) {
-        score_st =
-            wamble_query_get_identity_total_score(target_identity_id, &score);
-        games_st = wamble_query_get_identity_games_played(target_identity_id,
-                                                          &games_played);
-        games960_st = wamble_query_get_identity_chess960_games_played(
-            target_identity_id, &chess960_games_played);
+        stats_st =
+            wamble_query_get_identity_player_stats(target_identity_id, &stats);
         if (target_handle[0] == '\0') {
           (void)wamble_query_get_identity_handle(
               target_identity_id, target_handle, sizeof(target_handle));
         }
       } else {
-        score_st =
-            wamble_query_get_player_total_score(target_session_id, &score);
-        games_st = wamble_query_get_session_games_played(target_session_id,
-                                                         &games_played);
-        games960_st = wamble_query_get_session_chess960_games_played(
-            target_session_id, &chess960_games_played);
+        stats_st =
+            wamble_query_get_session_player_stats(target_session_id, &stats);
       }
-      if (target_session_id == requester_session_id) {
-        if (score_st == DB_NOT_FOUND)
-          score = 0.0;
-        if (games_st == DB_NOT_FOUND)
-          games_played = 0;
-        if (games960_st == DB_NOT_FOUND)
-          chess960_games_played = 0;
+      if (target_session_id == requester_session_id &&
+          stats_st == DB_NOT_FOUND) {
+        memset(&stats, 0, sizeof(stats));
+        stats_st = DB_OK;
       }
-      if (!((score_st == DB_OK || (target_session_id == requester_session_id &&
-                                   score_st == DB_NOT_FOUND)) &&
-            (games_st == DB_OK || (target_session_id == requester_session_id &&
-                                   games_st == DB_NOT_FOUND)) &&
-            (games960_st == DB_OK ||
-             (target_session_id == requester_session_id &&
-              games960_st == DB_NOT_FOUND)))) {
+      if (stats_st == DB_OK) {
+        score = stats.score;
+        games_played = stats.games_played;
+        chess960_games_played = stats.chess960_games_played;
+      }
+      if (stats_st != DB_OK) {
         publish_server_protocol_status(SERVER_PROTOCOL_STATUS_UNKNOWN_PLAYER,
                                        profile_name);
         return complete_request_after_terminal_response(
@@ -3219,8 +3841,15 @@ static ServerStatus handle_message_impl(wamble_socket_t sockfd,
     if (page_index_ext < 0)
       page_index_ext = 0;
     int offset = (int)page_index_ext * limit;
-    DbLeaderboardResult lb = wamble_query_get_leaderboard(
-        requester_session_id, lb_type, limit, offset);
+    DbLeaderboardResult lb = {0};
+    if (!leaderboard_cache_lookup(requester_session_id, lb_type, limit, offset,
+                                  &lb)) {
+      lb = wamble_query_get_leaderboard(requester_session_id, lb_type, limit,
+                                        offset);
+      if (lb.status == DB_OK)
+        leaderboard_cache_store(requester_session_id, lb_type, limit, offset,
+                                &lb);
+    }
     if (lb.status != DB_OK) {
       return complete_request_after_terminal_response(
           sockfd, msg, cliaddr,

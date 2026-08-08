@@ -310,6 +310,8 @@ WAMBLE_TEST(board_pairing_fails_closed_when_prior_mover_group_missing) {
   WamblePlayer *p = create_new_player();
   T_ASSERT(p != NULL);
   T_ASSERT(db_create_session(p->token, 0) > 0);
+  T_ASSERT_STATUS(db_assign_session_treatment(p->token, "", NULL, 0, NULL),
+                  DB_OK);
   WambleTreatmentAction actions[1];
   int action_count = 0;
   T_ASSERT_STATUS(db_resolve_treatment_actions(p->token, "", "board.read", NULL,
@@ -356,6 +358,8 @@ WAMBLE_TEST(board_pairing_uses_persistent_treatment_without_live_network) {
   WamblePlayer *p = create_new_player();
   T_ASSERT(p != NULL);
   T_ASSERT(db_create_session(p->token, 0) > 0);
+  T_ASSERT_STATUS(db_assign_session_treatment(p->token, "", NULL, 0, NULL),
+                  DB_OK);
   WambleTreatmentAction actions[1];
   int action_count = 0;
   T_ASSERT_STATUS(db_resolve_treatment_actions(p->token, "", "board.read", NULL,

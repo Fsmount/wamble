@@ -122,14 +122,19 @@ static int ws_connect_and_upgrade(int port) {
 static void ws_drive_runtime_until_idle(wamble_socket_t srv,
                                         const char *profile_name) {
   int saw_progress = 0;
+  int idle_streak = 0;
   for (int i = 0; i < 40; i++) {
     TransportDriveResult r = network_runtime_drive_once_with_gateway(
         srv, g_test_gateway, 0, profile_name);
     ws_gateway_flush_outbound(g_test_gateway);
-    if (r.progress_count > 0 || r.inbound_pending > 0 || r.dispatch_pending > 0)
+    if (r.progress_count > 0 || r.inbound_pending > 0 ||
+        r.dispatch_pending > 0) {
       saw_progress = 1;
-    if (saw_progress && r.progress_count == 0 && r.inbound_pending == 0 &&
-        r.dispatch_pending == 0)
+      idle_streak = 0;
+    } else if (saw_progress) {
+      idle_streak++;
+    }
+    if (idle_streak >= 5)
       break;
     wamble_sleep_ms(5);
   }
@@ -732,6 +737,7 @@ WAMBLE_TEST(ws_server_protocol_discovery_and_fragmented_tos_roundtrip) {
     uint8_t out_flags = 0;
     T_ASSERT_EQ_INT(ws_recv_next_non_ack_msg(&out, &out_flags, 2000), 0);
     T_ASSERT_EQ_INT(out.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+    ws_drive_runtime_until_idle(srv, "open");
 
     struct WambleMsg list_req = {0};
     list_req.ctrl = WAMBLE_CTRL_LIST_PROFILES;
@@ -745,6 +751,7 @@ WAMBLE_TEST(ws_server_protocol_discovery_and_fragmented_tos_roundtrip) {
     T_ASSERT_EQ_INT(ws_recv_next_non_ack_msg(&out, &out_flags, 2000), 0);
     T_ASSERT_EQ_INT(out.ctrl, WAMBLE_CTRL_PROFILES_LIST);
     T_ASSERT_STREQ(out.view.profiles_list, "open");
+    ws_drive_runtime_until_idle(srv, "open");
 
     struct WambleMsg info_req = {0};
     info_req.ctrl = WAMBLE_CTRL_GET_PROFILE_INFO;
@@ -767,6 +774,7 @@ WAMBLE_TEST(ws_server_protocol_discovery_and_fragmented_tos_roundtrip) {
       T_ASSERT_EQ_INT(ws_path->value_type, WAMBLE_TREATMENT_VALUE_STRING);
       T_ASSERT_STREQ(ws_path->string_value, "/ws");
     }
+    ws_drive_runtime_until_idle(srv, "open");
 
     struct WambleMsg tos_req = {0};
     tos_req.ctrl = WAMBLE_CTRL_GET_PROFILE_TOS;
@@ -888,7 +896,7 @@ WAMBLE_TEST(ws_server_protocol_profile_terms_acceptance_roundtrip) {
                   0);
   T_ASSERT_EQ_INT(hello_out.ctrl, WAMBLE_CTRL_SERVER_HELLO);
   memcpy(client_token, hello_out.token, TOKEN_LENGTH);
-  T_ASSERT_EQ_INT(wamble_query_create_session(client_token, 0, NULL), DB_OK);
+  T_ASSERT(db_create_session(client_token, 0) > 0);
 
   struct WambleMsg missing_info_req = {0};
   missing_info_req.ctrl = WAMBLE_CTRL_GET_PROFILE_INFO;
@@ -1061,6 +1069,7 @@ WAMBLE_TEST(ws_server_protocol_fragmented_profiles_list_roundtrip) {
   uint8_t out_flags = 0;
   T_ASSERT_EQ_INT(ws_recv_next_non_ack_msg(&out, &out_flags, 2000), 0);
   T_ASSERT_EQ_INT(out.ctrl, WAMBLE_CTRL_SERVER_HELLO);
+  ws_drive_runtime_until_idle(srv, "profile-00");
 
   struct WambleMsg list_req = {0};
   list_req.ctrl = WAMBLE_CTRL_LIST_PROFILES;

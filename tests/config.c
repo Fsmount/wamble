@@ -630,6 +630,7 @@ WAMBLE_TEST(config_db_policy_default_deny_can_be_overridden_by_treatment) {
   T_ASSERT_STATUS_OK(db_apply_config_treatment_rules("__default__"));
 
   T_ASSERT(db_create_session(token, 0) > 0);
+  T_ASSERT_STATUS(db_assign_session_treatment(token, "", NULL, 0, NULL), DB_OK);
 
   WamblePolicyDecision out = {0};
   T_ASSERT_STATUS(db_resolve_policy_decision(token, "", "game.move", "play",
@@ -661,6 +662,7 @@ WAMBLE_TEST(config_db_policy_explicit_deny_can_be_overridden_by_treatment) {
   T_ASSERT_STATUS_OK(db_apply_config_treatment_rules("__default__"));
 
   T_ASSERT(db_create_session(token, 0) > 0);
+  T_ASSERT_STATUS(db_assign_session_treatment(token, "", NULL, 0, NULL), DB_OK);
   T_ASSERT_STATUS_OK(test_db_apply_sql(
       "INSERT INTO global_policy_rules "
       "(global_identity_id, action, resource, scope, effect, permission_level, "
@@ -907,6 +909,7 @@ WAMBLE_TEST(config_db_apply_treatment_rules_and_assign_session) {
 
   uint64_t session_id = db_create_session(token, 0);
   T_ASSERT(session_id > 0);
+  T_ASSERT_STATUS(db_assign_session_treatment(token, "", NULL, 0, NULL), DB_OK);
 
   WambleTreatmentAction out[8];
   int out_count = 0;
@@ -948,6 +951,7 @@ WAMBLE_TEST(config_db_apply_treatment_view_rules) {
   T_ASSERT_STATUS_OK(db_apply_config_treatment_rules("__default__"));
 
   T_ASSERT(db_create_session(token, 0) > 0);
+  T_ASSERT_STATUS(db_assign_session_treatment(token, "", NULL, 0, NULL), DB_OK);
 
   WambleFact facts[2] = {0};
   snprintf(facts[0].key, sizeof(facts[0].key), "%s", "board.id");
@@ -1045,6 +1049,7 @@ WAMBLE_TEST(config_db_apply_treatment_last_move_rules) {
   T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
   T_ASSERT_STATUS_OK(db_apply_config_treatment_rules("__default__"));
   T_ASSERT(db_create_session(token, 0) > 0);
+  T_ASSERT_STATUS(db_assign_session_treatment(token, "", NULL, 0, NULL), DB_OK);
 
   WambleFact facts[2] = {0};
   snprintf(facts[0].key, sizeof(facts[0].key), "%s", "board.id");
@@ -1104,6 +1109,7 @@ WAMBLE_TEST(config_db_apply_treatment_payload_rules) {
   T_ASSERT_STATUS_OK(db_apply_config_treatment_rules("__default__"));
 
   T_ASSERT(db_create_session(token, 0) > 0);
+  T_ASSERT_STATUS(db_assign_session_treatment(token, "", NULL, 0, NULL), DB_OK);
   WambleFact facts[1] = {0};
   snprintf(facts[0].key, sizeof(facts[0].key), "%s", "last_move.uci");
   facts[0].value_type = WAMBLE_TREATMENT_VALUE_STRING;
@@ -1172,6 +1178,7 @@ WAMBLE_TEST(config_db_treatment_reassigns_when_runtime_facts_arrive) {
   WambleTreatmentAssignment assignment = {0};
   T_ASSERT_STATUS(db_get_session_treatment_assignment(token, &assignment),
                   DB_NOT_FOUND);
+  T_ASSERT_STATUS(db_assign_session_treatment(token, "", NULL, 0, NULL), DB_OK);
 
   WambleTreatmentAction actions[8];
   int action_count = 0;
@@ -1188,6 +1195,8 @@ WAMBLE_TEST(config_db_treatment_reassigns_when_runtime_facts_arrive) {
   snprintf(facts[0].key, sizeof(facts[0].key), "%s", "session.games");
   facts[0].value_type = WAMBLE_TREATMENT_VALUE_INT;
   facts[0].int_value = 3;
+  T_ASSERT_STATUS(db_assign_session_treatment(token, "", facts, 1, NULL),
+                  DB_OK);
   T_ASSERT_STATUS(db_resolve_treatment_actions(token, "", "prediction.submit",
                                                NULL, facts, 1, actions, 8,
                                                &action_count),
@@ -1249,6 +1258,8 @@ WAMBLE_TEST(config_db_logout_unlinks_persistent_identity_and_clears_treatment) {
       public_key_hex, public_key_hex, public_key_hex, public_key_hex,
       (unsigned long long)session_id);
   T_ASSERT_STATUS_OK(test_db_apply_sql(seed_sql));
+  T_ASSERT_STATUS(db_assign_session_treatment(player->token, "", NULL, 0, NULL),
+                  DB_OK);
 
   T_ASSERT(attach_persistent_identity(player->token, public_key) != NULL);
   wamble_intents_clear(&intents);
@@ -1308,6 +1319,7 @@ WAMBLE_TEST(config_db_treatment_group_refreshes_after_reassignment) {
   T_ASSERT_STATUS(config_load(cfg_path, NULL, NULL, 0), CONFIG_LOAD_OK);
   T_ASSERT_STATUS_OK(db_apply_config_treatment_rules("__default__"));
   T_ASSERT(db_create_session(token, 0) > 0);
+  T_ASSERT_STATUS(db_assign_session_treatment(token, "", NULL, 0, NULL), DB_OK);
 
   WambleTreatmentAction actions[8];
   int action_count = 0;
@@ -1325,6 +1337,8 @@ WAMBLE_TEST(config_db_treatment_group_refreshes_after_reassignment) {
   snprintf(facts[0].key, sizeof(facts[0].key), "%s", "session.games");
   facts[0].value_type = WAMBLE_TREATMENT_VALUE_INT;
   facts[0].int_value = 3;
+  T_ASSERT_STATUS(db_assign_session_treatment(token, "", facts, 1, NULL),
+                  DB_OK);
   T_ASSERT_STATUS(db_resolve_treatment_actions(token, "", "prediction.submit",
                                                NULL, facts, 1, actions, 8,
                                                &action_count),
@@ -1449,6 +1463,10 @@ WAMBLE_TEST(config_db_treatment_scopes_by_profile_source) {
 
   T_ASSERT(db_create_session(token_alpha, 0) > 0);
   T_ASSERT(db_create_session(token_beta, 0) > 0);
+  T_ASSERT_STATUS(
+      db_assign_session_treatment(token_alpha, "alpha", NULL, 0, NULL), DB_OK);
+  T_ASSERT_STATUS(
+      db_assign_session_treatment(token_beta, "beta", NULL, 0, NULL), DB_OK);
 
   WambleTreatmentAction actions[8];
   int action_count = 0;
@@ -1457,9 +1475,17 @@ WAMBLE_TEST(config_db_treatment_scopes_by_profile_source) {
                                                0, actions, 8, &action_count),
                   DB_OK);
   WambleTreatmentAssignment assignment = {0};
-  T_ASSERT_STATUS(db_get_session_treatment_assignment(token_alpha, &assignment),
-                  DB_OK);
-  T_ASSERT_STREQ(assignment.group_key, "control");
+  T_ASSERT_STATUS(
+      wamble_query_get_session_treatment_assignment(token_alpha, &assignment),
+      DB_NOT_FOUND);
+  long alpha_control_rows = 0;
+  T_ASSERT_EQ_INT(
+      test_db_query_int("SELECT COUNT(*) FROM session_treatment_assignments "
+                        "WHERE profile_name = 'alpha' AND "
+                        "treatment_group_key = 'control'",
+                        &alpha_control_rows),
+      0);
+  T_ASSERT_EQ_INT(alpha_control_rows, 1);
   T_ASSERT_EQ_INT(action_count, 1);
   T_ASSERT_STREQ(actions[0].output_key, "prediction.gated");
   T_ASSERT(actions[0].value_type == WAMBLE_TREATMENT_VALUE_BOOL ||
@@ -1473,9 +1499,17 @@ WAMBLE_TEST(config_db_treatment_scopes_by_profile_source) {
                                                "prediction.submit", NULL, NULL,
                                                0, actions, 8, &action_count),
                   DB_OK);
-  T_ASSERT_STATUS(db_get_session_treatment_assignment(token_beta, &assignment),
-                  DB_OK);
-  T_ASSERT_STREQ(assignment.group_key, "vip");
+  T_ASSERT_STATUS(
+      wamble_query_get_session_treatment_assignment(token_beta, &assignment),
+      DB_NOT_FOUND);
+  long beta_vip_rows = 0;
+  T_ASSERT_EQ_INT(
+      test_db_query_int(
+          "SELECT COUNT(*) FROM session_treatment_assignments "
+          "WHERE profile_name = 'beta' AND treatment_group_key = 'vip'",
+          &beta_vip_rows),
+      0);
+  T_ASSERT_EQ_INT(beta_vip_rows, 1);
 
   T_ASSERT_EQ_INT(db_treatment_edge_allows("alpha", "control", "vip"), 1);
   T_ASSERT_EQ_INT(db_treatment_edge_allows("beta", "control", "vip"), 0);

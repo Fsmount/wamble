@@ -179,6 +179,8 @@ int main(int argc, char **argv) {
     exec_file(c, "migrations/012_profile_board_mode_variants.sql");
     exec_file(c, "migrations/013_profile_terms_acceptances.sql");
     exec_file(c, "migrations/014_profile_canonical_payout_points.sql");
+    exec_file(c, "migrations/016_profile_last_move_shown.sql");
+    exec_file(c, "migrations/017_profile_session_treatment_assignments.sql");
   }
   if (do_migrate_global) {
     exec_file(c, "migrations/005_global_identity_trust.sql");

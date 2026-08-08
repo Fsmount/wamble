@@ -1,8 +1,42 @@
 #include "../include/wamble/wamble.h"
+#include "../include/wamble/wamble_db.h"
+struct WambleIntentBuffer *wamble_intents_create(void);
+void wamble_intents_destroy(struct WambleIntentBuffer *buf);
+int wamble_intents_count(const struct WambleIntentBuffer *buf);
+int wamble_intents_append_buffer(struct WambleIntentBuffer *dst,
+                                 struct WambleIntentBuffer *src);
+struct WambleIntentBuffer *wamble_get_intent_buffer(void);
+void wamble_set_intent_buffer(struct WambleIntentBuffer *buf);
+int wamble_persistence_flush_buffer(struct WambleIntentBuffer *buf,
+                                    const WambleQueryService *qs,
+                                    int max_batches, int max_intents,
+                                    int max_payload_bytes);
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
+void wamble_persist_board_created(uint64_t board_id, const char *fen,
+                                  int mode_variant_id);
+void wamble_persist_board_mark_dormant(uint64_t board_id, const char *fen);
+void wamble_persist_board_reservation_created(uint64_t board_id,
+                                              const uint8_t *token,
+                                              int timeout_seconds,
+                                              bool reserved_for_white);
+void wamble_persist_board_last_mover_snapshot(uint64_t board_id,
+                                              const char *group_key);
+void wamble_persist_board_reserved(uint64_t board_id, const char *fen,
+                                   const uint8_t *token, int timeout_seconds,
+                                   bool reserved_for_white,
+                                   time_t reservation_time,
+                                   bool create_reservation);
+void wamble_persist_board_activated(uint64_t board_id, const char *fen,
+                                    const char *last_mover_group);
+void wamble_persist_board_reservation_released(uint64_t board_id,
+                                               const char *fen);
+void wamble_persist_board_archived_result(uint64_t board_id, const char *fen,
+                                          char winning_side, int move_count,
+                                          int duration_seconds,
+                                          const char *termination_reason);
 void profile_runtime_manager_event_signal(void);
 
 static WAMBLE_THREAD_LOCAL WambleBoard *board_cached;
@@ -15,11 +49,82 @@ static WAMBLE_THREAD_LOCAL int next_board_id_initialized = 0;
 static WAMBLE_THREAD_LOCAL int next_board_id_mutex_initialized = 0;
 static WAMBLE_THREAD_LOCAL wamble_mutex_t board_mutex;
 static WAMBLE_THREAD_LOCAL int board_mutex_initialized = 0;
+static WAMBLE_THREAD_LOCAL int board_manager_mutex_held_depth = 0;
+
+static int board_manager_mutex_lock(void) {
+  int rc = wamble_mutex_lock(&board_mutex);
+  if (rc == 0)
+    board_manager_mutex_held_depth++;
+  return rc;
+}
+
+static int board_manager_mutex_unlock(void) {
+  if (board_manager_mutex_held_depth > 0)
+    board_manager_mutex_held_depth--;
+  return wamble_mutex_unlock(&board_mutex);
+}
+
+int wamble_architecture_board_lock_held(void) {
+  return board_manager_mutex_held_depth > 0;
+}
 static WAMBLE_THREAD_LOCAL ReservationReleaseNotification
     *reservation_release_notifications;
 static WAMBLE_THREAD_LOCAL int reservation_release_notification_cap = 0;
 static WAMBLE_THREAD_LOCAL int reservation_release_notification_head = 0;
 static WAMBLE_THREAD_LOCAL int reservation_release_notification_count = 0;
+
+typedef struct BoardSupplyRefreshState {
+  wamble_mutex_t mutex;
+  int mutex_ready;
+  int in_progress;
+  int ready;
+  int observed_total_boards;
+  int target_boards;
+  int min_boards;
+  int max_boards;
+  wamble_thread_t thread;
+  int thread_joinable;
+  const WambleQueryService *qs;
+  char profile_name[PROFILE_NAME_MAX_LENGTH];
+  char profile_conn[512];
+  char global_conn[512];
+} BoardSupplyRefreshState;
+
+static WAMBLE_THREAD_LOCAL BoardSupplyRefreshState *board_supply_refresh_state;
+
+static int
+board_capture_worker_context(const WambleQueryService **out_qs,
+                             char *profile_name, size_t profile_name_len,
+                             char *profile_conn, size_t profile_conn_len,
+                             char *global_conn, size_t global_conn_len) {
+  const WambleConfig *cfg = get_config();
+  const WambleQueryService *qs = wamble_get_query_service();
+  const char *profile = wamble_runtime_profile_key();
+  if (!cfg || !qs || !profile_name || profile_name_len == 0 ||
+      db_format_connection_string(cfg, 0, profile_conn, profile_conn_len) !=
+          0 ||
+      db_format_connection_string(cfg, 1, global_conn, global_conn_len) != 0)
+    return -1;
+  int n = snprintf(profile_name, profile_name_len, "%s",
+                   (profile && profile[0]) ? profile : "__default__");
+  if (n < 0 || (size_t)n >= profile_name_len)
+    return -1;
+  *out_qs = qs;
+  return 0;
+}
+
+static void board_supply_refresh_state_free(void) {
+  if (!board_supply_refresh_state)
+    return;
+  if (board_supply_refresh_state->thread_joinable) {
+    (void)wamble_thread_join(board_supply_refresh_state->thread, NULL);
+    board_supply_refresh_state->thread_joinable = 0;
+  }
+  if (board_supply_refresh_state->mutex_ready)
+    wamble_mutex_destroy(&board_supply_refresh_state->mutex);
+  free(board_supply_refresh_state);
+  board_supply_refresh_state = NULL;
+}
 
 #define BOARD_MAP_SIZE (get_config()->max_boards * 2)
 static WAMBLE_THREAD_LOCAL int *board_index_map;
@@ -192,13 +297,403 @@ queue_reservation_release_notification_locked(const uint8_t token[TOKEN_LENGTH],
   profile_runtime_manager_event_signal();
 }
 
+typedef struct ExpiredReservationCheck {
+  uint64_t board_id;
+  uint8_t token[TOKEN_LENGTH];
+} ExpiredReservationCheck;
+
+static void *board_supply_refresh_worker(void *arg) {
+  BoardSupplyRefreshState *state = (BoardSupplyRefreshState *)arg;
+  if (!state)
+    return NULL;
+  int context_ok = db_set_global_store_connection(state->global_conn) == 0 &&
+                   db_init(state->profile_conn) == 0;
+  wamble_set_runtime_profile_key(state->profile_name);
+  wamble_set_query_service(state->qs);
+  DbBoardIdList dormant = {DB_ERR_EXEC, NULL, 0};
+  DbBoardIdList active = {DB_ERR_EXEC, NULL, 0};
+  DbBoardIdList reserved = {DB_ERR_EXEC, NULL, 0};
+  if (context_ok) {
+    dormant = wamble_query_list_boards_by_status("DORMANT");
+    active = wamble_query_list_boards_by_status("ACTIVE");
+    reserved = wamble_query_list_boards_by_status("RESERVED");
+  }
+  int lists_ok = context_ok && dormant.status == DB_OK &&
+                 active.status == DB_OK && reserved.status == DB_OK;
+  int observed_total = 0;
+  int target_boards = 0;
+  if (lists_ok) {
+    observed_total = dormant.count + active.count + reserved.count;
+    int longest_game = 0;
+    int players = 0;
+    (void)wamble_query_get_longest_game_moves(&longest_game);
+    (void)wamble_query_get_active_session_count(&players);
+    target_boards = longest_game * players;
+    if (target_boards < state->min_boards)
+      target_boards = state->min_boards;
+    if (target_boards > state->max_boards)
+      target_boards = state->max_boards;
+  }
+  db_cleanup_thread();
+  wamble_set_query_service(NULL);
+  wamble_set_runtime_profile_key(NULL);
+  wamble_mutex_lock(&state->mutex);
+  state->observed_total_boards = observed_total;
+  state->target_boards = target_boards;
+  state->ready = lists_ok ? 1 : 0;
+  state->in_progress = 0;
+  wamble_mutex_unlock(&state->mutex);
+  profile_runtime_manager_event_signal();
+  return NULL;
+}
+
+static void board_supply_refresh_start_async(void) {
+  if (!board_supply_refresh_state)
+    return;
+  BoardSupplyRefreshState *state = board_supply_refresh_state;
+  wamble_mutex_lock(&state->mutex);
+  if (state->in_progress || state->ready || state->thread_joinable) {
+    wamble_mutex_unlock(&state->mutex);
+    return;
+  }
+  state->min_boards = get_config()->min_boards;
+  state->max_boards = get_config()->max_boards;
+  if (board_capture_worker_context(
+          &state->qs, state->profile_name, sizeof(state->profile_name),
+          state->profile_conn, sizeof(state->profile_conn), state->global_conn,
+          sizeof(state->global_conn)) != 0) {
+    wamble_mutex_unlock(&state->mutex);
+    return;
+  }
+  state->in_progress = 1;
+  wamble_mutex_unlock(&state->mutex);
+  wamble_thread_t thread;
+  if (wamble_thread_create(&thread, board_supply_refresh_worker, state) != 0) {
+    wamble_mutex_lock(&state->mutex);
+    state->in_progress = 0;
+    wamble_mutex_unlock(&state->mutex);
+    return;
+  }
+  wamble_mutex_lock(&state->mutex);
+  state->thread = thread;
+  state->thread_joinable = 1;
+  wamble_mutex_unlock(&state->mutex);
+}
+
+static int board_supply_refresh_consume(int *observed_total,
+                                        int *target_boards) {
+  if (!board_supply_refresh_state || !observed_total || !target_boards)
+    return 0;
+  BoardSupplyRefreshState *state = board_supply_refresh_state;
+  int have = 0;
+  wamble_thread_t completed_thread = 0;
+  int join_completed_thread = 0;
+  wamble_mutex_lock(&state->mutex);
+  if (!state->in_progress && state->thread_joinable) {
+    completed_thread = state->thread;
+    state->thread = 0;
+    state->thread_joinable = 0;
+    join_completed_thread = 1;
+  }
+  if (state->ready) {
+    *observed_total = state->observed_total_boards;
+    *target_boards = state->target_boards;
+    state->ready = 0;
+    have = 1;
+  }
+  wamble_mutex_unlock(&state->mutex);
+  if (join_completed_thread)
+    (void)wamble_thread_join(completed_thread, NULL);
+  return have;
+}
+
+typedef struct BoardScoringJob {
+  uint64_t board_id;
+  GameResult result;
+  wamble_thread_t thread;
+  wamble_mutex_t mutex;
+  int completed;
+  int thread_joined;
+  int retry_needed;
+  struct WambleIntentBuffer *intents;
+  const WambleQueryService *qs;
+  int max_batches;
+  int max_intents;
+  int max_payload_bytes;
+  char profile_name[PROFILE_NAME_MAX_LENGTH];
+  char profile_conn[512];
+  char global_conn[512];
+  struct BoardScoringJob *next;
+} BoardScoringJob;
+
+typedef struct PendingBoardCompletion {
+  uint64_t board_id;
+  GameResult result;
+  uint8_t player_token[TOKEN_LENGTH];
+  struct PendingBoardCompletion *next;
+} PendingBoardCompletion;
+
+static WAMBLE_THREAD_LOCAL BoardScoringJob *g_board_scoring_jobs;
+static WAMBLE_THREAD_LOCAL PendingBoardCompletion *g_pending_board_completions;
+static WAMBLE_THREAD_LOCAL wamble_mutex_t g_board_scoring_jobs_mutex;
+static WAMBLE_THREAD_LOCAL int g_board_scoring_jobs_mutex_ready = 0;
+
+static void board_scoring_jobs_ensure_mutex(void) {
+  if (!g_board_scoring_jobs_mutex_ready &&
+      wamble_mutex_init(&g_board_scoring_jobs_mutex) == 0) {
+    g_board_scoring_jobs_mutex_ready = 1;
+  }
+}
+
+static volatile int g_board_scoring_pause_for_tests = 0;
+static volatile int g_board_scoring_started_for_tests = 0;
+static volatile int g_board_scoring_completed_for_tests = 0;
+
+void wamble_architecture_board_scoring_pause_for_tests(int pause) {
+  g_board_scoring_pause_for_tests = pause ? 1 : 0;
+}
+
+void wamble_architecture_board_scoring_counters_for_tests(int *out_started,
+                                                          int *out_completed) {
+  if (out_started)
+    *out_started = g_board_scoring_started_for_tests;
+  if (out_completed)
+    *out_completed = g_board_scoring_completed_for_tests;
+}
+
+static void *board_scoring_worker(void *arg) {
+  BoardScoringJob *job = (BoardScoringJob *)arg;
+  if (job) {
+    g_board_scoring_started_for_tests++;
+    while (g_board_scoring_pause_for_tests)
+      wamble_sleep_ms(1);
+    wamble_set_runtime_profile_key(job->profile_name);
+    wamble_set_query_service(job->qs);
+    int retry_needed = 0;
+    struct WambleIntentBuffer *intents = wamble_intents_create();
+    wamble_set_intent_buffer(intents);
+    if (!intents || db_set_global_store_connection(job->global_conn) != 0 ||
+        db_init(job->profile_conn) != 0) {
+      retry_needed = 1;
+    } else {
+      ScoringStatus scoring_status =
+          calculate_and_distribute_pot_for_completed_board(job->board_id,
+                                                           job->result);
+      retry_needed = (scoring_status == SCORING_ERR_DB ||
+                      scoring_status == SCORING_ERR_INVALID);
+    }
+    wamble_set_intent_buffer(NULL);
+    db_cleanup_thread();
+    wamble_set_query_service(NULL);
+    wamble_set_runtime_profile_key(NULL);
+    g_board_scoring_completed_for_tests++;
+    wamble_mutex_lock(&job->mutex);
+    job->intents = intents;
+    job->retry_needed = retry_needed;
+    job->completed = 1;
+    wamble_mutex_unlock(&job->mutex);
+  }
+  return NULL;
+}
+
+static int board_scoring_job_flush(BoardScoringJob *job) {
+  if (!job || !job->intents)
+    return 1;
+  const WambleQueryService *qs = wamble_get_query_service();
+  if (!qs)
+    qs = job->qs;
+  struct WambleIntentBuffer *saved = wamble_get_intent_buffer();
+  int rc =
+      wamble_persistence_flush_buffer(job->intents, qs, job->max_batches,
+                                      job->max_intents, job->max_payload_bytes);
+  wamble_set_intent_buffer(saved);
+  return rc;
+}
+
+static void board_scoring_jobs_reap_completed(void) {
+  if (!g_board_scoring_jobs_mutex_ready)
+    return;
+  wamble_mutex_lock(&g_board_scoring_jobs_mutex);
+  BoardScoringJob **link = &g_board_scoring_jobs;
+  while (*link) {
+    BoardScoringJob *job = *link;
+    wamble_mutex_lock(&job->mutex);
+    int completed = job->completed;
+    int retry_needed = job->retry_needed;
+    wamble_mutex_unlock(&job->mutex);
+    if (!completed) {
+      link = &job->next;
+      continue;
+    }
+    if (!job->thread_joined) {
+      (void)wamble_thread_join(job->thread, NULL);
+      job->thread_joined = 1;
+    }
+    if (retry_needed) {
+      wamble_intents_destroy(job->intents);
+      job->intents = NULL;
+      wamble_mutex_lock(&job->mutex);
+      job->completed = 0;
+      job->retry_needed = 0;
+      wamble_mutex_unlock(&job->mutex);
+      if (wamble_thread_create(&job->thread, board_scoring_worker, job) == 0) {
+        job->thread_joined = 0;
+      } else {
+        wamble_mutex_lock(&job->mutex);
+        job->completed = 1;
+        job->retry_needed = 1;
+        wamble_mutex_unlock(&job->mutex);
+      }
+      link = &job->next;
+      continue;
+    }
+    if (!board_scoring_job_flush(job)) {
+      link = &job->next;
+      continue;
+    }
+    *link = job->next;
+    wamble_intents_destroy(job->intents);
+    wamble_mutex_destroy(&job->mutex);
+    free(job);
+  }
+  wamble_mutex_unlock(&g_board_scoring_jobs_mutex);
+}
+
+static void board_scoring_jobs_join_all(void) {
+  if (!g_board_scoring_jobs_mutex_ready)
+    return;
+  for (;;) {
+    wamble_mutex_lock(&g_board_scoring_jobs_mutex);
+    BoardScoringJob *job = g_board_scoring_jobs;
+    if (job)
+      g_board_scoring_jobs = job->next;
+    wamble_mutex_unlock(&g_board_scoring_jobs_mutex);
+    if (!job)
+      break;
+    if (!job->thread_joined) {
+      (void)wamble_thread_join(job->thread, NULL);
+      job->thread_joined = 1;
+    }
+    wamble_mutex_lock(&job->mutex);
+    int retry_needed = job->retry_needed;
+    wamble_mutex_unlock(&job->mutex);
+    if (retry_needed) {
+      for (int attempt = 0; attempt < 3; attempt++) {
+        ScoringStatus status = calculate_and_distribute_pot_for_completed_board(
+            job->board_id, job->result);
+        if (status != SCORING_ERR_DB && status != SCORING_ERR_INVALID)
+          break;
+        wamble_sleep_ms(10);
+      }
+    } else if (!board_scoring_job_flush(job)) {
+      struct WambleIntentBuffer *profile_intents = wamble_get_intent_buffer();
+      while (wamble_intents_append_buffer(profile_intents, job->intents) != 0) {
+        if (board_scoring_job_flush(job))
+          break;
+        wamble_sleep_ms(10);
+      }
+    }
+    wamble_intents_destroy(job->intents);
+    wamble_mutex_destroy(&job->mutex);
+    free(job);
+  }
+}
+
+int board_game_completion_defer(uint64_t board_id, GameResult result,
+                                const uint8_t *player_token) {
+  for (PendingBoardCompletion *it = g_pending_board_completions; it;
+       it = it->next) {
+    if (it->board_id == board_id)
+      return 0;
+  }
+  PendingBoardCompletion *pending =
+      (PendingBoardCompletion *)calloc(1, sizeof(*pending));
+  if (!pending)
+    return -1;
+  pending->board_id = board_id;
+  pending->result = result;
+  if (player_token)
+    memcpy(pending->player_token, player_token, TOKEN_LENGTH);
+  pending->next = g_pending_board_completions;
+  g_pending_board_completions = pending;
+  return 0;
+}
+
+static void board_process_deferred_completions(void) {
+  struct WambleIntentBuffer *intents = wamble_get_intent_buffer();
+  if (!intents || wamble_intents_count(intents) > 0)
+    return;
+  while (g_pending_board_completions) {
+    PendingBoardCompletion *pending = g_pending_board_completions;
+    g_pending_board_completions = pending->next;
+    (void)board_game_completed(pending->board_id, pending->result);
+    WamblePlayer *player = get_player_by_token(pending->player_token);
+    if (player)
+      (void)find_board_for_player(player);
+    free(pending);
+  }
+}
+
+void board_manager_persistence_shutdown(void) {
+  board_process_deferred_completions();
+  board_scoring_jobs_join_all();
+  board_supply_refresh_state_free();
+}
+
+static void board_scoring_enqueue_async(uint64_t board_id, GameResult result) {
+  board_scoring_jobs_ensure_mutex();
+  board_scoring_jobs_reap_completed();
+  BoardScoringJob *job = (BoardScoringJob *)calloc(1, sizeof(*job));
+  if (!job)
+    return;
+  job->board_id = board_id;
+  job->result = result;
+  const WambleConfig *cfg = get_config();
+  job->max_batches = 16;
+  job->max_intents = cfg ? cfg->persistence_max_intents : 0;
+  job->max_payload_bytes = cfg ? cfg->persistence_max_payload_bytes : 0;
+  if (wamble_mutex_init(&job->mutex) != 0) {
+    free(job);
+    (void)calculate_and_distribute_pot(board_id);
+    return;
+  }
+  if (board_capture_worker_context(&job->qs, job->profile_name,
+                                   sizeof(job->profile_name), job->profile_conn,
+                                   sizeof(job->profile_conn), job->global_conn,
+                                   sizeof(job->global_conn)) != 0) {
+    wamble_mutex_destroy(&job->mutex);
+    free(job);
+    (void)calculate_and_distribute_pot(board_id);
+    return;
+  }
+  if (wamble_thread_create(&job->thread, board_scoring_worker, job) != 0) {
+    wamble_mutex_destroy(&job->mutex);
+    free(job);
+    (void)calculate_and_distribute_pot(board_id);
+    return;
+  }
+  wamble_mutex_lock(&g_board_scoring_jobs_mutex);
+  job->next = g_board_scoring_jobs;
+  g_board_scoring_jobs = job;
+  wamble_mutex_unlock(&g_board_scoring_jobs_mutex);
+}
+
 void board_manager_tick() {
   if (!board_manager_ready())
     return;
+  board_scoring_jobs_reap_completed();
+  board_process_deferred_completions();
   time_t now = wamble_now_wall();
   int refresh_board_supply = 0;
+  ExpiredReservationCheck *expired_checks = NULL;
+  int expired_check_count = 0;
+  int expired_check_cap =
+      get_config()->max_boards > 0 ? get_config()->max_boards : 0;
+  if (expired_check_cap > 0)
+    expired_checks = (ExpiredReservationCheck *)calloc(
+        (size_t)expired_check_cap, sizeof(*expired_checks));
 
-  wamble_mutex_lock(&board_mutex);
+  board_manager_mutex_lock();
 
   for (int i = num_cached_boards - 1; i >= 0; i--) {
     WambleBoard *board = &board_cached[i];
@@ -210,10 +705,11 @@ void board_manager_tick() {
       }
       time_t reservation_age = now - board->reservation_time;
       if (reservation_age >= get_config()->reservation_timeout) {
-        WamblePlayer *player =
-            get_player_by_token(board->reservation_player_token);
-        if (!player || !player->has_persistent_identity) {
-          transition_reserved_to_dormant(board);
+        if (expired_checks && expired_check_count < expired_check_cap) {
+          expired_checks[expired_check_count].board_id = board->id;
+          memcpy(expired_checks[expired_check_count].token,
+                 board->reservation_player_token, TOKEN_LENGTH);
+          expired_check_count++;
         }
       }
     }
@@ -226,7 +722,7 @@ void board_manager_tick() {
           queue_reservation_release_notification_locked(board->last_mover_token,
                                                         board->id);
         }
-        wamble_emit_update_board(board->id, board->fen, "DORMANT");
+        wamble_persist_board_mark_dormant(board->id, board->fen);
       }
     }
   }
@@ -234,29 +730,36 @@ void board_manager_tick() {
   if (now - last_count_update >= 60)
     refresh_board_supply = 1;
 
-  wamble_mutex_unlock(&board_mutex);
+  board_manager_mutex_unlock();
+
+  for (int i = 0; i < expired_check_count; i++) {
+    WamblePlayer *player = get_player_by_token(expired_checks[i].token);
+    if (player && player->has_persistent_identity)
+      continue;
+    board_manager_mutex_lock();
+    int idx = board_map_get(expired_checks[i].board_id);
+    if (idx >= 0) {
+      WambleBoard *board = &board_cached[idx];
+      if (board->state == BOARD_STATE_RESERVED &&
+          tokens_equal(board->reservation_player_token,
+                       expired_checks[i].token) &&
+          now - board->reservation_time >= get_config()->reservation_timeout) {
+        transition_reserved_to_dormant(board);
+      }
+    }
+    board_manager_mutex_unlock();
+  }
+  free(expired_checks);
 
   if (!refresh_board_supply)
     return;
 
-  DbBoardIdList dormant = wamble_query_list_boards_by_status("DORMANT");
-  DbBoardIdList active = wamble_query_list_boards_by_status("ACTIVE");
-  DbBoardIdList reserved = wamble_query_list_boards_by_status("RESERVED");
-  bool lists_ok = (dormant.status == DB_OK && active.status == DB_OK &&
-                   reserved.status == DB_OK);
-  if (!lists_ok)
+  int observed_total_boards = 0;
+  int target_boards = 0;
+  if (!board_supply_refresh_consume(&observed_total_boards, &target_boards)) {
+    board_supply_refresh_start_async();
     return;
-
-  int observed_total_boards = dormant.count + active.count + reserved.count;
-  int longest_game = 0;
-  int players = 0;
-  (void)wamble_query_get_longest_game_moves(&longest_game);
-  (void)wamble_query_get_active_session_count(&players);
-  int target_boards = longest_game * players;
-  if (target_boards < get_config()->min_boards)
-    target_boards = get_config()->min_boards;
-  if (target_boards > get_config()->max_boards)
-    target_boards = get_config()->max_boards;
+  }
 
   int boards_to_create = target_boards - observed_total_boards;
   int created_count = 0;
@@ -272,18 +775,27 @@ void board_manager_tick() {
       chess960_gen_fen(c960_pos, c960_fen, sizeof(c960_fen));
       fen_to_use = c960_fen;
     }
-    wamble_emit_create_board(new_board_id, fen_to_use, INITIAL_BOARD_STATUS,
-                             c960_pos);
+    wamble_persist_board_created(new_board_id, fen_to_use, c960_pos);
     created_count++;
   }
 
-  wamble_mutex_lock(&board_mutex);
+  board_manager_mutex_lock();
   total_boards = observed_total_boards + created_count;
   last_count_update = now;
-  wamble_mutex_unlock(&board_mutex);
+  board_manager_mutex_unlock();
 }
 
 void board_manager_init(void) {
+  board_scoring_jobs_join_all();
+  while (g_pending_board_completions) {
+    PendingBoardCompletion *pending = g_pending_board_completions;
+    g_pending_board_completions = pending->next;
+    free(pending);
+  }
+  if (g_board_scoring_jobs_mutex_ready) {
+    wamble_mutex_destroy(&g_board_scoring_jobs_mutex);
+    g_board_scoring_jobs_mutex_ready = 0;
+  }
   if (board_cached || board_index_map) {
     free(board_cached);
     free(board_index_map);
@@ -294,6 +806,7 @@ void board_manager_init(void) {
     free(reservation_release_notifications);
     reservation_release_notifications = NULL;
   }
+  board_supply_refresh_state_free();
   reservation_release_notification_cap = 0;
   reservation_release_notification_head = 0;
   reservation_release_notification_count = 0;
@@ -308,6 +821,13 @@ void board_manager_init(void) {
   next_board_id_initialized = 0;
   wamble_mutex_init(&board_mutex);
   board_mutex_initialized = 1;
+  board_scoring_jobs_ensure_mutex();
+  board_supply_refresh_state =
+      (BoardSupplyRefreshState *)calloc(1, sizeof(*board_supply_refresh_state));
+  if (board_supply_refresh_state &&
+      wamble_mutex_init(&board_supply_refresh_state->mutex) == 0) {
+    board_supply_refresh_state->mutex_ready = 1;
+  }
   if (get_config()->max_boards <= 0)
     return;
   board_cached = malloc(sizeof(WambleBoard) * (size_t)get_config()->max_boards);
@@ -374,8 +894,8 @@ void board_manager_init(void) {
         board_map_put(b->id, slot);
         if (slot >= num_cached_boards)
           num_cached_boards = slot + 1;
-        wamble_emit_create_board(new_board_id, b->fen, INITIAL_BOARD_STATUS,
-                                 b->mode_params.chess960_position_id);
+        wamble_persist_board_created(new_board_id, b->fen,
+                                     b->mode_params.chess960_position_id);
         total_boards++;
       }
     }
@@ -386,8 +906,6 @@ static void transition_to_archived(WambleBoard *board, GameResult result) {
   time_t now = wamble_now_wall();
   board->state = BOARD_STATE_ARCHIVED;
   board->result = result;
-
-  wamble_emit_update_board(board->id, board->fen, "ARCHIVED");
 
   char winning_side = 'd';
   if (result == GAME_RESULT_WHITE_WINS) {
@@ -411,8 +929,9 @@ static void transition_to_archived(WambleBoard *board, GameResult result) {
              result == GAME_RESULT_BLACK_WINS) {
     termination_reason = "win";
   }
-  wamble_emit_record_game_result(board->id, winning_side, move_count,
-                                 duration_seconds, termination_reason);
+  wamble_persist_board_archived_result(board->id, board->fen, winning_side,
+                                       move_count, duration_seconds,
+                                       termination_reason);
 
   total_boards--;
 }
@@ -648,15 +1167,9 @@ static void apply_reservation_to_board(WambleBoard *board,
   memcpy(board->reservation_player_token, player->token, TOKEN_LENGTH);
   board->reserved_for_white = (board->board.turn == 'w');
 
-  wamble_emit_update_board(board->id, board->fen, "RESERVED");
-  wamble_emit_update_board_assignment_time(board->id);
-  wamble_emit_update_board_reservation_meta(board->id, now,
-                                            board->reserved_for_white);
-
-  if (player->has_persistent_identity)
-    wamble_emit_create_reservation(board->id, player->token,
-                                   get_config()->reservation_timeout,
-                                   board->reserved_for_white);
+  wamble_persist_board_reserved(
+      board->id, board->fen, player->token, get_config()->reservation_timeout,
+      board->reserved_for_white, now, player->has_persistent_identity);
 }
 
 static WambleBoard *
@@ -701,52 +1214,48 @@ int board_fill_active_reservation_for_token(const uint8_t *player_token,
   if (!board_manager_ready() || !out)
     return 0;
   memset(out, 0, sizeof(*out));
-  wamble_mutex_lock(&board_mutex);
+  board_manager_mutex_lock();
   found = snapshot_active_reservation_for_token_locked(player_token, NULL, out);
-  wamble_mutex_unlock(&board_mutex);
+  board_manager_mutex_unlock();
   return found;
 }
 
-static WambleBoard *load_board_into_cache(uint64_t board_id) {
+static WambleBoard *populate_board_cache_from_result(uint64_t board_id,
+                                                     const DbBoardResult *br) {
   int cache_slot = find_cache_slot_for_board();
-  if (cache_slot < 0) {
-    return NULL;
-  }
-
-  DbBoardResult br = wamble_query_get_board(board_id);
-  if (br.status != DB_OK) {
+  if (cache_slot < 0 || !br || br->status != DB_OK) {
     return NULL;
   }
 
   WambleBoard *board = &board_cached[cache_slot];
   board->id = board_id;
   {
-    size_t __len = strnlen(br.fen, FEN_MAX_LENGTH - 1);
-    memcpy(board->fen, br.fen, __len);
+    size_t __len = strnlen(br->fen, FEN_MAX_LENGTH - 1);
+    memcpy(board->fen, br->fen, __len);
     board->fen[__len] = '\0';
   }
   parse_fen_to_bitboard(board->fen, &board->board);
-  board->state = board_state_from_string(br.status_text);
+  board->state = board_state_from_string(br->status_text);
   board->result = GAME_RESULT_IN_PROGRESS;
   board->last_move_time = 0;
   board->creation_time =
-      (br.created_at > 0) ? br.created_at : wamble_now_wall();
-  board->last_assignment_time = br.last_assignment_time;
-  board->last_move_time = br.last_move_time;
+      (br->created_at > 0) ? br->created_at : wamble_now_wall();
+  board->last_assignment_time = br->last_assignment_time;
+  board->last_move_time = br->last_move_time;
   snprintf(board->last_move_uci, sizeof(board->last_move_uci), "%s",
-           br.last_move_uci);
+           br->last_move_uci);
   snprintf(board->last_move_shown_uci, sizeof(board->last_move_shown_uci), "%s",
-           br.last_move_shown_uci);
+           br->last_move_shown_uci);
   snprintf(board->last_mover_treatment_group,
            sizeof(board->last_mover_treatment_group), "%s",
-           br.last_mover_treatment_group);
+           br->last_mover_treatment_group);
   memset(board->last_mover_token, 0, TOKEN_LENGTH);
   memset(board->reservation_player_token, 0, TOKEN_LENGTH);
-  board->reservation_time = br.reservation_time;
-  board->reserved_for_white = br.reserved_for_white;
+  board->reservation_time = br->reservation_time;
+  board->reserved_for_white = br->reserved_for_white;
   board->board.game_mode =
-      (br.mode_variant_id >= 0) ? GAME_MODE_CHESS960 : GAME_MODE_STANDARD;
-  board->mode_params.chess960_position_id = br.mode_variant_id;
+      (br->mode_variant_id >= 0) ? GAME_MODE_CHESS960 : GAME_MODE_STANDARD;
+  board->mode_params.chess960_position_id = br->mode_variant_id;
 
   board_map_put(board_id, cache_slot);
   if (cache_slot >= num_cached_boards) {
@@ -817,20 +1326,43 @@ void board_move_played(uint64_t board_id, const uint8_t *player_token,
                        const char *uci_move) {
   if (!board_manager_ready())
     return;
-  wamble_mutex_lock(&board_mutex);
 
+  uint8_t reserved_token_snapshot[TOKEN_LENGTH] = {0};
+  int needs_reserved_transition = 0;
+
+  board_manager_mutex_lock();
   int idx = board_map_get(board_id);
+  if (idx >= 0 && board_cached[idx].state == BOARD_STATE_RESERVED) {
+    memcpy(reserved_token_snapshot, board_cached[idx].reservation_player_token,
+           TOKEN_LENGTH);
+    needs_reserved_transition = 1;
+  }
+  board_manager_mutex_unlock();
+
+  WambleTreatmentAssignment assignment = {0};
+  int have_assignment = 0;
+  if (needs_reserved_transition && !token_is_zero(reserved_token_snapshot) &&
+      wamble_query_get_session_treatment_assignment(reserved_token_snapshot,
+                                                    &assignment) == DB_OK) {
+    have_assignment = 1;
+  }
+
+  board_manager_mutex_lock();
+
+  idx = board_map_get(board_id);
   if (idx >= 0) {
     WambleBoard *board = &board_cached[idx];
 
     if (board->state == BOARD_STATE_RESERVED) {
-      WambleTreatmentAssignment assignment = {0};
-      board->last_mover_treatment_group[0] = '\0';
-      if (wamble_query_get_session_treatment_assignment(
-              board->reservation_player_token, &assignment) == DB_OK) {
-        snprintf(board->last_mover_treatment_group,
-                 sizeof(board->last_mover_treatment_group), "%s",
-                 assignment.group_key);
+      if (needs_reserved_transition &&
+          tokens_equal(board->reservation_player_token,
+                       reserved_token_snapshot)) {
+        board->last_mover_treatment_group[0] = '\0';
+        if (have_assignment) {
+          snprintf(board->last_mover_treatment_group,
+                   sizeof(board->last_mover_treatment_group), "%s",
+                   assignment.group_key);
+        }
       }
       if (player_token)
         memcpy(board->last_mover_token, player_token, TOKEN_LENGTH);
@@ -845,11 +1377,8 @@ void board_move_played(uint64_t board_id, const uint8_t *player_token,
       board->state = BOARD_STATE_ACTIVE;
       board->last_move_time = wamble_now_wall();
 
-      wamble_emit_update_board(board->id, board->fen, "ACTIVE");
-      wamble_emit_update_board_move_meta(board->id,
-                                         board->last_mover_treatment_group);
-      wamble_emit_remove_reservation(board->id);
-      wamble_emit_update_board_reservation_meta(board->id, 0, false);
+      wamble_persist_board_activated(board->id, board->fen,
+                                     board->last_mover_treatment_group);
       memset(board->reservation_player_token, 0, TOKEN_LENGTH);
       board->reservation_time = 0;
       board->reserved_for_white = false;
@@ -865,35 +1394,43 @@ void board_move_played(uint64_t board_id, const uint8_t *player_token,
         board->last_move_shown_uci[0] = '\0';
       }
       board->last_move_time = wamble_now_wall();
-      wamble_emit_update_board_move_meta(board->id,
-                                         board->last_mover_treatment_group);
+      wamble_persist_board_last_mover_snapshot(
+          board->id, board->last_mover_treatment_group);
     }
   }
 
-  wamble_mutex_unlock(&board_mutex);
+  board_manager_mutex_unlock();
 }
 
 void board_game_completed(uint64_t board_id, GameResult result) {
   if (!board_manager_ready())
     return;
-  wamble_mutex_lock(&board_mutex);
+  WambleBoard rating_snapshot;
+  int have_rating_snapshot = 0;
+  memset(&rating_snapshot, 0, sizeof(rating_snapshot));
+
+  board_manager_mutex_lock();
   int idx = board_map_get(board_id);
   if (idx >= 0) {
     WambleBoard *board = &board_cached[idx];
     board->result = result;
-    update_player_ratings(board);
+    rating_snapshot = *board;
+    have_rating_snapshot = 1;
   }
-  wamble_mutex_unlock(&board_mutex);
+  board_manager_mutex_unlock();
 
-  calculate_and_distribute_pot(board_id);
+  if (have_rating_snapshot)
+    update_player_ratings(&rating_snapshot);
 
-  wamble_mutex_lock(&board_mutex);
+  board_scoring_enqueue_async(board_id, result);
+
+  board_manager_mutex_lock();
   idx = board_map_get(board_id);
   if (idx >= 0) {
     WambleBoard *board = &board_cached[idx];
     transition_to_archived(board, result);
   }
-  wamble_mutex_unlock(&board_mutex);
+  board_manager_mutex_unlock();
   prediction_expire_board(board_id);
 }
 
@@ -901,7 +1438,7 @@ bool board_is_reserved_for_player(uint64_t board_id,
                                   const uint8_t *player_token) {
   if (!board_manager_ready())
     return false;
-  wamble_mutex_lock(&board_mutex);
+  board_manager_mutex_lock();
 
   int idx = board_map_get(board_id);
   if (idx >= 0) {
@@ -909,11 +1446,11 @@ bool board_is_reserved_for_player(uint64_t board_id,
     bool is_reserved = (board->state == BOARD_STATE_RESERVED) &&
                        (memcmp(board->reservation_player_token, player_token,
                                TOKEN_LENGTH) == 0);
-    wamble_mutex_unlock(&board_mutex);
+    board_manager_mutex_unlock();
     return is_reserved;
   }
 
-  wamble_mutex_unlock(&board_mutex);
+  board_manager_mutex_unlock();
   return false;
 }
 
@@ -926,15 +1463,13 @@ static void transition_reserved_to_dormant(WambleBoard *board) {
   board->reservation_time = 0;
   board->reserved_for_white = false;
 
-  wamble_emit_update_board(board->id, board->fen, "DORMANT");
-  wamble_emit_remove_reservation(board->id);
-  wamble_emit_update_board_reservation_meta(board->id, 0, false);
+  wamble_persist_board_reservation_released(board->id, board->fen);
 }
 
 void board_release_reservation(uint64_t board_id) {
   if (!board_manager_ready())
     return;
-  wamble_mutex_lock(&board_mutex);
+  board_manager_mutex_lock();
 
   int idx = board_map_get(board_id);
   if (idx >= 0) {
@@ -944,24 +1479,24 @@ void board_release_reservation(uint64_t board_id) {
     }
   }
 
-  wamble_mutex_unlock(&board_mutex);
+  board_manager_mutex_unlock();
 }
 
 int board_emit_persistent_reservation_for_token(const uint8_t *player_token) {
   WambleBoard *board = NULL;
   if (!board_manager_ready() || !player_token || token_is_zero(player_token))
     return 0;
-  wamble_mutex_lock(&board_mutex);
+  board_manager_mutex_lock();
   (void)snapshot_active_reservation_for_token_locked(player_token, &board,
                                                      NULL);
   if (board) {
-    wamble_emit_create_reservation(board->id, board->reservation_player_token,
-                                   get_config()->reservation_timeout,
-                                   board->reserved_for_white);
-    wamble_mutex_unlock(&board_mutex);
+    wamble_persist_board_reservation_created(
+        board->id, board->reservation_player_token,
+        get_config()->reservation_timeout, board->reserved_for_white);
+    board_manager_mutex_unlock();
     return 1;
   }
-  wamble_mutex_unlock(&board_mutex);
+  board_manager_mutex_unlock();
   return 0;
 }
 
@@ -969,7 +1504,7 @@ int board_collect_reservation_release_notifications(
     ReservationReleaseNotification *out, int max) {
   if (!out || max <= 0 || !board_mutex_initialized)
     return 0;
-  wamble_mutex_lock(&board_mutex);
+  board_manager_mutex_lock();
   int n = reservation_release_notification_count;
   if (n > max)
     n = max;
@@ -984,21 +1519,21 @@ int board_collect_reservation_release_notifications(
         reservation_release_notification_cap;
     reservation_release_notification_count -= n;
   }
-  wamble_mutex_unlock(&board_mutex);
+  board_manager_mutex_unlock();
   return n;
 }
 
 int board_manager_count_active_or_reserved(void) {
   if (!board_mutex_initialized || !board_cached)
     return 0;
-  wamble_mutex_lock(&board_mutex);
+  board_manager_mutex_lock();
   int n = 0;
   for (int i = 0; i < num_cached_boards; i++) {
     BoardState s = board_cached[i].state;
     if (s == BOARD_STATE_ACTIVE || s == BOARD_STATE_RESERVED)
       n++;
   }
-  wamble_mutex_unlock(&board_mutex);
+  board_manager_mutex_unlock();
   return n;
 }
 
@@ -1016,7 +1551,7 @@ int board_manager_export(WambleBoard *out, int max, int *out_count,
     }
     return 0;
   }
-  wamble_mutex_lock(&board_mutex);
+  board_manager_mutex_lock();
   int n = num_cached_boards;
   if (n > max)
     n = max;
@@ -1031,7 +1566,7 @@ int board_manager_export(WambleBoard *out, int max, int *out_count,
     *out_next_id = next_board_id;
     wamble_mutex_unlock(&next_board_id_mutex);
   }
-  wamble_mutex_unlock(&board_mutex);
+  board_manager_mutex_unlock();
   return 0;
 }
 
@@ -1044,7 +1579,7 @@ int board_manager_import(const WambleBoard *in, int count, uint64_t next_id) {
   if (count > capacity)
     count = capacity;
 
-  wamble_mutex_lock(&board_mutex);
+  board_manager_mutex_lock();
 
   memset(board_cached, 0, sizeof(WambleBoard) * (size_t)capacity);
   for (int i = 0; i < BOARD_MAP_SIZE; i++)
@@ -1060,7 +1595,7 @@ int board_manager_import(const WambleBoard *in, int count, uint64_t next_id) {
   next_board_id = (next_id > 0) ? next_id : (uint64_t)(count + 1);
   next_board_id_initialized = 1;
   wamble_mutex_unlock(&next_board_id_mutex);
-  wamble_mutex_unlock(&board_mutex);
+  board_manager_mutex_unlock();
   return 0;
 }
 
@@ -1119,8 +1654,6 @@ static int append_dormant_eligible_boards(WamblePlayer *player,
   for (int i = 0; i < dormant.count && eligible_count < eligible_capacity;
        i++) {
     uint64_t board_id = dormant.ids[i];
-    if (board_map_get(board_id) >= 0)
-      continue;
 
     DbBoardResult br = wamble_query_get_board(board_id);
     if (br.status != DB_OK)
@@ -1164,22 +1697,24 @@ static int append_dormant_eligible_boards(WamblePlayer *player,
   return eligible_count;
 }
 
-static WambleBoard *select_scored_board(const ScoredBoard *eligible_boards,
-                                        int eligible_count,
-                                        double total_score) {
-  if (!eligible_boards || eligible_count <= 0 || total_score <= 0.0)
-    return NULL;
+static int select_scored_board(const ScoredBoard *eligible_boards,
+                               int eligible_count, double total_score,
+                               ScoredBoard *out_selected) {
+  if (out_selected)
+    memset(out_selected, 0, sizeof(*out_selected));
+  if (!eligible_boards || eligible_count <= 0 || total_score <= 0.0 ||
+      !out_selected)
+    return 0;
 
   double random_value = rng_double() * total_score;
   for (int i = 0; i < eligible_count; i++) {
     random_value -= eligible_boards[i].score;
     if (random_value > 0)
       continue;
-    if (eligible_boards[i].is_cached)
-      return eligible_boards[i].board;
-    return load_board_into_cache(eligible_boards[i].board_id);
+    *out_selected = eligible_boards[i];
+    return 1;
   }
-  return NULL;
+  return 0;
 }
 
 WambleBoard *find_board_for_player(WamblePlayer *player) {
@@ -1187,53 +1722,79 @@ WambleBoard *find_board_for_player(WamblePlayer *player) {
     return NULL;
   }
 
-  wamble_mutex_lock(&board_mutex);
+  board_manager_mutex_lock();
 
   WambleBoard *existing_reserved =
       find_reserved_board_for_token_locked(player->token);
   if (existing_reserved) {
-    wamble_mutex_unlock(&board_mutex);
+    board_manager_mutex_unlock();
     return existing_reserved;
   }
 
   int eligible_capacity = get_config()->max_boards * 2;
   if (eligible_capacity <= 0) {
-    wamble_mutex_unlock(&board_mutex);
+    board_manager_mutex_unlock();
     return NULL;
   }
   ScoredBoard *eligible_boards =
       calloc((size_t)eligible_capacity, sizeof(*eligible_boards));
   if (!eligible_boards) {
-    wamble_mutex_unlock(&board_mutex);
+    board_manager_mutex_unlock();
     return NULL;
   }
   double total_score = 0.0;
   int eligible_count = collect_cached_eligible_boards(
       player, eligible_boards, eligible_capacity, &total_score);
+  board_manager_mutex_unlock();
+
   eligible_count = append_dormant_eligible_boards(
       player, eligible_boards, eligible_count, eligible_capacity, &total_score);
-  WambleBoard *selected_board =
-      select_scored_board(eligible_boards, eligible_count, total_score);
+  ScoredBoard selected = {0};
+  int have_selected = select_scored_board(eligible_boards, eligible_count,
+                                          total_score, &selected);
 
-  if (selected_board) {
-    apply_reservation_to_board(selected_board, player);
+  DbBoardResult selected_board_result = {0};
+  if (have_selected && !selected.is_cached)
+    selected_board_result = wamble_query_get_board(selected.board_id);
+
+  board_manager_mutex_lock();
+  existing_reserved = find_reserved_board_for_token_locked(player->token);
+  if (existing_reserved) {
     free(eligible_boards);
-    wamble_mutex_unlock(&board_mutex);
-    return selected_board;
+    board_manager_mutex_unlock();
+    return existing_reserved;
+  }
+
+  if (have_selected) {
+    int selected_idx = board_map_get(selected.board_id);
+    WambleBoard *selected_board =
+        (selected_idx >= 0) ? &board_cached[selected_idx] : NULL;
+    if (!selected_board && !selected.is_cached &&
+        selected_board_result.status == DB_OK) {
+      selected_board = populate_board_cache_from_result(selected.board_id,
+                                                        &selected_board_result);
+    }
+    if (selected_board && is_board_eligible_for_assignment(selected_board) &&
+        board_pairing_allowed_for_player(selected_board, player)) {
+      apply_reservation_to_board(selected_board, player);
+      free(eligible_boards);
+      board_manager_mutex_unlock();
+      return selected_board;
+    }
   }
 
   if (total_boards < get_config()->max_boards) {
     int new_board_index = create_new_board_for_player(player);
     if (new_board_index >= 0) {
-      selected_board = &board_cached[new_board_index];
+      WambleBoard *new_board = &board_cached[new_board_index];
       free(eligible_boards);
-      wamble_mutex_unlock(&board_mutex);
-      return selected_board;
+      board_manager_mutex_unlock();
+      return new_board;
     }
   }
 
   free(eligible_boards);
-  wamble_mutex_unlock(&board_mutex);
+  board_manager_mutex_unlock();
   return NULL;
 }
 
@@ -1272,8 +1833,8 @@ static int create_new_board_for_player(WamblePlayer *player) {
   } else {
     strcpy(board->fen, INITIAL_BOARD_FEN);
   }
-  wamble_emit_create_board(board->id, board->fen, INITIAL_BOARD_STATUS,
-                           board->mode_params.chess960_position_id);
+  wamble_persist_board_created(board->id, board->fen,
+                               board->mode_params.chess960_position_id);
 
   board->result = GAME_RESULT_IN_PROGRESS;
   parse_fen_to_bitboard(board->fen, &board->board);
@@ -1299,15 +1860,27 @@ static int create_new_board_for_player(WamblePlayer *player) {
 WambleBoard *get_board_by_id(uint64_t board_id) {
   if (!board_manager_ready())
     return NULL;
-  wamble_mutex_lock(&board_mutex);
+  board_manager_mutex_lock();
   int idx = board_map_get(board_id);
   if (idx >= 0) {
     WambleBoard *b = &board_cached[idx];
-    wamble_mutex_unlock(&board_mutex);
+    board_manager_mutex_unlock();
     return b;
   }
+  board_manager_mutex_unlock();
 
-  WambleBoard *loaded_board = load_board_into_cache(board_id);
-  wamble_mutex_unlock(&board_mutex);
+  DbBoardResult br = wamble_query_get_board(board_id);
+  if (br.status != DB_OK)
+    return NULL;
+
+  board_manager_mutex_lock();
+  idx = board_map_get(board_id);
+  if (idx >= 0) {
+    WambleBoard *b = &board_cached[idx];
+    board_manager_mutex_unlock();
+    return b;
+  }
+  WambleBoard *loaded_board = populate_board_cache_from_result(board_id, &br);
+  board_manager_mutex_unlock();
   return loaded_board;
 }

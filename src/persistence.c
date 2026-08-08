@@ -4,6 +4,149 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef enum {
+  PERSISTENCE_STATUS_OK = 0,
+  PERSISTENCE_STATUS_NO_BUFFER = 1,
+  PERSISTENCE_STATUS_ALLOC_FAIL = 2,
+  PERSISTENCE_STATUS_APPLY_FAIL = 3,
+  PERSISTENCE_STATUS_EMPTY = 4,
+} PersistenceStatus;
+
+typedef enum {
+  WAMBLE_INTENT_UPDATE_BOARD = 1,
+  WAMBLE_INTENT_UPDATE_BOARD_ASSIGNMENT_TIME = 2,
+  WAMBLE_INTENT_CREATE_RESERVATION = 3,
+  WAMBLE_INTENT_REMOVE_RESERVATION = 4,
+  WAMBLE_INTENT_RECORD_GAME_RESULT = 5,
+  WAMBLE_INTENT_UPDATE_SESSION_LAST_SEEN = 6,
+  WAMBLE_INTENT_CREATE_SESSION = 7,
+  WAMBLE_INTENT_LINK_SESSION_TO_PUBKEY = 8,
+  WAMBLE_INTENT_RECORD_PAYOUT = 9,
+  WAMBLE_INTENT_CREATE_BOARD = 10,
+  WAMBLE_INTENT_RECORD_MOVE = 11,
+  WAMBLE_INTENT_UPDATE_BOARD_MOVE_META = 12,
+  WAMBLE_INTENT_UPDATE_BOARD_RESERVATION_META = 13,
+  WAMBLE_INTENT_RECORD_PREDICTION = 14,
+  WAMBLE_INTENT_RESOLVE_PREDICTION = 15,
+  WAMBLE_INTENT_UNLINK_SESSION_IDENTITY = 16,
+  WAMBLE_INTENT_UPDATE_PLAYER_RATING = 17,
+  WAMBLE_INTENT_RECORD_LAST_MOVE_SHOWN = 18,
+  WAMBLE_INTENT_RECORD_PROFILE_TERMS_ACCEPTANCE = 19,
+  WAMBLE_INTENT_ASSIGN_SESSION_TREATMENT = 20,
+} WambleIntentType;
+
+typedef struct WamblePersistenceIntent {
+  WambleIntentType type;
+  union {
+    struct {
+      uint64_t board_id;
+      char fen[FEN_MAX_LENGTH];
+      char status[STATUS_MAX_LENGTH];
+    } update_board;
+    struct {
+      uint64_t board_id;
+      char fen[FEN_MAX_LENGTH];
+      char status[STATUS_MAX_LENGTH];
+      int mode_variant_id;
+    } create_board;
+    struct {
+      uint64_t board_id;
+    } update_board_assignment_time;
+    struct {
+      uint64_t board_id;
+      uint8_t token[TOKEN_LENGTH];
+      int timeout_seconds;
+      int reserved_for_white;
+    } create_reservation;
+    struct {
+      uint64_t board_id;
+    } remove_reservation;
+    struct {
+      uint64_t board_id;
+      char winning_side;
+      int move_count;
+      int duration_seconds;
+      char termination_reason[32];
+    } record_game_result;
+    struct {
+      uint8_t token[TOKEN_LENGTH];
+    } update_session_last_seen;
+    struct {
+      uint8_t token[TOKEN_LENGTH];
+      uint64_t player_id;
+      char treatment_group_key[128];
+    } create_session;
+    struct {
+      uint8_t token[TOKEN_LENGTH];
+      uint8_t public_key[32];
+    } link_session_to_pubkey;
+    struct {
+      uint8_t token[TOKEN_LENGTH];
+    } unlink_session_identity;
+    struct {
+      uint64_t board_id;
+      uint8_t token[TOKEN_LENGTH];
+      double points;
+      double canonical_points;
+    } record_payout;
+    struct {
+      uint8_t token[TOKEN_LENGTH];
+      double rating;
+    } update_player_rating;
+    struct {
+      uint64_t board_id;
+      uint8_t token[TOKEN_LENGTH];
+      char move_uci[MAX_UCI_LENGTH];
+      int move_number;
+    } record_move;
+    struct {
+      uint8_t token[TOKEN_LENGTH];
+      char profile_name[128];
+      uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH];
+      char tos_text[FEN_MAX_LENGTH];
+    } record_profile_terms_acceptance;
+    struct {
+      uint8_t token[TOKEN_LENGTH];
+      char profile_name[128];
+    } assign_session_treatment;
+    struct {
+      uint64_t board_id;
+      char last_mover_treatment_group[128];
+    } update_board_move_meta;
+    struct {
+      uint64_t board_id;
+      uint8_t token[TOKEN_LENGTH];
+      char shown_uci[MAX_UCI_LENGTH];
+    } record_last_move_shown;
+    struct {
+      uint64_t board_id;
+      time_t reservation_time;
+      int reserved_for_white;
+    } update_board_reservation_meta;
+    struct {
+      uint64_t board_id;
+      uint64_t parent_id;
+      uint8_t token[TOKEN_LENGTH];
+      char predicted_move_uci[MAX_UCI_LENGTH];
+      int move_number;
+      int correct_streak;
+    } record_prediction;
+    struct {
+      uint64_t board_id;
+      uint8_t token[TOKEN_LENGTH];
+      int move_number;
+      char status[STATUS_MAX_LENGTH];
+      double points_awarded;
+    } resolve_prediction;
+  } as;
+} WamblePersistenceIntent;
+
+typedef struct WambleIntentBuffer {
+  struct WamblePersistenceIntent *items;
+  int count;
+  int capacity;
+} WambleIntentBuffer;
+
 static WAMBLE_THREAD_LOCAL const WambleQueryService *g_qs_tls = NULL;
 static const WambleQueryService *g_qs_default = NULL;
 static WAMBLE_THREAD_LOCAL WambleIntentBuffer *g_intents_tls = NULL;
@@ -40,7 +183,7 @@ const WambleQueryService *wamble_get_query_service(void) {
 void wamble_set_intent_buffer(struct WambleIntentBuffer *buf) {
   g_intents_tls = buf;
 }
-static struct WambleIntentBuffer *wamble_get_intent_buffer(void) {
+struct WambleIntentBuffer *wamble_get_intent_buffer(void) {
   return g_intents_tls;
 }
 
@@ -73,6 +216,69 @@ void wamble_intents_clear(struct WambleIntentBuffer *buf) {
   buf->count = 0;
 }
 
+struct WambleIntentBuffer *wamble_intents_create(void) {
+  struct WambleIntentBuffer *buf =
+      (struct WambleIntentBuffer *)calloc(1, sizeof(*buf));
+  if (!buf)
+    return NULL;
+  wamble_intents_init(buf);
+  return buf;
+}
+
+void wamble_intents_destroy(struct WambleIntentBuffer *buf) {
+  if (!buf)
+    return;
+  wamble_intents_free(buf);
+  free(buf);
+}
+
+int wamble_intents_count(const struct WambleIntentBuffer *buf) {
+  return buf ? buf->count : 0;
+}
+
+struct WambleIntentBuffer *
+wamble_intents_clone(const struct WambleIntentBuffer *src) {
+  struct WambleIntentBuffer *dst = wamble_intents_create();
+  if (!dst)
+    return NULL;
+  if (!src || src->count <= 0)
+    return dst;
+  dst->items = (struct WamblePersistenceIntent *)malloc((size_t)src->count *
+                                                        sizeof(*dst->items));
+  if (!dst->items) {
+    wamble_intents_destroy(dst);
+    return NULL;
+  }
+  memcpy(dst->items, src->items, (size_t)src->count * sizeof(*dst->items));
+  dst->count = src->count;
+  dst->capacity = src->count;
+  return dst;
+}
+
+int wamble_intents_replace_flushed_prefix(struct WambleIntentBuffer *dst,
+                                          struct WambleIntentBuffer *remaining,
+                                          int copied_count) {
+  if (!dst || copied_count <= 0)
+    return 0;
+  if (copied_count > dst->count)
+    copied_count = dst->count;
+  int tail_count = dst->count - copied_count;
+  int remaining_count = remaining ? remaining->count : 0;
+  int new_count = remaining_count + tail_count;
+
+  if (remaining_count > 0) {
+    memcpy(dst->items, remaining->items,
+           (size_t)remaining_count * sizeof(*dst->items));
+    remaining->count = 0;
+  }
+  if (tail_count > 0) {
+    memmove(dst->items + remaining_count, dst->items + copied_count,
+            (size_t)tail_count * sizeof(*dst->items));
+  }
+  dst->count = new_count;
+  return 0;
+}
+
 static void intents_ensure(struct WambleIntentBuffer *buf, int add) {
   if (!buf)
     return;
@@ -91,6 +297,20 @@ static void intents_ensure(struct WambleIntentBuffer *buf, int add) {
   }
   buf->items = ni;
   buf->capacity = newcap;
+}
+
+int wamble_intents_append_buffer(struct WambleIntentBuffer *dst,
+                                 struct WambleIntentBuffer *src) {
+  if (!dst || !src || src->count <= 0)
+    return 0;
+  intents_ensure(dst, src->count);
+  if (dst->capacity - dst->count < src->count)
+    return -1;
+  memcpy(&dst->items[dst->count], src->items,
+         (size_t)src->count * sizeof(*src->items));
+  dst->count += src->count;
+  src->count = 0;
+  return 0;
 }
 
 static void intents_push(struct WamblePersistenceIntent in) {
@@ -205,6 +425,58 @@ void wamble_emit_create_session(const uint8_t *token, uint64_t player_id) {
   intents_push(it);
 }
 
+void wamble_emit_assign_session_treatment(const uint8_t *token,
+                                          const char *profile_name) {
+  if (!token)
+    return;
+  db_invalidate_treatment_action_cache();
+  struct WamblePersistenceIntent it = {0};
+  it.type = WAMBLE_INTENT_ASSIGN_SESSION_TREATMENT;
+  memcpy(it.as.assign_session_treatment.token, token, TOKEN_LENGTH);
+  intent_copy_str(it.as.assign_session_treatment.profile_name,
+                  sizeof(it.as.assign_session_treatment.profile_name),
+                  profile_name);
+  intents_push(it);
+}
+
+void wamble_emit_record_profile_terms_acceptance(
+    const uint8_t *token, const char *profile_name,
+    const uint8_t tos_hash[WAMBLE_FRAGMENT_HASH_LENGTH], const char *tos_text) {
+  if (!token || !tos_hash || !tos_text)
+    return;
+  struct WamblePersistenceIntent it = {0};
+  it.type = WAMBLE_INTENT_RECORD_PROFILE_TERMS_ACCEPTANCE;
+  memcpy(it.as.record_profile_terms_acceptance.token, token, TOKEN_LENGTH);
+  memcpy(it.as.record_profile_terms_acceptance.tos_hash, tos_hash,
+         WAMBLE_FRAGMENT_HASH_LENGTH);
+  intent_copy_str(it.as.record_profile_terms_acceptance.profile_name,
+                  sizeof(it.as.record_profile_terms_acceptance.profile_name),
+                  profile_name);
+  intent_copy_str(it.as.record_profile_terms_acceptance.tos_text,
+                  sizeof(it.as.record_profile_terms_acceptance.tos_text),
+                  tos_text);
+  intents_push(it);
+}
+
+void wamble_emit_record_prediction(uint64_t board_id, const uint8_t *token,
+                                   uint64_t parent_prediction_id,
+                                   const char *predicted_move_uci,
+                                   int move_number, int correct_streak) {
+  if (board_id == 0 || !token || !predicted_move_uci || move_number <= 0)
+    return;
+  struct WamblePersistenceIntent it = {0};
+  it.type = WAMBLE_INTENT_RECORD_PREDICTION;
+  it.as.record_prediction.board_id = board_id;
+  it.as.record_prediction.parent_id = parent_prediction_id;
+  memcpy(it.as.record_prediction.token, token, TOKEN_LENGTH);
+  intent_copy_str(it.as.record_prediction.predicted_move_uci,
+                  sizeof(it.as.record_prediction.predicted_move_uci),
+                  predicted_move_uci);
+  it.as.record_prediction.move_number = move_number;
+  it.as.record_prediction.correct_streak = correct_streak;
+  intents_push(it);
+}
+
 void wamble_emit_update_board_move_meta(uint64_t board_id,
                                         const char *group_key) {
   if (board_id == 0)
@@ -265,6 +537,11 @@ void wamble_emit_unlink_session_identity(const uint8_t *token) {
   memcpy(it.as.unlink_session_identity.token, token, TOKEN_LENGTH);
   intents_push(it);
 }
+
+void wamble_emit_record_payout_with_canonical(uint64_t board_id,
+                                              const uint8_t *token,
+                                              double points,
+                                              double canonical_points);
 
 void wamble_emit_record_payout(uint64_t board_id, const uint8_t *token,
                                double points) {
@@ -330,6 +607,66 @@ void wamble_emit_create_board(uint64_t board_id, const char *fen,
   intents_push(it);
 }
 
+void wamble_persist_board_created(uint64_t board_id, const char *fen,
+                                  int mode_variant_id) {
+  wamble_emit_create_board(board_id, fen, "DORMANT", mode_variant_id);
+}
+
+void wamble_persist_board_mark_dormant(uint64_t board_id, const char *fen) {
+  wamble_emit_update_board(board_id, fen, "DORMANT");
+}
+
+void wamble_persist_board_reservation_created(uint64_t board_id,
+                                              const uint8_t *token,
+                                              int timeout_seconds,
+                                              bool reserved_for_white) {
+  wamble_emit_create_reservation(board_id, token, timeout_seconds,
+                                 reserved_for_white);
+}
+
+void wamble_persist_board_last_mover_snapshot(uint64_t board_id,
+                                              const char *group_key) {
+  wamble_emit_update_board_move_meta(board_id, group_key);
+}
+
+void wamble_persist_board_reserved(uint64_t board_id, const char *fen,
+                                   const uint8_t *token, int timeout_seconds,
+                                   bool reserved_for_white,
+                                   time_t reservation_time,
+                                   bool create_reservation) {
+  wamble_emit_update_board(board_id, fen, "RESERVED");
+  wamble_emit_update_board_assignment_time(board_id);
+  wamble_emit_update_board_reservation_meta(board_id, reservation_time,
+                                            reserved_for_white);
+  if (create_reservation)
+    wamble_emit_create_reservation(board_id, token, timeout_seconds,
+                                   reserved_for_white);
+}
+
+void wamble_persist_board_activated(uint64_t board_id, const char *fen,
+                                    const char *last_mover_group) {
+  wamble_emit_update_board(board_id, fen, "ACTIVE");
+  wamble_emit_update_board_move_meta(board_id, last_mover_group);
+  wamble_emit_remove_reservation(board_id);
+  wamble_emit_update_board_reservation_meta(board_id, 0, false);
+}
+
+void wamble_persist_board_reservation_released(uint64_t board_id,
+                                               const char *fen) {
+  wamble_emit_update_board(board_id, fen, "DORMANT");
+  wamble_emit_remove_reservation(board_id);
+  wamble_emit_update_board_reservation_meta(board_id, 0, false);
+}
+
+void wamble_persist_board_archived_result(uint64_t board_id, const char *fen,
+                                          char winning_side, int move_count,
+                                          int duration_seconds,
+                                          const char *termination_reason) {
+  wamble_emit_update_board(board_id, fen, "ARCHIVED");
+  wamble_emit_record_game_result(board_id, winning_side, move_count,
+                                 duration_seconds, termination_reason);
+}
+
 typedef struct {
   uint8_t token[TOKEN_LENGTH];
   DbStatus status;
@@ -391,28 +728,27 @@ static int apply_one_intent_db(const struct WamblePersistenceIntent *it,
                                SessionResolveCache *cache) {
   switch (it->type) {
   case WAMBLE_INTENT_UPDATE_BOARD:
-    return db_async_update_board(it->as.update_board.board_id,
+    return db_apply_update_board(it->as.update_board.board_id,
                                  it->as.update_board.fen,
                                  it->as.update_board.status);
   case WAMBLE_INTENT_UPDATE_BOARD_ASSIGNMENT_TIME:
-    return db_async_update_board_assignment_time(
+    return db_apply_update_board_assignment_time(
         it->as.update_board_assignment_time.board_id);
   case WAMBLE_INTENT_CREATE_RESERVATION: {
     uint64_t sid = 0;
     DbStatus st =
         resolve_session_id_cached(cache, it->as.create_reservation.token, &sid);
     if (st != DB_OK || sid == 0)
-      return 0;
-    return db_async_create_reservation(
+      return -1;
+    return db_apply_create_reservation(
         it->as.create_reservation.board_id, sid,
         it->as.create_reservation.timeout_seconds,
         it->as.create_reservation.reserved_for_white);
   }
   case WAMBLE_INTENT_REMOVE_RESERVATION:
-    db_async_remove_reservation(it->as.remove_reservation.board_id);
-    return 0;
+    return db_apply_remove_reservation(it->as.remove_reservation.board_id);
   case WAMBLE_INTENT_RECORD_GAME_RESULT:
-    return db_async_record_game_result(
+    return db_apply_record_game_result(
         it->as.record_game_result.board_id,
         it->as.record_game_result.winning_side,
         it->as.record_game_result.move_count,
@@ -423,9 +759,8 @@ static int apply_one_intent_db(const struct WamblePersistenceIntent *it,
     DbStatus st = resolve_session_id_cached(
         cache, it->as.update_session_last_seen.token, &sid);
     if (st != DB_OK || sid == 0)
-      return 0;
-    db_async_update_session_last_seen(sid);
-    return 0;
+      return -1;
+    return db_apply_update_session_last_seen(sid);
   }
   case WAMBLE_INTENT_CREATE_SESSION: {
     uint64_t sid = db_create_session(it->as.create_session.token,
@@ -435,33 +770,29 @@ static int apply_one_intent_db(const struct WamblePersistenceIntent *it,
     return sid > 0 ? 0 : -1;
   }
   case WAMBLE_INTENT_LINK_SESSION_TO_PUBKEY: {
-    const WambleQueryService *qs = wamble_get_query_service();
     uint64_t sid = 0;
     if (resolve_session_id_cached(cache, it->as.link_session_to_pubkey.token,
                                   &sid) != DB_OK ||
-        sid == 0 || !qs || !qs->link_session_to_pubkey)
+        sid == 0)
       return -1;
-    return qs->link_session_to_pubkey(sid,
-                                      it->as.link_session_to_pubkey.public_key);
+    return db_apply_link_session_to_pubkey(
+        sid, it->as.link_session_to_pubkey.public_key);
   }
   case WAMBLE_INTENT_UNLINK_SESSION_IDENTITY: {
-    const WambleQueryService *qs = wamble_get_query_service();
     uint64_t sid = 0;
     if (resolve_session_id_cached(cache, it->as.unlink_session_identity.token,
                                   &sid) != DB_OK ||
-        sid == 0 || !qs || !qs->unlink_session_identity)
-      return 0;
-    if (qs->unlink_session_identity(sid) < 0)
-      return 0;
-    return 0;
+        sid == 0)
+      return -1;
+    return db_apply_unlink_session_identity(sid);
   }
   case WAMBLE_INTENT_RECORD_PAYOUT: {
     uint64_t sid = 0;
     DbStatus st =
         resolve_session_id_cached(cache, it->as.record_payout.token, &sid);
     if (st != DB_OK || sid == 0)
-      return 0;
-    return db_async_record_payout_with_canonical(
+      return -1;
+    return db_apply_record_payout_with_canonical(
         it->as.record_payout.board_id, sid, it->as.record_payout.points,
         it->as.record_payout.canonical_points);
   }
@@ -470,8 +801,8 @@ static int apply_one_intent_db(const struct WamblePersistenceIntent *it,
     DbStatus st = resolve_session_id_cached(
         cache, it->as.update_player_rating.token, &sid);
     if (st != DB_OK || sid == 0)
-      return 0;
-    return db_async_update_player_rating(sid,
+      return -1;
+    return db_apply_update_player_rating(sid,
                                          it->as.update_player_rating.rating);
   }
   case WAMBLE_INTENT_CREATE_BOARD: {
@@ -490,17 +821,17 @@ static int apply_one_intent_db(const struct WamblePersistenceIntent *it,
     DbStatus st =
         resolve_session_id_cached(cache, it->as.record_move.token, &sid);
     if (st != DB_OK || sid == 0)
-      return 0;
-    return db_async_record_move(it->as.record_move.board_id, sid,
+      return -1;
+    return db_apply_record_move(it->as.record_move.board_id, sid,
                                 it->as.record_move.move_uci,
                                 it->as.record_move.move_number);
   }
   case WAMBLE_INTENT_UPDATE_BOARD_MOVE_META:
-    return db_async_update_board_move_meta(
+    return db_apply_update_board_move_meta(
         it->as.update_board_move_meta.board_id,
         it->as.update_board_move_meta.last_mover_treatment_group);
   case WAMBLE_INTENT_UPDATE_BOARD_RESERVATION_META:
-    return db_async_update_board_reservation_meta(
+    return db_apply_update_board_reservation_meta(
         it->as.update_board_reservation_meta.board_id,
         it->as.update_board_reservation_meta.reservation_time,
         it->as.update_board_reservation_meta.reserved_for_white);
@@ -509,20 +840,37 @@ static int apply_one_intent_db(const struct WamblePersistenceIntent *it,
     DbStatus st =
         resolve_session_id_cached(cache, it->as.record_prediction.token, &sid);
     if (st != DB_OK || sid == 0)
-      return 0;
-    return db_async_create_prediction(
+      return -1;
+    return db_apply_create_prediction(
         it->as.record_prediction.board_id, sid,
         it->as.record_prediction.parent_id,
         it->as.record_prediction.predicted_move_uci,
-        it->as.record_prediction.move_number, 0);
+        it->as.record_prediction.move_number,
+        it->as.record_prediction.correct_streak);
   }
+  case WAMBLE_INTENT_RECORD_PROFILE_TERMS_ACCEPTANCE: {
+    uint64_t acceptance_id = 0;
+    DbStatus st = db_record_profile_terms_acceptance(
+        it->as.record_profile_terms_acceptance.token,
+        it->as.record_profile_terms_acceptance.profile_name,
+        it->as.record_profile_terms_acceptance.tos_hash,
+        it->as.record_profile_terms_acceptance.tos_text, &acceptance_id);
+    return st == DB_OK ? 0 : -1;
+  }
+  case WAMBLE_INTENT_ASSIGN_SESSION_TREATMENT:
+    return db_assign_session_treatment(
+               it->as.assign_session_treatment.token,
+               it->as.assign_session_treatment.profile_name, NULL, 0,
+               NULL) == DB_OK
+               ? 0
+               : -1;
   case WAMBLE_INTENT_RESOLVE_PREDICTION: {
     uint64_t sid = 0;
     DbStatus st =
         resolve_session_id_cached(cache, it->as.resolve_prediction.token, &sid);
     if (st != DB_OK || sid == 0)
-      return 0;
-    return db_async_resolve_prediction(
+      return -1;
+    return db_apply_resolve_prediction(
         it->as.resolve_prediction.board_id, sid,
         it->as.resolve_prediction.move_number, it->as.resolve_prediction.status,
         it->as.resolve_prediction.points_awarded);
@@ -532,57 +880,14 @@ static int apply_one_intent_db(const struct WamblePersistenceIntent *it,
     DbStatus st = resolve_session_id_cached(
         cache, it->as.record_last_move_shown.token, &sid);
     if (st != DB_OK || sid == 0)
-      return 0;
-    return db_async_record_last_move_shown(
+      return -1;
+    return db_apply_record_last_move_shown(
         it->as.record_last_move_shown.board_id, sid,
         it->as.record_last_move_shown.shown_uci);
   }
   default:
-    return 0;
-  }
-}
-
-typedef struct {
-  int idx;
-  const struct WamblePersistenceIntent *it;
-} IntentRef;
-
-static int append_ref_cmp(const void *a, const void *b) {
-  const IntentRef *ra = (const IntentRef *)a;
-  const IntentRef *rb = (const IntentRef *)b;
-  if (ra->it->type != rb->it->type)
-    return (int)ra->it->type - (int)rb->it->type;
-  if (ra->it->as.record_move.board_id < rb->it->as.record_move.board_id)
     return -1;
-  if (ra->it->as.record_move.board_id > rb->it->as.record_move.board_id)
-    return 1;
-
-  const uint8_t *ta = NULL;
-  const uint8_t *tb = NULL;
-  if (ra->it->type == WAMBLE_INTENT_RECORD_MOVE) {
-    ta = ra->it->as.record_move.token;
-    tb = rb->it->as.record_move.token;
-  } else {
-    ta = ra->it->as.record_payout.token;
-    tb = rb->it->as.record_payout.token;
   }
-  int tok_cmp = memcmp(ta, tb, TOKEN_LENGTH);
-  if (tok_cmp != 0)
-    return tok_cmp;
-
-  if (ra->it->type == WAMBLE_INTENT_RECORD_MOVE) {
-    if (ra->it->as.record_move.move_number < rb->it->as.record_move.move_number)
-      return -1;
-    if (ra->it->as.record_move.move_number > rb->it->as.record_move.move_number)
-      return 1;
-    return strcmp(ra->it->as.record_move.move_uci,
-                  rb->it->as.record_move.move_uci);
-  }
-  if (ra->it->as.record_payout.points < rb->it->as.record_payout.points)
-    return -1;
-  if (ra->it->as.record_payout.points > rb->it->as.record_payout.points)
-    return 1;
-  return 0;
 }
 
 static int
@@ -626,6 +931,10 @@ intent_payload_estimate_bytes(const struct WamblePersistenceIntent *it) {
     return 8 + TOKEN_LENGTH + 4 + STATUS_MAX_LENGTH + 8;
   case WAMBLE_INTENT_RECORD_LAST_MOVE_SHOWN:
     return 8 + TOKEN_LENGTH + MAX_UCI_LENGTH;
+  case WAMBLE_INTENT_RECORD_PROFILE_TERMS_ACCEPTANCE:
+    return TOKEN_LENGTH + 128 + WAMBLE_FRAGMENT_HASH_LENGTH + FEN_MAX_LENGTH;
+  case WAMBLE_INTENT_ASSIGN_SESSION_TREATMENT:
+    return TOKEN_LENGTH + 128;
   default:
     return sizeof(*it);
   }
@@ -678,23 +987,8 @@ PersistenceStatus wamble_apply_intents_with_db_checked(
   if (out_selected_bytes)
     *out_selected_bytes = selected_payload_bytes;
 
-  uint8_t *handled = (uint8_t *)calloc((size_t)to_apply, 1);
-  IntentRef *append_refs =
-      (IntentRef *)malloc(sizeof(*append_refs) * (size_t)to_apply);
-  int *exec_idx = (int *)malloc(sizeof(*exec_idx) * (size_t)to_apply);
-  if (!handled || !append_refs) {
-    free(handled);
-    free(append_refs);
-    free(exec_idx);
-    handled = NULL;
-    append_refs = NULL;
-    exec_idx = NULL;
-  }
-
   int failures = 0;
   int write_idx = 0;
-  int exec_count = 0;
-  int txn_success = 0;
   SessionResolveEntry *session_cache_items = NULL;
   SessionResolveCache session_cache = {0};
 
@@ -707,162 +1001,18 @@ PersistenceStatus wamble_apply_intents_with_db_checked(
     }
   }
 
-  if (handled && append_refs && exec_idx) {
-    for (int i = to_apply - 1; i >= 0; i--) {
-      if (handled[i])
-        continue;
-      struct WamblePersistenceIntent *it = &buf->items[i];
-
-      if (it->type == WAMBLE_INTENT_UPDATE_BOARD) {
-        handled[i] = 1;
-        for (int j = i - 1; j >= 0; j--) {
-          if (!handled[j] && buf->items[j].type == WAMBLE_INTENT_UPDATE_BOARD &&
-              buf->items[j].as.update_board.board_id ==
-                  it->as.update_board.board_id)
-            handled[j] = 1;
-        }
-        exec_idx[exec_count++] = i;
-        continue;
-      }
-      if (it->type == WAMBLE_INTENT_UPDATE_BOARD_ASSIGNMENT_TIME) {
-        handled[i] = 1;
-        for (int j = i - 1; j >= 0; j--) {
-          if (!handled[j] &&
-              buf->items[j].type ==
-                  WAMBLE_INTENT_UPDATE_BOARD_ASSIGNMENT_TIME &&
-              buf->items[j].as.update_board_assignment_time.board_id ==
-                  it->as.update_board_assignment_time.board_id) {
-            handled[j] = 1;
-          }
-        }
-        exec_idx[exec_count++] = i;
-        continue;
-      }
-      if (it->type == WAMBLE_INTENT_UPDATE_BOARD_MOVE_META) {
-        handled[i] = 1;
-        for (int j = i - 1; j >= 0; j--) {
-          if (!handled[j] &&
-              buf->items[j].type == WAMBLE_INTENT_UPDATE_BOARD_MOVE_META &&
-              buf->items[j].as.update_board_move_meta.board_id ==
-                  it->as.update_board_move_meta.board_id) {
-            handled[j] = 1;
-          }
-        }
-        exec_idx[exec_count++] = i;
-        continue;
-      }
-      if (it->type == WAMBLE_INTENT_UPDATE_BOARD_RESERVATION_META) {
-        handled[i] = 1;
-        for (int j = i - 1; j >= 0; j--) {
-          if (!handled[j] &&
-              buf->items[j].type ==
-                  WAMBLE_INTENT_UPDATE_BOARD_RESERVATION_META &&
-              buf->items[j].as.update_board_reservation_meta.board_id ==
-                  it->as.update_board_reservation_meta.board_id) {
-            handled[j] = 1;
-          }
-        }
-        exec_idx[exec_count++] = i;
-        continue;
-      }
-      if (it->type == WAMBLE_INTENT_UPDATE_SESSION_LAST_SEEN) {
-        handled[i] = 1;
-        for (int j = i - 1; j >= 0; j--) {
-          if (!handled[j] &&
-              buf->items[j].type == WAMBLE_INTENT_UPDATE_SESSION_LAST_SEEN &&
-              memcmp(buf->items[j].as.update_session_last_seen.token,
-                     it->as.update_session_last_seen.token,
-                     TOKEN_LENGTH) == 0) {
-            handled[j] = 1;
-          }
-        }
-        exec_idx[exec_count++] = i;
-        continue;
-      }
-      if (it->type == WAMBLE_INTENT_REMOVE_RESERVATION) {
-        handled[i] = 1;
-        for (int j = i - 1; j >= 0; j--) {
-          if (!handled[j] &&
-              buf->items[j].type == WAMBLE_INTENT_REMOVE_RESERVATION &&
-              buf->items[j].as.remove_reservation.board_id ==
-                  it->as.remove_reservation.board_id) {
-            handled[j] = 1;
-          }
-        }
-        exec_idx[exec_count++] = i;
-      }
-    }
-
-    int append_count = 0;
-    for (int i = 0; i < to_apply; i++) {
-      if (handled[i])
-        continue;
-      if (buf->items[i].type == WAMBLE_INTENT_RECORD_MOVE ||
-          buf->items[i].type == WAMBLE_INTENT_RECORD_PAYOUT) {
-        append_refs[append_count].idx = i;
-        append_refs[append_count].it = &buf->items[i];
-        append_count++;
-      }
-    }
-    qsort(append_refs, (size_t)append_count, sizeof(*append_refs),
-          append_ref_cmp);
-    for (int i = 0; i < append_count; i++) {
-      int idx = append_refs[i].idx;
-      if (handled[idx])
-        continue;
-      handled[idx] = 1;
-      exec_idx[exec_count++] = idx;
-    }
-
-    for (int i = 0; i < to_apply; i++) {
-      if (handled[i])
-        continue;
-      handled[i] = 1;
-      exec_idx[exec_count++] = i;
-    }
-
-    if (exec_count > 0 && db_write_batch_begin() == 0) {
-      int ok = 1;
-      for (int i = 0; i < exec_count; i++) {
-        if (apply_one_intent_db(&buf->items[exec_idx[i]], &session_cache) < 0) {
-          ok = 0;
-          break;
-        }
-      }
-      if (ok && db_write_batch_commit() == 0) {
-        txn_success = 1;
-      } else {
-        db_write_batch_rollback();
-      }
-    }
-
-    if (!txn_success) {
-      for (int i = 0; i < exec_count; i++) {
-        struct WamblePersistenceIntent *it = &buf->items[exec_idx[i]];
-        if (apply_one_intent_db(it, &session_cache) < 0) {
-          failures++;
-          buf->items[write_idx++] = *it;
-        }
-      }
-    }
-  } else {
-    for (int i = 0; i < to_apply; i++) {
-      struct WamblePersistenceIntent *it = &buf->items[i];
-      int rc = apply_one_intent_db(it, &session_cache);
-      if (rc < 0) {
-        failures++;
-        buf->items[write_idx++] = *it;
-      }
+  for (int i = 0; i < to_apply; i++) {
+    struct WamblePersistenceIntent *it = &buf->items[i];
+    if (apply_one_intent_db(it, &session_cache) < 0) {
+      failures = 1;
+      int pending = to_apply - i;
+      memmove(&buf->items[write_idx], it,
+              (size_t)pending * sizeof(*buf->items));
+      write_idx += pending;
+      break;
     }
   }
   free(session_cache_items);
-  if (txn_success) {
-    failures = 0;
-    write_idx = 0;
-  }
-  free(exec_idx);
-  free(append_refs);
-  free(handled);
 
   if (to_apply < buf->count) {
     int tail = buf->count - to_apply;
@@ -884,4 +1034,29 @@ PersistenceStatus wamble_apply_intents_with_db_checked(
   if (out_failures)
     *out_failures = failures;
   return g_persist_status;
+}
+
+int wamble_persistence_flush_buffer(struct WambleIntentBuffer *buf,
+                                    const WambleQueryService *qs,
+                                    int max_batches, int max_intents,
+                                    int max_payload_bytes) {
+  if (!buf || max_batches <= 0)
+    return 1;
+  wamble_set_query_service(qs);
+  wamble_set_intent_buffer(buf);
+  for (int i = 0; i < max_batches && buf->count > 0; i++) {
+    int attempted = 0;
+    int failures = 0;
+    wamble_persistence_clear_status();
+    PersistenceStatus st = wamble_apply_intents_with_db_checked(
+        buf, max_intents, max_payload_bytes, NULL, &attempted, &failures);
+    if (st == PERSISTENCE_STATUS_OK || st == PERSISTENCE_STATUS_EMPTY) {
+      if (attempted > 0)
+        continue;
+      break;
+    }
+    if (attempted <= 0 || failures > 0 || st == PERSISTENCE_STATUS_APPLY_FAIL)
+      break;
+  }
+  return buf->count <= 0;
 }

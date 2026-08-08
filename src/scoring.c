@@ -1,6 +1,11 @@
 #include "wamble/wamble.h"
 #include <string.h>
 
+void wamble_emit_record_payout_with_canonical(uint64_t board_id,
+                                              const uint8_t *token,
+                                              double points,
+                                              double canonical_points);
+
 typedef struct {
   uint8_t player_token[TOKEN_LENGTH];
   int white_moves;
@@ -315,6 +320,29 @@ ScoringStatus calculate_and_distribute_pot(uint64_t board_id) {
     return SCORING_NONE;
   }
   return calculate_and_distribute_pot_for_moves_internal(board_id, board,
+                                                         mres.rows, mres.count);
+}
+
+ScoringStatus
+calculate_and_distribute_pot_for_completed_board(uint64_t board_id,
+                                                 GameResult result) {
+  if (result == GAME_RESULT_IN_PROGRESS)
+    return SCORING_NONE;
+
+  DbMovesResult mres = wamble_query_get_moves_for_board(board_id);
+  if (mres.status == DB_NOT_FOUND)
+    return SCORING_NONE;
+  if (mres.status != DB_OK)
+    return SCORING_ERR_DB;
+  if (mres.count <= 0 || !mres.rows)
+    return SCORING_NONE;
+
+  WambleBoard board_stub;
+  memset(&board_stub, 0, sizeof(board_stub));
+  board_stub.id = board_id;
+  board_stub.result = result;
+
+  return calculate_and_distribute_pot_for_moves_internal(board_id, &board_stub,
                                                          mres.rows, mres.count);
 }
 

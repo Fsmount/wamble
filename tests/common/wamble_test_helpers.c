@@ -625,6 +625,38 @@ int test_db_apply_sql(const char *sql) {
   return test_db_apply_sql_file(path);
 }
 
+int test_db_query_int(const char *sql, long *out_value) {
+  if (!sql || !out_value)
+    return -1;
+  PGconn *c = db_connect();
+  if (!c)
+    return -1;
+  PGresult *r = PQexec(c, sql);
+  if (!r) {
+    PQfinish(c);
+    return -1;
+  }
+  if (PQresultStatus(r) != PGRES_TUPLES_OK || PQntuples(r) != 1 ||
+      PQnfields(r) != 1) {
+    fprintf(stderr, "[test-db] query_int failed: %s\n",
+            PQerrorMessage(c) ? PQerrorMessage(c) : "(unknown)");
+    PQclear(r);
+    PQfinish(c);
+    return -1;
+  }
+  char *end = NULL;
+  long value = strtol(PQgetvalue(r, 0, 0), &end, 10);
+  if (!end || *end != '\0') {
+    PQclear(r);
+    PQfinish(c);
+    return -1;
+  }
+  *out_value = value;
+  PQclear(r);
+  PQfinish(c);
+  return 0;
+}
+
 int test_db_reset_schema(const char *schema_name) {
   if (!schema_name || !*schema_name)
     return -1;
@@ -636,6 +668,11 @@ int test_db_reset_schema(const char *schema_name) {
 #else
 int test_db_drop_schema(const char *schema_name) {
   (void)schema_name;
+  return -1;
+}
+int test_db_query_int(const char *sql, long *out_value) {
+  (void)sql;
+  (void)out_value;
   return -1;
 }
 int test_db_reset_schema(const char *schema_name) {
